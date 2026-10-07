@@ -1,6 +1,6 @@
 # Holodeck
 
-A tvOS 27 Metal showcase with five animated procedural effects and three ray-marched material spheres. All shaders are Swift strings compiled at runtime; no precompiled Metal library is required.
+A Metal showcase for tvOS 26.0 and later with five animated procedural effects and three ray-marched material spheres. All shaders are Swift strings compiled at runtime; no precompiled Metal library is required.
 
 ## Controls
 
@@ -35,7 +35,7 @@ struct ShaderUniforms {
 
 ## Validation
 
-Run the Holodeck scheme's tests on a tvOS 27 Apple TV simulator. The unit tests compile all eight shaders, render floating-point frames, check coverage and animation, and save PNG attachments. They also verify cache reuse, uniform layout, stale selections, failure recovery, and paused time. UI tests exercise all eight selections, focus restoration, Back dismissal, and background/resume, with screenshots saved in the test result bundle.
+Run the Holodeck scheme's tests on a tvOS 26 or later Apple TV simulator. The unit tests compile all eight shaders, render floating-point frames, check coverage and animation, and save PNG attachments. They also verify cache reuse, uniform layout, stale selections, failure recovery, and paused time. UI tests exercise all eight selections, focus restoration, Back dismissal, and background/resume, with screenshots saved in the test result bundle.
 
 ```sh
 xcodebuild -project Holodeck.xcodeproj -scheme Holodeck \
@@ -43,4 +43,4 @@ xcodebuild -project Holodeck.xcodeproj -scheme Holodeck \
   -parallel-testing-enabled NO test
 ```
 
-The connected Arrowhead device currently runs tvOS 26.6 and cannot run this app's retained tvOS 27.0 target.
+The minimum deployment target is tvOS 26.0. Verify shader rendering, remote navigation, and background/resume on tvOS 26 before release.

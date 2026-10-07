@@ -376,7 +376,7 @@
 				SDKROOT = appletvos;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
-				TVOS_DEPLOYMENT_TARGET = 27.0;
+				TVOS_DEPLOYMENT_TARGET = 26.0;
 			};
 			name = Debug;
 		};
@@ -432,7 +432,7 @@
 				MTL_FAST_MATH = YES;
 				SDKROOT = appletvos;
 				SWIFT_COMPILATION_MODE = wholemodule;
-				TVOS_DEPLOYMENT_TARGET = 27.0;
+				TVOS_DEPLOYMENT_TARGET = 26.0;
 				VALIDATE_PRODUCT = YES;
 			};
 			name = Release;
@@ -455,7 +455,7 @@
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 3;
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Holodeck.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Holodeck";
-				TVOS_DEPLOYMENT_TARGET = 27.0;
+				TVOS_DEPLOYMENT_TARGET = 26.0;
 			};
 			name = Debug;
 		};
@@ -477,7 +477,7 @@
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 3;
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Holodeck.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Holodeck";
-				TVOS_DEPLOYMENT_TARGET = 27.0;
+				TVOS_DEPLOYMENT_TARGET = 26.0;
 			};
 			name = Release;
 		};
