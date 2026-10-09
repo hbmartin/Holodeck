@@ -17,6 +17,10 @@ nonisolated enum RendererStartupError: LocalizedError {
 final class GameViewController: UIViewController, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout {
     @Dependency(\.rendererFactory) private var rendererFactory
     @Dependency(\.shaderPreferences) private var shaderPreferences
+    @Dependency(\.catalogService) private var catalogService
+    private lazy var catalog = catalogService.initialSnapshot
+    private lazy var shaders = catalog.shaders
+    private var catalogRefreshTask: Task<Void, Never>?
     @Dependency(\.continuousClock) private var hintClock
     private var startupShader = ShaderCatalog.initialShader
     private(set) var shaderSelectionTask: Task<Void, Never>?
@@ -51,6 +55,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     deinit {
         hintTask?.cancel()
         shaderSelectionTask?.cancel()
+        catalogRefreshTask?.cancel()
     }
 
     override var canBecomeFirstResponder: Bool { true }
@@ -63,7 +68,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         view.backgroundColor = .black
         view.accessibilityIdentifier = "shader-surface"
         let savedID = shaderPreferences.lastShaderID()
-        startupShader = ShaderCatalog.shaders.first { $0.id == savedID } ?? ShaderCatalog.initialShader
+        startupShader = shaders.first { $0.id == savedID } ?? catalog.initialShader
         buildPicker()
         buildHint()
         selectGesture.allowedPressTypes = [NSNumber(value: UIPress.PressType.select.rawValue)]
@@ -81,6 +86,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             self.renderer = renderer
             metalView.delegate = renderer
             chooseShader(startupShader, origin: .startup)
+            refreshCatalog()
         } catch {
             showUnavailable(error.localizedDescription)
         }
@@ -96,6 +102,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         renderer?.setActive(active)
         if unavailableMessage != nil { (view as? MTKView)?.isPaused = true }
         if active {
+            refreshCatalog()
             // UIKit may clear the first responder when the app leaves the foreground.
             becomeFirstResponder()
             let focused = UIFocusSystem.focusSystem(for: view)?.focusedItem as? UIView
@@ -105,6 +112,44 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
                 setNeedsFocusUpdate()
                 updateFocusIfNeeded()
             }
+        }
+    }
+
+    private func refreshCatalog() {
+        guard catalogRefreshTask == nil, unavailableMessage == nil else { return }
+        let service = catalogService
+        catalogRefreshTask = Task { [weak self] in
+            defer { self?.catalogRefreshTask = nil }
+            do {
+                if let snapshot = try await service.refresh(), !Task.isCancelled {
+                    self?.applyCatalog(snapshot)
+                }
+            } catch {
+                // Refresh failures preserve the offline catalog and do not interrupt playback.
+                print("Shader catalog refresh failed: \(error)")
+            }
+        }
+    }
+
+    /// The service supplies a fully validated snapshot; preserve browsing by stable ID.
+    func applyCatalog(_ snapshot: CatalogSnapshot) {
+        guard (try? snapshot.validate()) != nil else { return }
+        let browsingID = browsingIndexPath.flatMap { index in
+            shaders.indices.contains(index.item) ? shaders[index.item].id : nil
+        }
+        catalog = snapshot
+        shaders = snapshot.shaders
+        if let browsingID, let index = shaders.firstIndex(where: { $0.id == browsingID }) {
+            browsingIndexPath = IndexPath(item: index, section: 0)
+        } else {
+            browsingIndexPath = nil
+        }
+        collectionView.reloadData()
+        if pickerIsVisible {
+            let index = browsingIndexPath ?? preferredShaderIndexPath
+            collectionView.scrollToItem(at: index, at: .centeredHorizontally, animated: false)
+            setNeedsFocusUpdate()
+            updateFocusIfNeeded()
         }
     }
 
@@ -319,7 +364,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     private var preferredShaderIndexPath: IndexPath {
         let id = renderer?.activeShader?.id ?? startupShader.id
-        return IndexPath(item: ShaderCatalog.shaders.firstIndex(where: { $0.id == id }) ?? 0, section: 0)
+        return IndexPath(item: shaders.firstIndex(where: { $0.id == id }) ?? 0, section: 0)
     }
 
     private func updateVisibleCards() {
@@ -330,13 +375,13 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     private func configure(_ cell: ShaderCardCell, at indexPath: IndexPath) {
-        let shader = ShaderCatalog.shaders[indexPath.item]
+        let shader = shaders[indexPath.item]
         cell.configure(shader: shader, active: renderer?.activeShader?.id == shader.id,
-                       loading: pendingSelection?.shader.id == shader.id)
+                       loading: pendingSelection?.shader.id == shader.id, catalogService: catalogService)
     }
 
     func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
-        ShaderCatalog.shaders.count
+        shaders.count
     }
 
     func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
@@ -346,7 +391,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
-        chooseShader(ShaderCatalog.shaders[indexPath.item])
+        chooseShader(shaders[indexPath.item])
     }
 
     func indexPathForPreferredFocusedView(in collectionView: UICollectionView) -> IndexPath? {

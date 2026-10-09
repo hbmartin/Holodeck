@@ -7,6 +7,63 @@ import ConcurrencyExtras
 
 @MainActor
 final class HolodeckTests: XCTestCase {
+    func testRefreshDuringSelectionKeepsPendingShaderAndCurrentPlayback() async throws {
+        let (controller, compiler, pipeline) = try await controlledController()
+        try await waitForRequest("plasma", in: compiler)
+        let initial = try XCTUnwrap(controller.shaderSelectionTask)
+        await compiler.complete("plasma", pipeline: pipeline)
+        try await waitForSelection(initial)
+        controller.openPickerFromRemote()
+        let collection: UICollectionView = try findView("shader-cards", in: controller)
+        controller.collectionView(collection, didSelectItemAt: IndexPath(item: 1, section: 0))
+        try await waitForRequest("aurora", in: compiler)
+        let pending = try XCTUnwrap(controller.shaderSelectionTask)
+        var refreshed = ShaderCatalog.bundled
+        refreshed.manifest.shaders.reverse()
+        refreshed.publicationRevision = String(repeating: "a", count: 40)
+        controller.applyCatalog(refreshed)
+        XCTAssertEqual(controller.collectionView(collection, numberOfItemsInSection: 0), 8)
+        let status: UILabel = try findView("shader-status", in: controller)
+        XCTAssertEqual(status.text, "Loading Aurora…")
+        await compiler.complete("aurora", pipeline: pipeline)
+        try await waitForSelection(pending)
+        XCTAssertTrue(status.text?.hasPrefix("Now showing Aurora") == true)
+        controller.openPickerFromRemote()
+        XCTAssertEqual(controller.indexPathForPreferredFocusedView(in: collection)?.item, 6)
+    }
+
+    func testRemovedActiveShaderKeepsPlayingAndNewSelectionIsAvailable() async throws {
+        let preferences = PreferenceSpy(id: "plasma")
+        let (controller, compiler, pipeline) = try await controlledController(preferences: preferences.client)
+        try await waitForRequest("plasma", in: compiler)
+        let initial = try XCTUnwrap(controller.shaderSelectionTask)
+        await compiler.complete("plasma", pipeline: pipeline)
+        try await waitForSelection(initial)
+        controller.openPickerFromRemote()
+        let collection: UICollectionView = try findView("shader-cards", in: controller)
+        var refreshed = ShaderCatalog.bundled
+        var added = refreshed.manifest.shaders[0]
+        added.id = "ninth-shader"; added.name = "Ninth Shader"
+        added.sourcePath = "sources/ninth-shader.metal"
+        added.previewPath = "previews/ninth-shader.png"
+        refreshed.sources[added.id] = refreshed.sources["plasma"]
+        refreshed.manifest.shaders.removeFirst()
+        refreshed.sources.removeValue(forKey: "plasma")
+        refreshed.manifest.shaders.append(added)
+        refreshed.manifest.defaultShaderID = "aurora"
+        refreshed.publicationRevision = String(repeating: "a", count: 40)
+        controller.applyCatalog(refreshed)
+        let status: UILabel = try findView("shader-status", in: controller)
+        XCTAssertTrue(status.text?.hasPrefix("Now showing Plasma") == true)
+        XCTAssertEqual(preferences.id, "plasma")
+        controller.collectionView(collection, didSelectItemAt: IndexPath(item: 7, section: 0))
+        try await waitForRequest("ninth-shader", in: compiler)
+        let selection = try XCTUnwrap(controller.shaderSelectionTask)
+        await compiler.complete("ninth-shader", pipeline: pipeline)
+        try await waitForSelection(selection)
+        XCTAssertEqual(preferences.id, "ninth-shader")
+    }
+
     func testUniformLayout() {
         XCTAssertEqual(MemoryLayout<ShaderUniforms>.size, 16)
         XCTAssertEqual(MemoryLayout<ShaderUniforms>.stride, 16)

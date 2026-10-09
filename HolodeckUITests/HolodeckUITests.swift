@@ -6,6 +6,37 @@ final class HolodeckUITests: XCTestCase {
 
     override func setUpWithError() throws { continueAfterFailure = false }
 
+    func testCatalogRefreshPreservesFocusPlaybackAndShowsNinthShader() {
+        let app = isolatedApp()
+        app.launchArguments.append("--ui-test-refresh-catalog")
+        app.launch()
+        XCTAssertTrue(app.staticTexts["Press Select to choose a shader"].waitForExistence(timeout: 15))
+        openPicker(in: app)
+        remote.press(.right)
+        let aurora = card("aurora", in: app)
+        waitForFocus(aurora)
+        remote.press(.playPause)
+        waitForFocus(aurora)
+        XCTAssertEqual(aurora.value as? String, "")
+        remote.press(.right)
+        let plasma = card("plasma", in: app)
+        waitForFocus(plasma)
+        XCTAssertEqual(plasma.value as? String, "Now showing")
+        remote.press(.right)
+        let ninth = card("ninth-shader", in: app)
+        waitForFocus(ninth)
+        XCTAssertTrue(ninth.label.contains("Updated"))
+        remote.press(.select)
+        XCTAssertTrue(app.otherElements["shader-picker"].waitForNonExistence(timeout: 10))
+        openPicker(in: app)
+        waitForFocus(ninth)
+        XCTAssertEqual(ninth.value as? String, "Now showing")
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Remote catalog with preview and update date"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
+
     func testDefaultLaunchSelectionAndFocusRestoration() {
         let app = launchShowcase()
         openPicker(in: app)

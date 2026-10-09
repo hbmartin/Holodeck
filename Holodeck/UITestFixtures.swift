@@ -17,6 +17,7 @@ final class UITestFixtures: NSObject {
         if let index = arguments.firstIndex(of: "--ui-test-storage-suite"), index + 1 < arguments.count,
            let defaults = UserDefaults(suiteName: arguments[index + 1]) {
             dependencies.shaderPreferences = .userDefaults(defaults)
+            dependencies.catalogService = CatalogService(bundled: ShaderCatalog.bundled, storage: .disabled, enabled: false)
         }
         if arguments.contains("--ui-test-metal-unavailable") {
             dependencies.metalDevice = nil
@@ -38,6 +39,10 @@ final class UITestFixtures: NSObject {
             let releaseGesture = UITapGestureRecognizer(target: self, action: #selector(releaseInitialShader))
             releaseGesture.allowedPressTypes = [NSNumber(value: UIPress.PressType.playPause.rawValue)]
             controller.view.addGestureRecognizer(releaseGesture)
+        } else if arguments.contains("--ui-test-refresh-catalog") {
+            let refreshGesture = UITapGestureRecognizer(target: self, action: #selector(refreshCatalog))
+            refreshGesture.allowedPressTypes = [NSNumber(value: UIPress.PressType.playPause.rawValue)]
+            controller.view.addGestureRecognizer(refreshGesture)
         } else if arguments.contains("--ui-test-repeat-activation") {
             let activationGesture = UITapGestureRecognizer(target: self, action: #selector(repeatActivation))
             activationGesture.allowedPressTypes = [NSNumber(value: UIPress.PressType.playPause.rawValue)]
@@ -47,6 +52,20 @@ final class UITestFixtures: NSObject {
 
     @objc private func releaseInitialShader() {
         Task { await gate.release() }
+    }
+
+    @objc private func refreshCatalog() {
+        var snapshot = ShaderCatalog.bundled
+        var added = snapshot.manifest.shaders[0]
+        added.id = "ninth-shader"
+        added.name = "Ninth Shader"
+        added.sourcePath = "sources/ninth-shader.metal"
+        added.previewPath = "previews/ninth-shader.png"
+        snapshot.sources[added.id] = snapshot.sources["plasma"]
+        snapshot.manifest.shaders.reverse()
+        snapshot.manifest.shaders.append(added)
+        snapshot.publicationRevision = String(repeating: "a", count: 40)
+        controller?.applyCatalog(snapshot)
     }
 
     @objc private func repeatActivation() {

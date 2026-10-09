@@ -25,7 +25,10 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
             // XCTest still launches a real host scene before constructing scoped test controllers.
             let isTestHost = $0.context == .test
             $0.context = .live
-            if isTestHost { $0.shaderPreferences = .inMemory() }
+            if isTestHost {
+                $0.shaderPreferences = .inMemory()
+                $0.catalogService = CatalogService(bundled: ShaderCatalog.bundled, storage: .disabled, enabled: false)
+            }
             #if DEBUG
             fixtures.configure(&$0)
             #endif
