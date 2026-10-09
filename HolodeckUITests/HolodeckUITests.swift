@@ -31,6 +31,7 @@ final class HolodeckUITests: XCTestCase {
         remote.press(.right)
         remote.press(.menu)
         XCTAssertTrue(app.otherElements["shader-picker"].waitForNonExistence(timeout: 5))
+        XCTAssertEqual(app.state, .runningForeground)
         openPicker(in: app)
         XCTAssertEqual(card("plasma", in: app).value as? String, "Now showing")
         XCTAssertTrue(card("plasma", in: app).hasFocus)
@@ -61,7 +62,7 @@ final class HolodeckUITests: XCTestCase {
         remote.press(.select)
         XCTAssertTrue(app.otherElements["shader-picker"].waitForNonExistence(timeout: 10))
         remote.press(.home)
-        XCTAssertTrue(app.wait(for: .runningBackground, timeout: 5))
+        waitForBackground(app)
         app.activate()
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 5))
         let surface = app.otherElements["shader-surface"]
@@ -71,6 +72,47 @@ final class HolodeckUITests: XCTestCase {
         openPicker(in: app)
         XCTAssertEqual(card("aurora", in: app).value as? String, "Now showing")
         XCTAssertTrue(card("aurora", in: app).hasFocus)
+    }
+
+    func testUnavailableRendererKeepsErrorAndBackReturnsHome() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-test-metal-unavailable"]
+        app.launch()
+        let status = app.staticTexts["shader-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 5))
+        XCTAssertEqual(status.label, "Metal rendering is unavailable on this device.")
+        XCTAssertTrue(app.otherElements["shader-surface"].hasFocus)
+        remote.press(.select)
+        XCTAssertEqual(status.label, "Metal rendering is unavailable on this device.")
+        XCTAssertTrue(app.otherElements["shader-picker"].exists)
+        remote.press(.menu)
+        waitForBackground(app)
+    }
+
+    func testInitialLoadingPreservesOpenPickerAndBrowsingFocus() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-test-hold-initial-shader"]
+        app.launch()
+        XCTAssertTrue(app.staticTexts["Loading Plasma…"].waitForExistence(timeout: 5))
+        openPicker(in: app)
+        for id in ["aurora", "waves", "kaleidoscope", "starfield", "chrome"] {
+            remote.press(.right)
+            XCTAssertTrue(card(id, in: app).hasFocus)
+        }
+        remote.press(.playPause)
+        let loaded = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH %@", "Now showing Plasma"),
+                                              object: app.staticTexts["shader-status"])
+        XCTAssertEqual(XCTWaiter.wait(for: [loaded], timeout: 10), .completed)
+        XCTAssertTrue(app.otherElements["shader-picker"].exists)
+        XCTAssertTrue(card("chrome", in: app).hasFocus)
+        XCTAssertFalse(app.staticTexts["Press Select to choose a shader"].exists)
+    }
+
+    private func waitForBackground(_ app: XCUIApplication) {
+        let states = [XCUIApplication.State.runningBackground.rawValue,
+                      XCUIApplication.State.runningBackgroundSuspended.rawValue] as NSArray
+        let backgrounded = XCTNSPredicateExpectation(predicate: NSPredicate(format: "state IN %@", states), object: app)
+        XCTAssertEqual(XCTWaiter.wait(for: [backgrounded], timeout: 5), .completed)
     }
 
     private func launchShowcase() -> XCUIApplication {

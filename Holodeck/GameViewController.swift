@@ -1,8 +1,43 @@
 import UIKit
 import MetalKit
 
+nonisolated enum RendererStartupError: LocalizedError {
+    case metalUnavailable
+    case initializationFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .metalUnavailable: return "Metal rendering is unavailable on this device."
+        case .initializationFailed: return "The renderer could not start. Relaunch Holodeck to try again."
+        }
+    }
+}
+
 final class GameViewController: UIViewController, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout {
+    var rendererFactory: @MainActor (MTKView) throws -> Renderer = { metalView in
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--ui-test-metal-unavailable") {
+            throw RendererStartupError.metalUnavailable
+        }
+        #endif
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw RendererStartupError.metalUnavailable
+        }
+        metalView.device = device
+        #if DEBUG
+        let compiler: (any ShaderCompiling)? = ProcessInfo.processInfo.arguments.contains("--ui-test-hold-initial-shader")
+            ? HeldInitialShaderCompiler(device: device) : nil
+        #else
+        let compiler: (any ShaderCompiling)? = nil
+        #endif
+        guard let renderer = Renderer(metalKitView: metalView, compiler: compiler) else {
+            throw RendererStartupError.initializationFailed
+        }
+        return renderer
+    }
+    private(set) var shaderSelectionTask: Task<Void, Never>?
     private var renderer: Renderer?
+    private var unavailableMessage: String?
     private let picker = UIVisualEffectView(effect: UIBlurEffect(style: .dark))
     private let statusLabel = UILabel()
     private let spinner = UIActivityIndicatorView(style: .medium)
@@ -12,6 +47,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     private var pendingShaderID: String?
     private var pickerIsVisible = false
     private lazy var selectGesture = UITapGestureRecognizer(target: self, action: #selector(openPickerFromRemote))
+    private lazy var menuGesture = UITapGestureRecognizer(target: self, action: #selector(closePickerFromRemote))
     private let collectionView: UICollectionView = {
         let layout = UICollectionViewFlowLayout()
         layout.scrollDirection = .horizontal
@@ -22,7 +58,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     override var canBecomeFirstResponder: Bool { true }
     override var preferredFocusEnvironments: [any UIFocusEnvironment] {
-        pickerIsVisible ? [collectionView] : [view]
+        pickerIsVisible && unavailableMessage == nil ? [collectionView] : [view]
     }
 
     override func viewDidLoad() {
@@ -33,20 +69,29 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         buildHint()
         selectGesture.allowedPressTypes = [NSNumber(value: UIPress.PressType.select.rawValue)]
         view.addGestureRecognizer(selectGesture)
+        menuGesture.allowedPressTypes = [NSNumber(value: UIPress.PressType.menu.rawValue)]
+        menuGesture.isEnabled = false
+        view.addGestureRecognizer(menuGesture)
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--ui-test-hold-initial-shader") {
+            let releaseGesture = UITapGestureRecognizer(target: self, action: #selector(releaseInitialShaderFromRemote))
+            releaseGesture.allowedPressTypes = [NSNumber(value: UIPress.PressType.playPause.rawValue)]
+            view.addGestureRecognizer(releaseGesture)
+        }
+        #endif
 
-        guard let metalView = view as? MTKView,
-              let device = MTLCreateSystemDefaultDevice() else {
-            showUnavailable("Metal rendering is unavailable on this device.")
+        guard let metalView = view as? MTKView else {
+            showUnavailable(RendererStartupError.metalUnavailable.localizedDescription)
             return
         }
-        metalView.device = device
-        guard let renderer = Renderer(metalKitView: metalView) else {
-            showUnavailable("The renderer could not start. Relaunch Holodeck to try again.")
-            return
+        do {
+            let renderer = try rendererFactory(metalView)
+            self.renderer = renderer
+            metalView.delegate = renderer
+            chooseShader(ShaderCatalog.initialShader, isInitial: true)
+        } catch {
+            showUnavailable(error.localizedDescription)
         }
-        self.renderer = renderer
-        metalView.delegate = renderer
-        chooseShader(ShaderCatalog.initialShader, isInitial: true)
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -63,14 +108,6 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             setNeedsFocusUpdate()
             updateFocusIfNeeded()
         }
-    }
-
-    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        if pickerIsVisible, presses.contains(where: { $0.type == .menu }) {
-            hidePicker()
-            return
-        }
-        super.pressesBegan(presses, with: event)
     }
 
     private func buildPicker() {
@@ -92,9 +129,12 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         statusLabel.accessibilityIdentifier = "shader-status"
         spinner.hidesWhenStopped = true
         spinner.color = .white
+        spinner.accessibilityIdentifier = "shader-loading"
         let statusRow = UIStackView(arrangedSubviews: [spinner, statusLabel])
+        statusRow.accessibilityIdentifier = "shader-status-row"
         statusRow.spacing = 12
         statusRow.alignment = .center
+        statusRow.heightAnchor.constraint(equalToConstant: max(40, spinner.intrinsicContentSize.height)).isActive = true
         let heading = UIStackView(arrangedSubviews: [eyebrow, title, statusRow])
         heading.axis = .vertical
         heading.spacing = 8
@@ -102,6 +142,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         picker.contentView.addSubview(heading)
 
         collectionView.translatesAutoresizingMaskIntoConstraints = false
+        collectionView.accessibilityIdentifier = "shader-cards"
         collectionView.backgroundColor = .clear
         collectionView.clipsToBounds = false
         collectionView.contentInset = UIEdgeInsets(top: 16, left: 72, bottom: 16, right: 72)
@@ -115,19 +156,20 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             picker.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             picker.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             picker.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            picker.heightAnchor.constraint(equalToConstant: 430),
             heading.leadingAnchor.constraint(equalTo: picker.contentView.leadingAnchor, constant: 72),
             heading.trailingAnchor.constraint(equalTo: picker.contentView.trailingAnchor, constant: -72),
             heading.topAnchor.constraint(equalTo: picker.contentView.topAnchor, constant: 26),
             collectionView.leadingAnchor.constraint(equalTo: picker.contentView.leadingAnchor),
             collectionView.trailingAnchor.constraint(equalTo: picker.contentView.trailingAnchor),
             collectionView.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 10),
+            collectionView.heightAnchor.constraint(equalToConstant: 272),
             collectionView.bottomAnchor.constraint(equalTo: picker.contentView.bottomAnchor, constant: -30)
         ])
     }
 
     private func buildHint() {
         hint.translatesAutoresizingMaskIntoConstraints = false
+        hint.accessibilityIdentifier = "shader-hint"
         hint.layer.cornerRadius = 18
         hint.clipsToBounds = true
         hintLabel.text = "Loading Plasma…"
@@ -148,20 +190,24 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     private func showPicker() {
         selectGesture.isEnabled = false
+        menuGesture.isEnabled = unavailableMessage == nil
         hintTask?.cancel()
         hint.isHidden = true
         pickerIsVisible = true
-        (view as? ShowcaseMetalView)?.acceptsFocus = false
+        (view as? ShowcaseMetalView)?.acceptsFocus = unavailableMessage != nil
         picker.isHidden = false
-        if pendingShaderID == nil { updateStatus() }
+        if pendingShaderID == nil || unavailableMessage != nil { updateStatus() }
         updateVisibleCards()
         view.layoutIfNeeded()
-        collectionView.scrollToItem(at: preferredShaderIndexPath, at: .centeredHorizontally, animated: false)
+        if unavailableMessage == nil {
+            collectionView.scrollToItem(at: preferredShaderIndexPath, at: .centeredHorizontally, animated: false)
+        }
         setNeedsFocusUpdate()
         updateFocusIfNeeded()
     }
 
     private func hidePicker(cancelSelection: Bool = true) {
+        guard unavailableMessage == nil else { return }
         if cancelSelection, renderer?.activeShader != nil {
             renderer?.cancelPendingSelection()
             pendingShaderID = nil
@@ -169,6 +215,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         }
         pickerIsVisible = false
         selectGesture.isEnabled = true
+        menuGesture.isEnabled = false
         (view as? ShowcaseMetalView)?.acceptsFocus = true
         picker.isHidden = true
         setNeedsFocusUpdate()
@@ -176,7 +223,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     private func chooseShader(_ shader: ShaderDefinition, isInitial: Bool = false) {
-        guard let renderer else { return }
+        guard let renderer, unavailableMessage == nil else { return }
         hintTask?.cancel()
         hint.isHidden = !isInitial
         pendingShaderID = shader.id
@@ -184,15 +231,18 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         spinner.startAnimating()
         updateVisibleCards()
 
-        Task { [weak self] in
+        shaderSelectionTask = Task { [weak self] in
             do {
                 guard try await renderer.select(shader), let self else { return }
                 self.pendingShaderID = nil
                 self.spinner.stopAnimating()
                 self.updateStatus()
                 self.updateVisibleCards()
-                self.hidePicker(cancelSelection: false)
-                if isInitial { self.showStartupHint() }
+                if isInitial {
+                    if !self.pickerIsVisible { self.showStartupHint() }
+                } else {
+                    self.hidePicker(cancelSelection: false)
+                }
             } catch {
                 guard let self else { return }
                 self.pendingShaderID = nil
@@ -204,9 +254,20 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         }
     }
 
-    @objc private func openPickerFromRemote() {
+    @objc func openPickerFromRemote() {
         showPicker()
     }
+
+    @objc func closePickerFromRemote() {
+        guard pickerIsVisible, unavailableMessage == nil else { return }
+        hidePicker()
+    }
+
+    #if DEBUG
+    @objc private func releaseInitialShaderFromRemote() {
+        Task { await HeldInitialShaderCompiler.gate.release() }
+    }
+    #endif
 
     private func showStartupHint() {
         hintLabel.text = "Press Select to choose a shader"
@@ -219,7 +280,9 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     private func updateStatus() {
-        if let active = renderer?.activeShader {
+        if let unavailableMessage {
+            statusLabel.text = unavailableMessage
+        } else if let active = renderer?.activeShader {
             statusLabel.text = "Now showing \(active.title) · Select to play · Back to close"
         } else {
             statusLabel.text = "Select a shader to begin · Back to close"
@@ -227,9 +290,11 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     private func showUnavailable(_ message: String) {
-        showPicker()
-        statusLabel.text = message
+        unavailableMessage = message
+        pendingShaderID = nil
+        spinner.stopAnimating()
         collectionView.isUserInteractionEnabled = false
+        showPicker()
     }
 
     private var preferredShaderIndexPath: IndexPath {
@@ -268,3 +333,35 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         preferredShaderIndexPath
     }
 }
+
+#if DEBUG
+/// The UI regression controls startup completion with Play/Pause instead of a timing delay.
+private actor HeldInitialShaderCompiler: ShaderCompiling {
+    static let gate = InitialShaderGate()
+    private let compiler: ShaderCompiler
+
+    init(device: any MTLDevice) { compiler = ShaderCompiler(device: device) }
+
+    func pipeline(for shader: ShaderDefinition) async throws -> any MTLRenderPipelineState {
+        if shader.id == ShaderCatalog.initialShader.id { await Self.gate.wait() }
+        return try await compiler.pipeline(for: shader)
+    }
+}
+
+private actor InitialShaderGate {
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if released { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+}
+#endif
