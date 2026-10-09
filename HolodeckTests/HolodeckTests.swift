@@ -136,6 +136,208 @@ final class HolodeckTests: XCTestCase {
         XCTAssertTrue(view.isPaused)
     }
 
+    func testInitialActivationKeepsPickerAndBrowsingPosition() async throws {
+        let (controller, compiler, pipeline) = try await controlledController()
+        try await waitForRequest("plasma", in: compiler)
+        let initial = try XCTUnwrap(controller.shaderSelectionTask)
+        controller.openPickerFromRemote()
+        let collection: UICollectionView = try findView("shader-cards", in: controller)
+        let index = IndexPath(item: 5, section: 0)
+        collection.scrollToItem(at: index, at: .centeredHorizontally, animated: false)
+        collection.layoutIfNeeded()
+        XCTAssertNotNil(collection.cellForItem(at: index))
+        let offset = collection.contentOffset
+
+        await compiler.complete("plasma", pipeline: pipeline)
+        try await waitForSelection(initial)
+
+        let picker: UIView = try findView("shader-picker", in: controller)
+        let hint: UIView = try findView("shader-hint", in: controller)
+        let status: UILabel = try findView("shader-status", in: controller)
+        XCTAssertFalse(picker.isHidden)
+        XCTAssertTrue(hint.isHidden)
+        XCTAssertEqual(collection.contentOffset, offset)
+        XCTAssertTrue(status.text?.hasPrefix("Now showing Plasma") == true)
+    }
+
+    func testInitialLoadingContinuesAfterBackDismissal() async throws {
+        let (controller, compiler, pipeline) = try await controlledController()
+        try await waitForRequest("plasma", in: compiler)
+        let initial = try XCTUnwrap(controller.shaderSelectionTask)
+        controller.openPickerFromRemote()
+        controller.closePickerFromRemote()
+        let picker: UIView = try findView("shader-picker", in: controller)
+        XCTAssertTrue(picker.isHidden)
+
+        await compiler.complete("plasma", pipeline: pipeline)
+        try await waitForSelection(initial)
+        let hint: UIView = try findView("shader-hint", in: controller)
+        let status: UILabel = try findView("shader-status", in: controller)
+        XCTAssertTrue(picker.isHidden)
+        XCTAssertFalse(hint.isHidden)
+        XCTAssertTrue(status.text?.hasPrefix("Now showing Plasma") == true)
+    }
+
+    func testExplicitSelectionSupersedesInitialCompletionAndFailure() async throws {
+        for initialFails in [false, true] {
+            let (controller, compiler, pipeline) = try await controlledController()
+            try await waitForRequest("plasma", in: compiler)
+            let initial = try XCTUnwrap(controller.shaderSelectionTask)
+            controller.openPickerFromRemote()
+            let collection: UICollectionView = try findView("shader-cards", in: controller)
+            controller.collectionView(collection, didSelectItemAt: IndexPath(item: 1, section: 0))
+            try await waitForRequest("aurora", in: compiler)
+            let selected = try XCTUnwrap(controller.shaderSelectionTask)
+            await compiler.complete("aurora", pipeline: pipeline)
+            try await waitForSelection(selected)
+
+            if initialFails {
+                await compiler.fail("plasma")
+            } else {
+                await compiler.complete("plasma", pipeline: pipeline)
+            }
+            try await waitForSelection(initial)
+
+            let picker: UIView = try findView("shader-picker", in: controller)
+            let hint: UIView = try findView("shader-hint", in: controller)
+            let status: UILabel = try findView("shader-status", in: controller)
+            XCTAssertTrue(picker.isHidden)
+            XCTAssertTrue(hint.isHidden)
+            XCTAssertTrue(status.text?.hasPrefix("Now showing Aurora") == true)
+        }
+    }
+
+    func testUnavailableErrorsSurvivePickerUpdates() async throws {
+        for error in [RendererStartupError.metalUnavailable, .initializationFailed] {
+            let controller = try await hostController { _ in throw error }
+            let picker: UIView = try findView("shader-picker", in: controller)
+            let hint: UIView = try findView("shader-hint", in: controller)
+            let status: UILabel = try findView("shader-status", in: controller)
+            let spinner: UIActivityIndicatorView = try findView("shader-loading", in: controller)
+            let collection: UICollectionView = try findView("shader-cards", in: controller)
+            XCTAssertNil(controller.shaderSelectionTask)
+            for _ in 0..<3 {
+                controller.openPickerFromRemote()
+                controller.closePickerFromRemote()
+                XCTAssertFalse(picker.isHidden)
+                XCTAssertTrue(hint.isHidden)
+                XCTAssertEqual(status.text, error.localizedDescription)
+                XCTAssertFalse(spinner.isAnimating)
+                XCTAssertFalse(collection.isUserInteractionEnabled)
+            }
+        }
+    }
+
+    func testPickerLayoutIsStableWhileLoadingReadyAndUnavailable() async throws {
+        let sizes = [CGSize(width: 1920, height: 1080), CGSize(width: 1280, height: 720)]
+        let (controller, compiler, pipeline) = try await controlledController()
+        try await waitForRequest("plasma", in: compiler)
+        let initial = try XCTUnwrap(controller.shaderSelectionTask)
+        controller.openPickerFromRemote()
+        let loading = try sizes.map { try checkPickerLayout(controller, size: $0) }
+        await compiler.complete("plasma", pipeline: pipeline)
+        try await waitForSelection(initial)
+        for (index, size) in sizes.enumerated() {
+            XCTAssertEqual(try checkPickerLayout(controller, size: size), loading[index])
+        }
+
+        let unavailable = try await hostController { _ in throw RendererStartupError.metalUnavailable }
+        for (index, size) in sizes.enumerated() {
+            XCTAssertEqual(try checkPickerLayout(unavailable, size: size), loading[index])
+        }
+    }
+
+    private func controlledController() async throws -> (GameViewController, ControlledCompiler, any MTLRenderPipelineState) {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let pipeline = try await ShaderCompiler(device: device).pipeline(for: ShaderCatalog.initialShader)
+        let compiler = ControlledCompiler()
+        addTeardownBlock { await compiler.cancelAll() }
+        let controller = try await hostController { view in
+            view.device = device
+            return try XCTUnwrap(Renderer(metalKitView: view, compiler: compiler))
+        }
+        return (controller, compiler, pipeline)
+    }
+
+    private func hostController(factory: @escaping @MainActor (MTKView) throws -> Renderer) async throws -> GameViewController {
+        let storyboard = UIStoryboard(name: "Main", bundle: Bundle(for: GameViewController.self))
+        let controller = try XCTUnwrap(storyboard.instantiateInitialViewController() as? GameViewController)
+        controller.rendererFactory = factory
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        var presenter = try XCTUnwrap(scene.windows.first(where: \.isKeyWindow)?.rootViewController)
+        while let presented = presenter.presentedViewController { presenter = presented }
+        controller.modalPresentationStyle = .fullScreen
+        let appeared = XCTestExpectation(description: "Controller finishes appearing")
+        presenter.present(controller, animated: false) { appeared.fulfill() }
+        let result = await XCTWaiter.fulfillment(of: [appeared], timeout: 5)
+        XCTAssertEqual(result, .completed)
+        guard result == .completed else { throw ControllerTestError.timedOut }
+        controller.view.layoutIfNeeded()
+        addTeardownBlock { @MainActor in
+            controller.setSceneActive(false)
+            let dismissed = XCTestExpectation(description: "Controller finishes disappearing")
+            controller.dismiss(animated: false) { dismissed.fulfill() }
+            let result = await XCTWaiter.fulfillment(of: [dismissed], timeout: 5)
+            XCTAssertEqual(result, .completed)
+        }
+        return controller
+    }
+
+    private func waitForRequest(_ id: String, in compiler: ControlledCompiler) async throws {
+        let checkpoint = XCTestExpectation(description: "Compiler receives \(id)")
+        let waiting = Task {
+            await compiler.waitForRequest(id)
+            checkpoint.fulfill()
+        }
+        defer { waiting.cancel() }
+        let result = await XCTWaiter.fulfillment(of: [checkpoint], timeout: 5)
+        XCTAssertEqual(result, .completed)
+        guard result == .completed else { throw ControllerTestError.timedOut }
+    }
+
+    private func waitForSelection(_ task: Task<Void, Never>) async throws {
+        let finished = XCTestExpectation(description: "Selection updates the controller")
+        let waiting = Task {
+            await task.value
+            finished.fulfill()
+        }
+        defer { waiting.cancel() }
+        let result = await XCTWaiter.fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(result, .completed)
+        guard result == .completed else { throw ControllerTestError.timedOut }
+    }
+
+    private func findView<T: UIView>(_ identifier: String, in controller: GameViewController) throws -> T {
+        func search(_ view: UIView) -> T? {
+            if view.accessibilityIdentifier == identifier, let found = view as? T { return found }
+            for child in view.subviews {
+                if let found = search(child) { return found }
+            }
+            return nil
+        }
+        return try XCTUnwrap(search(controller.view), "Missing \(identifier)")
+    }
+
+    private func checkPickerLayout(_ controller: GameViewController, size: CGSize) throws -> CGRect {
+        controller.view.bounds.size = size
+        controller.view.setNeedsLayout()
+        controller.view.layoutIfNeeded()
+        let collection: UICollectionView = try findView("shader-cards", in: controller)
+        let layout = try XCTUnwrap(collection.collectionViewLayout as? UICollectionViewFlowLayout)
+        XCTAssertEqual(layout.itemSize, CGSize(width: 320, height: 232))
+        XCTAssertGreaterThan(collection.bounds.height - collection.adjustedContentInset.top
+                             - collection.adjustedContentInset.bottom, layout.itemSize.height)
+        let first = try XCTUnwrap(collection.cellForItem(at: IndexPath(item: 0, section: 0)))
+        let frame = first.convert(first.bounds, to: controller.view)
+        let visible = collection.convert(collection.bounds, to: controller.view)
+        let expandedHeight = first.bounds.height * 1.045
+        XCTAssertGreaterThanOrEqual(frame.midY - expandedHeight / 2, visible.minY)
+        XCTAssertLessThanOrEqual(frame.midY + expandedHeight / 2, visible.maxY)
+        let status: UIView = try findView("shader-status-row", in: controller)
+        XCTAssertGreaterThanOrEqual(status.bounds.height, 40)
+        return visible
+    }
+
     private func controlledRenderer() async throws -> (Renderer, ControlledCompiler, any MTLRenderPipelineState) {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let pipeline = try await ShaderCompiler(device: device).pipeline(for: ShaderCatalog.initialShader)
@@ -225,4 +427,15 @@ private actor ControlledCompiler: ShaderCompiling {
     func fail(_ id: String) {
         requests.removeValue(forKey: id)?.resume(throwing: ShaderCompilationError.missingFunction("fragmentShader"))
     }
+
+    func cancelAll() {
+        let pending = Array(requests.values)
+        let waiting = Array(waiters.values)
+        requests.removeAll()
+        waiters.removeAll()
+        pending.forEach { $0.resume(throwing: CancellationError()) }
+        waiting.forEach { $0.resume() }
+    }
 }
+
+private enum ControllerTestError: Error { case timedOut }

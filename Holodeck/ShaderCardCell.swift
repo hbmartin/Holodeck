@@ -23,12 +23,12 @@ final class ShaderCardCell: UICollectionViewCell {
         categoryLabel.font = .systemFont(ofSize: 15, weight: .bold)
         categoryLabel.textColor = UIColor.white.withAlphaComponent(0.75)
         titleLabel.font = .systemFont(ofSize: 30, weight: .semibold)
+        titleLabel.textColor = .white
         descriptionLabel.font = .systemFont(ofSize: 19, weight: .regular)
         descriptionLabel.textColor = UIColor.white.withAlphaComponent(0.85)
         descriptionLabel.numberOfLines = 3
         stateLabel.font = .systemFont(ofSize: 15, weight: .bold)
         stateLabel.textColor = .white
-        [titleLabel, descriptionLabel, stateLabel].forEach { $0.textColor = .white }
 
         let stack = UIStackView(arrangedSubviews: [categoryLabel, titleLabel, descriptionLabel, stateLabel])
         stack.axis = .vertical
