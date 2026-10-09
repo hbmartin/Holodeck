@@ -10,7 +10,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     private lazy var session = withDependencies(from: self) {
         ViewerSession(catalogService: catalogService, preferences: shaderPreferences, policy: .tv)
     }
-    private var catalog: CatalogSnapshot? { session.catalog }
+    private var catalog: ValidatedCatalog? { session.catalog }
     private var shaders: [ShaderDefinition] { session.shaders }
     private var collections: [CatalogCollection] { catalog?.collections ?? [] }
     private var collectionID = "all"
@@ -174,7 +174,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         }
     }
 
-    func applyCatalog(_ snapshot: CatalogSnapshot) { session.applyCatalog(snapshot) }
+    func applyCatalog(_ snapshot: ValidatedCatalog) { session.applyCatalog(snapshot) }
 
     private func buildPicker() {
         picker.translatesAutoresizingMaskIntoConstraints = false
@@ -295,10 +295,14 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     private func hidePicker(cancelSelection: Bool = true) {
         guard unavailableMessage == nil else { return }
         if cancelSelection, pendingSelection?.origin == .user {
-            session.cancelPendingSelection()
+            session.cancelPendingSelection(resumeStartup: true)
             spinner.stopAnimating()
             updateVisibleCards()
-            if session.activeShader == nil, let startupShader { chooseShader(startupShader, origin: .startup) }
+        }
+        // Back can reveal a loading startup, but never an empty viewer after a compile failure.
+        if !shaders.isEmpty, session.activeShader == nil, pendingSelection == nil {
+            updateStatus()
+            return
         }
         pickerIsVisible = false
         selectGesture.isEnabled = true
@@ -365,8 +369,10 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             statusLabel.text = "Loading \(pendingSelection.shader.title)…"
         } else if let active = renderer?.activeShader {
             statusLabel.text = "Now showing \(active.title) · Select to play · Back to close"
+        } else if case .selection(let shader, _) = session.failure?.operation {
+            statusLabel.text = "Couldn’t load \(shader.title). Choose another shader."
         } else {
-            statusLabel.text = "Select a shader to begin · Back to close"
+            statusLabel.text = "Select a shader to begin"
         }
     }
 
@@ -380,8 +386,10 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     private var preferredShaderIndexPath: IndexPath {
-        let id = renderer?.activeShader?.id ?? startupShader?.id
-        return IndexPath(item: visibleShaders.firstIndex(where: { $0.id == id }) ?? 0, section: 0)
+        let ids = [renderer?.activeShader?.id, startupShader?.id, catalog?.initialShader.id].compactMap { $0 }
+        let visible = visibleShaders
+        let index = ids.lazy.compactMap { id in visible.firstIndex { $0.id == id } }.first ?? 0
+        return IndexPath(item: index, section: 0)
     }
 
     private func updateVisibleCards() {

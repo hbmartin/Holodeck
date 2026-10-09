@@ -40,12 +40,13 @@ public final class ViewerSession {
         public let operation: Operation
     }
 
-    public private(set) var catalog: CatalogSnapshot?
+    public private(set) var catalog: ValidatedCatalog?
     public private(set) var shaders: [ShaderDefinition]
     public private(set) var startupShader: ShaderDefinition?
     public private(set) var activeShader: ShaderDefinition?
     public private(set) var pendingSelection: PendingSelection?
     public private(set) var isRefreshing = false
+    public private(set) var requiresExplicitSelection = false
     public var failure: Failure?
     @ObservationIgnored public var onEvent: ((Event) -> Void)?
     @ObservationIgnored public private(set) var selectionTask: Task<Void, Never>?
@@ -58,15 +59,16 @@ public final class ViewerSession {
     @ObservationIgnored private var active = false
     @ObservationIgnored private var hasBeenActive = false
     @ObservationIgnored private var savedID: String?
+    @ObservationIgnored private var recoveryFailure: Failure?
 
     public init(catalogService: CatalogService, preferences: ShaderPreferences, policy: ViewerPolicy) {
         self.catalogService = catalogService
         self.preferences = preferences
         self.policy = policy
-        catalog = catalogService.initialSnapshot
-        shaders = catalogService.initialSnapshot?.shaders ?? []
+        catalog = catalogService.initialCatalog
+        shaders = catalogService.initialCatalog?.shaders ?? []
         savedID = policy.restoresLastScene ? preferences.lastShaderID() : nil
-        startupShader = shaders.first { $0.id == savedID } ?? catalog?.initialShader
+        startupShader = catalog?.startupShader(savedID: savedID)
     }
 
     isolated deinit {
@@ -95,11 +97,14 @@ public final class ViewerSession {
     public func refresh(force: Bool = false) -> Task<Void, Never> {
         if let refreshTask { return refreshTask }
         isRefreshing = true
-        failure = nil
+        if case .catalog = failure?.operation { failure = nil }
         onEvent?(.catalogLoading)
         let service = catalogService
         let task = Task { [weak self] in
             defer { self?.isRefreshing = false; self?.refreshTask = nil }
+            let cached = await service.current()
+            guard !Task.isCancelled else { return }
+            if let cached { self?.applyCatalog(cached) }
             do {
                 let refreshed = try await service.refresh(force: force)
                 let current = await service.current()
@@ -110,8 +115,14 @@ public final class ViewerSession {
                     throw CatalogError.invalidManifest
                 }
             } catch {
+                let current = await service.current()
                 guard !Task.isCancelled, let self else { return }
-                self.failure = Failure(message: "Couldn’t download scenes. Check your internet connection and try again.", operation: .catalog)
+                if let current { self.applyCatalog(current) }
+                if self.requiresExplicitSelection {
+                    self.failure = self.failure ?? self.recoveryFailure
+                } else if self.failure == nil {
+                    self.failure = Failure(message: "Couldn’t download scenes. Check your internet connection and try again.", operation: .catalog)
+                }
                 self.onEvent?(.catalogFailed)
             }
         }
@@ -119,14 +130,14 @@ public final class ViewerSession {
         return task
     }
 
-    public func applyCatalog(_ snapshot: CatalogSnapshot) {
-        guard (try? snapshot.validate()) != nil,
-              snapshot.publicationRevision != catalog?.publicationRevision else { return }
+    public func applyCatalog(_ snapshot: ValidatedCatalog) {
+        guard snapshot.publicationRevision != catalog?.publicationRevision else { return }
+        let firstCatalog = catalog == nil
         catalog = snapshot
         shaders = snapshot.shaders
-        failure = nil
-        if startupShader == nil, activeShader == nil, pendingSelection == nil {
-            startupShader = shaders.first { $0.id == savedID } ?? snapshot.initialShader
+        if case .catalog = failure?.operation { failure = nil }
+        startupShader = snapshot.startupShader(savedID: savedID)
+        if firstCatalog, activeShader == nil, pendingSelection == nil, !requiresExplicitSelection {
             if let startupShader, renderer != nil { select(startupShader, origin: .startup) }
         } else if policy.replacesUpdatedScene, pendingSelection == nil,
                   let activeShader, let updated = shaders.first(where: { $0.id == activeShader.id }) {
@@ -156,6 +167,8 @@ public final class ViewerSession {
                 guard try await renderer.select(shader), self.generation == request else { return }
                 self.activeShader = self.shaders.first { $0.id == shader.id && $0.sourceHash == shader.sourceHash } ?? shader
                 self.pendingSelection = nil
+                self.requiresExplicitSelection = false
+                self.recoveryFailure = nil
                 if self.policy.restoresLastScene { self.preferences.setLastShaderID(shader.id) }
                 self.onEvent?(.activated(origin))
                 // If a refresh arrived during a user selection, resolve the newer source now.
@@ -167,7 +180,9 @@ public final class ViewerSession {
             } catch {
                 guard self.generation == request else { return }
                 self.pendingSelection = nil
+                if self.activeShader == nil { self.requiresExplicitSelection = true }
                 self.failure = Failure(message: "Couldn’t load \(shader.title). Try again or choose another scene.", operation: .selection(shader, origin))
+                if self.requiresExplicitSelection { self.recoveryFailure = self.failure }
                 self.onEvent?(.selectionFailed)
             }
         }
@@ -179,7 +194,10 @@ public final class ViewerSession {
         generation &+= 1
         renderer?.cancelPendingSelection()
         pendingSelection = nil
-        if resumeStartup, activeShader == nil, let startupShader { select(startupShader, origin: .startup) }
+        if requiresExplicitSelection { failure = recoveryFailure }
+        if resumeStartup, !requiresExplicitSelection, activeShader == nil, let startupShader {
+            select(startupShader, origin: .startup)
+        }
     }
 
     public func retry(_ failure: Failure) {

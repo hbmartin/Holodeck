@@ -5,15 +5,15 @@ import XCTest
 final class ViewerSessionTests: XCTestCase {
     private func session(_ policy: ViewerPolicy = .mac, saved: String? = "aurora") -> (ViewerSession, FakeRenderer, PreferenceRecorder) {
         let recorder = PreferenceRecorder(saved)
-        let session = ViewerSession(catalogService: CatalogService(storage: TestCatalog.storage, enabled: false),
+        let session = ViewerSession(catalogService: CatalogService.offline(initialCatalog: TestCatalog.catalog, storage: TestCatalog.storage),
                                     preferences: recorder.preferences, policy: policy)
         let renderer = FakeRenderer()
         session.attach(renderer)
         return (session, renderer, recorder)
     }
     private func settled(_ session: ViewerSession) async {
-        await session.selectionTask?.value
         await session.refreshTask?.value
+        await session.selectionTask?.value
     }
     private func changed(_ id: String = "plasma", metadataOnly: Bool = false) -> CatalogSnapshot {
         var snapshot = TestCatalog.snapshot
@@ -84,19 +84,19 @@ final class ViewerSessionTests: XCTestCase {
         let discovery = SceneDiscovery(tags: ["fluid"], moods: ["energetic"], motion: "steady")
         metadata.manifest.shaders[0].discovery = discovery
         metadata.manifest.collections = [CatalogCollection(id: "featured", name: "Featured", description: "Selected scenes.", shaderIDs: ["plasma"])]
-        mac.applyCatalog(metadata)
+        mac.applyCatalog(try! metadata.validated())
         XCTAssertEqual(mac.activeShader?.title, "Updated Scene")
         XCTAssertEqual(mac.activeShader?.discovery, discovery)
         XCTAssertEqual(renderer.activations.count, 1)
         var revised = changed()
         revised.publicationRevision = String(repeating: "d", count: 40)
-        mac.applyCatalog(revised)
+        mac.applyCatalog(try! revised.validated())
         await settled(mac)
         XCTAssertEqual(renderer.activations.count, 2)
-        XCTAssertEqual(mac.activeShader?.sourceHash, revised.shaders[0].sourceHash)
+        XCTAssertEqual(mac.activeShader?.sourceHash, try! revised.validated().shaders[0].sourceHash)
         let (tv, tvRenderer, _) = session(.tv, saved: nil)
         await settled(tv)
-        tv.applyCatalog(revised)
+        tv.applyCatalog(try! revised.validated())
         await settled(tv)
         XCTAssertEqual(tvRenderer.activations.count, 1)
         XCTAssertEqual(tv.activeShader?.title, "Plasma")
@@ -106,7 +106,7 @@ final class ViewerSessionTests: XCTestCase {
         let (session, renderer, _) = session()
         await settled(session)
         renderer.held = true
-        session.applyCatalog(changed())
+        session.applyCatalog(try! changed().validated())
         let update = session.selectionTask!
         await renderer.waitForRequest("plasma")
         let user = session.select(TestCatalog.shaders[1])
@@ -122,7 +122,7 @@ final class ViewerSessionTests: XCTestCase {
         let (session, renderer, _) = session()
         await settled(session)
         renderer.failNext = true
-        session.applyCatalog(changed())
+        session.applyCatalog(try! changed().validated())
         await settled(session)
         XCTAssertEqual(session.activeShader?.title, "Plasma")
         let failure = try XCTUnwrap(session.failure)
@@ -139,11 +139,102 @@ final class ViewerSessionTests: XCTestCase {
         snapshot.manifest.shaders.removeAll { $0.id == "plasma" }
         snapshot.manifest.defaultShaderID = "aurora"
         snapshot.sources.removeValue(forKey: "plasma")
-        session.applyCatalog(snapshot)
+        session.applyCatalog(try! snapshot.validated())
         XCTAssertEqual(session.activeShader?.id, "plasma")
         XCTAssertEqual(renderer.activations.count, 1)
         XCTAssertTrue(SceneLibrary.filter(session.shaders, query: "no such scene", favoritesOnly: false, favorites: []).isEmpty)
         XCTAssertEqual(session.activeShader?.id, "plasma")
+    }
+
+    func testFailedStartupRequiresExplicitRecoveryAcrossRefreshAndCancellation() async throws {
+        let (session, renderer, prefs) = session(.tv)
+        renderer.failNext = true
+        await settled(session)
+        XCTAssertNil(session.activeShader)
+        XCTAssertTrue(session.requiresExplicitSelection)
+        let failure = try XCTUnwrap(session.failure)
+        session.applyCatalog(try changed("aurora").validated())
+        XCTAssertEqual(session.failure?.id, failure.id)
+        XCTAssertTrue(session.requiresExplicitSelection)
+        XCTAssertEqual(session.startupShader?.title, "Updated Scene")
+        renderer.held = true
+        let selection = session.select(TestCatalog.shaders[2])
+        await renderer.waitForRequest("waves")
+        session.cancelPendingSelection(resumeStartup: true)
+        renderer.finish("waves")
+        await selection.value
+        XCTAssertNil(session.pendingSelection)
+        XCTAssertNil(session.activeShader)
+        XCTAssertEqual(renderer.selections.count, 2, "Back must not retry the failed startup")
+        XCTAssertEqual(prefs.id, "aurora")
+        XCTAssertEqual(prefs.writes, 0)
+        renderer.held = false
+        await session.select(TestCatalog.shaders[2]).value
+        XCTAssertFalse(session.requiresExplicitSelection)
+        XCTAssertEqual(prefs.id, "waves")
+    }
+
+    func testRemovedStartupResumesLatestDefaultAfterUserCancellation() async throws {
+        let (session, renderer, _) = session(.tv)
+        renderer.held = true
+        await renderer.waitForRequest("aurora")
+        await session.refreshTask?.value
+        let initial = session.selectionTask!
+        var latest = changed()
+        latest.manifest.shaders.removeAll { $0.id == "aurora" }
+        latest.sources.removeValue(forKey: "aurora")
+        session.applyCatalog(try latest.validated())
+        let user = session.select(TestCatalog.shaders[2])
+        await renderer.waitForRequest("waves")
+        session.cancelPendingSelection(resumeStartup: true)
+        await renderer.waitForRequest("plasma")
+        XCTAssertEqual(renderer.selections.last?.source, latest.sources["plasma"])
+        renderer.finish("aurora")
+        renderer.finish("waves")
+        renderer.finish("plasma")
+        await initial.value
+        await user.value
+        await settled(session)
+        XCTAssertEqual(session.activeShader?.source, latest.sources["plasma"])
+    }
+
+    func testExplicitStartupRetryUsesLatestDefinitionAndSavesOnlyOnSuccess() async throws {
+        let (session, renderer, prefs) = session(.tv)
+        renderer.failNext = true
+        await settled(session)
+        let failure = try XCTUnwrap(session.failure)
+        let latest = changed("aurora")
+        session.applyCatalog(try latest.validated())
+        XCTAssertEqual(prefs.writes, 0)
+        session.retry(failure)
+        await settled(session)
+        XCTAssertEqual(session.activeShader?.source, latest.sources["aurora"])
+        XCTAssertNil(session.failure)
+        XCTAssertFalse(session.requiresExplicitSelection)
+        XCTAssertEqual(prefs.id, "aurora")
+        XCTAssertEqual(prefs.writes, 1)
+    }
+
+    func testNewSessionReconcilesSharedCatalogAfterUnchangedThrottledAndFailedChecks() async throws {
+        let latest = changed()
+        let box = CatalogTestBox()
+        try box.storage.write("snapshot.json", TestCatalog.data)
+        var responses = ["/git/ref/heads/published": Data("{\"object\":{\"sha\":\"\(latest.publicationRevision)\"}}".utf8),
+                         "/catalog.json": try JSONEncoder().encode(latest.manifest)]
+        for entry in latest.manifest.shaders { responses["/\(entry.sourcePath)"] = Data(latest.sources[entry.id]!.utf8) }
+        box.setResponses(responses)
+        let service = CatalogService(network: box.network, storage: box.storage, clock: box.clock)
+        _ = try await service.refresh()
+        for scenario in 0..<3 {
+            if scenario > 0 { await box.clock.advance(by: .seconds(900)) }
+            if scenario == 2 { box.setResponses([:]) }
+            let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .tv)
+            session.attach(FakeRenderer())
+            await settled(session)
+            XCTAssertEqual(session.catalog?.publicationRevision, latest.publicationRevision)
+            XCTAssertEqual(session.activeShader?.title, "Updated Scene")
+            if scenario == 2 { XCTAssertNotNil(session.failure) }
+        }
     }
 
     func testFirstActivationDoesNotRetryFailedInitialDownload() async {
@@ -166,6 +257,20 @@ final class ViewerSessionTests: XCTestCase {
         await settled(session)
         let resumedRequests = await counter.count
         XCTAssertEqual(resumedRequests, 2)
+    }
+
+    func testCachedStartupActivatesBeforeTheNetworkRefreshCompletes() async {
+        let gate = PreviewRequestGate()
+        let service = CatalogService(network: CatalogNetwork { _, _ in await gate.image("published") }, storage: TestCatalog.storage)
+        let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .tv)
+        session.attach(FakeRenderer())
+        await gate.waitForRequest("published")
+        await session.selectionTask?.value
+        XCTAssertEqual(session.activeShader?.id, "plasma")
+        XCTAssertTrue(session.isRefreshing)
+        await gate.complete("published", data: Data("{\"object\":{\"sha\":\"\(TestCatalog.catalog.publicationRevision)\"}}".utf8))
+        await settled(session)
+        XCTAssertFalse(session.isRefreshing)
     }
 
     func testActivityPausesRendererAndOfflineFailurePreservesCatalog() async {
@@ -200,6 +305,7 @@ private final class PreferenceRecorder {
 private final class FakeRenderer: SceneRendering {
     var activeShader: ShaderDefinition?
     var activations: [String] = []
+    var selections: [ShaderDefinition] = []
     var held = false
     var failNext = false
     var isActive = false
@@ -207,6 +313,7 @@ private final class FakeRenderer: SceneRendering {
     private var pending: [String: CheckedContinuation<Void, Error>] = [:]
     private var observers: [String: CheckedContinuation<Void, Never>] = [:]
     func select(_ shader: ShaderDefinition) async throws -> Bool {
+        selections.append(shader)
         let request = generation
         if held {
             try await withCheckedThrowingContinuation { continuation in

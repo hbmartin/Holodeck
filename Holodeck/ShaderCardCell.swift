@@ -8,7 +8,6 @@ final class ShaderCardCell: UICollectionViewCell {
     private let updatedLabel = UILabel()
     private(set) var previewTask: Task<Void, Never>?
     private var representedPreview: ShaderPreview?
-    private var representedID: String?
     private let categoryLabel = UILabel()
     private let titleLabel = UILabel()
     private let descriptionLabel = UILabel()
@@ -16,6 +15,7 @@ final class ShaderCardCell: UICollectionViewCell {
 
     override init(frame: CGRect) {
         super.init(frame: frame)
+        contentView.backgroundColor = .black
         previewImageView.contentMode = .scaleAspectFill
         previewImageView.clipsToBounds = true
         contentView.addSubview(previewImageView)
@@ -62,18 +62,19 @@ final class ShaderCardCell: UICollectionViewCell {
         categoryLabel.text = shader.category.rawValue
         updatedLabel.text = shader.updatedAt.map { "Updated " + $0.formatted(date: .abbreviated, time: .omitted) }
         updatedLabel.isHidden = shader.updatedAt == nil
-        if representedID != shader.id || representedPreview != shader.preview {
+        let previousHash = representedPreview?.hash
+        representedPreview = shader.preview
+        if previousHash != shader.preview?.hash {
             previewTask?.cancel()
+            previewTask = nil
             previewImageView.image = nil
-            representedID = shader.id
-            representedPreview = shader.preview
-            if let preview = shader.preview, let catalogService {
-                let id = shader.id
-                previewTask = Task { [weak self] in
-                    guard let data = try? await catalogService.preview(preview), !Task.isCancelled,
-                          let self, self.representedID == id, self.representedPreview == preview else { return }
-                    self.previewImageView.image = UIImage(data: data)
-                }
+        }
+        if previewImageView.image == nil, previewTask == nil, let preview = shader.preview, let catalogService {
+            previewTask = Task { [weak self] in
+                let image = try? await catalogService.previewImage(preview, maxPixelSize: 640)
+                guard !Task.isCancelled, let self, self.representedPreview?.hash == preview.hash else { return }
+                self.previewTask = nil
+                if let image { self.previewImageView.image = UIImage(cgImage: image) }
             }
         }
         titleLabel.text = shader.title
@@ -95,7 +96,6 @@ final class ShaderCardCell: UICollectionViewCell {
         super.prepareForReuse()
         previewTask?.cancel()
         previewTask = nil
-        representedID = nil
         representedPreview = nil
         previewImageView.image = nil
     }

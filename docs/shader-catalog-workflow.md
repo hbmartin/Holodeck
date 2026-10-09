@@ -17,15 +17,16 @@ flowchart LR
     Author[Shader author on a Metal-capable Mac] --> Main[HolodeckShaders main]
     Main --> CI[GitHub Actions validation]
     CI --> Published[HolodeckShaders published]
-    Published --> API[Public GitHub APIs]
-    API --> Service[Holodeck catalog service]
+    Published --> API[GitHub API resolves published commit]
+    API --> Raw[Raw content at fixed commit]
+    Raw --> Service[Holodeck catalog service]
     Service --> Cache[Downloaded disk snapshot]
     Service --> Picker[Picker metadata and previews]
     Service --> Compiler[Runtime Metal compiler]
     Compiler --> Renderer[Playing shader]
 ```
 
-There is no backend or user login. GitHub's public APIs deliver the content. Authoring and publishing use the contributor's normal GitHub permissions.
+There is no backend or user login. One public GitHub REST API request resolves the publication; commit-pinned raw URLs deliver assets without consuming the REST API quota. Authoring and publishing use the contributor's normal GitHub permissions.
 
 ## Authoring layout
 
@@ -194,7 +195,7 @@ Keep schema version 1 and the rendering contract compatible with released apps. 
 
 ## App startup and refresh control flow
 
-The catalog service injects networking, storage, and refresh time. Its current snapshot is optional until a valid disk snapshot or download is available.
+The catalog service injects networking, storage, and a monotonic clock. Construction performs no disk reads. Actor-isolated `current()` lazily reads and validates the existing `CatalogSnapshot` JSON once, preparing immutable `ValidatedCatalog` values with dates, verified source hashes, shader definitions and collections. Its current catalog is optional until a valid disk snapshot or download is available. Sessions apply cached state before the network check and reconcile current state after both successful and failed refreshes, so reconnected scenes receive the latest catalog.
 
 ```mermaid
 flowchart TD
@@ -223,7 +224,7 @@ flowchart TD
     Save -. Failure .-> Failure
 ```
 
-With a usable snapshot, refresh attempts are throttled to once per 15 minutes, including failed attempts. This is triggered by launch and actual foreground returns; there is no polling timer. Without a usable snapshot, Select can retry immediately. Concurrent refresh requests do not start overlapping downloads.
+With a usable snapshot, refresh attempts are throttled by `ContinuousClock` to once per 15 minutes, including failed attempts. Wall-clock changes do not affect eligibility. This is triggered by launch and actual foreground returns; there is no polling timer. Forced checks bypass the throttle. Without a usable snapshot, Select can retry immediately. Concurrent refresh requests share the same operation and result.
 
 The app first requests:
 
@@ -231,17 +232,21 @@ The app first requests:
 GET https://api.github.com/repos/hbmartin/HolodeckShaders/git/ref/heads/published
 ```
 
-It then fetches the manifest and assets through the repository Contents API, using the resolved commit as `ref` and requesting raw contents:
+It then fetches the manifest and assets using raw URLs pinned to the resolved commit:
 
 ```text
-GET https://api.github.com/repos/hbmartin/HolodeckShaders/contents/catalog.json?ref=<published-commit>
-GET https://api.github.com/repos/hbmartin/HolodeckShaders/contents/sources/<id>.metal?ref=<published-commit>
-GET https://api.github.com/repos/hbmartin/HolodeckShaders/contents/previews/<id>.png?ref=<published-commit>
+GET https://raw.githubusercontent.com/hbmartin/HolodeckShaders/<published-commit>/catalog.json
+GET https://raw.githubusercontent.com/hbmartin/HolodeckShaders/<published-commit>/sources/<id>.metal
+GET https://raw.githubusercontent.com/hbmartin/HolodeckShaders/<published-commit>/previews/<id>.png
 ```
 
 Every asset belongs to that fixed commit even if `published` changes during download. An unchanged publication skips downloading the catalog again.
 
+The URLSession delegate accumulates `Data` chunks, rejects non-200 responses and oversized declared lengths, and cancels on streamed overflow or task cancellation. Requests retain a 30-second timeout. Limits are 64 KiB for the reference, 2 MiB for the manifest, 1 MiB per source, 16 MiB for all sources and 8 MiB per preview. Sources download sequentially. Previews load independently and never block catalog activation.
+
 The app rejects unsupported schemas, invalid metadata or paths, duplicate IDs, missing defaults or sources, and source hash mismatches. It downloads and verifies **all sources** before writing and activating a snapshot. Network, validation, cancellation, or disk-write failures retain the previous snapshot. A snapshot is a single atomically written `snapshot.json` containing the manifest, sources, and publication revision in the app's `ShaderCatalog` cache directory.
+
+Timezone-bearing ISO-8601 dates accept whole or fractional seconds and numeric offsets; malformed and timezone-free values are rejected. Strict UTF-8 decoding retains BOM bytes, so the persisted string reproduces the exact source bytes that were hashed. The disk format and schema version remain unchanged, including compatibility with legacy and discovery-enabled catalogs. Runtime consumers use the prepared catalog without revalidating it on the main actor.
 
 ## Selection, pipeline reuse, and previews
 
@@ -271,9 +276,11 @@ sequenceDiagram
 
 Catalog refresh updates the picker and preserves focus by stable ID. Playback keeps its existing pipeline, including when that ID disappears from the catalog. On the next launch, a saved ID missing from the current snapshot resolves to the manifest default. Pending selections retain their selected source; a catalog refresh does not replace a selection already in progress.
 
+TV filters survive refreshes. If the focused ID disappears, focus prefers a visible active shader, then the latest resolved startup/default shader, then the first visible result. Startup resolution is updated with every catalog. After compilation fails before any activation, the picker stays open with the error; Back and canceled selections do not retry that failed startup automatically. The saved ID survives until an explicit selection succeeds. Before startup fails, canceling a different pending selection may resume the latest startup definition; Back can hide a pending startup and restore its loading hint. Mac retains its existing policy of replacing changed active sources after successful compilation.
+
 Pipelines are cached by shader ID plus source hash. Identical source reuses its compiled pipeline; revised source under the same ID compiles again when selected. Only the latest successful selection activates and updates the saved preference.
 
-Previews download on demand, independently of source activation, and cache as `preview-<SHA-256>.png`. The app verifies image hashes and uses the card gradient on missing or failed images. Reused cells cancel their prior image task and check their represented shader before displaying a result. Cards format `updatedAt` as a localized, abbreviated date.
+Previews download on demand, independently of source activation, and cache as `preview-<SHA-256>.png`. An actor-owned 16 MiB LRU cache stores verified encoded data, and a separate 32 MiB LRU cache stores decoded thumbnails by hash and requested size. Concurrent requests coalesce by hash (and size for decoding). ImageIO decodes 640-pixel TV and 176-pixel Mac thumbnails away from the UI actor. Memory hits skip disk reads, hashing and decoding; identical hashes retain displayed images across metadata and revision changes. Reused cells cancel their prior image task and guard the represented hash before displaying a result. Missing images use an opaque gradient base; successful previews retain the translucent overlay. Cards format `updatedAt` as a localized, abbreviated date.
 
 ## Failure behavior and verification
 
@@ -284,6 +291,7 @@ Previews download on demand, independently of source activation, and cache as `p
 | First launch has no valid cache and download fails | Download error and Select-to-retry state; no built-in shader fallback |
 | Source download is incomplete or a hash is wrong | Candidate rejected; previous app snapshot retained |
 | Preview fails to load | Card gradient remains; catalog and source selection remain usable |
+| Startup source fails runtime compilation | TV picker remains open with the error; Back does not expose an empty viewer, and the saved ID remains until a successful selection |
 | Refreshed source fails runtime compilation | Selection fails; current playing shader and saved successful ID remain |
 | Active shader is removed from the catalog | Current playback continues; next launch resolves a missing saved ID to the default |
 

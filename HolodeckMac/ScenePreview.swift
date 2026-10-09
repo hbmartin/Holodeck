@@ -6,6 +6,7 @@ struct ScenePreview: View {
     let shader: ShaderDefinition
     let service: CatalogService
     @State private var image: NSImage?
+    @State private var imageHash: String?
 
     var body: some View {
         ZStack {
@@ -20,10 +21,12 @@ struct ScenePreview: View {
         .clipShape(RoundedRectangle(cornerRadius: 5))
         .accessibilityHidden(true)
         .task(id: shader.preview) {
-            image = nil
+            if imageHash != shader.preview?.hash { image = nil; imageHash = nil }
+            guard image == nil else { return }
             guard let preview = shader.preview,
-                  let data = try? await service.preview(preview), !Task.isCancelled else { return }
-            image = NSImage(data: data)
+                  let decoded = try? await service.previewImage(preview, maxPixelSize: 176), !Task.isCancelled else { return }
+            image = NSImage(cgImage: decoded, size: NSSize(width: decoded.width, height: decoded.height))
+            imageHash = preview.hash
         }
     }
 }
