@@ -12,6 +12,8 @@ A Metal showcase for tvOS 26.0 and later with five animated procedural effects a
 
 ## Shader catalog
 
+See [Shader repositories and catalog workflow](docs/shader-catalog-workflow.md) for the repository relationship, an add-a-shader walkthrough, and publishing and runtime control-flow diagrams.
+
 [HolodeckShaders](https://github.com/hbmartin/HolodeckShaders) owns shader bodies, shared Metal helpers, metadata and generated previews. Its publishing workflow validates content and tvOS Metal compilation before replacing the public `published` branch with one complete snapshot. Follow that repository's authoring instructions to add a shader; no app release is needed for catalog updates.
 
 The app resolves `published` to a commit, then downloads the manifest and sources at that exact revision. It validates schema version 1, metadata, unique IDs, paths, dates and SHA-256 hashes before atomically caching and activating a snapshot. Failed refreshes retain the previous catalog. Refreshes run in the background at launch and foreground return, throttled to once per 15 minutes once a usable catalog exists, including failed refresh attempts. With an empty cache, Select retries a failed download immediately. GitHub rate limits and network errors leave offline content usable.
