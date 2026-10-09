@@ -80,8 +80,13 @@ final class ViewerSessionTests: XCTestCase {
     func testChangedSourceActivatesImmediatelyAndMetadataDoesNotRestart() async {
         let (mac, renderer, _) = session()
         await settled(mac)
-        mac.applyCatalog(changed(metadataOnly: true))
+        var metadata = changed(metadataOnly: true)
+        let discovery = SceneDiscovery(tags: ["fluid"], moods: ["energetic"], motion: "steady")
+        metadata.manifest.shaders[0].discovery = discovery
+        metadata.manifest.collections = [CatalogCollection(id: "featured", name: "Featured", description: "Selected scenes.", shaderIDs: ["plasma"])]
+        mac.applyCatalog(metadata)
         XCTAssertEqual(mac.activeShader?.title, "Updated Scene")
+        XCTAssertEqual(mac.activeShader?.discovery, discovery)
         XCTAssertEqual(renderer.activations.count, 1)
         var revised = changed()
         revised.publicationRevision = String(repeating: "d", count: 40)

@@ -264,7 +264,7 @@ final class CatalogTests: XCTestCase {
     }
 }
 
-private nonisolated final class CatalogTestBox: @unchecked Sendable {
+nonisolated final class CatalogTestBox: @unchecked Sendable {
     private let lock = NSLock()
     private var stored: [String: Data] = [:]
     private var responses: [String: Data] = [:]
