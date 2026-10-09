@@ -6,6 +6,37 @@ final class HolodeckUITests: XCTestCase {
 
     override func setUpWithError() throws { continueAfterFailure = false }
 
+    func testFirstLaunchDownloadsCatalogAfterConnectionRetry() {
+        let app = isolatedApp()
+        app.launchArguments += ["--ui-test-download-catalog", "--ui-test-fail-catalog-once"]
+        app.launch()
+        let message = "Couldn’t download shaders. Connect to the internet and press Select to retry."
+        XCTAssertTrue(app.staticTexts[message].firstMatch.waitForExistence(timeout: 10))
+        remote.press(.select)
+        let plasma = card("plasma", in: app)
+        XCTAssertTrue(plasma.waitForExistence(timeout: 10))
+        let active = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", "Now showing"), object: plasma)
+        XCTAssertEqual(XCTWaiter.wait(for: [active], timeout: 10), .completed)
+        waitForFocus(plasma)
+        remote.press(.menu)
+        XCTAssertTrue(app.otherElements["shader-picker"].waitForNonExistence(timeout: 5))
+    }
+
+    func testFirstLaunchOfflineShowsRetryWithoutShaders() {
+        let app = isolatedApp()
+        app.launchArguments.append("--ui-test-empty-cache")
+        app.launch()
+        let message = "Couldn’t download shaders. Connect to the internet and press Select to retry."
+        XCTAssertTrue(app.staticTexts[message].firstMatch.waitForExistence(timeout: 10))
+        remote.press(.select)
+        XCTAssertTrue(app.otherElements["shader-picker"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts[message].firstMatch.waitForExistence(timeout: 5))
+        XCTAssertFalse(card("plasma", in: app).exists)
+        remote.press(.menu)
+        XCTAssertTrue(app.otherElements["shader-picker"].waitForNonExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts[message].firstMatch.exists)
+    }
+
     func testCatalogRefreshPreservesFocusPlaybackAndShowsNinthShader() {
         let app = isolatedApp()
         app.launchArguments.append("--ui-test-refresh-catalog")
@@ -248,6 +279,8 @@ final class HolodeckUITests: XCTestCase {
 
     private func isolatedApp() -> XCUIApplication {
         let app = XCUIApplication()
+        let url = Bundle(for: HolodeckUITests.self).url(forResource: "CatalogFixture", withExtension: "json", subdirectory: "TestSupport")!
+        app.launchEnvironment["HOLODECK_UI_TEST_CATALOG"] = try! String(contentsOf: url, encoding: .utf8)
         app.launchArguments = ["--ui-test-storage-suite", "me.haroldmartin.Holodeck.ui-tests." + UUID().uuidString]
         return app
     }

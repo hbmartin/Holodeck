@@ -6,7 +6,7 @@ import UIKit
 @MainActor
 final class CatalogTests: XCTestCase {
     private func candidate(ninth: Bool = false) -> CatalogSnapshot {
-        var snapshot = ShaderCatalog.bundled
+        var snapshot = TestCatalog.snapshot
         snapshot.publicationRevision = String(repeating: "a", count: 40)
         if ninth {
             var entry = snapshot.manifest.shaders[0]
@@ -20,7 +20,7 @@ final class CatalogTests: XCTestCase {
         return snapshot
     }
 
-    private func makeService(_ candidate: CatalogSnapshot, box: CatalogTestBox = CatalogTestBox()) throws -> CatalogService {
+    private func makeService(_ candidate: CatalogSnapshot, box: CatalogTestBox = CatalogTestBox(), cached: Bool = true) throws -> CatalogService {
         var responses: [String: Data] = [
             "/git/ref/heads/published": Data("{\"object\":{\"sha\":\"\(candidate.publicationRevision)\"}}".utf8),
             "/contents/catalog.json": try JSONEncoder().encode(candidate.manifest)
@@ -29,14 +29,36 @@ final class CatalogTests: XCTestCase {
             responses["/contents/\(entry.sourcePath)"] = candidate.sources[entry.id].map { Data($0.utf8) }
         }
         box.setResponses(responses)
-        return CatalogService(bundled: ShaderCatalog.bundled, network: box.network, storage: box.storage, now: { box.date })
+        let storage = CatalogStorage(read: { name in
+            if let value = try box.storage.read(name) { return value }
+            return cached && name == "snapshot.json" ? TestCatalog.data : nil
+        }, write: box.storage.write)
+        return CatalogService(network: box.network, storage: storage, now: { box.date })
     }
 
-    func testBundledCatalogAndEveryPreviewValidateOffline() async throws {
-        let snapshot = ShaderCatalog.bundled
+    func testFirstLaunchHasNoCatalogAndCanRetryImmediatelyAfterNetworkFailure() async throws {
+        let box = CatalogTestBox()
+        let expected = candidate()
+        let service = try makeService(expected, box: box, cached: false)
+        XCTAssertNil(service.initialSnapshot)
+        let responses = box.responseFiles
+        box.setResponses([:])
+        do { _ = try await service.refresh(); XCTFail("Offline first launch must fail") } catch {}
+        let empty = await service.current()
+        XCTAssertNil(empty)
+        XCTAssertNil(box.files["snapshot.json"])
+        box.setResponses(responses)
+        let downloaded = try await service.refresh()
+        XCTAssertEqual(downloaded?.shaders.count, 8)
+        XCTAssertEqual(downloaded?.publicationRevision, expected.publicationRevision)
+        XCTAssertNotNil(box.files["snapshot.json"])
+    }
+
+    func testCachedCatalogAndEveryPreviewValidateOffline() async throws {
+        let snapshot = TestCatalog.snapshot
         try snapshot.validate()
-        let service = CatalogService(bundled: snapshot, storage: .disabled, enabled: false)
-        XCTAssertEqual(service.initialSnapshot.shaders.count, 8)
+        let service = CatalogService(storage: TestCatalog.storage, enabled: false)
+        XCTAssertEqual(service.initialSnapshot?.shaders.count, 8)
         let refreshed = try await service.refresh()
         XCTAssertNil(refreshed)
         for shader in snapshot.shaders {
@@ -67,7 +89,7 @@ final class CatalogTests: XCTestCase {
         let updated = try await service.refresh()
         XCTAssertEqual(updated?.shaders.count, 9)
         let current = await service.current()
-        XCTAssertEqual(current.publicationRevision, expected.publicationRevision)
+        XCTAssertEqual(current?.publicationRevision, expected.publicationRevision)
         let data = try XCTUnwrap(box.files["snapshot.json"])
         let persisted = try JSONDecoder().decode(CatalogSnapshot.self, from: data)
         try persisted.validate()
@@ -83,14 +105,14 @@ final class CatalogTests: XCTestCase {
             if !writeFails { expected.sources["aurora"] = "corrupt download" }
             let box = CatalogTestBox()
             if writeFails {
-                try box.storage.write("snapshot.json", JSONEncoder().encode(ShaderCatalog.bundled))
+                try box.storage.write("snapshot.json", JSONEncoder().encode(TestCatalog.snapshot))
             }
             let previousFile = box.files["snapshot.json"]
             box.failWrites = writeFails
             let service = try makeService(expected, box: box)
             do { _ = try await service.refresh(); XCTFail("Invalid publication must fail") } catch {}
             let current = await service.current()
-            XCTAssertEqual(current.publicationRevision, ShaderCatalog.bundled.publicationRevision)
+            XCTAssertEqual(current?.publicationRevision, TestCatalog.snapshot.publicationRevision)
             XCTAssertEqual(box.files["snapshot.json"], previousFile)
         }
     }
@@ -101,29 +123,29 @@ final class CatalogTests: XCTestCase {
         let service = try makeService(expected, box: box)
         do { _ = try await service.refresh(); XCTFail("Missing source must fail") } catch {}
         let current = await service.current()
-        XCTAssertEqual(current.shaders.count, 8)
+        XCTAssertEqual(current?.shaders.count, 8)
         XCTAssertNil(box.files["snapshot.json"])
-        let offline = CatalogService(bundled: ShaderCatalog.bundled, network: box.network, storage: .disabled)
+        let offline = CatalogService(network: box.network, storage: TestCatalog.storage)
         box.setResponses([:])
         do { _ = try await offline.refresh(); XCTFail("Offline refresh must fail") } catch {}
         let fallback = await offline.current()
-        XCTAssertEqual(fallback.initialShader.id, "plasma")
+        XCTAssertEqual(fallback?.initialShader.id, "plasma")
     }
 
     func testStartupUsesValidCacheAndRejectsCorruptCache() throws {
         let cached = candidate(ninth: true)
         let box = CatalogTestBox()
         try box.storage.write("snapshot.json", JSONEncoder().encode(cached))
-        let service = CatalogService(bundled: ShaderCatalog.bundled, storage: box.storage, enabled: false)
-        XCTAssertEqual(service.initialSnapshot.shaders.count, 9)
+        let service = CatalogService(storage: box.storage, enabled: false)
+        XCTAssertEqual(service.initialSnapshot?.shaders.count, 9)
         try box.storage.write("snapshot.json", Data("interrupted JSON".utf8))
-        let fallback = CatalogService(bundled: ShaderCatalog.bundled, storage: box.storage, enabled: false)
-        XCTAssertEqual(fallback.initialSnapshot.shaders.count, 8)
+        let fallback = CatalogService(storage: box.storage, enabled: false)
+        XCTAssertNil(fallback.initialSnapshot)
     }
 
     func testRefreshThrottlesAndUnchangedPublicationSkipsAssets() async throws {
         let box = CatalogTestBox()
-        let service = try makeService(ShaderCatalog.bundled, box: box)
+        let service = try makeService(TestCatalog.snapshot, box: box)
         let unchanged = try await service.refresh()
         XCTAssertNil(unchanged)
         XCTAssertEqual(box.urls.count, 1)
@@ -140,14 +162,14 @@ final class CatalogTests: XCTestCase {
 
     func testConcurrentRefreshDoesNotStartDuplicateDownloads() async throws {
         let gate = PreviewRequestGate()
-        let service = CatalogService(bundled: ShaderCatalog.bundled,
+        let service = CatalogService(
                                      network: CatalogNetwork { url, _ in await gate.image(url.lastPathComponent) },
-                                     storage: .disabled)
+                                     storage: TestCatalog.storage)
         let first = Task { try await service.refresh() }
         await gate.waitForRequest("published")
         let concurrent = try await service.refresh()
         XCTAssertNil(concurrent)
-        let reference = Data("{\"object\":{\"sha\":\"\(ShaderCatalog.bundled.publicationRevision)\"}}".utf8)
+        let reference = Data("{\"object\":{\"sha\":\"\(TestCatalog.snapshot.publicationRevision)\"}}".utf8)
         await gate.complete("published", data: reference)
         let result = try await first.value
         XCTAssertNil(result)
@@ -167,7 +189,7 @@ final class CatalogTests: XCTestCase {
         let box = CatalogTestBox()
         let image = Data([137, 80, 78, 71, 13, 10, 26, 10] + Array("test-image".utf8))
         let preview = ShaderPreview(path: "previews/test.png", hash: CatalogHash.sha256(image), publicationRevision: candidate().publicationRevision)
-        let service = CatalogService(bundled: ShaderCatalog.bundled, network: box.network, storage: box.storage)
+        let service = CatalogService(network: box.network, storage: box.storage)
         box.setResponses(["/contents/previews/test.png": Data("corrupt".utf8)])
         do { _ = try await service.preview(preview); XCTFail("Bad image hash must fail") } catch {}
         XCTAssertTrue(box.files.isEmpty)
@@ -185,20 +207,19 @@ final class CatalogTests: XCTestCase {
 
     func testReusedCardIgnoresLatePreviewCompletion() async throws {
         let gate = PreviewRequestGate()
-        let service = CatalogService(bundled: ShaderCatalog.bundled,
+        let service = CatalogService(
                                      network: CatalogNetwork { url, _ in await gate.image(url.lastPathComponent) },
-                                     storage: .disabled)
-        var old = ShaderCatalog.shaders[0]
-        var new = ShaderCatalog.shaders[1]
+                                     storage: TestCatalog.storage)
+        var old = TestCatalog.shaders[0]
+        var new = TestCatalog.shaders[1]
         func data(for shader: ShaderDefinition, suffix: String) throws -> Data {
-            let url = try XCTUnwrap(Bundle.main.url(forResource: "preview-" + shader.preview!.hash, withExtension: "png"))
-            var bytes = try Data(contentsOf: url)
-            bytes.append(Data(suffix.utf8)) // PNG permits trailing bytes; distinct hashes bypass bundled lookup.
+            var bytes = try TestCatalog.preview(named: "preview-" + shader.preview!.hash + ".png")
+            bytes.append(Data(suffix.utf8))
             return bytes
         }
         let oldData = try data(for: old, suffix: "old")
         let newData = try data(for: new, suffix: "new")
-        let revision = ShaderCatalog.bundled.publicationRevision
+        let revision = TestCatalog.snapshot.publicationRevision
         old.preview = ShaderPreview(path: "previews/old.png", hash: CatalogHash.sha256(oldData), publicationRevision: revision)
         new.preview = ShaderPreview(path: "previews/new.png", hash: CatalogHash.sha256(newData), publicationRevision: revision)
         let cell = ShaderCardCell(frame: CGRect(x: 0, y: 0, width: 320, height: 232))
@@ -221,9 +242,9 @@ final class CatalogTests: XCTestCase {
     }
 
     func testCardReuseClearsPreviewAndShowsLocalizedDate() async throws {
-        let service = CatalogService(bundled: ShaderCatalog.bundled, storage: .disabled, enabled: false)
+        let service = CatalogService(storage: TestCatalog.storage, enabled: false)
         let cell = ShaderCardCell(frame: CGRect(x: 0, y: 0, width: 320, height: 232))
-        let first = ShaderCatalog.shaders[0]
+        let first = TestCatalog.shaders[0]
         cell.configure(shader: first, active: false, loading: false, catalogService: service)
         let image = try XCTUnwrap(cell.contentView.subviews.compactMap { $0 as? UIImageView }.first)
         let loaded = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in image.image != nil }, object: nil)
@@ -233,7 +254,7 @@ final class CatalogTests: XCTestCase {
         XCTAssertNil(image.image)
         let missing = ShaderDefinition(id: "missing", title: "Missing", category: .procedural,
                                        description: "Unavailable preview", colors: first.colors, source: first.source,
-                                       preview: ShaderPreview(path: "previews/missing.png", hash: String(repeating: "b", count: 64), publicationRevision: ShaderCatalog.bundled.publicationRevision))
+                                       preview: ShaderPreview(path: "previews/missing.png", hash: String(repeating: "b", count: 64), publicationRevision: TestCatalog.snapshot.publicationRevision))
         cell.configure(shader: missing, active: false, loading: false, catalogService: service)
         XCTAssertNil(image.image)
         XCTAssertFalse(cell.accessibilityLabel?.contains("Updated") == true)
@@ -242,7 +263,7 @@ final class CatalogTests: XCTestCase {
     func testPipelineCacheRecompilesSameIDWithChangedSource() async throws {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let compiler = ShaderCompiler(device: device)
-        let first = ShaderCatalog.initialShader
+        let first = TestCatalog.initialShader
         var revised = ShaderDefinition(id: first.id, title: first.title, category: first.category,
                                        description: first.description, colors: first.colors, source: first.source + "\n// revision\n")
         revised.updatedAt = Date()
@@ -262,6 +283,7 @@ private nonisolated final class CatalogTestBox: @unchecked Sendable {
     private var clock = Date(timeIntervalSince1970: 0)
     private var failing = false
     var files: [String: Data] { lock.withLock { stored } }
+    var responseFiles: [String: Data] { lock.withLock { responses } }
     var urls: [URL] { lock.withLock { requests } }
     var date: Date { lock.withLock { clock } }
     var failWrites: Bool {

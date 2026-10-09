@@ -18,7 +18,7 @@ final class HolodeckTests: XCTestCase {
         controller.collectionView(collection, didSelectItemAt: IndexPath(item: 1, section: 0))
         try await waitForRequest("aurora", in: compiler)
         let pending = try XCTUnwrap(controller.shaderSelectionTask)
-        var refreshed = ShaderCatalog.bundled
+        var refreshed = TestCatalog.snapshot
         refreshed.manifest.shaders.reverse()
         refreshed.publicationRevision = String(repeating: "a", count: 40)
         controller.applyCatalog(refreshed)
@@ -41,7 +41,7 @@ final class HolodeckTests: XCTestCase {
         try await waitForSelection(initial)
         controller.openPickerFromRemote()
         let collection: UICollectionView = try findView("shader-cards", in: controller)
-        var refreshed = ShaderCatalog.bundled
+        var refreshed = TestCatalog.snapshot
         var added = refreshed.manifest.shaders[0]
         added.id = "ninth-shader"; added.name = "Ninth Shader"
         added.sourcePath = "sources/ninth-shader.metal"
@@ -89,11 +89,11 @@ final class HolodeckTests: XCTestCase {
     }
 
     func testCatalog() {
-        XCTAssertEqual(ShaderCatalog.shaders.count, 8)
-        XCTAssertEqual(Set(ShaderCatalog.shaders.map(\.id)).count, 8)
-        XCTAssertEqual(ShaderCatalog.shaders.filter { $0.category == .procedural }.count, 5)
-        XCTAssertEqual(ShaderCatalog.shaders.filter { $0.category == .material }.count, 3)
-        XCTAssertEqual(ShaderCatalog.initialShader.id, "plasma")
+        XCTAssertEqual(TestCatalog.shaders.count, 8)
+        XCTAssertEqual(Set(TestCatalog.shaders.map(\.id)).count, 8)
+        XCTAssertEqual(TestCatalog.shaders.filter { $0.category == .procedural }.count, 5)
+        XCTAssertEqual(TestCatalog.shaders.filter { $0.category == .material }.count, 3)
+        XCTAssertEqual(TestCatalog.initialShader.id, "plasma")
     }
 
     func testEveryShaderCompilesRendersAndAnimates() async throws {
@@ -101,7 +101,7 @@ final class HolodeckTests: XCTestCase {
         let compiler = ShaderCompiler(device: device, pixelFormat: .rgba32Float)
         let queue = try XCTUnwrap(device.makeCommandQueue())
         var materials: [[Float]] = []
-        for shader in ShaderCatalog.shaders {
+        for shader in TestCatalog.shaders {
             let pipeline = try await compiler.pipeline(for: shader)
             let first = try render(device: device, queue: queue, pipeline: pipeline, time: 0)
             let later = try render(device: device, queue: queue, pipeline: pipeline, time: 6)
@@ -122,8 +122,8 @@ final class HolodeckTests: XCTestCase {
 
     func testPipelineCache() async throws {
         let compiler = ShaderCompiler(device: try XCTUnwrap(MTLCreateSystemDefaultDevice()))
-        let first = try await compiler.pipeline(for: ShaderCatalog.initialShader)
-        let again = try await compiler.pipeline(for: ShaderCatalog.initialShader)
+        let first = try await compiler.pipeline(for: TestCatalog.initialShader)
+        let again = try await compiler.pipeline(for: TestCatalog.initialShader)
         XCTAssertTrue(first === again)
     }
 
@@ -131,9 +131,9 @@ final class HolodeckTests: XCTestCase {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let view = MTKView(frame: .zero, device: device)
         let renderer = try makeRenderer(view: view)
-        let activated = try await renderer.select(ShaderCatalog.initialShader)
+        let activated = try await renderer.select(TestCatalog.initialShader)
         XCTAssertTrue(activated)
-        let missingFragment = ShaderCatalog.initialShader.source.replacingOccurrences(
+        let missingFragment = TestCatalog.initialShader.source.replacingOccurrences(
             of: "fragment float4 fragmentShader", with: "fragment float4 otherFragment")
         for source in ["not valid Metal source", "#include <metal_stdlib>\nusing namespace metal;", missingFragment] {
             let bad = ShaderDefinition(id: UUID().uuidString, title: "Broken", category: .procedural,
@@ -149,7 +149,7 @@ final class HolodeckTests: XCTestCase {
 
     func testLatestSelectionWinsAndStaleFailuresAreIgnored() async throws {
         let (renderer, compiler, pipeline) = try await controlledRenderer()
-        let older = ShaderCatalog.shaders[1], newer = ShaderCatalog.shaders[2]
+        let older = TestCatalog.shaders[1], newer = TestCatalog.shaders[2]
         let olderTask = Task { try await renderer.select(older) }
         await compiler.waitForRequest(older.id)
         let newerTask = Task { try await renderer.select(newer) }
@@ -165,12 +165,12 @@ final class HolodeckTests: XCTestCase {
 
         let firstTask = Task { try await renderer.select(older) }
         await compiler.waitForRequest(older.id)
-        let secondTask = Task { try await renderer.select(ShaderCatalog.shaders[3]) }
-        await compiler.waitForRequest(ShaderCatalog.shaders[3].id)
+        let secondTask = Task { try await renderer.select(TestCatalog.shaders[3]) }
+        await compiler.waitForRequest(TestCatalog.shaders[3].id)
         await compiler.complete(older.id, pipeline: pipeline)
         let staleActivated = try await firstTask.value
         XCTAssertFalse(staleActivated)
-        await compiler.complete(ShaderCatalog.shaders[3].id, pipeline: pipeline)
+        await compiler.complete(TestCatalog.shaders[3].id, pipeline: pipeline)
         let latestActivated = try await secondTask.value
         XCTAssertTrue(latestActivated)
         XCTAssertEqual(renderer.activeShader?.id, "kaleidoscope")
@@ -178,7 +178,7 @@ final class HolodeckTests: XCTestCase {
 
     func testDismissingPendingSelectionAndSceneActivity() async throws {
         let (renderer, compiler, pipeline) = try await controlledRenderer()
-        let shader = ShaderCatalog.shaders[1]
+        let shader = TestCatalog.shaders[1]
         let pending = Task { try await renderer.select(shader) }
         await compiler.waitForRequest(shader.id)
         renderer.cancelPendingSelection()
@@ -462,7 +462,7 @@ final class HolodeckTests: XCTestCase {
         let view = MTKView(frame: .zero, device: device)
         let renderer = try makeRenderer(view: view, compilerFactory: { _, _ in compiler }, now: { time.value })
         renderer.setActive(true)
-        let initial = Task { try await renderer.select(ShaderCatalog.initialShader) }
+        let initial = Task { try await renderer.select(TestCatalog.initialShader) }
         await compiler.waitForRequest("plasma")
         await compiler.complete("plasma", pipeline: pipeline)
         let activated = try await initial.value
@@ -479,7 +479,7 @@ final class HolodeckTests: XCTestCase {
         XCTAssertFalse(view.isPaused)
         time.value = 102
         XCTAssertEqual(renderer.animationTime, 5)
-        let next = Task { try await renderer.select(ShaderCatalog.shaders[1]) }
+        let next = Task { try await renderer.select(TestCatalog.shaders[1]) }
         await compiler.waitForRequest("aurora")
         await compiler.complete("aurora", pipeline: pipeline)
         let nextActivated = try await next.value
@@ -592,7 +592,7 @@ final class HolodeckTests: XCTestCase {
 
         for index in [3, 4] {
             controller.collectionView(collection, didSelectItemAt: IndexPath(item: index, section: 0))
-            let id = ShaderCatalog.shaders[index].id
+            let id = TestCatalog.shaders[index].id
             try await waitForRequest(id, in: compiler)
             let canceled = try XCTUnwrap(controller.shaderSelectionTask)
             controller.closePickerFromRemote()
@@ -654,7 +654,7 @@ final class HolodeckTests: XCTestCase {
 
     private static let controllerPipeline = Task { @MainActor in
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let pipeline = try await ShaderCompiler(device: device).pipeline(for: ShaderCatalog.initialShader)
+        let pipeline = try await ShaderCompiler(device: device).pipeline(for: TestCatalog.initialShader)
         return (device, pipeline)
     }
 
@@ -679,6 +679,7 @@ final class HolodeckTests: XCTestCase {
         let storyboard = UIStoryboard(name: "Main", bundle: Bundle(for: GameViewController.self))
         let controller = try withDependencies {
             $0.context = .test
+            $0.catalogService = CatalogService(storage: TestCatalog.storage, enabled: false)
             $0.rendererFactory = factory
             $0.shaderPreferences = preferences
             $0.continuousClock = clock
@@ -784,12 +785,12 @@ final class HolodeckTests: XCTestCase {
 
     private func controlledRenderer() async throws -> (Renderer, ControlledCompiler, any MTLRenderPipelineState) {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let pipeline = try await ShaderCompiler(device: device).pipeline(for: ShaderCatalog.initialShader)
+        let pipeline = try await ShaderCompiler(device: device).pipeline(for: TestCatalog.initialShader)
         let compiler = ControlledCompiler()
         addTeardownBlock { await compiler.cancelAll() }
         let view = MTKView(frame: .zero, device: device)
         let renderer = try makeRenderer(view: view, compilerFactory: { _, _ in compiler })
-        let initial = Task { try await renderer.select(ShaderCatalog.initialShader) }
+        let initial = Task { try await renderer.select(TestCatalog.initialShader) }
         await compiler.waitForRequest("plasma")
         await compiler.complete("plasma", pipeline: pipeline)
         let activated = try await initial.value
