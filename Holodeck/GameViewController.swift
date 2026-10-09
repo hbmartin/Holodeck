@@ -1,5 +1,6 @@
 import UIKit
 import MetalKit
+import Dependencies
 
 nonisolated enum RendererStartupError: LocalizedError {
     case metalUnavailable
@@ -14,27 +15,10 @@ nonisolated enum RendererStartupError: LocalizedError {
 }
 
 final class GameViewController: UIViewController, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout {
-    var rendererFactory: @MainActor (MTKView) throws -> Renderer = { metalView in
-        #if DEBUG
-        if ProcessInfo.processInfo.arguments.contains("--ui-test-metal-unavailable") {
-            throw RendererStartupError.metalUnavailable
-        }
-        #endif
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            throw RendererStartupError.metalUnavailable
-        }
-        metalView.device = device
-        #if DEBUG
-        let compiler: (any ShaderCompiling)? = ProcessInfo.processInfo.arguments.contains("--ui-test-hold-initial-shader")
-            ? HeldInitialShaderCompiler(device: device) : nil
-        #else
-        let compiler: (any ShaderCompiling)? = nil
-        #endif
-        guard let renderer = Renderer(metalKitView: metalView, compiler: compiler) else {
-            throw RendererStartupError.initializationFailed
-        }
-        return renderer
-    }
+    @Dependency(\.rendererFactory) private var rendererFactory
+    @Dependency(\.shaderPreferences) private var shaderPreferences
+    @Dependency(\.continuousClock) private var hintClock
+    private var startupShader = ShaderCatalog.initialShader
     private(set) var shaderSelectionTask: Task<Void, Never>?
     private var renderer: Renderer?
     private var unavailableMessage: String?
@@ -43,9 +27,17 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     private let spinner = UIActivityIndicatorView(style: .medium)
     private let hint = UIVisualEffectView(effect: UIBlurEffect(style: .dark))
     private let hintLabel = UILabel()
-    private var hintTask: Task<Void, Never>?
-    private var pendingShaderID: String?
+    private(set) var hintTask: Task<Void, Never>?
+    private enum SelectionOrigin { case startup, user }
+    private struct PendingSelection {
+        let shader: ShaderDefinition
+        let origin: SelectionOrigin
+        let generation: UInt64
+    }
+    private var pendingSelection: PendingSelection?
+    private var selectionGeneration: UInt64 = 0
     private var pickerIsVisible = false
+    private var browsingIndexPath: IndexPath?
     private lazy var selectGesture = UITapGestureRecognizer(target: self, action: #selector(openPickerFromRemote))
     private lazy var menuGesture = UITapGestureRecognizer(target: self, action: #selector(closePickerFromRemote))
     private let collectionView: UICollectionView = {
@@ -56,6 +48,11 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         return UICollectionView(frame: .zero, collectionViewLayout: layout)
     }()
 
+    deinit {
+        hintTask?.cancel()
+        shaderSelectionTask?.cancel()
+    }
+
     override var canBecomeFirstResponder: Bool { true }
     override var preferredFocusEnvironments: [any UIFocusEnvironment] {
         pickerIsVisible && unavailableMessage == nil ? [collectionView] : [view]
@@ -65,6 +62,8 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         super.viewDidLoad()
         view.backgroundColor = .black
         view.accessibilityIdentifier = "shader-surface"
+        let savedID = shaderPreferences.lastShaderID()
+        startupShader = ShaderCatalog.shaders.first { $0.id == savedID } ?? ShaderCatalog.initialShader
         buildPicker()
         buildHint()
         selectGesture.allowedPressTypes = [NSNumber(value: UIPress.PressType.select.rawValue)]
@@ -72,23 +71,16 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         menuGesture.allowedPressTypes = [NSNumber(value: UIPress.PressType.menu.rawValue)]
         menuGesture.isEnabled = false
         view.addGestureRecognizer(menuGesture)
-        #if DEBUG
-        if ProcessInfo.processInfo.arguments.contains("--ui-test-hold-initial-shader") {
-            let releaseGesture = UITapGestureRecognizer(target: self, action: #selector(releaseInitialShaderFromRemote))
-            releaseGesture.allowedPressTypes = [NSNumber(value: UIPress.PressType.playPause.rawValue)]
-            view.addGestureRecognizer(releaseGesture)
-        }
-        #endif
-
         guard let metalView = view as? MTKView else {
             showUnavailable(RendererStartupError.metalUnavailable.localizedDescription)
             return
         }
+        metalView.isPaused = true
         do {
-            let renderer = try rendererFactory(metalView)
+            let renderer = try withDependencies(from: self) { try rendererFactory(metalView) }
             self.renderer = renderer
             metalView.delegate = renderer
-            chooseShader(ShaderCatalog.initialShader, isInitial: true)
+            chooseShader(startupShader, origin: .startup)
         } catch {
             showUnavailable(error.localizedDescription)
         }
@@ -102,11 +94,17 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     func setSceneActive(_ active: Bool) {
         renderer?.setActive(active)
+        if unavailableMessage != nil { (view as? MTKView)?.isPaused = true }
         if active {
             // UIKit may clear the first responder when the app leaves the foreground.
             becomeFirstResponder()
-            setNeedsFocusUpdate()
-            updateFocusIfNeeded()
+            let focused = UIFocusSystem.focusSystem(for: view)?.focusedItem as? UIView
+            let focusIsRestored = pickerIsVisible && unavailableMessage == nil
+                ? focused?.isDescendant(of: collectionView) == true : focused === view
+            if !focusIsRestored {
+                setNeedsFocusUpdate()
+                updateFocusIfNeeded()
+            }
         }
     }
 
@@ -145,7 +143,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         collectionView.accessibilityIdentifier = "shader-cards"
         collectionView.backgroundColor = .clear
         collectionView.clipsToBounds = false
-        collectionView.contentInset = UIEdgeInsets(top: 16, left: 72, bottom: 16, right: 72)
+        collectionView.contentInset = UIEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         collectionView.showsHorizontalScrollIndicator = false
         collectionView.remembersLastFocusedIndexPath = false
         collectionView.dataSource = self
@@ -156,14 +154,14 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             picker.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             picker.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             picker.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            heading.leadingAnchor.constraint(equalTo: picker.contentView.leadingAnchor, constant: 72),
-            heading.trailingAnchor.constraint(equalTo: picker.contentView.trailingAnchor, constant: -72),
+            heading.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            heading.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             heading.topAnchor.constraint(equalTo: picker.contentView.topAnchor, constant: 26),
-            collectionView.leadingAnchor.constraint(equalTo: picker.contentView.leadingAnchor),
-            collectionView.trailingAnchor.constraint(equalTo: picker.contentView.trailingAnchor),
+            collectionView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
+            collectionView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
             collectionView.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 10),
             collectionView.heightAnchor.constraint(equalToConstant: 272),
-            collectionView.bottomAnchor.constraint(equalTo: picker.contentView.bottomAnchor, constant: -30)
+            collectionView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -30)
         ])
     }
 
@@ -172,7 +170,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         hint.accessibilityIdentifier = "shader-hint"
         hint.layer.cornerRadius = 18
         hint.clipsToBounds = true
-        hintLabel.text = "Loading Plasma…"
+        hintLabel.text = "Loading \(startupShader.title)…"
         hintLabel.font = .systemFont(ofSize: 23, weight: .medium)
         hintLabel.textColor = .white
         hintLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -189,6 +187,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     private func showPicker() {
+        let wasVisible = pickerIsVisible
         selectGesture.isEnabled = false
         menuGesture.isEnabled = unavailableMessage == nil
         hintTask?.cancel()
@@ -196,8 +195,10 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         pickerIsVisible = true
         (view as? ShowcaseMetalView)?.acceptsFocus = unavailableMessage != nil
         picker.isHidden = false
-        if pendingShaderID == nil || unavailableMessage != nil { updateStatus() }
+        if pendingSelection == nil { updateStatus() }
         updateVisibleCards()
+        guard !wasVisible else { return }
+        browsingIndexPath = preferredShaderIndexPath
         view.layoutIfNeeded()
         if unavailableMessage == nil {
             collectionView.scrollToItem(at: preferredShaderIndexPath, at: .centeredHorizontally, animated: false)
@@ -208,48 +209,62 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     private func hidePicker(cancelSelection: Bool = true) {
         guard unavailableMessage == nil else { return }
-        if cancelSelection, renderer?.activeShader != nil {
+        if cancelSelection, pendingSelection?.origin == .user {
+            selectionGeneration &+= 1
             renderer?.cancelPendingSelection()
-            pendingShaderID = nil
+            pendingSelection = nil
             spinner.stopAnimating()
+            updateVisibleCards()
+            if renderer?.activeShader == nil {
+                chooseShader(startupShader, origin: .startup)
+            }
         }
         pickerIsVisible = false
         selectGesture.isEnabled = true
         menuGesture.isEnabled = false
         (view as? ShowcaseMetalView)?.acceptsFocus = true
         picker.isHidden = true
+        showLoadingHintIfNeeded()
         setNeedsFocusUpdate()
         updateFocusIfNeeded()
     }
 
-    private func chooseShader(_ shader: ShaderDefinition, isInitial: Bool = false) {
+    private func chooseShader(_ shader: ShaderDefinition, origin: SelectionOrigin = .user) {
         guard let renderer, unavailableMessage == nil else { return }
         hintTask?.cancel()
-        hint.isHidden = !isInitial
-        pendingShaderID = shader.id
+        hint.isHidden = true
+        selectionGeneration &+= 1
+        let selection = PendingSelection(shader: shader, origin: origin, generation: selectionGeneration)
+        pendingSelection = selection
+        showLoadingHintIfNeeded()
         statusLabel.text = "Loading \(shader.title)…"
         spinner.startAnimating()
         updateVisibleCards()
 
-        shaderSelectionTask = Task { [weak self] in
-            do {
-                guard try await renderer.select(shader), let self else { return }
-                self.pendingShaderID = nil
-                self.spinner.stopAnimating()
-                self.updateStatus()
-                self.updateVisibleCards()
-                if isInitial {
-                    if !self.pickerIsVisible { self.showStartupHint() }
-                } else {
-                    self.hidePicker(cancelSelection: false)
+        shaderSelectionTask = withDependencies(from: self) {
+            Task { [weak self] in
+                guard self?.pendingSelection?.generation == selection.generation else { return }
+                do {
+                    guard try await renderer.select(shader), let self,
+                          self.pendingSelection?.generation == selection.generation else { return }
+                    self.pendingSelection = nil
+                    self.shaderPreferences.setLastShaderID(shader.id)
+                    self.spinner.stopAnimating()
+                    self.updateStatus()
+                    self.updateVisibleCards()
+                    if origin == .startup {
+                        if !self.pickerIsVisible { self.showStartupHint() }
+                    } else {
+                        self.hidePicker(cancelSelection: false)
+                    }
+                } catch {
+                    guard let self, self.pendingSelection?.generation == selection.generation else { return }
+                    self.pendingSelection = nil
+                    self.spinner.stopAnimating()
+                    self.showPicker()
+                    self.statusLabel.text = "Couldn’t load \(shader.title). Choose another shader."
+                    print("Shader compilation failed for \(shader.id): \(error)")
                 }
-            } catch {
-                guard let self else { return }
-                self.pendingShaderID = nil
-                self.spinner.stopAnimating()
-                self.showPicker()
-                self.statusLabel.text = "Couldn’t load \(shader.title). Choose another shader."
-                print("Shader compilation failed for \(shader.id): \(error)")
             }
         }
     }
@@ -263,19 +278,23 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         hidePicker()
     }
 
-    #if DEBUG
-    @objc private func releaseInitialShaderFromRemote() {
-        Task { await HeldInitialShaderCompiler.gate.release() }
+    private func showLoadingHintIfNeeded() {
+        guard !pickerIsVisible, renderer?.activeShader == nil,
+              let selection = pendingSelection, selection.origin == .startup else { return }
+        hintLabel.text = "Loading \(selection.shader.title)…"
+        hint.isHidden = false
     }
-    #endif
 
     private func showStartupHint() {
         hintLabel.text = "Press Select to choose a shader"
         hint.isHidden = false
-        hintTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(4))
-            guard !Task.isCancelled else { return }
-            self?.hint.isHidden = true
+        let clock = hintClock
+        hintTask = withDependencies(from: self) {
+            Task { [weak self] in
+                do { try await clock.sleep(for: .seconds(4)) } catch { return }
+                guard !Task.isCancelled else { return }
+                self?.hint.isHidden = true
+            }
         }
     }
 
@@ -291,14 +310,15 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     private func showUnavailable(_ message: String) {
         unavailableMessage = message
-        pendingShaderID = nil
+        pendingSelection = nil
+        (view as? MTKView)?.isPaused = true
         spinner.stopAnimating()
         collectionView.isUserInteractionEnabled = false
         showPicker()
     }
 
     private var preferredShaderIndexPath: IndexPath {
-        let id = renderer?.activeShader?.id ?? ShaderCatalog.initialShader.id
+        let id = renderer?.activeShader?.id ?? startupShader.id
         return IndexPath(item: ShaderCatalog.shaders.firstIndex(where: { $0.id == id }) ?? 0, section: 0)
     }
 
@@ -312,7 +332,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     private func configure(_ cell: ShaderCardCell, at indexPath: IndexPath) {
         let shader = ShaderCatalog.shaders[indexPath.item]
         cell.configure(shader: shader, active: renderer?.activeShader?.id == shader.id,
-                       loading: pendingShaderID == shader.id)
+                       loading: pendingSelection?.shader.id == shader.id)
     }
 
     func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
@@ -330,38 +350,11 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     func indexPathForPreferredFocusedView(in collectionView: UICollectionView) -> IndexPath? {
-        preferredShaderIndexPath
+        browsingIndexPath ?? preferredShaderIndexPath
+    }
+
+    func collectionView(_ collectionView: UICollectionView, didUpdateFocusIn context: UICollectionViewFocusUpdateContext,
+                        with coordinator: UIFocusAnimationCoordinator) {
+        if let indexPath = context.nextFocusedIndexPath { browsingIndexPath = indexPath }
     }
 }
-
-#if DEBUG
-/// The UI regression controls startup completion with Play/Pause instead of a timing delay.
-private actor HeldInitialShaderCompiler: ShaderCompiling {
-    static let gate = InitialShaderGate()
-    private let compiler: ShaderCompiler
-
-    init(device: any MTLDevice) { compiler = ShaderCompiler(device: device) }
-
-    func pipeline(for shader: ShaderDefinition) async throws -> any MTLRenderPipelineState {
-        if shader.id == ShaderCatalog.initialShader.id { await Self.gate.wait() }
-        return try await compiler.pipeline(for: shader)
-    }
-}
-
-private actor InitialShaderGate {
-    private var released = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    func wait() async {
-        if released { return }
-        await withCheckedContinuation { waiters.append($0) }
-    }
-
-    func release() {
-        released = true
-        let pending = waiters
-        waiters.removeAll()
-        pending.forEach { $0.resume() }
-    }
-}
-#endif

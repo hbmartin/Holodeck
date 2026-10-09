@@ -6,16 +6,40 @@
 //
 
 import UIKit
+import Dependencies
 
 class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
     var window: UIWindow?
+    #if DEBUG
+    private var uiTestFixtures: UITestFixtures?
+    #endif
 
     func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
-        // Use this method to optionally configure and attach the UIWindow `window` to the provided UIWindowScene `scene`.
-        // If using a storyboard, the `window` property will automatically be initialized and attached to the scene.
-        // This delegate does not imply the connecting scene or session are new (see `application:configurationForConnectingSceneSession` instead).
-        guard let _ = (scene as? UIWindowScene) else { return }
+        guard let windowScene = scene as? UIWindowScene else { return }
+        #if DEBUG
+        let fixtures = UITestFixtures()
+        uiTestFixtures = fixtures
+        #endif
+        let controller = withDependencies {
+            // XCTest still launches a real host scene before constructing scoped test controllers.
+            let isTestHost = $0.context == .test
+            $0.context = .live
+            if isTestHost { $0.shaderPreferences = .inMemory() }
+            #if DEBUG
+            fixtures.configure(&$0)
+            #endif
+        } operation: {
+            UIStoryboard(name: "Main", bundle: nil).instantiateInitialViewController() as? GameViewController
+        }
+        guard let controller else { return }
+        let window = UIWindow(windowScene: windowScene)
+        window.rootViewController = controller
+        self.window = window
+        #if DEBUG
+        fixtures.installControls(on: controller)
+        #endif
+        window.makeKeyAndVisible()
     }
 
     func sceneDidDisconnect(_ scene: UIScene) {

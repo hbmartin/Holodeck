@@ -1,5 +1,8 @@
 import XCTest
 import MetalKit
+import Dependencies
+import Clocks
+import ConcurrencyExtras
 @testable import Holodeck
 
 @MainActor
@@ -70,7 +73,7 @@ final class HolodeckTests: XCTestCase {
     func testInvalidSourceAndMissingEntryPointPreserveActiveShader() async throws {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let view = MTKView(frame: .zero, device: device)
-        let renderer = try XCTUnwrap(Renderer(metalKitView: view))
+        let renderer = try makeRenderer(view: view)
         let activated = try await renderer.select(ShaderCatalog.initialShader)
         XCTAssertTrue(activated)
         let missingFragment = ShaderCatalog.initialShader.source.replacingOccurrences(
@@ -128,7 +131,7 @@ final class HolodeckTests: XCTestCase {
         XCTAssertEqual(renderer.activeShader?.id, "plasma")
 
         let view = MTKView(frame: .zero, device: renderer.device)
-        let lifecycleRenderer = try XCTUnwrap(Renderer(metalKitView: view))
+        let lifecycleRenderer = try makeRenderer(view: view)
         XCTAssertTrue(view.isPaused)
         lifecycleRenderer.setActive(true)
         XCTAssertFalse(view.isPaused)
@@ -168,6 +171,9 @@ final class HolodeckTests: XCTestCase {
         controller.closePickerFromRemote()
         let picker: UIView = try findView("shader-picker", in: controller)
         XCTAssertTrue(picker.isHidden)
+        let loadingHint: UIView = try findView("shader-hint", in: controller)
+        XCTAssertFalse(loadingHint.isHidden)
+        XCTAssertTrue(loadingHint.subviewsRecursive.contains { ($0 as? UILabel)?.text == "Loading Plasma…" })
 
         await compiler.complete("plasma", pipeline: pipeline)
         try await waitForSelection(initial)
@@ -175,6 +181,117 @@ final class HolodeckTests: XCTestCase {
         let status: UILabel = try findView("shader-status", in: controller)
         XCTAssertTrue(picker.isHidden)
         XCTAssertFalse(hint.isHidden)
+        XCTAssertTrue(status.text?.hasPrefix("Now showing Plasma") == true)
+    }
+
+    func testInitialFailureKeepsPickerAndBrowsingPosition() async throws {
+        let (controller, compiler, _) = try await controlledController()
+        try await waitForRequest("plasma", in: compiler)
+        let initial = try XCTUnwrap(controller.shaderSelectionTask)
+        controller.openPickerFromRemote()
+        let collection: UICollectionView = try findView("shader-cards", in: controller)
+        collection.scrollToItem(at: IndexPath(item: 5, section: 0), at: .centeredHorizontally, animated: false)
+        collection.layoutIfNeeded()
+        let offset = collection.contentOffset
+        await compiler.fail("plasma")
+        try await waitForSelection(initial)
+        let picker: UIView = try findView("shader-picker", in: controller)
+        let status: UILabel = try findView("shader-status", in: controller)
+        XCTAssertFalse(picker.isHidden)
+        XCTAssertEqual(collection.contentOffset, offset)
+        XCTAssertEqual(status.text, "Couldn’t load Plasma. Choose another shader.")
+    }
+
+    func testStartupBackCancelsUserSelectionAndResumesPlasma() async throws {
+        for selectedFails in [false, true] {
+            for fallbackFirst in [false, true] {
+                let (controller, compiler, pipeline) = try await controlledController()
+                try await waitForRequest("plasma", in: compiler)
+                let initial = try XCTUnwrap(controller.shaderSelectionTask)
+                controller.openPickerFromRemote()
+                let collection: UICollectionView = try findView("shader-cards", in: controller)
+                controller.collectionView(collection, didSelectItemAt: IndexPath(item: 1, section: 0))
+                try await waitForRequest("aurora", in: compiler)
+                let selected = try XCTUnwrap(controller.shaderSelectionTask)
+                controller.closePickerFromRemote()
+                let hint: UIView = try findView("shader-hint", in: controller)
+                XCTAssertFalse(hint.isHidden)
+                try await waitForRequest("plasma", occurrence: 2, in: compiler)
+                let fallback = try XCTUnwrap(controller.shaderSelectionTask)
+                controller.openPickerFromRemote()
+                let picker: UIView = try findView("shader-picker", in: controller)
+                let status: UILabel = try findView("shader-status", in: controller)
+
+                if fallbackFirst {
+                    await compiler.complete("plasma", occurrence: 2, pipeline: pipeline)
+                    try await waitForSelection(fallback)
+                }
+                let before = status.text
+                if selectedFails { await compiler.fail("aurora") }
+                else { await compiler.complete("aurora", pipeline: pipeline) }
+                try await waitForSelection(selected)
+                XCTAssertFalse(picker.isHidden)
+                XCTAssertEqual(status.text, before)
+                await compiler.fail("plasma", occurrence: 1)
+                try await waitForSelection(initial)
+                XCTAssertEqual(status.text, before)
+                if !fallbackFirst {
+                    await compiler.complete("plasma", occurrence: 2, pipeline: pipeline)
+                    try await waitForSelection(fallback)
+                }
+                XCTAssertFalse(picker.isHidden)
+                XCTAssertTrue(status.text?.hasPrefix("Now showing Plasma") == true)
+                let plasma = try XCTUnwrap(collection.cellForItem(at: IndexPath(item: 0, section: 0)))
+                XCTAssertEqual(plasma.accessibilityValue, "Now showing")
+                XCTAssertTrue(hint.isHidden)
+            }
+        }
+    }
+
+    func testBackCancelsSelectionBeforeItsTaskStarts() async throws {
+        let (controller, compiler, pipeline) = try await controlledController()
+        try await waitForRequest("plasma", in: compiler)
+        let initial = try XCTUnwrap(controller.shaderSelectionTask)
+        controller.openPickerFromRemote()
+        let collection: UICollectionView = try findView("shader-cards", in: controller)
+        controller.collectionView(collection, didSelectItemAt: IndexPath(item: 1, section: 0))
+        let canceled = try XCTUnwrap(controller.shaderSelectionTask)
+        controller.closePickerFromRemote()
+        try await waitForSelection(canceled)
+        let auroraRequests = await compiler.requestCount("aurora")
+        XCTAssertEqual(auroraRequests, 0)
+        try await waitForRequest("plasma", occurrence: 2, in: compiler)
+        let fallback = try XCTUnwrap(controller.shaderSelectionTask)
+        await compiler.complete("plasma", occurrence: 2, pipeline: pipeline)
+        try await waitForSelection(fallback)
+        await compiler.complete("plasma", occurrence: 1, pipeline: pipeline)
+        try await waitForSelection(initial)
+        let picker: UIView = try findView("shader-picker", in: controller)
+        let hint: UIView = try findView("shader-hint", in: controller)
+        XCTAssertTrue(picker.isHidden)
+        XCTAssertFalse(hint.isHidden)
+    }
+
+    func testControllerBackRetainsActiveShader() async throws {
+        let (controller, compiler, pipeline) = try await controlledController()
+        try await waitForRequest("plasma", in: compiler)
+        let initial = try XCTUnwrap(controller.shaderSelectionTask)
+        await compiler.complete("plasma", pipeline: pipeline)
+        try await waitForSelection(initial)
+        controller.openPickerFromRemote()
+        let collection: UICollectionView = try findView("shader-cards", in: controller)
+        controller.collectionView(collection, didSelectItemAt: IndexPath(item: 1, section: 0))
+        try await waitForRequest("aurora", in: compiler)
+        let selected = try XCTUnwrap(controller.shaderSelectionTask)
+        controller.closePickerFromRemote()
+        controller.openPickerFromRemote()
+        let status: UILabel = try findView("shader-status", in: controller)
+        let before = status.text
+        await compiler.complete("aurora", pipeline: pipeline)
+        try await waitForSelection(selected)
+        let picker: UIView = try findView("shader-picker", in: controller)
+        XCTAssertFalse(picker.isHidden)
+        XCTAssertEqual(status.text, before)
         XCTAssertTrue(status.text?.hasPrefix("Now showing Plasma") == true)
     }
 
@@ -209,14 +326,22 @@ final class HolodeckTests: XCTestCase {
 
     func testUnavailableErrorsSurvivePickerUpdates() async throws {
         for error in [RendererStartupError.metalUnavailable, .initializationFailed] {
-            let controller = try await hostController { _ in throw error }
+            let controller = try await hostController(factory: { view in
+                if case .initializationFailed = error { view.device = MTLCreateSystemDefaultDevice() }
+                throw error
+            })
             let picker: UIView = try findView("shader-picker", in: controller)
             let hint: UIView = try findView("shader-hint", in: controller)
             let status: UILabel = try findView("shader-status", in: controller)
             let spinner: UIActivityIndicatorView = try findView("shader-loading", in: controller)
             let collection: UICollectionView = try findView("shader-cards", in: controller)
             XCTAssertNil(controller.shaderSelectionTask)
+            let metalView = try XCTUnwrap(controller.view as? MTKView)
+            XCTAssertTrue(metalView.isPaused)
             for _ in 0..<3 {
+                controller.setSceneActive(false)
+                controller.setSceneActive(true)
+                XCTAssertTrue(metalView.isPaused)
                 controller.openPickerFromRemote()
                 controller.closePickerFromRemote()
                 XCTAssertFalse(picker.isHidden)
@@ -229,81 +354,328 @@ final class HolodeckTests: XCTestCase {
     }
 
     func testPickerLayoutIsStableWhileLoadingReadyAndUnavailable() async throws {
-        let sizes = [CGSize(width: 1920, height: 1080), CGSize(width: 1280, height: 720)]
-        let (controller, compiler, pipeline) = try await controlledController()
-        try await waitForRequest("plasma", in: compiler)
-        let initial = try XCTUnwrap(controller.shaderSelectionTask)
-        controller.openPickerFromRemote()
-        let loading = try sizes.map { try checkPickerLayout(controller, size: $0) }
-        await compiler.complete("plasma", pipeline: pipeline)
-        try await waitForSelection(initial)
-        for (index, size) in sizes.enumerated() {
-            XCTAssertEqual(try checkPickerLayout(controller, size: size), loading[index])
-        }
-
-        let unavailable = try await hostController { _ in throw RendererStartupError.metalUnavailable }
-        for (index, size) in sizes.enumerated() {
-            XCTAssertEqual(try checkPickerLayout(unavailable, size: size), loading[index])
+        for size in [CGSize(width: 1920, height: 1080), CGSize(width: 1280, height: 720)] {
+            let (controller, compiler, pipeline) = try await controlledController(size: size)
+            try await waitForRequest("plasma", in: compiler)
+            let initial = try XCTUnwrap(controller.shaderSelectionTask)
+            controller.openPickerFromRemote()
+            let loading = try checkPickerLayout(controller, size: size)
+            await compiler.complete("plasma", pipeline: pipeline)
+            try await waitForSelection(initial)
+            XCTAssertEqual(try checkPickerLayout(controller, size: size), loading)
+            let unavailable = try await hostController(size: size, factory: { _ in throw RendererStartupError.metalUnavailable })
+            XCTAssertEqual(try checkPickerLayout(unavailable, size: size), loading)
         }
     }
 
-    private func controlledController() async throws -> (GameViewController, ControlledCompiler, any MTLRenderPipelineState) {
-        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let pipeline = try await ShaderCompiler(device: device).pipeline(for: ShaderCatalog.initialShader)
+    func testDeviceAndCompilerOverridesSurviveControllerConstructionScope() async throws {
+        let (device, pipeline) = try await Self.controllerPipeline.value
         let compiler = ControlledCompiler()
         addTeardownBlock { await compiler.cancelAll() }
-        let controller = try await hostController { view in
-            view.device = device
-            return try XCTUnwrap(Renderer(metalKitView: view, compiler: compiler))
+        let preferences = PreferenceSpy()
+        let controller = try await hostController(preferences: preferences.client, dependencies: {
+            $0.metalDevice = device
+            $0.shaderCompilerFactory = { actualDevice, pixelFormat in
+                XCTAssertTrue(actualDevice === device)
+                XCTAssertEqual(pixelFormat, .bgra8Unorm_srgb)
+                return compiler
+            }
+        })
+        XCTAssertTrue((controller.view as? MTKView)?.device === device)
+        try await waitForRequest("plasma", in: compiler)
+        let selection = try XCTUnwrap(controller.shaderSelectionTask)
+        await compiler.complete("plasma", pipeline: pipeline)
+        try await waitForSelection(selection)
+        XCTAssertEqual(preferences.writes, ["plasma"])
+    }
+
+    func testMissingMetalUsesRegisteredDeviceDependency() async throws {
+        let controller = try await hostController(dependencies: { $0.metalDevice = nil })
+        let status: UILabel = try findView("shader-status", in: controller)
+        XCTAssertEqual(status.text, RendererStartupError.metalUnavailable.localizedDescription)
+        XCTAssertNil(controller.shaderSelectionTask)
+        XCTAssertTrue((controller.view as? MTKView)?.isPaused == true)
+    }
+
+    func testRendererUsesControlledTimeForPauseResumeAndSelectionReset() async throws {
+        let (device, pipeline) = try await Self.controllerPipeline.value
+        let compiler = ControlledCompiler()
+        addTeardownBlock { await compiler.cancelAll() }
+        let time = ControlledTime(value: 10)
+        let view = MTKView(frame: .zero, device: device)
+        let renderer = try makeRenderer(view: view, compilerFactory: { _, _ in compiler }, now: { time.value })
+        renderer.setActive(true)
+        let initial = Task { try await renderer.select(ShaderCatalog.initialShader) }
+        await compiler.waitForRequest("plasma")
+        await compiler.complete("plasma", pipeline: pipeline)
+        let activated = try await initial.value
+        XCTAssertTrue(activated)
+        XCTAssertEqual(renderer.animationTime, 0)
+        time.value = 12
+        XCTAssertEqual(renderer.animationTime, 2)
+        time.value = 13
+        renderer.setActive(false)
+        XCTAssertTrue(view.isPaused)
+        time.value = 100
+        XCTAssertEqual(renderer.animationTime, 3)
+        renderer.setActive(true)
+        XCTAssertFalse(view.isPaused)
+        time.value = 102
+        XCTAssertEqual(renderer.animationTime, 5)
+        let next = Task { try await renderer.select(ShaderCatalog.shaders[1]) }
+        await compiler.waitForRequest("aurora")
+        await compiler.complete("aurora", pipeline: pipeline)
+        let nextActivated = try await next.value
+        XCTAssertTrue(nextActivated)
+        XCTAssertEqual(renderer.animationTime, 0)
+    }
+
+    func testStartupHintUsesFourSecondClockAndCancelsWhenPickerOpens() async throws {
+        // Advance virtual time and main-actor UI tasks on a deterministic test executor.
+        try await withMainSerialExecutor {
+            for opensPicker in [false, true] {
+                let clock = TestClock()
+                let (controller, compiler, pipeline) = try await controlledController(clock: clock)
+                try await waitForRequest("plasma", in: compiler)
+                let initial = try XCTUnwrap(controller.shaderSelectionTask)
+                await compiler.complete("plasma", pipeline: pipeline)
+                try await waitForSelection(initial)
+                let hint: UIView = try findView("shader-hint", in: controller)
+                let hintTask = try XCTUnwrap(controller.hintTask)
+                await clock.advance(by: .seconds(3))
+                XCTAssertFalse(hint.isHidden)
+                if opensPicker {
+                    controller.openPickerFromRemote()
+                    XCTAssertTrue(hintTask.isCancelled)
+                    XCTAssertTrue(hint.isHidden)
+                    try await waitForSelection(hintTask)
+                    try await clock.checkSuspension()
+                    await clock.advance(by: .seconds(1))
+                    XCTAssertTrue(hint.isHidden)
+                } else {
+                    await clock.advance(by: .seconds(1))
+                    try await waitForSelection(hintTask)
+                    XCTAssertTrue(hint.isHidden)
+                }
+            }
         }
+    }
+
+    func testSavedAbsentAndUnknownShaderIDsResolveOnceAndSaveAfterActivation() async throws {
+        for savedID in [nil, "aurora", "removed-shader"] as [String?] {
+            let preferences = PreferenceSpy(id: savedID)
+            let (controller, compiler, pipeline) = try await controlledController(preferences: preferences.client)
+            let expected = savedID == "aurora" ? "aurora" : "plasma"
+            try await waitForRequest(expected, in: compiler)
+            XCTAssertEqual(preferences.reads, 1)
+            XCTAssertTrue(preferences.writes.isEmpty)
+            let hint: UIView = try findView("shader-hint", in: controller)
+            let title = expected == "aurora" ? "Aurora" : "Plasma"
+            XCTAssertTrue(hint.subviewsRecursive.contains { ($0 as? UILabel)?.text == "Loading \(title)…" })
+            let initial = try XCTUnwrap(controller.shaderSelectionTask)
+            controller.openPickerFromRemote()
+            let collection: UICollectionView = try findView("shader-cards", in: controller)
+            XCTAssertEqual(controller.indexPathForPreferredFocusedView(in: collection)?.item, expected == "aurora" ? 1 : 0)
+            await compiler.complete(expected, pipeline: pipeline)
+            try await waitForSelection(initial)
+            XCTAssertEqual(preferences.id, expected)
+            XCTAssertEqual(preferences.writes, [expected])
+            XCTAssertEqual(preferences.reads, 1)
+        }
+    }
+
+    func testRestoredShaderFailureKeepsSavedIDAndAllowsRecovery() async throws {
+        let preferences = PreferenceSpy(id: "aurora")
+        let (controller, compiler, pipeline) = try await controlledController(preferences: preferences.client)
+        try await waitForRequest("aurora", in: compiler)
+        let initial = try XCTUnwrap(controller.shaderSelectionTask)
+        await compiler.fail("aurora")
+        try await waitForSelection(initial)
+        let picker: UIView = try findView("shader-picker", in: controller)
+        let status: UILabel = try findView("shader-status", in: controller)
+        let collection: UICollectionView = try findView("shader-cards", in: controller)
+        XCTAssertFalse(picker.isHidden)
+        XCTAssertEqual(status.text, "Couldn’t load Aurora. Choose another shader.")
+        XCTAssertEqual(controller.indexPathForPreferredFocusedView(in: collection)?.item, 1)
+        XCTAssertEqual(preferences.id, "aurora")
+        XCTAssertTrue(preferences.writes.isEmpty)
+        let plasmaRequests = await compiler.requestCount("plasma")
+        XCTAssertEqual(plasmaRequests, 0)
+        controller.collectionView(collection, didSelectItemAt: IndexPath(item: 2, section: 0))
+        try await waitForRequest("waves", in: compiler)
+        let recovery = try XCTUnwrap(controller.shaderSelectionTask)
+        await compiler.complete("waves", pipeline: pipeline)
+        try await waitForSelection(recovery)
+        XCTAssertEqual(preferences.writes, ["waves"])
+    }
+
+    func testFailedCanceledAndSupersededSelectionsNeverOverwritePreferences() async throws {
+        let preferences = PreferenceSpy(id: "plasma")
+        let (controller, compiler, pipeline) = try await controlledController(preferences: preferences.client)
+        try await waitForRequest("plasma", in: compiler)
+        let startup = try XCTUnwrap(controller.shaderSelectionTask)
+        controller.openPickerFromRemote()
+        let collection: UICollectionView = try findView("shader-cards", in: controller)
+        controller.collectionView(collection, didSelectItemAt: IndexPath(item: 1, section: 0))
+        try await waitForRequest("aurora", in: compiler)
+        let selected = try XCTUnwrap(controller.shaderSelectionTask)
+        await compiler.complete("aurora", pipeline: pipeline)
+        try await waitForSelection(selected)
+        await compiler.complete("plasma", pipeline: pipeline)
+        try await waitForSelection(startup)
+        XCTAssertEqual(preferences.writes, ["aurora"])
+
+        controller.openPickerFromRemote()
+        controller.collectionView(collection, didSelectItemAt: IndexPath(item: 2, section: 0))
+        try await waitForRequest("waves", in: compiler)
+        let failed = try XCTUnwrap(controller.shaderSelectionTask)
+        await compiler.fail("waves")
+        try await waitForSelection(failed)
+        XCTAssertEqual(preferences.writes, ["aurora"])
+
+        for index in [3, 4] {
+            controller.collectionView(collection, didSelectItemAt: IndexPath(item: index, section: 0))
+            let id = ShaderCatalog.shaders[index].id
+            try await waitForRequest(id, in: compiler)
+            let canceled = try XCTUnwrap(controller.shaderSelectionTask)
+            controller.closePickerFromRemote()
+            if index == 3 { await compiler.complete(id, pipeline: pipeline) } else { await compiler.fail(id) }
+            try await waitForSelection(canceled)
+            XCTAssertEqual(preferences.writes, ["aurora"])
+            controller.openPickerFromRemote()
+        }
+        XCTAssertEqual(preferences.id, "aurora")
+    }
+
+    func testBackRestartsRememberedStartupAndPreservesBrowsing() async throws {
+        let preferences = PreferenceSpy(id: "waves")
+        let (controller, compiler, pipeline) = try await controlledController(preferences: preferences.client)
+        try await waitForRequest("waves", occurrence: 1, in: compiler)
+        let initial = try XCTUnwrap(controller.shaderSelectionTask)
+        controller.openPickerFromRemote()
+        let collection: UICollectionView = try findView("shader-cards", in: controller)
+        controller.collectionView(collection, didSelectItemAt: IndexPath(item: 1, section: 0))
+        try await waitForRequest("aurora", in: compiler)
+        let canceled = try XCTUnwrap(controller.shaderSelectionTask)
+        controller.closePickerFromRemote()
+        try await waitForRequest("waves", occurrence: 2, in: compiler)
+        let resumed = try XCTUnwrap(controller.shaderSelectionTask)
+        let hint: UIView = try findView("shader-hint", in: controller)
+        XCTAssertTrue(hint.subviewsRecursive.contains { ($0 as? UILabel)?.text == "Loading Waves…" })
+        XCTAssertTrue(preferences.writes.isEmpty)
+        controller.openPickerFromRemote()
+        collection.scrollToItem(at: IndexPath(item: 5, section: 0), at: .centeredHorizontally, animated: false)
+        collection.layoutIfNeeded()
+        let offset = collection.contentOffset
+        await compiler.complete("waves", occurrence: 2, pipeline: pipeline)
+        try await waitForSelection(resumed)
+        XCTAssertEqual(collection.contentOffset, offset)
+        await compiler.fail("aurora")
+        await compiler.complete("waves", occurrence: 1, pipeline: pipeline)
+        try await waitForSelection(canceled)
+        try await waitForSelection(initial)
+        XCTAssertEqual(preferences.writes, ["waves"])
+        XCTAssertEqual(preferences.reads, 1)
+    }
+
+    func testPreferencesUserDefaultsRoundTripAndMemoryIsolation() throws {
+        let suite = "Holodeck.unit-tests." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let preferences = ShaderPreferences.userDefaults(defaults)
+        XCTAssertNil(preferences.lastShaderID())
+        preferences.setLastShaderID("aurora")
+        let reopened = ShaderPreferences.userDefaults(try XCTUnwrap(UserDefaults(suiteName: suite)))
+        XCTAssertEqual(reopened.lastShaderID(), "aurora")
+        preferences.setLastShaderID(nil)
+        XCTAssertNil(reopened.lastShaderID())
+        let first = ShaderPreferences.inMemory()
+        let second = ShaderPreferences.inMemory()
+        first.setLastShaderID("waves")
+        XCTAssertNil(second.lastShaderID())
+    }
+
+    private static let controllerPipeline = Task { @MainActor in
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let pipeline = try await ShaderCompiler(device: device).pipeline(for: ShaderCatalog.initialShader)
+        return (device, pipeline)
+    }
+
+    private func controlledController(size: CGSize? = nil,
+                                      preferences: ShaderPreferences = .inMemory(),
+                                      clock: any Clock<Duration> = TestClock()) async throws -> (GameViewController, ControlledCompiler, any MTLRenderPipelineState) {
+        let (device, pipeline) = try await Self.controllerPipeline.value
+        let compiler = ControlledCompiler()
+        addTeardownBlock { await compiler.cancelAll() }
+        let controller = try await hostController(size: size, preferences: preferences, clock: clock, dependencies: {
+            $0.metalDevice = device
+            $0.shaderCompilerFactory = { _, _ in compiler }
+        })
         return (controller, compiler, pipeline)
     }
 
-    private func hostController(factory: @escaping @MainActor (MTKView) throws -> Renderer) async throws -> GameViewController {
+    private func hostController(size: CGSize? = nil,
+                                preferences: ShaderPreferences = .inMemory(),
+                                clock: any Clock<Duration> = TestClock(),
+                                dependencies: (inout DependencyValues) -> Void = { _ in },
+                                factory: @escaping @MainActor @Sendable (MTKView) throws -> Renderer = RendererFactoryKey.liveValue) async throws -> GameViewController {
         let storyboard = UIStoryboard(name: "Main", bundle: Bundle(for: GameViewController.self))
-        let controller = try XCTUnwrap(storyboard.instantiateInitialViewController() as? GameViewController)
-        controller.rendererFactory = factory
+        let controller = try withDependencies {
+            $0.context = .test
+            $0.rendererFactory = factory
+            $0.shaderPreferences = preferences
+            $0.continuousClock = clock
+            $0.monotonicTime = { 0 }
+            dependencies(&$0)
+        } operation: {
+            try XCTUnwrap(storyboard.instantiateInitialViewController() as? GameViewController)
+        }
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         var presenter = try XCTUnwrap(scene.windows.first(where: \.isKeyWindow)?.rootViewController)
         while let presented = presenter.presentedViewController { presenter = presented }
-        controller.modalPresentationStyle = .fullScreen
-        let appeared = XCTestExpectation(description: "Controller finishes appearing")
-        presenter.present(controller, animated: false) { appeared.fulfill() }
-        let result = await XCTWaiter.fulfillment(of: [appeared], timeout: 5)
-        XCTAssertEqual(result, .completed)
-        guard result == .completed else { throw ControllerTestError.timedOut }
-        controller.view.layoutIfNeeded()
+        let hosted: UIViewController = size.map { LayoutHost(controller: controller, size: $0) } ?? controller
+        hosted.modalPresentationStyle = .fullScreen
         addTeardownBlock { @MainActor in
+            controller.hintTask?.cancel()
             controller.setSceneActive(false)
+            guard hosted.presentingViewController != nil else { return }
             let dismissed = XCTestExpectation(description: "Controller finishes disappearing")
-            controller.dismiss(animated: false) { dismissed.fulfill() }
+            hosted.dismiss(animated: false) { dismissed.fulfill() }
             let result = await XCTWaiter.fulfillment(of: [dismissed], timeout: 5)
             XCTAssertEqual(result, .completed)
         }
+        let appeared = XCTestExpectation(description: "Controller finishes appearing")
+        presenter.present(hosted, animated: false) { appeared.fulfill() }
+        try await waitForExpectation(appeared)
+        hosted.view.layoutIfNeeded()
+        if let host = hosted as? LayoutHost { host.configureSafeArea() }
+        controller.view.layoutIfNeeded()
         return controller
     }
 
-    private func waitForRequest(_ id: String, in compiler: ControlledCompiler) async throws {
-        let checkpoint = XCTestExpectation(description: "Compiler receives \(id)")
-        let waiting = Task {
-            await compiler.waitForRequest(id)
-            checkpoint.fulfill()
+    private func waitForRequest(_ id: String, occurrence: Int? = nil, in compiler: ControlledCompiler) async throws {
+        try await waitForAsync("Compiler receives \(id) request \(occurrence.map(String.init) ?? "next")") {
+            await compiler.waitForRequest(id, occurrence: occurrence)
         }
-        defer { waiting.cancel() }
-        let result = await XCTWaiter.fulfillment(of: [checkpoint], timeout: 5)
-        XCTAssertEqual(result, .completed)
-        guard result == .completed else { throw ControllerTestError.timedOut }
     }
 
     private func waitForSelection(_ task: Task<Void, Never>) async throws {
-        let finished = XCTestExpectation(description: "Selection updates the controller")
+        try await waitForAsync("Selection updates the controller") { await task.value }
+    }
+
+    private func waitForAsync(_ description: String, operation: @escaping @MainActor () async -> Void) async throws {
+        let checkpoint = XCTestExpectation(description: description)
         let waiting = Task {
-            await task.value
-            finished.fulfill()
+            await operation()
+            checkpoint.fulfill()
         }
         defer { waiting.cancel() }
-        let result = await XCTWaiter.fulfillment(of: [finished], timeout: 5)
-        XCTAssertEqual(result, .completed)
+        try await waitForExpectation(checkpoint)
+    }
+
+    private func waitForExpectation(_ expectation: XCTestExpectation) async throws {
+        let result = await XCTWaiter.fulfillment(of: [expectation], timeout: 5)
+        XCTAssertEqual(result, .completed, expectation.expectationDescription)
         guard result == .completed else { throw ControllerTestError.timedOut }
     }
 
@@ -319,9 +691,9 @@ final class HolodeckTests: XCTestCase {
     }
 
     private func checkPickerLayout(_ controller: GameViewController, size: CGSize) throws -> CGRect {
-        controller.view.bounds.size = size
-        controller.view.setNeedsLayout()
         controller.view.layoutIfNeeded()
+        XCTAssertEqual(controller.view.bounds.size, size)
+        XCTAssertEqual(controller.view.safeAreaInsets, UIEdgeInsets(top: 60, left: 90, bottom: 60, right: 90))
         let collection: UICollectionView = try findView("shader-cards", in: controller)
         let layout = try XCTUnwrap(collection.collectionViewLayout as? UICollectionViewFlowLayout)
         XCTAssertEqual(layout.itemSize, CGSize(width: 320, height: 232))
@@ -330,20 +702,36 @@ final class HolodeckTests: XCTestCase {
         let first = try XCTUnwrap(collection.cellForItem(at: IndexPath(item: 0, section: 0)))
         let frame = first.convert(first.bounds, to: controller.view)
         let visible = collection.convert(collection.bounds, to: controller.view)
-        let expandedHeight = first.bounds.height * 1.045
-        XCTAssertGreaterThanOrEqual(frame.midY - expandedHeight / 2, visible.minY)
-        XCTAssertLessThanOrEqual(frame.midY + expandedHeight / 2, visible.maxY)
+        let safe = controller.view.safeAreaLayoutGuide.layoutFrame
+        let expanded = CGRect(x: frame.midX - first.bounds.width * 1.045 / 2,
+                              y: frame.midY - first.bounds.height * 1.045 / 2,
+                              width: first.bounds.width * 1.045, height: first.bounds.height * 1.045)
+        XCTAssertGreaterThanOrEqual(expanded.minY, visible.minY)
+        XCTAssertLessThanOrEqual(expanded.maxY, visible.maxY)
+        XCTAssertTrue(safe.contains(expanded), "Focused card must fit the safe area: \(expanded), \(safe)")
         let status: UIView = try findView("shader-status-row", in: controller)
         XCTAssertGreaterThanOrEqual(status.bounds.height, 40)
         return visible
+    }
+
+    private func makeRenderer(view: MTKView,
+                              compilerFactory: @escaping @Sendable (any MTLDevice, MTLPixelFormat) -> any ShaderCompiling = ShaderCompilerFactoryKey.liveValue,
+                              now: @escaping @MainActor @Sendable () -> TimeInterval = { 0 }) throws -> Renderer {
+        try withDependencies {
+            $0.shaderCompilerFactory = compilerFactory
+            $0.monotonicTime = now
+        } operation: {
+            try XCTUnwrap(Renderer(metalKitView: view))
+        }
     }
 
     private func controlledRenderer() async throws -> (Renderer, ControlledCompiler, any MTLRenderPipelineState) {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let pipeline = try await ShaderCompiler(device: device).pipeline(for: ShaderCatalog.initialShader)
         let compiler = ControlledCompiler()
+        addTeardownBlock { await compiler.cancelAll() }
         let view = MTKView(frame: .zero, device: device)
-        let renderer = try XCTUnwrap(Renderer(metalKitView: view, compiler: compiler))
+        let renderer = try makeRenderer(view: view, compilerFactory: { _, _ in compiler })
         let initial = Task { try await renderer.select(ShaderCatalog.initialShader) }
         await compiler.waitForRequest("plasma")
         await compiler.complete("plasma", pipeline: pipeline)
@@ -405,32 +793,54 @@ final class HolodeckTests: XCTestCase {
 }
 
 private actor ControlledCompiler: ShaderCompiling {
-    private var requests: [String: CheckedContinuation<any MTLRenderPipelineState, any Error>] = [:]
-    private var waiters: [String: CheckedContinuation<Void, Never>] = [:]
+    private struct Request: Hashable {
+        let id: String
+        let occurrence: Int
+    }
+    private var counts: [String: Int] = [:]
+    private var requests: [Request: CheckedContinuation<any MTLRenderPipelineState, any Error>] = [:]
+    private var waiters: [Request: [CheckedContinuation<Void, Never>]] = [:]
+    private var canceled = false
 
     func pipeline(for shader: ShaderDefinition) async throws -> any MTLRenderPipelineState {
-        try await withCheckedThrowingContinuation { continuation in
-            requests[shader.id] = continuation
-            waiters.removeValue(forKey: shader.id)?.resume()
+        guard !canceled else { throw CancellationError() }
+        counts[shader.id, default: 0] += 1
+        let request = Request(id: shader.id, occurrence: counts[shader.id]!)
+        return try await withCheckedThrowingContinuation { continuation in
+            requests[request] = continuation
+            waiters.removeValue(forKey: request)?.forEach { $0.resume() }
         }
     }
 
-    func waitForRequest(_ id: String) async {
-        if requests[id] != nil { return }
-        await withCheckedContinuation { waiters[id] = $0 }
+    func requestCount(_ id: String) -> Int { counts[id, default: 0] }
+
+    func waitForRequest(_ id: String, occurrence: Int? = nil) async {
+        guard !canceled else { return }
+        if let occurrence, counts[id, default: 0] >= occurrence { return }
+        if occurrence == nil, requests.keys.contains(where: { $0.id == id }) { return }
+        let request = Request(id: id, occurrence: occurrence ?? (counts[id, default: 0] + 1))
+        await withCheckedContinuation { waiters[request, default: []].append($0) }
     }
 
-    func complete(_ id: String, pipeline: any MTLRenderPipelineState) {
-        requests.removeValue(forKey: id)?.resume(returning: pipeline)
+    func complete(_ id: String, occurrence: Int? = nil, pipeline: any MTLRenderPipelineState) {
+        guard let request = pendingRequest(id, occurrence: occurrence) else { return }
+        requests.removeValue(forKey: request)?.resume(returning: pipeline)
     }
 
-    func fail(_ id: String) {
-        requests.removeValue(forKey: id)?.resume(throwing: ShaderCompilationError.missingFunction("fragmentShader"))
+    func fail(_ id: String, occurrence: Int? = nil) {
+        guard let request = pendingRequest(id, occurrence: occurrence) else { return }
+        requests.removeValue(forKey: request)?.resume(throwing: ShaderCompilationError.missingFunction("fragmentShader"))
+    }
+
+    private func pendingRequest(_ id: String, occurrence: Int?) -> Request? {
+        if let occurrence { return Request(id: id, occurrence: occurrence) }
+        return requests.keys.filter { $0.id == id }.min { $0.occurrence < $1.occurrence }
     }
 
     func cancelAll() {
+        canceled = true
         let pending = Array(requests.values)
-        let waiting = Array(waiters.values)
+        let waiting = waiters.values.flatMap { $0 }
         requests.removeAll()
         waiters.removeAll()
         pending.forEach { $0.resume(throwing: CancellationError()) }
@@ -438,4 +848,72 @@ private actor ControlledCompiler: ShaderCompiling {
     }
 }
 
+@MainActor
+private final class LayoutHost: UIViewController {
+    private let controller: GameViewController
+    private let size: CGSize
+
+    init(controller: GameViewController, size: CGSize) {
+        self.controller = controller
+        self.size = size
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("Layout hosts are created by tests.") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        addChild(controller)
+        controller.view.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(controller.view)
+        NSLayoutConstraint.activate([
+            controller.view.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            controller.view.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            controller.view.widthAnchor.constraint(equalToConstant: size.width),
+            controller.view.heightAnchor.constraint(equalToConstant: size.height)
+        ])
+        controller.didMove(toParent: self)
+    }
+
+    func configureSafeArea() {
+        view.layoutIfNeeded()
+        let inherited = controller.view.safeAreaInsets
+        controller.additionalSafeAreaInsets = UIEdgeInsets(top: max(0, 60 - inherited.top),
+                                                          left: max(0, 90 - inherited.left),
+                                                          bottom: max(0, 60 - inherited.bottom),
+                                                          right: max(0, 90 - inherited.right))
+        view.layoutIfNeeded()
+    }
+}
+
+@MainActor
+private extension UIView {
+    var subviewsRecursive: [UIView] { subviews + subviews.flatMap { $0.subviewsRecursive } }
+}
+
 private enum ControllerTestError: Error { case timedOut }
+
+@MainActor
+private final class PreferenceSpy {
+    var id: String?
+    var reads = 0
+    var writes: [String?] = []
+
+    init(id: String? = nil) { self.id = id }
+
+    var client: ShaderPreferences {
+        ShaderPreferences(lastShaderID: {
+            self.reads += 1
+            return self.id
+        }, setLastShaderID: {
+            self.id = $0
+            self.writes.append($0)
+        })
+    }
+}
+
+@MainActor
+private final class ControlledTime {
+    var value: TimeInterval
+    init(value: TimeInterval) { self.value = value }
+}
