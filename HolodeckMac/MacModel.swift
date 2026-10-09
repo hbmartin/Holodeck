@@ -11,6 +11,9 @@ final class MacModel {
     let defaults: UserDefaults
     var query = ""
     var favoritesOnly = false
+    var collectionID = "all"
+    var mood = ""
+    var motion = ""
     var sidebarVisible: Bool {
         didSet { defaults.set(sidebarVisible, forKey: "holodeck.sidebarVisible") }
     }
@@ -51,7 +54,19 @@ final class MacModel {
     }
 
     var filteredScenes: [ShaderDefinition] {
-        SceneLibrary.filter(session.shaders, query: query, favoritesOnly: favoritesOnly, favorites: favorites.ids)
+        SceneLibrary.filter(session.shaders, query: query, favoritesOnly: favoritesOnly, favorites: favorites.ids,
+                            collection: collections.first { $0.id == collectionID },
+                            mood: mood.isEmpty ? nil : mood, motion: motion.isEmpty ? nil : motion)
+    }
+    var collections: [CatalogCollection] { session.catalog?.collections ?? [] }
+    var moods: [String] { SceneLibrary.moods(session.shaders) }
+    var motions: [String] { SceneLibrary.motions(session.shaders) }
+    var hasFilters: Bool { collectionID != "all" || !mood.isEmpty || !motion.isEmpty || !query.isEmpty || favoritesOnly }
+    func resetFilters() { collectionID = "all"; mood = ""; motion = ""; query = ""; favoritesOnly = false }
+    func reconcileFilters() {
+        if !collections.contains(where: { $0.id == collectionID }) { collectionID = "all" }
+        if !moods.contains(mood) { mood = "" }
+        if !motions.contains(motion) { motion = "" }
     }
     var selectedID: String? { session.pendingSelection?.shader.id ?? session.activeShader?.id }
 

@@ -22,6 +22,8 @@ The Mac render area is always 16:9 with black letterboxing. It targets 30 fps an
 
 ## Shared core
 
+Both viewers support ordered curated collections and mood/motion filters. TV retains one horizontal scene row with selectors above it; Back closes an option chooser before dismissing the picker. Mac combines collections and filters with tag search and local favorites. Reset Filters clears browsing constraints without changing playback. Filters last for the current session. Older catalogs fall back to Procedural and Materials collections and hide unavailable discovery controls.
+
 `HolodeckCore` is a local Swift package used by both app targets. It contains catalog models and validation, revision-pinned networking and atomic disk caching, preview fetching, source-aware compilation, the Metal renderer and animation clock, injectable dependencies, viewer/session state, favorites persistence, filtering, and adaptive rendering policy. UIKit focus and Siri Remote behavior stay in the TV target; SwiftUI and AppKit window/view adapters stay in the Mac target.
 
 `ViewerSession` exposes catalog refresh (including forced checks), scene selection, pending cancellation, activity, and retry. `ViewerPolicy.tv` restores the last successful scene and retains active shaders across updates. `ViewerPolicy.mac` starts the catalog default and replaces changed active shaders. `RenderingPolicy.tv` retains native 60 fps rendering; `.mac` enables adaptive 30 fps rendering. Concurrent catalog refreshes share one operation and return the same result.

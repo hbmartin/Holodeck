@@ -1,6 +1,32 @@
 import Foundation
 import CryptoKit
 
+nonisolated public struct SceneDiscovery: Codable, Sendable, Equatable {
+    public var tags: [String]
+    public var moods: [String]
+    public var motion: String
+    public init(tags: [String], moods: [String], motion: String) {
+        self.tags = tags; self.moods = moods; self.motion = motion
+    }
+    public var summary: String { (moods.map { $0.capitalized } + [motion.capitalized + " motion"]).joined(separator: " · ") }
+    public func validate() throws {
+        guard tags.count <= 32, moods.count <= 8, Set(tags).count == tags.count,
+              Set(moods).count == moods.count,
+              (tags + moods + [motion]).allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.count <= 100 })
+        else { throw CatalogError.invalidManifest }
+    }
+}
+
+nonisolated public struct CatalogCollection: Codable, Sendable, Equatable, Identifiable {
+    public var id: String
+    public var name: String
+    public var description: String
+    public var shaderIDs: [String]
+    public init(id: String, name: String, description: String, shaderIDs: [String]) {
+        self.id = id; self.name = name; self.description = description; self.shaderIDs = shaderIDs
+    }
+}
+
 nonisolated public struct ShaderDefinition: Identifiable, Sendable {
     public enum Category: String, Codable, Sendable {
         case procedural = "PROCEDURAL"
@@ -14,10 +40,13 @@ nonisolated public struct ShaderDefinition: Identifiable, Sendable {
     public let source: String
     public var updatedAt: Date? = nil
     public var preview: ShaderPreview? = nil
+    public var discovery: SceneDiscovery? = nil
     public init(id: String, title: String, category: Category, description: String,
-                colors: [SIMD3<Float>], source: String, updatedAt: Date? = nil, preview: ShaderPreview? = nil) {
+                colors: [SIMD3<Float>], source: String, updatedAt: Date? = nil, preview: ShaderPreview? = nil,
+                discovery: SceneDiscovery? = nil) {
         self.id = id; self.title = title; self.category = category; self.description = description
         self.colors = colors; self.source = source; self.updatedAt = updatedAt; self.preview = preview
+        self.discovery = discovery
     }
     public var sourceHash: String { CatalogHash.sha256(Data(source.utf8)) }
 }
@@ -56,11 +85,13 @@ nonisolated public struct CatalogManifest: Codable, Sendable {
         public var sourceSHA256: String
         public var previewPath: String
         public var previewSHA256: String
+        public var discovery: SceneDiscovery? = nil
     }
     public var schemaVersion: Int
     public var defaultShaderID: String
     public var sourceRevision: String
     public var shaders: [Entry]
+    public var collections: [CatalogCollection]? = nil
 
     public static func date(_ string: String) -> Date? {
         ISO8601DateFormatter().date(from: string)
@@ -72,6 +103,7 @@ nonisolated public struct CatalogManifest: Codable, Sendable {
               Set(shaders.map(\.id)).count == shaders.count,
               shaders.contains(where: { $0.id == defaultShaderID }) else { throw CatalogError.invalidManifest }
         for shader in shaders {
+            try shader.discovery?.validate()
             guard !shader.id.isEmpty, shader.id.count <= 100,
                   shader.id.range(of: "^[a-z0-9]+(-[a-z0-9]+)*$", options: .regularExpression) != nil,
                   !shader.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -84,6 +116,19 @@ nonisolated public struct CatalogManifest: Codable, Sendable {
                   shader.previewPath == "previews/\(shader.id).png",
                   CatalogHash.isSHA(shader.sourceSHA256), CatalogHash.isSHA(shader.previewSHA256)
             else { throw CatalogError.invalidManifest }
+        }
+        if let collections {
+            guard collections.count <= 100, Set(collections.map(\.id)).count == collections.count else { throw CatalogError.invalidManifest }
+            let ids = Set(shaders.map(\.id))
+            for collection in collections {
+                guard collection.id != "all", collection.id.count <= 100,
+                      collection.id.range(of: "^[a-z0-9]+(-[a-z0-9]+)*$", options: .regularExpression) != nil,
+                      !collection.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, collection.name.count <= 200,
+                      !collection.description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, collection.description.count <= 2000,
+                      !collection.shaderIDs.isEmpty, collection.shaderIDs.count <= 500,
+                      Set(collection.shaderIDs).count == collection.shaderIDs.count,
+                      Set(collection.shaderIDs).isSubset(of: ids) else { throw CatalogError.invalidManifest }
+            }
         }
     }
 }
@@ -114,9 +159,11 @@ nonisolated public struct CatalogSnapshot: Codable, Sendable {
             ShaderDefinition(id: entry.id, title: entry.name, category: entry.category,
                              description: entry.description, colors: entry.colors.map { SIMD3($0[0], $0[1], $0[2]) },
                              source: sources[entry.id]!, updatedAt: CatalogManifest.date(entry.updatedAt),
-                             preview: ShaderPreview(path: entry.previewPath, hash: entry.previewSHA256, publicationRevision: publicationRevision))
+                             preview: ShaderPreview(path: entry.previewPath, hash: entry.previewSHA256, publicationRevision: publicationRevision),
+                             discovery: entry.discovery)
         }
     }
 
     public var initialShader: ShaderDefinition { shaders.first { $0.id == manifest.defaultShaderID }! }
+    public var collections: [CatalogCollection] { SceneLibrary.collections(manifest.collections, shaders: shaders) }
 }

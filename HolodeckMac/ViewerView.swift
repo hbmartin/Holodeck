@@ -37,6 +37,10 @@ struct ViewerView: View {
                         VStack(alignment: .leading, spacing: 5) {
                             Text(shader.title).font(.title3.bold()).accessibilityIdentifier("active-scene-title")
                             Text(shader.category.rawValue).font(.caption).foregroundStyle(.secondary)
+                            if let discovery = shader.discovery {
+                                Text(discovery.summary).font(.caption).foregroundStyle(.secondary)
+                                    .accessibilityIdentifier("active-scene-discovery")
+                            }
                             Text(shader.description).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         }
                         Spacer()
@@ -76,6 +80,7 @@ struct ViewerView: View {
             Button("OK", role: .cancel) { session.failure = nil; model.startupError = nil }
         } message: { Text(model.startupError ?? session.failure?.message ?? "") }
         .onChange(of: model.searchFocusRequest) { focus = .search }
+        .onChange(of: session.catalog?.publicationRevision) { model.reconcileFilters() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.updateActivity(appActive: true) }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willResignActiveNotification)) { _ in model.updateActivity(appActive: false) }
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willSleepNotification)) { _ in
@@ -91,12 +96,31 @@ struct ViewerView: View {
             TextField("Search scenes", text: $model.query)
                 .textFieldStyle(.roundedBorder).focused($focus, equals: .search)
                 .accessibilityIdentifier("scene-search").padding(12)
-            Toggle("Favorites", isOn: $model.favoritesOnly)
-                .toggleStyle(.button).accessibilityIdentifier("favorites-filter")
-                .padding(.horizontal, 12).padding(.bottom, 8)
+            VStack(spacing: 8) {
+                Picker("Collection", selection: $model.collectionID) {
+                    Text("All").tag("all")
+                    ForEach(model.collections) { Text($0.name).tag($0.id) }
+                }.accessibilityIdentifier("collection-filter")
+                if !model.moods.isEmpty {
+                    Picker("Mood", selection: $model.mood) {
+                        Text("Any").tag("")
+                        ForEach(model.moods, id: \.self) { Text($0.capitalized).tag($0) }
+                    }.accessibilityIdentifier("mood-filter")
+                }
+                if !model.motions.isEmpty {
+                    Picker("Motion", selection: $model.motion) {
+                        Text("Any").tag("")
+                        ForEach(model.motions, id: \.self) { Text($0.capitalized).tag($0) }
+                    }.accessibilityIdentifier("motion-filter")
+                }
+                Toggle("Favorites", isOn: $model.favoritesOnly)
+                    .toggleStyle(.button).accessibilityIdentifier("favorites-filter")
+                Button("Reset Filters") { model.resetFilters() }
+                    .disabled(!model.hasFilters).accessibilityIdentifier("reset-filters")
+            }.padding(.horizontal, 12).padding(.bottom, 12)
             if model.filteredScenes.isEmpty {
                 ContentUnavailableView(model.session.shaders.isEmpty ? "No Scenes Yet" :
-                                       (model.favoritesOnly && model.query.isEmpty ? "No Favorites Yet" : "No Matching Scenes"),
+                                       (model.favoritesOnly && model.query.isEmpty && model.collectionID == "all" && model.mood.isEmpty && model.motion.isEmpty ? "No Favorites Yet" : "No Matching Scenes"),
                                        systemImage: model.favoritesOnly ? "star" : "magnifyingglass")
                     .frame(maxHeight: .infinity)
             } else {
@@ -104,32 +128,25 @@ struct ViewerView: View {
                     model.select($0)
                     focus = .library
                 })) {
-                    ForEach([ShaderDefinition.Category.procedural, .material], id: \.rawValue) { category in
-                        let scenes = model.filteredScenes.filter { $0.category == category }
-                        if !scenes.isEmpty {
-                            Section(category.rawValue) {
-                                ForEach(scenes) { shader in
-                                    HStack(spacing: 10) {
-                                        ScenePreview(shader: shader, service: model.session.catalogService)
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            Text(shader.title).lineLimit(2)
-                                            if model.session.pendingSelection?.shader.id == shader.id {
-                                                Text("Loading…").font(.caption).foregroundStyle(.secondary)
-                                            } else if model.session.activeShader?.id == shader.id {
-                                                Text("Now showing").font(.caption).foregroundStyle(.secondary)
-                                            }
-                                        }
-                                        Spacer(minLength: 0)
-                                        if model.favorites.ids.contains(shader.id) { Image(systemName: "star.fill").font(.caption).accessibilityHidden(true) }
-                                    }
-                                    .tag(shader.id)
-                                    .accessibilityIdentifier("shader-" + shader.id)
-                                    .accessibilityLabel(shader.title)
-                                    .accessibilityValue(model.session.pendingSelection?.shader.id == shader.id ? "Loading" :
-                                                        (model.session.activeShader?.id == shader.id ? "Now showing" : ""))
+                    ForEach(model.filteredScenes) { shader in
+                        HStack(spacing: 10) {
+                            ScenePreview(shader: shader, service: model.session.catalogService)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(shader.title).lineLimit(2)
+                                if model.session.pendingSelection?.shader.id == shader.id {
+                                    Text("Loading…").font(.caption).foregroundStyle(.secondary)
+                                } else if model.session.activeShader?.id == shader.id {
+                                    Text("Now showing").font(.caption).foregroundStyle(.secondary)
                                 }
                             }
+                            Spacer(minLength: 0)
+                            if model.favorites.ids.contains(shader.id) { Image(systemName: "star.fill").font(.caption).accessibilityHidden(true) }
                         }
+                        .tag(shader.id)
+                        .accessibilityIdentifier("shader-" + shader.id)
+                        .accessibilityLabel(shader.title)
+                        .accessibilityValue(model.session.pendingSelection?.shader.id == shader.id ? "Loading" :
+                                            (model.session.activeShader?.id == shader.id ? "Now showing" : ""))
                     }
                 }
                 .listStyle(.sidebar).focused($focus, equals: .library).accessibilityIdentifier("scene-list")

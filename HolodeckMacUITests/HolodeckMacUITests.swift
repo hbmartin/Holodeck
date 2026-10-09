@@ -4,10 +4,10 @@ import XCTest
 final class HolodeckMacUITests: XCTestCase {
     nonisolated override func setUpWithError() throws { continueAfterFailure = false }
 
-    private func app(suite: String = "HolodeckMacUITests-" + UUID().uuidString, arguments: [String] = []) throws -> XCUIApplication {
+    private func app(suite: String = "HolodeckMacUITests-" + UUID().uuidString, arguments: [String] = [], discovery: Bool = false) throws -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments = ["--ui-test-storage-suite", suite] + arguments
-        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "CatalogFixture", withExtension: "json", subdirectory: "TestSupport"))
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: discovery ? "DiscoveryFixture" : "CatalogFixture", withExtension: "json", subdirectory: "TestSupport"))
         app.launchEnvironment["HOLODECK_UI_TEST_CATALOG"] = try String(contentsOf: url, encoding: .utf8)
         return app
     }
@@ -117,5 +117,37 @@ final class HolodeckMacUITests: XCTestCase {
         XCTAssertTrue(unavailable.windows.firstMatch.buttons["OK"].firstMatch.waitForExistence(timeout: 10))
         XCTAssertTrue(unavailable.staticTexts["Renderer Unavailable"].exists)
         unavailable.windows.firstMatch.buttons["OK"].firstMatch.click()
+    }
+
+    func testDiscoveryFiltersSearchAndResetPreservePlayback() throws {
+        let app = try app(discovery: true)
+        app.launch()
+        waitForTitle("Plasma", in: app)
+        element("collection-filter", in: app).click()
+        app.menuItems["Atmospheric"].click()
+        XCTAssertTrue(element("shader-aurora", in: app).waitForExistence(timeout: 5))
+        XCTAssertFalse(element("shader-plasma", in: app).exists)
+        waitForTitle("Plasma", in: app)
+        let filtered = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
+        filtered.name = "Mac Atmospheric collection keeps Plasma playing"
+        filtered.lifetime = .keepAlways
+        add(filtered)
+        element("mood-filter", in: app).click()
+        app.menuItems["Energetic"].click()
+        XCTAssertTrue(app.staticTexts["No Matching Scenes"].waitForExistence(timeout: 5))
+        waitForTitle("Plasma", in: app)
+        let empty = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
+        empty.name = "Mac empty intersection and Reset Filters"
+        empty.lifetime = .keepAlways
+        add(empty)
+        element("reset-filters", in: app).click()
+        let search = element("scene-search", in: app)
+        search.click(); search.typeText("material")
+        XCTAssertTrue(element("shader-chrome", in: app).waitForExistence(timeout: 5))
+        XCTAssertFalse(element("shader-aurora", in: app).exists)
+        waitForTitle("Plasma", in: app)
+        element("reset-filters", in: app).click()
+        XCTAssertTrue(element("shader-plasma", in: app).waitForExistence(timeout: 5))
+        XCTAssertTrue(element("active-scene-discovery", in: app).exists)
     }
 }

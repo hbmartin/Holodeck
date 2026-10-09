@@ -277,9 +277,9 @@ final class HolodeckUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [backgrounded], timeout: 5), .completed)
     }
 
-    private func isolatedApp() -> XCUIApplication {
+    private func isolatedApp(discovery: Bool = false) -> XCUIApplication {
         let app = XCUIApplication()
-        let url = Bundle(for: HolodeckUITests.self).url(forResource: "CatalogFixture", withExtension: "json", subdirectory: "TestSupport")!
+        let url = Bundle(for: HolodeckUITests.self).url(forResource: discovery ? "DiscoveryFixture" : "CatalogFixture", withExtension: "json", subdirectory: "TestSupport")!
         app.launchEnvironment["HOLODECK_UI_TEST_CATALOG"] = try! String(contentsOf: url, encoding: .utf8)
         app.launchArguments = ["--ui-test-storage-suite", "me.haroldmartin.Holodeck.ui-tests." + UUID().uuidString]
         return app
@@ -299,5 +299,73 @@ final class HolodeckUITests: XCTestCase {
 
     private func card(_ id: String, in app: XCUIApplication) -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: "shader-\(id)").firstMatch
+    }
+
+    func testDiscoveryChooserFilteringEmptyResultsAndBack() {
+        let app = isolatedApp(discovery: true)
+        app.launch()
+        XCTAssertTrue(app.staticTexts["Press Select to choose a shader"].waitForExistence(timeout: 15))
+        openPicker(in: app)
+        waitForFocus(card("plasma", in: app))
+        remote.press(.up)
+        let collection = app.buttons["collection-filter"]
+        waitForFocus(collection)
+        remote.press(.select)
+        XCTAssertTrue(app.alerts.firstMatch.waitForExistence(timeout: 5))
+        remote.press(.down) // All -> Featured
+        remote.press(.down) // Featured -> Atmospheric
+        remote.press(.select)
+        XCTAssertTrue(app.alerts.firstMatch.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(collection.label.contains("Atmospheric"), collection.label)
+        waitForFocus(collection)
+        remote.press(.down)
+        waitForFocus(card("aurora", in: app))
+        XCTAssertFalse(card("plasma", in: app).exists)
+        let filtered = XCTAttachment(screenshot: app.screenshot())
+        filtered.name = "Atmospheric collection keeps Plasma playing"
+        filtered.lifetime = .keepAlways
+        add(filtered)
+        remote.press(.up)
+        waitForFocus(collection)
+        remote.press(.right)
+        let mood = app.buttons["mood-filter"]
+        waitForFocus(mood)
+        remote.press(.select)
+        XCTAssertTrue(app.alerts.firstMatch.waitForExistence(timeout: 5))
+        remote.press(.down) // Any -> Calm
+        remote.press(.down) // Calm -> Dreamy
+        remote.press(.down) // Dreamy -> Energetic
+        remote.press(.select)
+        XCTAssertTrue(app.staticTexts["no-matching-shaders"].waitForExistence(timeout: 5))
+        waitForFocus(mood)
+        remote.press(.right)
+        let motion = app.buttons["motion-filter"]
+        waitForFocus(motion)
+        remote.press(.select)
+        XCTAssertTrue(app.alerts.firstMatch.waitForExistence(timeout: 5))
+        remote.press(.down) // Any -> Slow
+        remote.press(.select)
+        waitForFocus(motion)
+        XCTAssertTrue(motion.label.contains("Slow"), motion.label)
+        XCTAssertTrue(app.staticTexts["no-matching-shaders"].exists)
+        let empty = XCTAttachment(screenshot: app.screenshot())
+        empty.name = "Empty intersection retains usable TV controls"
+        empty.lifetime = .keepAlways
+        add(empty)
+        remote.press(.right)
+        waitForFocus(app.buttons["reset-filters"])
+        remote.press(.select)
+        waitForFocus(collection)
+        remote.press(.select)
+        XCTAssertTrue(app.alerts.firstMatch.waitForExistence(timeout: 5))
+        remote.press(.menu)
+        XCTAssertTrue(app.alerts.firstMatch.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(app.otherElements["shader-picker"].exists)
+        waitForFocus(collection)
+        remote.press(.down)
+        waitForFocus(card("plasma", in: app)) // Empty results reset to the active shader.
+        XCTAssertEqual(card("plasma", in: app).value as? String, "Now showing")
+        remote.press(.menu)
+        XCTAssertTrue(app.otherElements["shader-picker"].waitForNonExistence(timeout: 5))
     }
 }

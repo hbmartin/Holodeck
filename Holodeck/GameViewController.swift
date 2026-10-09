@@ -12,6 +12,24 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
     private var catalog: CatalogSnapshot? { session.catalog }
     private var shaders: [ShaderDefinition] { session.shaders }
+    private var collections: [CatalogCollection] { catalog?.collections ?? [] }
+    private var collectionID = "all"
+    private var mood = ""
+    private var motion = ""
+    private var visibleShaders: [ShaderDefinition] {
+        SceneLibrary.filter(shaders, query: "", favoritesOnly: false, favorites: [],
+                            collection: collections.first { $0.id == collectionID },
+                            mood: mood.isEmpty ? nil : mood, motion: motion.isEmpty ? nil : motion)
+    }
+    private let filterControls = UIStackView()
+    private let collectionButton = UIButton(type: .system)
+    private let moodButton = UIButton(type: .system)
+    private let motionButton = UIButton(type: .system)
+    private let resetButton = UIButton(type: .system)
+    private let emptyResults = UILabel()
+    private var chooser: UIAlertController?
+    private let cardsFocusGuide = UIFocusGuide()
+    private weak var returnFocusButton: UIButton?
     private var startupShader: ShaderDefinition? { session.startupShader }
     private var pendingSelection: ViewerSession.PendingSelection? { session.pendingSelection }
     private typealias SelectionOrigin = ViewerSession.SelectionOrigin
@@ -45,7 +63,15 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     override var canBecomeFirstResponder: Bool { true }
     override var preferredFocusEnvironments: [any UIFocusEnvironment] {
-        pickerIsVisible && unavailableMessage == nil && !shaders.isEmpty ? [collectionView] : [view]
+        guard pickerIsVisible, unavailableMessage == nil, !shaders.isEmpty else { return [view] }
+        if let returnFocusButton, !returnFocusButton.isHidden { return [returnFocusButton] }
+        return visibleShaders.isEmpty ? [resetButton] : [collectionView]
+    }
+
+    override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
+        super.didUpdateFocus(in: context, with: coordinator)
+        // Route Down from controls into the preferred card without intercepting Up from cards.
+        cardsFocusGuide.isEnabled = context.nextFocusedView?.isDescendant(of: filterControls) == true && !visibleShaders.isEmpty
     }
 
     override func viewDidLoad() {
@@ -89,7 +115,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             becomeFirstResponder()
             let focused = UIFocusSystem.focusSystem(for: view)?.focusedItem as? UIView
             let focusIsRestored = pickerIsVisible && unavailableMessage == nil
-                ? (shaders.isEmpty ? focused === view : focused?.isDescendant(of: collectionView) == true) : focused === view
+                ? (shaders.isEmpty ? focused === view : focused?.isDescendant(of: picker) == true) : focused === view
             if !focusIsRestored {
                 setNeedsFocusUpdate()
                 updateFocusIfNeeded()
@@ -122,15 +148,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         case .catalogChanged:
             catalogErrorMessage = nil
             (view as? ShowcaseMetalView)?.acceptsFocus = !pickerIsVisible || unavailableMessage != nil
-            browsingIndexPath = browsingShaderID.flatMap { id in
-                shaders.firstIndex { $0.id == id }.map { IndexPath(item: $0, section: 0) }
-            }
-            collectionView.reloadData()
-            if pickerIsVisible, !shaders.isEmpty {
-                collectionView.scrollToItem(at: browsingIndexPath ?? preferredShaderIndexPath, at: .centeredHorizontally, animated: false)
-                setNeedsFocusUpdate()
-                updateFocusIfNeeded()
-            }
+            refreshBrowsing()
         case .selectionStarted:
             hintTask?.cancel()
             hint.isHidden = true
@@ -183,7 +201,8 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         statusRow.spacing = 12
         statusRow.alignment = .center
         statusRow.heightAnchor.constraint(equalToConstant: max(40, spinner.intrinsicContentSize.height)).isActive = true
-        let heading = UIStackView(arrangedSubviews: [eyebrow, title, statusRow])
+        buildFilterControls()
+        let heading = UIStackView(arrangedSubviews: [eyebrow, title, statusRow, filterControls])
         heading.axis = .vertical
         heading.spacing = 8
         heading.translatesAutoresizingMaskIntoConstraints = false
@@ -199,8 +218,21 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         collectionView.dataSource = self
         collectionView.delegate = self
         collectionView.register(ShaderCardCell.self, forCellWithReuseIdentifier: ShaderCardCell.reuseIdentifier)
+        emptyResults.text = "No matching shaders"
+        emptyResults.textColor = .white
+        emptyResults.textAlignment = .center
+        emptyResults.font = .systemFont(ofSize: 24)
+        emptyResults.accessibilityIdentifier = "no-matching-shaders"
+        collectionView.backgroundView = emptyResults
+        updateFilterControls()
         picker.contentView.addSubview(collectionView)
+        picker.contentView.addLayoutGuide(cardsFocusGuide)
+        cardsFocusGuide.preferredFocusEnvironments = [collectionView]
         NSLayoutConstraint.activate([
+            cardsFocusGuide.topAnchor.constraint(equalTo: filterControls.bottomAnchor),
+            cardsFocusGuide.bottomAnchor.constraint(equalTo: collectionView.topAnchor),
+            cardsFocusGuide.leadingAnchor.constraint(equalTo: collectionView.leadingAnchor),
+            cardsFocusGuide.trailingAnchor.constraint(equalTo: collectionView.trailingAnchor),
             picker.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             picker.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             picker.bottomAnchor.constraint(equalTo: view.bottomAnchor),
@@ -245,13 +277,15 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         pickerIsVisible = true
         (view as? ShowcaseMetalView)?.acceptsFocus = unavailableMessage != nil || shaders.isEmpty
         picker.isHidden = false
+        updateFilterControls()
         if pendingSelection == nil { updateStatus() }
         updateVisibleCards()
         guard !wasVisible else { return }
+        returnFocusButton = nil
         browsingIndexPath = preferredShaderIndexPath
-        browsingShaderID = shaders.indices.contains(preferredShaderIndexPath.item) ? shaders[preferredShaderIndexPath.item].id : nil
+        browsingShaderID = visibleShaders.indices.contains(preferredShaderIndexPath.item) ? visibleShaders[preferredShaderIndexPath.item].id : nil
         view.layoutIfNeeded()
-        if unavailableMessage == nil, !shaders.isEmpty {
+        if unavailableMessage == nil, !visibleShaders.isEmpty {
             collectionView.scrollToItem(at: preferredShaderIndexPath, at: .centeredHorizontally, animated: false)
         }
         setNeedsFocusUpdate()
@@ -288,6 +322,12 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     @objc func closePickerFromRemote() {
         guard pickerIsVisible, unavailableMessage == nil else { return }
+        if let chooser, chooser.presentingViewController != nil {
+            chooser.dismiss(animated: true) { [weak self] in self?.restoreControlFocus() }
+            self.chooser = nil
+            return
+        }
+        chooser = nil
         hidePicker()
     }
 
@@ -321,6 +361,8 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             statusLabel.text = unavailableMessage
         } else if shaders.isEmpty {
             statusLabel.text = catalogErrorMessage ?? "Downloading shaders…"
+        } else if let pendingSelection {
+            statusLabel.text = "Loading \(pendingSelection.shader.title)…"
         } else if let active = renderer?.activeShader {
             statusLabel.text = "Now showing \(active.title) · Select to play · Back to close"
         } else {
@@ -339,7 +381,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     private var preferredShaderIndexPath: IndexPath {
         let id = renderer?.activeShader?.id ?? startupShader?.id
-        return IndexPath(item: shaders.firstIndex(where: { $0.id == id }) ?? 0, section: 0)
+        return IndexPath(item: visibleShaders.firstIndex(where: { $0.id == id }) ?? 0, section: 0)
     }
 
     private func updateVisibleCards() {
@@ -350,13 +392,14 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     private func configure(_ cell: ShaderCardCell, at indexPath: IndexPath) {
-        let shader = shaders[indexPath.item]
+        guard visibleShaders.indices.contains(indexPath.item) else { return }
+        let shader = visibleShaders[indexPath.item]
         cell.configure(shader: shader, active: renderer?.activeShader?.id == shader.id,
                        loading: pendingSelection?.shader.id == shader.id, catalogService: catalogService)
     }
 
     func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
-        shaders.count
+        visibleShaders.count
     }
 
     func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
@@ -366,20 +409,101 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
-        guard shaders.indices.contains(indexPath.item) else { return }
-        chooseShader(shaders[indexPath.item])
+        guard visibleShaders.indices.contains(indexPath.item) else { return }
+        chooseShader(visibleShaders[indexPath.item])
     }
 
     func indexPathForPreferredFocusedView(in collectionView: UICollectionView) -> IndexPath? {
-        guard !shaders.isEmpty else { return nil }
+        guard !visibleShaders.isEmpty else { return nil }
         return browsingIndexPath ?? preferredShaderIndexPath
     }
 
     func collectionView(_ collectionView: UICollectionView, didUpdateFocusIn context: UICollectionViewFocusUpdateContext,
                         with coordinator: UIFocusAnimationCoordinator) {
         if let indexPath = context.nextFocusedIndexPath {
+            returnFocusButton = nil
             browsingIndexPath = indexPath
-            browsingShaderID = shaders.indices.contains(indexPath.item) ? shaders[indexPath.item].id : nil
+            browsingShaderID = visibleShaders.indices.contains(indexPath.item) ? visibleShaders[indexPath.item].id : nil
         }
     }
+
+    private func buildFilterControls() {
+        filterControls.axis = .horizontal
+        filterControls.spacing = 24
+        filterControls.alignment = .center
+        for (button, id) in [(collectionButton, "collection-filter"), (moodButton, "mood-filter"), (motionButton, "motion-filter"), (resetButton, "reset-filters")] {
+            button.accessibilityIdentifier = id
+            button.titleLabel?.font = .systemFont(ofSize: 20, weight: .medium)
+            filterControls.addArrangedSubview(button)
+            button.heightAnchor.constraint(equalToConstant: 54).isActive = true
+        }
+        collectionButton.addTarget(self, action: #selector(chooseCollection), for: .primaryActionTriggered)
+        moodButton.addTarget(self, action: #selector(chooseMood), for: .primaryActionTriggered)
+        motionButton.addTarget(self, action: #selector(chooseMotion), for: .primaryActionTriggered)
+        resetButton.addTarget(self, action: #selector(resetFilters), for: .primaryActionTriggered)
+    }
+
+    private func updateFilterControls() {
+        filterControls.isHidden = shaders.isEmpty || unavailableMessage != nil
+        collectionButton.setTitle("Collection: " + (collections.first { $0.id == collectionID }?.name ?? "All"), for: .normal)
+        moodButton.setTitle("Mood: " + (mood.isEmpty ? "Any" : mood.capitalized), for: .normal)
+        motionButton.setTitle("Motion: " + (motion.isEmpty ? "Any" : motion.capitalized), for: .normal)
+        moodButton.isHidden = SceneLibrary.moods(shaders).isEmpty
+        motionButton.isHidden = SceneLibrary.motions(shaders).isEmpty
+        resetButton.setTitle("Reset Filters", for: .normal)
+        resetButton.isHidden = collectionID == "all" && mood.isEmpty && motion.isEmpty
+        emptyResults.isHidden = shaders.isEmpty || !visibleShaders.isEmpty
+        let focused = UIFocusSystem.focusSystem(for: view)?.focusedItem as? UIView
+        cardsFocusGuide.isEnabled = focused?.isDescendant(of: filterControls) == true && !visibleShaders.isEmpty && unavailableMessage == nil
+    }
+
+    private func refreshBrowsing(returningTo button: UIButton? = nil) {
+        if !collections.contains(where: { $0.id == collectionID }) { collectionID = "all" }
+        if !SceneLibrary.moods(shaders).contains(mood) { mood = "" }
+        if !SceneLibrary.motions(shaders).contains(motion) { motion = "" }
+        updateFilterControls()
+        browsingIndexPath = browsingShaderID.flatMap { id in visibleShaders.firstIndex { $0.id == id }.map { IndexPath(item: $0, section: 0) } }
+        browsingIndexPath = browsingIndexPath ?? (visibleShaders.isEmpty ? nil : preferredShaderIndexPath)
+        browsingShaderID = browsingIndexPath.map { visibleShaders[$0.item].id }
+        if let button { returnFocusButton = button.isHidden ? collectionButton : button }
+        collectionView.reloadData()
+        updateStatus()
+        if pickerIsVisible {
+            view.layoutIfNeeded()
+            if let browsingIndexPath { collectionView.scrollToItem(at: browsingIndexPath, at: .centeredHorizontally, animated: false) }
+            restoreControlFocus()
+        }
+    }
+
+    private func restoreControlFocus() { setNeedsFocusUpdate(); updateFocusIfNeeded() }
+
+    private func showOptions(_ title: String, values: [(String, String)], selected: String, sender: UIButton,
+                             apply: @escaping (String) -> Void) {
+        guard chooser?.presentingViewController == nil else { return }
+        returnFocusButton = sender
+        let alert = UIAlertController(title: title, message: nil, preferredStyle: .alert)
+        for (value, label) in values {
+            let action = UIAlertAction(title: label, style: .default) { [weak self] _ in
+                apply(value)
+                self?.chooser = nil
+                self?.refreshBrowsing(returningTo: sender)
+            }
+            alert.addAction(action)
+            if value == selected { alert.preferredAction = action }
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { [weak self] _ in self?.chooser = nil; self?.restoreControlFocus() })
+        chooser = alert
+        present(alert, animated: true)
+    }
+
+    @objc private func chooseCollection() {
+        showOptions("Collection", values: [("all", "All")] + collections.map { ($0.id, $0.name) }, selected: collectionID, sender: collectionButton) { [weak self] in self?.collectionID = $0 }
+    }
+    @objc private func chooseMood() {
+        showOptions("Mood", values: [("", "Any")] + SceneLibrary.moods(shaders).map { ($0, $0.capitalized) }, selected: mood, sender: moodButton) { [weak self] in self?.mood = $0 }
+    }
+    @objc private func chooseMotion() {
+        showOptions("Motion", values: [("", "Any")] + SceneLibrary.motions(shaders).map { ($0, $0.capitalized) }, selected: motion, sender: motionButton) { [weak self] in self?.motion = $0 }
+    }
+    @objc private func resetFilters() { collectionID = "all"; mood = ""; motion = ""; refreshBrowsing(returningTo: collectionButton) }
 }

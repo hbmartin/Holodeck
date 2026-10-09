@@ -48,6 +48,14 @@ The eight migrated IDs are `plasma`, `aurora`, `waves`, `kaleidoscope`, `starfie
 
 ## Add a shader
 
+HolodeckShaders also owns an authoring-only snippet and reference library. Start with its `docs/shader-library.md` and `docs/shader-authoring.md`; `tools/library.py` supports search, scaffolding, byte-preserving local imports, example compilation and sampled renders. Technical validation and editorial publication selection are separate.
+
+Schema version 1 accepts optional ordered `collections` (`id`, `name`, `description`, `shaderIDs`) and shader `discovery` (`tags`, `moods`, `motion`). Collections can overlap, but members must be published IDs. All retains manifest order. Apps store discovery strings openly, allowing future vocabulary, and read older cached snapshots without migration. The producer validates its documented vocabulary. Authoring `reuse` links never enter publication assets.
+
+Both app targets filter locally without altering playback, pending selection or animation time. Missing collection selections reset to All after refresh; unavailable mood/motion selections reset to Any. Mac search also matches discovery labels and tags. TV selector dismissal returns focus to its control; empty results leave filters and Reset usable. Preserve the existing per-platform startup and source-update policies.
+
+See [the implementation validation record](shader-library-validation.md) for compatibility, platform checks and remaining release checks.
+
 Use a Mac with Xcode, the tvOS SDK, a Metal-capable GPU, and Python 3. The Python tools use only the standard library. All commands in this section run in **HolodeckShaders**, not the app repository.
 
 ### 1. Create an authoring branch and files
