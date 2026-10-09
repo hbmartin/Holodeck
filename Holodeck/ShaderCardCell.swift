@@ -1,3 +1,4 @@
+import HolodeckCore
 import UIKit
 
 final class ShaderCardCell: UICollectionViewCell {

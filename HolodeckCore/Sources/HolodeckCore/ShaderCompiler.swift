@@ -1,31 +1,31 @@
 import Metal
 
-nonisolated enum ShaderCompilationError: LocalizedError {
+nonisolated public enum ShaderCompilationError: LocalizedError {
     case missingFunction(String)
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .missingFunction(let name): return "The shader is missing its \(name) entry point."
         }
     }
 }
 
-nonisolated protocol ShaderCompiling: Sendable {
+public protocol ShaderCompiling: Sendable {
     func pipeline(for shader: ShaderDefinition) async throws -> any MTLRenderPipelineState
 }
 
 /// Its actor executor keeps synchronous Metal compilation away from UIKit and drawing.
-actor ShaderCompiler: ShaderCompiling {
+public actor ShaderCompiler: ShaderCompiling {
     private let device: any MTLDevice
     private let pixelFormat: MTLPixelFormat
     private var pipelines: [String: any MTLRenderPipelineState] = [:]
 
-    init(device: any MTLDevice, pixelFormat: MTLPixelFormat = .bgra8Unorm_srgb) {
+    public init(device: any MTLDevice, pixelFormat: MTLPixelFormat = .bgra8Unorm_srgb) {
         self.device = device
         self.pixelFormat = pixelFormat
     }
 
-    func pipeline(for shader: ShaderDefinition) throws -> any MTLRenderPipelineState {
+    public func pipeline(for shader: ShaderDefinition) throws -> any MTLRenderPipelineState {
         let cacheKey = shader.id + ":" + shader.sourceHash
         if let cached = pipelines[cacheKey] { return cached }
         let library = try device.makeLibrary(source: shader.source, options: nil)

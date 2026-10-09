@@ -1,64 +1,72 @@
 import Foundation
 import CryptoKit
 
-nonisolated struct ShaderDefinition: Identifiable, Sendable {
-    enum Category: String, Codable, Sendable {
+nonisolated public struct ShaderDefinition: Identifiable, Sendable {
+    public enum Category: String, Codable, Sendable {
         case procedural = "PROCEDURAL"
         case material = "3D MATERIAL"
     }
-    let id: String
-    let title: String
-    let category: Category
-    let description: String
-    let colors: [SIMD3<Float>]
-    let source: String
-    var updatedAt: Date? = nil
-    var preview: ShaderPreview? = nil
-    var sourceHash: String { CatalogHash.sha256(Data(source.utf8)) }
+    public let id: String
+    public let title: String
+    public let category: Category
+    public let description: String
+    public let colors: [SIMD3<Float>]
+    public let source: String
+    public var updatedAt: Date? = nil
+    public var preview: ShaderPreview? = nil
+    public init(id: String, title: String, category: Category, description: String,
+                colors: [SIMD3<Float>], source: String, updatedAt: Date? = nil, preview: ShaderPreview? = nil) {
+        self.id = id; self.title = title; self.category = category; self.description = description
+        self.colors = colors; self.source = source; self.updatedAt = updatedAt; self.preview = preview
+    }
+    public var sourceHash: String { CatalogHash.sha256(Data(source.utf8)) }
 }
 
-nonisolated struct ShaderPreview: Sendable, Equatable {
-    let path: String
-    let hash: String
-    let publicationRevision: String
+nonisolated public struct ShaderPreview: Sendable, Equatable {
+    public let path: String
+    public let hash: String
+    public let publicationRevision: String
+    public init(path: String, hash: String, publicationRevision: String) {
+        self.path = path; self.hash = hash; self.publicationRevision = publicationRevision
+    }
 }
 
-nonisolated enum CatalogHash {
-    static func sha256(_ data: Data) -> String {
+nonisolated public enum CatalogHash {
+    public static func sha256(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
-    static func isSHA(_ value: String, length: Int = 64) -> Bool {
+    public static func isSHA(_ value: String, length: Int = 64) -> Bool {
         value.count == length && value.allSatisfy { "0123456789abcdef".contains($0) }
     }
 }
 
-nonisolated enum CatalogError: Error {
+nonisolated public enum CatalogError: Error {
     case invalidManifest, invalidSource, invalidPreview, invalidResponse, oversizedResponse
 }
 
-nonisolated struct CatalogManifest: Codable, Sendable {
-    struct Entry: Codable, Sendable {
-        var id: String
-        var name: String
-        var category: ShaderDefinition.Category
-        var description: String
-        var colors: [[Float]]
-        var updatedAt: String
-        var sourcePath: String
-        var sourceSHA256: String
-        var previewPath: String
-        var previewSHA256: String
+nonisolated public struct CatalogManifest: Codable, Sendable {
+    public struct Entry: Codable, Sendable {
+        public var id: String
+        public var name: String
+        public var category: ShaderDefinition.Category
+        public var description: String
+        public var colors: [[Float]]
+        public var updatedAt: String
+        public var sourcePath: String
+        public var sourceSHA256: String
+        public var previewPath: String
+        public var previewSHA256: String
     }
-    var schemaVersion: Int
-    var defaultShaderID: String
-    var sourceRevision: String
-    var shaders: [Entry]
+    public var schemaVersion: Int
+    public var defaultShaderID: String
+    public var sourceRevision: String
+    public var shaders: [Entry]
 
-    static func date(_ string: String) -> Date? {
+    public static func date(_ string: String) -> Date? {
         ISO8601DateFormatter().date(from: string)
     }
 
-    func validate() throws {
+    public func validate() throws {
         guard schemaVersion == 1, !shaders.isEmpty, shaders.count <= 500,
               CatalogHash.isSHA(sourceRevision, length: 40),
               Set(shaders.map(\.id)).count == shaders.count,
@@ -81,12 +89,15 @@ nonisolated struct CatalogManifest: Codable, Sendable {
 }
 
 /// A single JSON file makes disk activation atomic; sources are included and revalidated when read.
-nonisolated struct CatalogSnapshot: Codable, Sendable {
-    var manifest: CatalogManifest
-    var sources: [String: String]
-    var publicationRevision: String
+nonisolated public struct CatalogSnapshot: Codable, Sendable {
+    public var manifest: CatalogManifest
+    public var sources: [String: String]
+    public var publicationRevision: String
 
-    func validate() throws {
+    public init(manifest: CatalogManifest, sources: [String: String], publicationRevision: String) {
+        self.manifest = manifest; self.sources = sources; self.publicationRevision = publicationRevision
+    }
+    public func validate() throws {
         try manifest.validate()
         guard CatalogHash.isSHA(publicationRevision, length: 40), sources.count == manifest.shaders.count,
               sources.values.reduce(0, { $0 + $1.utf8.count }) <= 16_777_216 else {
@@ -98,7 +109,7 @@ nonisolated struct CatalogSnapshot: Codable, Sendable {
         }
     }
 
-    var shaders: [ShaderDefinition] {
+    public var shaders: [ShaderDefinition] {
         manifest.shaders.map { entry in
             ShaderDefinition(id: entry.id, title: entry.name, category: entry.category,
                              description: entry.description, colors: entry.colors.map { SIMD3($0[0], $0[1], $0[2]) },
@@ -107,5 +118,5 @@ nonisolated struct CatalogSnapshot: Codable, Sendable {
         }
     }
 
-    var initialShader: ShaderDefinition { shaders.first { $0.id == manifest.defaultShaderID }! }
+    public var initialShader: ShaderDefinition { shaders.first { $0.id == manifest.defaultShaderID }! }
 }

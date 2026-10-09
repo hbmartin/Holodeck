@@ -1,33 +1,23 @@
+import HolodeckCore
 import UIKit
 import MetalKit
 import Dependencies
-
-nonisolated enum RendererStartupError: LocalizedError {
-    case metalUnavailable
-    case initializationFailed
-
-    var errorDescription: String? {
-        switch self {
-        case .metalUnavailable: return "Metal rendering is unavailable on this device."
-        case .initializationFailed: return "The renderer could not start. Relaunch Holodeck to try again."
-        }
-    }
-}
 
 final class GameViewController: UIViewController, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout {
     @Dependency(\.rendererFactory) private var rendererFactory
     @Dependency(\.shaderPreferences) private var shaderPreferences
     @Dependency(\.catalogService) private var catalogService
-    private lazy var catalog = catalogService.initialSnapshot
-    private lazy var shaders = catalog?.shaders ?? []
-    private var catalogRefreshTask: Task<Void, Never>?
+    private lazy var session = withDependencies(from: self) {
+        ViewerSession(catalogService: catalogService, preferences: shaderPreferences, policy: .tv)
+    }
+    private var catalog: CatalogSnapshot? { session.catalog }
+    private var shaders: [ShaderDefinition] { session.shaders }
+    private var startupShader: ShaderDefinition? { session.startupShader }
+    private var pendingSelection: ViewerSession.PendingSelection? { session.pendingSelection }
+    private typealias SelectionOrigin = ViewerSession.SelectionOrigin
+    var shaderSelectionTask: Task<Void, Never>? { session.selectionTask }
     @Dependency(\.continuousClock) private var hintClock
-    private var startupShader: ShaderDefinition?
-    private var savedShaderID: String?
     private var catalogErrorMessage: String?
-    private var sceneIsActive = false
-    private var hasBeenActive = false
-    private(set) var shaderSelectionTask: Task<Void, Never>?
     private var renderer: Renderer?
     private var unavailableMessage: String?
     private let picker = UIVisualEffectView(effect: UIBlurEffect(style: .dark))
@@ -36,14 +26,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     private let hint = UIVisualEffectView(effect: UIBlurEffect(style: .dark))
     private let hintLabel = UILabel()
     private(set) var hintTask: Task<Void, Never>?
-    private enum SelectionOrigin { case startup, user }
-    private struct PendingSelection {
-        let shader: ShaderDefinition
-        let origin: SelectionOrigin
-        let generation: UInt64
-    }
-    private var pendingSelection: PendingSelection?
-    private var selectionGeneration: UInt64 = 0
+    private var browsingShaderID: String?
     private var pickerIsVisible = false
     private var browsingIndexPath: IndexPath?
     private lazy var selectGesture = UITapGestureRecognizer(target: self, action: #selector(openPickerFromRemote))
@@ -58,8 +41,6 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     deinit {
         hintTask?.cancel()
-        shaderSelectionTask?.cancel()
-        catalogRefreshTask?.cancel()
     }
 
     override var canBecomeFirstResponder: Bool { true }
@@ -71,8 +52,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         super.viewDidLoad()
         view.backgroundColor = .black
         view.accessibilityIdentifier = "shader-surface"
-        savedShaderID = shaderPreferences.lastShaderID()
-        startupShader = shaders.first { $0.id == savedShaderID } ?? catalog?.initialShader
+        session.onEvent = { [weak self] event in self?.handleSessionEvent(event) }
         buildPicker()
         buildHint()
         selectGesture.allowedPressTypes = [NSNumber(value: UIPress.PressType.select.rawValue)]
@@ -89,8 +69,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             let renderer = try withDependencies(from: self) { try rendererFactory(metalView) }
             self.renderer = renderer
             metalView.delegate = renderer
-            if let startupShader { chooseShader(startupShader, origin: .startup) }
-            refreshCatalog()
+            session.attach(renderer)
         } catch {
             showUnavailable(error.localizedDescription)
         }
@@ -103,13 +82,9 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     func setSceneActive(_ active: Bool) {
-        let returnedToForeground = active && hasBeenActive && !sceneIsActive
-        sceneIsActive = active
-        renderer?.setActive(active)
+        session.setActive(active)
         if unavailableMessage != nil { (view as? MTKView)?.isPaused = true }
         if active {
-            hasBeenActive = true
-            if returnedToForeground { refreshCatalog() }
             // UIKit may clear the first responder when the app leaves the foreground.
             becomeFirstResponder()
             let focused = UIFocusSystem.focusSystem(for: view)?.focusedItem as? UIView
@@ -123,73 +98,65 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     private func refreshCatalog() {
-        guard catalogRefreshTask == nil, unavailableMessage == nil else { return }
-        let service = catalogService
-        if shaders.isEmpty {
-            catalogErrorMessage = nil
-            statusLabel.text = "Downloading shaders…"
-            hintLabel.text = "Downloading shaders…"
+        guard unavailableMessage == nil else { return }
+        session.refresh()
+    }
+
+    private func handleSessionEvent(_ event: ViewerSession.Event) {
+        switch event {
+        case .catalogLoading:
+            if shaders.isEmpty {
+                catalogErrorMessage = nil
+                statusLabel.text = "Downloading shaders…"
+                hintLabel.text = "Downloading shaders…"
+                hint.isHidden = pickerIsVisible
+                spinner.startAnimating()
+            }
+        case .catalogFailed:
+            guard shaders.isEmpty else { return }
+            catalogErrorMessage = "Couldn’t download shaders. Connect to the internet and press Select to retry."
+            spinner.stopAnimating()
+            updateStatus()
+            hintLabel.text = catalogErrorMessage
             hint.isHidden = pickerIsVisible
+        case .catalogChanged:
+            catalogErrorMessage = nil
+            (view as? ShowcaseMetalView)?.acceptsFocus = !pickerIsVisible || unavailableMessage != nil
+            browsingIndexPath = browsingShaderID.flatMap { id in
+                shaders.firstIndex { $0.id == id }.map { IndexPath(item: $0, section: 0) }
+            }
+            collectionView.reloadData()
+            if pickerIsVisible, !shaders.isEmpty {
+                collectionView.scrollToItem(at: browsingIndexPath ?? preferredShaderIndexPath, at: .centeredHorizontally, animated: false)
+                setNeedsFocusUpdate()
+                updateFocusIfNeeded()
+            }
+        case .selectionStarted:
+            hintTask?.cancel()
+            hint.isHidden = true
+            showLoadingHintIfNeeded()
+            statusLabel.text = "Loading \(pendingSelection?.shader.title ?? "shader")…"
             spinner.startAnimating()
-        }
-        catalogRefreshTask = Task { [weak self] in
-            defer { self?.catalogRefreshTask = nil }
-            do {
-                let refreshed = try await service.refresh()
-                guard !Task.isCancelled else { return }
-                // Also pick up a snapshot already loaded by this shared service.
-                let current = await service.current()
-                if let snapshot = refreshed ?? current {
-                    if snapshot.publicationRevision != self?.catalog?.publicationRevision {
-                        self?.applyCatalog(snapshot)
-                    }
-                } else {
-                    self?.showCatalogDownloadError()
-                }
-            } catch {
-                // Refresh failures preserve the offline catalog and do not interrupt playback.
-                self?.showCatalogDownloadError()
-                print("Shader catalog refresh failed: \(error)")
+            updateVisibleCards()
+        case .activated(let origin):
+            spinner.stopAnimating()
+            updateStatus()
+            updateVisibleCards()
+            if origin == .startup {
+                if !pickerIsVisible { showStartupHint() }
+            } else {
+                hidePicker(cancelSelection: false)
+            }
+        case .selectionFailed:
+            spinner.stopAnimating()
+            showPicker()
+            if case .selection(let shader, _) = session.failure?.operation {
+                statusLabel.text = "Couldn’t load \(shader.title). Choose another shader."
             }
         }
     }
 
-    private func showCatalogDownloadError() {
-        guard shaders.isEmpty else { return }
-        catalogErrorMessage = "Couldn’t download shaders. Connect to the internet and press Select to retry."
-        spinner.stopAnimating()
-        updateStatus()
-        hintLabel.text = catalogErrorMessage
-        hint.isHidden = pickerIsVisible
-    }
-
-    /// The service supplies a fully validated snapshot; preserve browsing by stable ID.
-    func applyCatalog(_ snapshot: CatalogSnapshot) {
-        guard (try? snapshot.validate()) != nil else { return }
-        let browsingID = browsingIndexPath.flatMap { index in
-            shaders.indices.contains(index.item) ? shaders[index.item].id : nil
-        }
-        catalog = snapshot
-        shaders = snapshot.shaders
-        catalogErrorMessage = nil
-        if startupShader == nil, renderer?.activeShader == nil, pendingSelection == nil {
-            startupShader = shaders.first { $0.id == savedShaderID } ?? snapshot.initialShader
-            if let startupShader { chooseShader(startupShader, origin: .startup) }
-        }
-        (view as? ShowcaseMetalView)?.acceptsFocus = !pickerIsVisible || unavailableMessage != nil
-        if let browsingID, let index = shaders.firstIndex(where: { $0.id == browsingID }) {
-            browsingIndexPath = IndexPath(item: index, section: 0)
-        } else {
-            browsingIndexPath = nil
-        }
-        collectionView.reloadData()
-        if pickerIsVisible {
-            let index = browsingIndexPath ?? preferredShaderIndexPath
-            collectionView.scrollToItem(at: index, at: .centeredHorizontally, animated: false)
-            setNeedsFocusUpdate()
-            updateFocusIfNeeded()
-        }
-    }
+    func applyCatalog(_ snapshot: CatalogSnapshot) { session.applyCatalog(snapshot) }
 
     private func buildPicker() {
         picker.translatesAutoresizingMaskIntoConstraints = false
@@ -282,6 +249,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         updateVisibleCards()
         guard !wasVisible else { return }
         browsingIndexPath = preferredShaderIndexPath
+        browsingShaderID = shaders.indices.contains(preferredShaderIndexPath.item) ? shaders[preferredShaderIndexPath.item].id : nil
         view.layoutIfNeeded()
         if unavailableMessage == nil, !shaders.isEmpty {
             collectionView.scrollToItem(at: preferredShaderIndexPath, at: .centeredHorizontally, animated: false)
@@ -293,14 +261,10 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     private func hidePicker(cancelSelection: Bool = true) {
         guard unavailableMessage == nil else { return }
         if cancelSelection, pendingSelection?.origin == .user {
-            selectionGeneration &+= 1
-            renderer?.cancelPendingSelection()
-            pendingSelection = nil
+            session.cancelPendingSelection()
             spinner.stopAnimating()
             updateVisibleCards()
-            if renderer?.activeShader == nil, let startupShader {
-                chooseShader(startupShader, origin: .startup)
-            }
+            if session.activeShader == nil, let startupShader { chooseShader(startupShader, origin: .startup) }
         }
         pickerIsVisible = false
         selectGesture.isEnabled = true
@@ -313,43 +277,8 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     private func chooseShader(_ shader: ShaderDefinition, origin: SelectionOrigin = .user) {
-        guard let renderer, unavailableMessage == nil else { return }
-        hintTask?.cancel()
-        hint.isHidden = true
-        selectionGeneration &+= 1
-        let selection = PendingSelection(shader: shader, origin: origin, generation: selectionGeneration)
-        pendingSelection = selection
-        showLoadingHintIfNeeded()
-        statusLabel.text = "Loading \(shader.title)…"
-        spinner.startAnimating()
-        updateVisibleCards()
-
-        shaderSelectionTask = withDependencies(from: self) {
-            Task { [weak self] in
-                guard self?.pendingSelection?.generation == selection.generation else { return }
-                do {
-                    guard try await renderer.select(shader), let self,
-                          self.pendingSelection?.generation == selection.generation else { return }
-                    self.pendingSelection = nil
-                    self.shaderPreferences.setLastShaderID(shader.id)
-                    self.spinner.stopAnimating()
-                    self.updateStatus()
-                    self.updateVisibleCards()
-                    if origin == .startup {
-                        if !self.pickerIsVisible { self.showStartupHint() }
-                    } else {
-                        self.hidePicker(cancelSelection: false)
-                    }
-                } catch {
-                    guard let self, self.pendingSelection?.generation == selection.generation else { return }
-                    self.pendingSelection = nil
-                    self.spinner.stopAnimating()
-                    self.showPicker()
-                    self.statusLabel.text = "Couldn’t load \(shader.title). Choose another shader."
-                    print("Shader compilation failed for \(shader.id): \(error)")
-                }
-            }
-        }
+        guard renderer != nil, unavailableMessage == nil else { return }
+        session.select(shader, origin: origin)
     }
 
     @objc func openPickerFromRemote() {
@@ -401,7 +330,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     private func showUnavailable(_ message: String) {
         unavailableMessage = message
-        pendingSelection = nil
+        session.cancelPendingSelection()
         (view as? MTKView)?.isPaused = true
         spinner.stopAnimating()
         collectionView.isUserInteractionEnabled = false
@@ -448,6 +377,9 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     func collectionView(_ collectionView: UICollectionView, didUpdateFocusIn context: UICollectionViewFocusUpdateContext,
                         with coordinator: UIFocusAnimationCoordinator) {
-        if let indexPath = context.nextFocusedIndexPath { browsingIndexPath = indexPath }
+        if let indexPath = context.nextFocusedIndexPath {
+            browsingIndexPath = indexPath
+            browsingShaderID = shaders.indices.contains(indexPath.item) ? shaders[indexPath.item].id : nil
+        }
     }
 }

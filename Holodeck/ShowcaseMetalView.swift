@@ -1,3 +1,4 @@
+import HolodeckCore
 import MetalKit
 
 /// A full-screen shader still needs a focus target to receive Siri Remote presses.
