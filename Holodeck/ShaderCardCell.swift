@@ -3,6 +3,11 @@ import UIKit
 final class ShaderCardCell: UICollectionViewCell {
     static let reuseIdentifier = "ShaderCard"
     private let gradient = CAGradientLayer()
+    private let previewImageView = UIImageView()
+    private let updatedLabel = UILabel()
+    private(set) var previewTask: Task<Void, Never>?
+    private var representedPreview: ShaderPreview?
+    private var representedID: String?
     private let categoryLabel = UILabel()
     private let titleLabel = UILabel()
     private let descriptionLabel = UILabel()
@@ -10,7 +15,10 @@ final class ShaderCardCell: UICollectionViewCell {
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        contentView.layer.insertSublayer(gradient, at: 0)
+        previewImageView.contentMode = .scaleAspectFill
+        previewImageView.clipsToBounds = true
+        contentView.addSubview(previewImageView)
+        contentView.layer.addSublayer(gradient)
         contentView.layer.cornerRadius = 18
         contentView.clipsToBounds = true
         gradient.startPoint = CGPoint(x: 0, y: 1)
@@ -30,9 +38,11 @@ final class ShaderCardCell: UICollectionViewCell {
         stateLabel.font = .systemFont(ofSize: 15, weight: .bold)
         stateLabel.textColor = .white
 
-        let stack = UIStackView(arrangedSubviews: [categoryLabel, titleLabel, descriptionLabel, stateLabel])
+        updatedLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        updatedLabel.textColor = UIColor.white.withAlphaComponent(0.8)
+        let stack = UIStackView(arrangedSubviews: [categoryLabel, titleLabel, descriptionLabel, updatedLabel, stateLabel])
         stack.axis = .vertical
-        stack.spacing = 9
+        stack.spacing = 7
         stack.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -47,23 +57,51 @@ final class ShaderCardCell: UICollectionViewCell {
 
     required init?(coder: NSCoder) { fatalError("Shader cards are created programmatically.") }
 
-    func configure(shader: ShaderDefinition, active: Bool, loading: Bool) {
+    func configure(shader: ShaderDefinition, active: Bool, loading: Bool, catalogService: CatalogService? = nil) {
         categoryLabel.text = shader.category.rawValue
+        updatedLabel.text = shader.updatedAt.map { "Updated " + $0.formatted(date: .abbreviated, time: .omitted) }
+        updatedLabel.isHidden = shader.updatedAt == nil
+        if representedID != shader.id || representedPreview != shader.preview {
+            previewTask?.cancel()
+            previewImageView.image = nil
+            representedID = shader.id
+            representedPreview = shader.preview
+            if let preview = shader.preview, let catalogService {
+                let id = shader.id
+                previewTask = Task { [weak self] in
+                    guard let data = try? await catalogService.preview(preview), !Task.isCancelled,
+                          let self, self.representedID == id, self.representedPreview == preview else { return }
+                    self.previewImageView.image = UIImage(data: data)
+                }
+            }
+        }
         titleLabel.text = shader.title
         descriptionLabel.text = shader.description
         stateLabel.text = loading ? "LOADING…" : (active ? "NOW SHOWING" : " ")
         gradient.colors = shader.colors.map {
             UIColor(red: CGFloat($0.x * 0.65), green: CGFloat($0.y * 0.65),
-                    blue: CGFloat($0.z * 0.65), alpha: 1).cgColor
+                    blue: CGFloat($0.z * 0.65), alpha: 0.78).cgColor
         }
         accessibilityIdentifier = "shader-\(shader.id)"
-        accessibilityLabel = "\(shader.title), \(shader.category.rawValue), \(shader.description)"
+        accessibilityLabel = "\(shader.title), \(shader.category.rawValue), \(shader.description)" + (updatedLabel.text.map { ", " + $0 } ?? "")
         accessibilityValue = loading ? "Loading" : (active ? "Now showing" : "")
         accessibilityTraits = active ? [.button, .selected] : [.button]
     }
 
+    deinit { previewTask?.cancel() }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        previewTask?.cancel()
+        previewTask = nil
+        representedID = nil
+        representedPreview = nil
+        previewImageView.image = nil
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
+        previewImageView.frame = contentView.bounds
         gradient.frame = contentView.bounds
         layer.shadowPath = UIBezierPath(roundedRect: bounds, cornerRadius: 18).cgPath
     }

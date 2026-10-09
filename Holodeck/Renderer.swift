@@ -1,5 +1,5 @@
 import MetalKit
-import QuartzCore
+import Dependencies
 
 /// Matches ShaderUniforms in the runtime Metal source: 8 + 4 + 4 bytes.
 nonisolated struct ShaderUniforms {
@@ -36,6 +36,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     let device: any MTLDevice
     private let commandQueue: any MTLCommandQueue
     private let compiler: any ShaderCompiling
+    private let now: @MainActor @Sendable () -> TimeInterval
     private weak var view: MTKView?
     private var pipelineState: (any MTLRenderPipelineState)?
     private var selectionRequest: UInt64 = 0
@@ -44,11 +45,16 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var resolution = SIMD2<Float>(1, 1)
     private(set) var activeShader: ShaderDefinition?
 
-    init?(metalKitView: MTKView, compiler: (any ShaderCompiling)? = nil) {
+    var animationTime: Float { clock.elapsed(at: now()) }
+
+    init?(metalKitView: MTKView) {
         guard let device = metalKitView.device, let queue = device.makeCommandQueue() else { return nil }
+        @Dependency(\.shaderCompilerFactory) var compilerFactory
+        @Dependency(\.monotonicTime) var monotonicTime
         self.device = device
         commandQueue = queue
-        self.compiler = compiler ?? ShaderCompiler(device: device)
+        compiler = compilerFactory(device, .bgra8Unorm_srgb)
+        now = monotonicTime
         view = metalKitView
         super.init()
         metalKitView.colorPixelFormat = .bgra8Unorm_srgb
@@ -70,7 +76,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             guard request == selectionRequest else { return false }
             pipelineState = pipeline
             activeShader = shader
-            clock.reset(at: CACurrentMediaTime(), running: isActive)
+            clock.reset(at: now(), running: isActive)
             return true
         } catch {
             guard request == selectionRequest else { return false }
@@ -82,7 +88,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     func setActive(_ active: Bool) {
         isActive = active
-        clock.setRunning(active, at: CACurrentMediaTime())
+        clock.setRunning(active, at: now())
         view?.isPaused = !active
     }
 
@@ -93,7 +99,7 @@ final class Renderer: NSObject, MTKViewDelegate {
               let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return }
 
-        var uniforms = ShaderUniforms(resolution: resolution, time: clock.elapsed(at: CACurrentMediaTime()))
+        var uniforms = ShaderUniforms(resolution: resolution, time: animationTime)
         encoder.label = activeShader?.title
         encoder.setRenderPipelineState(pipelineState)
         // Metal copies these bytes; no shared mutable GPU buffer is needed.

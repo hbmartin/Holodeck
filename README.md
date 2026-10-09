@@ -4,41 +4,43 @@ A Metal showcase for tvOS 26.0 and later with five animated procedural effects a
 
 ## Controls
 
-- Launch opens Plasma full screen.
+- Launch restores the last successfully activated shader full screen. First launch, or a saved ID no longer in the catalog, opens Plasma. If a remembered shader fails to compile, the picker reports the error and keeps that saved ID until another shader succeeds.
 - Press **Select** to open the shader picker, use directional input to browse, and press **Select** to load a shader.
 - **Back** dismisses the picker. While a shader is loading, the current one keeps running. Dismissing a pending selection retains the current shader.
+- During startup, Back leaves the startup shader loading and restores its loading hint. If you dismiss a different pending selection before any shader is active, that selection is canceled and the resolved startup shader loads again. Reopening the picker focuses the active shader; compilation results and interruptions preserve your place while browsing.
 - Animation and drawing pause when the scene becomes inactive.
 
-## Adding a shader
+## Shader catalog
 
-The catalog is in `Holodeck/ShaderCatalog.swift`. Add an `effect(...)` entry with a unique ID, title, description, two card colors, and a multiline Metal body. The shared source supplies the full-screen vertex shader, uniforms, noise helpers, and fragment entry point. Your body implements:
+[HolodeckShaders](https://github.com/hbmartin/HolodeckShaders) owns shader bodies, shared Metal helpers, metadata and generated previews. Its publishing workflow validates content and tvOS Metal compilation before replacing the public `published` branch with one complete snapshot. Follow that repository's authoring instructions to add a shader; no app release is needed for catalog updates.
 
-```metal
-float3 shade(float2 p, float time, float2 pixel) {
-    return palette(length(p) - time * 0.1);
-}
+The app resolves `published` to a commit, then downloads the manifest and sources at that exact revision. It validates schema version 1, metadata, unique IDs, paths, dates and SHA-256 hashes before atomically caching and activating a snapshot. Failed refreshes retain the previous catalog. Refreshes run in the background at launch and foreground return, throttled to once per 15 minutes, including failed attempts. GitHub rate limits and network errors leave offline content usable.
+
+Startup uses the most recent valid disk snapshot, otherwise the bundled catalog. The picker updates names, previews and localized update dates while preserving focus by shader ID. The active shader continues until a new selection; if it disappears from the catalog, it can finish playing and the next launch uses the catalog default. Images load asynchronously, are cached by hash, and fall back to card gradients when unavailable.
+
+To refresh the checked-in offline snapshot:
+
+```sh
+python3 tools/update-bundled-catalog.py
 ```
 
-`p` is centered with positive Y pointing up, measured relative to drawable height so proportions survive size changes. `pixel` is the fragment's pixel coordinate. Return linear RGB; the fragment entry clamps it and writes opaque alpha to an sRGB drawable.
+This verifies all remote source and preview hashes before exporting `Holodeck/BundledCatalog`. Commit those resources with the app. Ordinary builds and tests require no network. PNG compression and text stripping are disabled in the app target so bundled image hashes remain identical to published files.
 
-For a completely self-contained implementation, add a `ShaderDefinition` whose `source` contains `vertexShader` and `fragmentShader`. The vertex entry generates a triangle using `vertex_id`, and the fragment entry receives this uniform block at buffer index 0:
+`ShaderCompiler` compiles complete source libraries on its actor executor, with the existing `vertexShader`, `fragmentShader` and 16-byte buffer-0 uniform contract. Pipelines are cached by shader ID and source hash; selecting a revised shader recompiles it. Only the latest selection can activate a pipeline. Compilation diagnostics go to the console; the picker reports failures and allows another selection.
 
-```metal
-struct ShaderUniforms {
-    float2 resolution; // Drawable size in pixels
-    float time;        // Active animation seconds since selection
-    float padding;
-};
-```
+## Dependencies
 
-`ShaderCompiler` compiles source and creates pipelines on its actor executor. Pipelines are cached by the immutable catalog ID for the process lifetime. Only the latest selection can activate a completed pipeline. Compilation diagnostics go to the console; the picker reports failures and allows another selection.
+Runtime services use Point-Free's `swift-dependencies` through internal `DependencyValues` keys: Metal device, renderer factory, shader compiler factory, monotonic animation time, and shader preferences. The catalog service additionally injects networking, disk storage and refresh time; tests and UI fixtures use bundled content with networking disabled. The startup hint uses the built-in continuous clock. The scene constructs the storyboard controller in a dependency scope; the controller propagates that scope to its renderer and tasks. The renderer retains its compiler and time closure rather than resolving dependencies on each frame.
+
+Preferences store `holodeck.lastShaderID` in UserDefaults only after a current selection activates successfully. Canceled, superseded, and failed selections leave the saved ID untouched. Tests override dependencies before controller construction, use a TestClock and isolated preferences, and explicitly opt into real GPU compilation where required. UI tests use a separate UserDefaults suite per test, including a relaunch test that reuses its suite.
 
 ## Validation
 
-Run the Holodeck scheme's tests on a tvOS 26 or later Apple TV simulator. The unit tests compile all eight shaders, render floating-point frames, check coverage and animation, and save PNG attachments. They also verify cache reuse, uniform layout, stale selections, failure recovery, and paused time. UI tests exercise all eight selections, focus restoration, Back dismissal, and background/resume, with screenshots saved in the test result bundle.
+Run the Holodeck scheme's tests on a tvOS 26 or later Apple TV simulator. The unit tests compile all eight shaders, render floating-point frames, check coverage and animation, and save PNG attachments. Catalog tests verify pinned downloads, a ninth shader, schema and asset rejection, atomic cache writes, offline fallback, refresh throttling, image hashes and revised-source compilation. They also verify cache reuse, uniform layout, stale selections, failure recovery, and paused time. UI tests exercise all eight selections, focus restoration, Back dismissal, and background/resume, with screenshots saved in the test result bundle.
 
 ```sh
 xcodebuild -project Holodeck.xcodeproj -scheme Holodeck \
+  -sdk appletvsimulator \
   -destination 'platform=tvOS Simulator,name=Apple TV 4K (3rd generation)' \
   -parallel-testing-enabled NO test
 ```

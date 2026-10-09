@@ -26,7 +26,8 @@ actor ShaderCompiler: ShaderCompiling {
     }
 
     func pipeline(for shader: ShaderDefinition) throws -> any MTLRenderPipelineState {
-        if let cached = pipelines[shader.id] { return cached }
+        let cacheKey = shader.id + ":" + shader.sourceHash
+        if let cached = pipelines[cacheKey] { return cached }
         let library = try device.makeLibrary(source: shader.source, options: nil)
         guard let vertex = library.makeFunction(name: "vertexShader") else {
             throw ShaderCompilationError.missingFunction("vertexShader")
@@ -41,7 +42,7 @@ actor ShaderCompiler: ShaderCompiling {
         descriptor.colorAttachments[0].pixelFormat = pixelFormat
         descriptor.rasterSampleCount = 1
         let pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
-        pipelines[shader.id] = pipeline
+        pipelines[cacheKey] = pipeline
         return pipeline
     }
 }

@@ -6,6 +6,14 @@
 	objectVersion = 110;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		A10000000000000000000001 /* Dependencies in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000003 /* Dependencies */; };
+		A10000000000000000000002 /* Dependencies in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000004 /* Dependencies */; };
+		A10000000000000000000006 /* IssueReporting in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000008 /* IssueReporting */; };
+		A10000000000000000000007 /* Clocks in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000009 /* Clocks */; };
+		A1000000000000000000000C /* ConcurrencyExtras in Frameworks */ = {isa = PBXBuildFile; productRef = A1000000000000000000000D /* ConcurrencyExtras */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		24051A613076DFD9003E9983 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -64,11 +72,16 @@
 		24051A453076DFD7003E9983 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				A10000000000000000000001 /* Dependencies in Frameworks */,
+				A10000000000000000000006 /* IssueReporting in Frameworks */,
 			);
 		};
 		24051A5D3076DFD9003E9983 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				A10000000000000000000002 /* Dependencies in Frameworks */,
+				A10000000000000000000007 /* Clocks in Frameworks */,
+				A1000000000000000000000C /* ConcurrencyExtras in Frameworks */,
 			);
 		};
 		24051A673076DFD9003E9983 /* Frameworks */ = {
@@ -116,6 +129,10 @@
 				24051A4A3076DFD7003E9983 /* Holodeck */,
 			);
 			name = Holodeck;
+			packageProductDependencies = (
+				A10000000000000000000003 /* Dependencies */,
+				A10000000000000000000008 /* IssueReporting */,
+			);
 			productName = Holodeck;
 			productReference = 24051A483076DFD7003E9983 /* Holodeck.app */;
 			productType = "com.apple.product-type.application";
@@ -137,6 +154,11 @@
 				24051A633076DFD9003E9983 /* HolodeckTests */,
 			);
 			name = HolodeckTests;
+			packageProductDependencies = (
+				A10000000000000000000004 /* Dependencies */,
+				A10000000000000000000009 /* Clocks */,
+				A1000000000000000000000D /* ConcurrencyExtras */,
+			);
 			productName = HolodeckTests;
 			productReference = 24051A603076DFD9003E9983 /* HolodeckTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
@@ -194,6 +216,12 @@
 			);
 			mainGroup = 24051A3F3076DFD7003E9983;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				A10000000000000000000005 /* XCRemoteSwiftPackageReference "swift-dependencies" */,
+				A1000000000000000000000A /* XCRemoteSwiftPackageReference "swift-issue-reporting" */,
+				A1000000000000000000000B /* XCRemoteSwiftPackageReference "swift-clocks" */,
+				A1000000000000000000000E /* XCRemoteSwiftPackageReference "swift-concurrency-extras" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 24051A493076DFD7003E9983 /* Products */;
 			projectDirPath = "";
@@ -261,12 +289,13 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = "App Icon & Top Shelf Image";
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				COMPRESS_PNG_FILES = NO;
+				STRIP_PNG_TEXT = NO;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = MGPHJKUJSY;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Holodeck/Info.plist;
-				INFOPLIST_KEY_UIMainStoryboardFile = Main;
 				INFOPLIST_KEY_UIRequiredDeviceCapabilities = metal;
 				INFOPLIST_KEY_UIUserInterfaceStyle = Automatic;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -291,12 +320,13 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = "App Icon & Top Shelf Image";
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				COMPRESS_PNG_FILES = NO;
+				STRIP_PNG_TEXT = NO;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = MGPHJKUJSY;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Holodeck/Info.plist;
-				INFOPLIST_KEY_UIMainStoryboardFile = Main;
 				INFOPLIST_KEY_UIRequiredDeviceCapabilities = metal;
 				INFOPLIST_KEY_UIUserInterfaceStyle = Automatic;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -557,6 +587,57 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+/* Begin XCRemoteSwiftPackageReference section */
+		A10000000000000000000005 /* XCRemoteSwiftPackageReference "swift-dependencies" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pointfreeco/swift-dependencies";
+			requirement = {kind = upToNextMajorVersion; minimumVersion = 1.17.1; };
+		};
+		A1000000000000000000000A /* XCRemoteSwiftPackageReference "swift-issue-reporting" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pointfreeco/swift-issue-reporting";
+			requirement = {kind = upToNextMajorVersion; minimumVersion = 2.1.0; };
+		};
+		A1000000000000000000000B /* XCRemoteSwiftPackageReference "swift-clocks" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pointfreeco/swift-clocks";
+			requirement = {kind = upToNextMajorVersion; minimumVersion = 1.1.1; };
+		};
+		A1000000000000000000000E /* XCRemoteSwiftPackageReference "swift-concurrency-extras" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pointfreeco/swift-concurrency-extras";
+			requirement = {kind = upToNextMajorVersion; minimumVersion = 1.4.1; };
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A10000000000000000000003 /* Dependencies */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A10000000000000000000005 /* XCRemoteSwiftPackageReference "swift-dependencies" */;
+			productName = Dependencies;
+		};
+		A10000000000000000000004 /* Dependencies */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A10000000000000000000005 /* XCRemoteSwiftPackageReference "swift-dependencies" */;
+			productName = Dependencies;
+		};
+		A10000000000000000000008 /* IssueReporting */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A1000000000000000000000A /* XCRemoteSwiftPackageReference "swift-issue-reporting" */;
+			productName = IssueReporting;
+		};
+		A10000000000000000000009 /* Clocks */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A1000000000000000000000B /* XCRemoteSwiftPackageReference "swift-clocks" */;
+			productName = Clocks;
+		};
+		A1000000000000000000000D /* ConcurrencyExtras */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A1000000000000000000000E /* XCRemoteSwiftPackageReference "swift-concurrency-extras" */;
+			productName = ConcurrencyExtras;
+		};
+/* End XCSwiftPackageProductDependency section */
+
 	};
 	rootObject = 24051A403076DFD7003E9983 /* Project object */;
 	validationLevel = 1;
