@@ -279,14 +279,14 @@ Previews download on demand, independently of source activation, and cache as `p
 | Refreshed source fails runtime compilation | Selection fails; current playing shader and saved successful ID remain |
 | Active shader is removed from the catalog | Current playback continues; next launch resolves a missing saved ID to the default |
 
-Holodeck's `TestSupport/` catalog and images are recorded fixtures linked only to test targets. They support deterministic tests and are excluded from the shipping app. Ordinary app builds and tests do not fetch live catalog content. See the [app validation instructions](../README.md#validation) for simulator tests; verify actual preview generation on a Metal-capable Mac and animation in the app when changing shaders.
+Holodeck's `HolodeckCore/Tests/HolodeckCoreTests/TestSupport/` catalog and images are recorded fixtures linked only to test targets. They support deterministic tests and are excluded from the shipping app. Ordinary app builds and tests do not fetch live catalog content. See the [app validation instructions](../README.md#validation) for simulator tests; verify actual preview generation on a Metal-capable Mac and animation in the app when changing shaders.
 
 Implementation references:
 
-- [Catalog model and validation](../Holodeck/ShaderCatalog.swift)
-- [Networking, refresh, disk snapshots, and preview cache](../Holodeck/CatalogService.swift)
+- [Catalog model and validation](../HolodeckCore/Sources/HolodeckCore/ShaderCatalog.swift)
+- [Networking, refresh, disk snapshots, and preview cache](../HolodeckCore/Sources/HolodeckCore/CatalogService.swift)
 - [Startup, lifecycle, picker updates, and selection](../Holodeck/GameViewController.swift)
-- [Pipeline compilation and reuse](../Holodeck/ShaderCompiler.swift)
-- [Playback and selection cancellation](../Holodeck/Renderer.swift)
+- [Pipeline compilation and reuse](../HolodeckCore/Sources/HolodeckCore/ShaderCompiler.swift)
+- [Playback and selection cancellation](../HolodeckCore/Sources/HolodeckCore/Renderer.swift)
 - [Shader authoring and publication tool](https://github.com/hbmartin/HolodeckShaders/blob/main/tools/catalog.py)
 - [Publication workflow](https://github.com/hbmartin/HolodeckShaders/blob/main/.github/workflows/publish.yml)

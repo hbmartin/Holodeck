@@ -1,9 +1,10 @@
 import Foundation
 import Dependencies
 
-nonisolated struct CatalogNetwork: Sendable {
-    var get: @Sendable (URL, Int) async throws -> Data
-    static let live = Self { url, limit in
+nonisolated public struct CatalogNetwork: Sendable {
+    public var get: @Sendable (URL, Int) async throws -> Data
+    public init(get: @escaping @Sendable (URL, Int) async throws -> Data) { self.get = get }
+    public static let live = Self { url, limit in
         var request = URLRequest(url: url)
         request.timeoutInterval = 30
         request.setValue(url.path.contains("/contents/") ? "application/vnd.github.raw+json" : "application/vnd.github+json", forHTTPHeaderField: "Accept")
@@ -21,11 +22,15 @@ nonisolated struct CatalogNetwork: Sendable {
     }
 }
 
-nonisolated struct CatalogStorage: Sendable {
-    var read: @Sendable (String) throws -> Data?
-    var write: @Sendable (String, Data) throws -> Void
+nonisolated public struct CatalogStorage: Sendable {
+    public var read: @Sendable (String) throws -> Data?
+    public var write: @Sendable (String, Data) throws -> Void
 
-    static func disk(at directory: URL) -> Self {
+    public init(read: @escaping @Sendable (String) throws -> Data?,
+                write: @escaping @Sendable (String, Data) throws -> Void) {
+        self.read = read; self.write = write
+    }
+    public static func disk(at directory: URL) -> Self {
         Self(read: { name in
             let url = directory.appendingPathComponent(name)
             guard FileManager.default.fileExists(atPath: url.path) else { return nil }
@@ -36,23 +41,23 @@ nonisolated struct CatalogStorage: Sendable {
         })
     }
 
-    static let live = disk(at: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("ShaderCatalog", isDirectory: true))
-    static let disabled = Self(read: { _ in nil }, write: { _, _ in })
+    public static let live = disk(at: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("ShaderCatalog", isDirectory: true))
+    public static let disabled = Self(read: { _ in nil }, write: { _, _ in })
 }
 
 /// Refresh downloads and persistence run off the UI executor. Failed refreshes never replace current.
-actor CatalogService {
-    nonisolated let initialSnapshot: CatalogSnapshot?
+public actor CatalogService {
+    public nonisolated let initialSnapshot: CatalogSnapshot?
     private var snapshot: CatalogSnapshot?
     private let network: CatalogNetwork
     private let storage: CatalogStorage
     private let now: @Sendable () -> Date
     private let enabled: Bool
     private var lastAttempt: Date?
-    private var refreshing = false
+    private var refreshTask: Task<CatalogSnapshot?, Error>?
     private let repository: String
 
-    init(network: CatalogNetwork = .live, storage: CatalogStorage = .live,
+    public init(network: CatalogNetwork = .live, storage: CatalogStorage = .live,
          now: @escaping @Sendable () -> Date = { Date() }, enabled: Bool = true,
          repository: String = "hbmartin/HolodeckShaders") {
         let cached: CatalogSnapshot? = {
@@ -70,16 +75,22 @@ actor CatalogService {
         self.repository = repository
     }
 
-    func current() -> CatalogSnapshot? { snapshot }
+    public func current() -> CatalogSnapshot? { snapshot }
 
     @discardableResult
-    func refresh() async throws -> CatalogSnapshot? {
-        guard enabled, !refreshing else { return nil }
+    public func refresh(force: Bool = false) async throws -> CatalogSnapshot? {
+        guard enabled else { return nil }
+        if let refreshTask { return try await refreshTask.value }
         let date = now()
-        if snapshot != nil, let lastAttempt, date.timeIntervalSince(lastAttempt) < 900 { return nil }
+        if !force, snapshot != nil, let lastAttempt, date.timeIntervalSince(lastAttempt) < 900 { return nil }
         lastAttempt = date
-        refreshing = true
-        defer { refreshing = false }
+        let task = Task { try await downloadPublication() }
+        refreshTask = task
+        defer { refreshTask = nil }
+        return try await task.value
+    }
+
+    private func downloadPublication() async throws -> CatalogSnapshot? {
         struct Commit: Decodable { let sha: String }
         let commitURL = URL(string: "https://api.github.com/repos/\(repository)/git/ref/heads/published")!
         struct Reference: Decodable { let object: Commit }
@@ -108,7 +119,7 @@ actor CatalogService {
         return candidate
     }
 
-    func preview(_ preview: ShaderPreview) async throws -> Data {
+    public func preview(_ preview: ShaderPreview) async throws -> Data {
         guard CatalogHash.isSHA(preview.hash), CatalogHash.isSHA(preview.publicationRevision, length: 40),
               preview.path.range(of: "^previews/[a-z0-9]+(-[a-z0-9]+)*\\.png$", options: .regularExpression) != nil
         else { throw CatalogError.invalidPreview }
@@ -132,14 +143,14 @@ actor CatalogService {
 }
 
 extension DependencyValues {
-    var catalogService: CatalogService {
+    public var catalogService: CatalogService {
         get { self[CatalogServiceKey.self] }
         set { self[CatalogServiceKey.self] = newValue }
     }
 }
 
-nonisolated enum CatalogServiceKey: DependencyKey {
-    static let liveValue = CatalogService()
-    static let testValue = CatalogService(storage: .disabled, enabled: false)
-    static let previewValue = CatalogService(storage: .disabled, enabled: false)
+nonisolated public enum CatalogServiceKey: DependencyKey {
+    public static let liveValue = CatalogService()
+    public static let testValue = CatalogService(storage: .disabled, enabled: false)
+    public static let previewValue = CatalogService(storage: .disabled, enabled: false)
 }

@@ -1,11 +1,10 @@
 import Foundation
-@testable import Holodeck
 @testable import HolodeckCore
 
 /// Recorded repository content belongs to test bundles only, never Holodeck.app.
 nonisolated enum TestCatalog {
     static let data: Data = {
-        let url = Bundle(for: HolodeckTests.self).url(forResource: "CatalogFixture", withExtension: "json", subdirectory: "TestSupport")!
+        let url = Bundle.module.url(forResource: "CatalogFixture", withExtension: "json", subdirectory: "TestSupport")!
         return try! Data(contentsOf: url)
     }()
     static let snapshot: CatalogSnapshot = {
@@ -20,7 +19,7 @@ nonisolated enum TestCatalog {
         return try? preview(named: name)
     }, write: { _, _ in })
     static func preview(named name: String) throws -> Data {
-        guard let url = Bundle(for: HolodeckTests.self).url(forResource: name, withExtension: nil, subdirectory: "TestSupport") else { throw CatalogError.invalidPreview }
+        guard let url = Bundle.module.url(forResource: name, withExtension: nil, subdirectory: "TestSupport") else { throw CatalogError.invalidPreview }
         return try Data(contentsOf: url)
     }
 }
