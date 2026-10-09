@@ -109,16 +109,3 @@ nonisolated struct CatalogSnapshot: Codable, Sendable {
 
     var initialShader: ShaderDefinition { shaders.first { $0.id == manifest.defaultShaderID }! }
 }
-
-/// Fixed local fixture and offline fallback; live controllers consume CatalogService instead.
-nonisolated enum ShaderCatalog {
-    static let bundled: CatalogSnapshot = {
-        guard let url = Bundle.main.url(forResource: "BundledCatalog", withExtension: "json"),
-              let data = try? Data(contentsOf: url),
-              let snapshot = try? JSONDecoder().decode(CatalogSnapshot.self, from: data),
-              (try? snapshot.validate()) != nil else { preconditionFailure("Missing or invalid bundled shader catalog") }
-        return snapshot
-    }()
-    static var shaders: [ShaderDefinition] { bundled.shaders }
-    static var initialShader: ShaderDefinition { bundled.initialShader }
-}

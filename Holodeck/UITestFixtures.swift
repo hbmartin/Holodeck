@@ -8,16 +8,30 @@ final class UITestFixtures: NSObject {
     private let arguments: [String]
     private let gate = InitialShaderGate()
     private weak var controller: GameViewController?
+    private var catalogFixture: CatalogSnapshot?
 
     init(arguments: [String] = ProcessInfo.processInfo.arguments) {
         self.arguments = arguments
+        if let value = ProcessInfo.processInfo.environment["HOLODECK_UI_TEST_CATALOG"],
+           let snapshot = try? JSONDecoder().decode(CatalogSnapshot.self, from: Data(value.utf8)),
+           (try? snapshot.validate()) != nil { catalogFixture = snapshot }
     }
 
     func configure(_ dependencies: inout DependencyValues) {
         if let index = arguments.firstIndex(of: "--ui-test-storage-suite"), index + 1 < arguments.count,
            let defaults = UserDefaults(suiteName: arguments[index + 1]) {
             dependencies.shaderPreferences = .userDefaults(defaults)
-            dependencies.catalogService = CatalogService(bundled: ShaderCatalog.bundled, storage: .disabled, enabled: false)
+            let data = catalogFixture.flatMap { try? JSONEncoder().encode($0) }
+            if arguments.contains("--ui-test-empty-cache") {
+                dependencies.catalogService = CatalogService(network: CatalogNetwork { _, _ in throw CatalogError.invalidResponse }, storage: .disabled)
+            } else if arguments.contains("--ui-test-download-catalog"), let catalogFixture {
+                let download = CatalogDownloadFixture(snapshot: catalogFixture, failFirst: arguments.contains("--ui-test-fail-catalog-once"))
+                dependencies.catalogService = CatalogService(network: CatalogNetwork { url, _ in try await download.get(url) }, storage: .disabled)
+            } else {
+                dependencies.catalogService = CatalogService(storage: CatalogStorage(read: { name in
+                    name == "snapshot.json" ? data : nil
+                }, write: { _, _ in }), enabled: false)
+            }
         }
         if arguments.contains("--ui-test-metal-unavailable") {
             dependencies.metalDevice = nil
@@ -25,7 +39,7 @@ final class UITestFixtures: NSObject {
             let gate = gate
             let failsInitial = arguments.contains("--ui-test-fail-initial-shader")
             let savedID = dependencies.shaderPreferences.lastShaderID()
-            let startupID = ShaderCatalog.shaders.first { $0.id == savedID }?.id ?? ShaderCatalog.initialShader.id
+            let startupID = catalogFixture?.shaders.first { $0.id == savedID }?.id ?? catalogFixture?.initialShader.id ?? "plasma"
             dependencies.shaderCompilerFactory = { device, pixelFormat in
                 HeldInitialShaderCompiler(device: device, pixelFormat: pixelFormat, startupID: startupID,
                                           gate: gate, failsInitial: failsInitial)
@@ -55,7 +69,7 @@ final class UITestFixtures: NSObject {
     }
 
     @objc private func refreshCatalog() {
-        var snapshot = ShaderCatalog.bundled
+        guard var snapshot = catalogFixture else { return }
         var added = snapshot.manifest.shaders[0]
         added.id = "ninth-shader"
         added.name = "Ninth Shader"
@@ -72,6 +86,27 @@ final class UITestFixtures: NSObject {
         controller?.setSceneActive(false)
         controller?.setSceneActive(true)
         controller?.setSceneActive(true)
+    }
+}
+
+private actor CatalogDownloadFixture {
+    let snapshot: CatalogSnapshot
+    var failFirst: Bool
+    init(snapshot: CatalogSnapshot, failFirst: Bool) {
+        self.snapshot = snapshot
+        self.failFirst = failFirst
+    }
+    func get(_ url: URL) throws -> Data {
+        if failFirst {
+            failFirst = false
+            throw CatalogError.invalidResponse
+        }
+        if url.path.hasSuffix("/published") {
+            return Data("{\"object\":{\"sha\":\"\(snapshot.publicationRevision)\"}}".utf8)
+        }
+        if url.lastPathComponent == "catalog.json" { return try JSONEncoder().encode(snapshot.manifest) }
+        if let source = snapshot.sources[url.deletingPathExtension().lastPathComponent] { return Data(source.utf8) }
+        throw CatalogError.invalidResponse
     }
 }
 

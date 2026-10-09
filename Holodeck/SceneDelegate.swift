@@ -27,7 +27,7 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
             $0.context = .live
             if isTestHost {
                 $0.shaderPreferences = .inMemory()
-                $0.catalogService = CatalogService(bundled: ShaderCatalog.bundled, storage: .disabled, enabled: false)
+                $0.catalogService = CatalogService(storage: .disabled, enabled: false)
             }
             #if DEBUG
             fixtures.configure(&$0)

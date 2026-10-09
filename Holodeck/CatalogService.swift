@@ -42,8 +42,8 @@ nonisolated struct CatalogStorage: Sendable {
 
 /// Refresh downloads and persistence run off the UI executor. Failed refreshes never replace current.
 actor CatalogService {
-    nonisolated let initialSnapshot: CatalogSnapshot
-    private var snapshot: CatalogSnapshot
+    nonisolated let initialSnapshot: CatalogSnapshot?
+    private var snapshot: CatalogSnapshot?
     private let network: CatalogNetwork
     private let storage: CatalogStorage
     private let now: @Sendable () -> Date
@@ -52,7 +52,7 @@ actor CatalogService {
     private var refreshing = false
     private let repository: String
 
-    init(bundled: CatalogSnapshot, network: CatalogNetwork = .live, storage: CatalogStorage = .live,
+    init(network: CatalogNetwork = .live, storage: CatalogStorage = .live,
          now: @escaping @Sendable () -> Date = { Date() }, enabled: Bool = true,
          repository: String = "hbmartin/HolodeckShaders") {
         let cached: CatalogSnapshot? = {
@@ -61,7 +61,7 @@ actor CatalogService {
                   (try? value.validate()) != nil else { return nil }
             return value
         }()
-        initialSnapshot = cached ?? bundled
+        initialSnapshot = cached
         snapshot = initialSnapshot
         self.network = network
         self.storage = storage
@@ -70,13 +70,13 @@ actor CatalogService {
         self.repository = repository
     }
 
-    func current() -> CatalogSnapshot { snapshot }
+    func current() -> CatalogSnapshot? { snapshot }
 
     @discardableResult
     func refresh() async throws -> CatalogSnapshot? {
         guard enabled, !refreshing else { return nil }
         let date = now()
-        if let lastAttempt, date.timeIntervalSince(lastAttempt) < 900 { return nil }
+        if snapshot != nil, let lastAttempt, date.timeIntervalSince(lastAttempt) < 900 { return nil }
         lastAttempt = date
         refreshing = true
         defer { refreshing = false }
@@ -86,7 +86,7 @@ actor CatalogService {
         let reference = try JSONDecoder().decode(Reference.self, from: await network.get(commitURL, 65_536))
         let revision = reference.object.sha
         guard CatalogHash.isSHA(revision, length: 40) else { throw CatalogError.invalidManifest }
-        if revision == snapshot.publicationRevision { return nil }
+        if revision == snapshot?.publicationRevision { return nil }
         let manifest = try JSONDecoder().decode(CatalogManifest.self, from: await network.get(assetURL("catalog.json", revision: revision), 2_097_152))
         try manifest.validate()
         var sources: [String: String] = [:]
@@ -114,8 +114,6 @@ actor CatalogService {
         else { throw CatalogError.invalidPreview }
         let filename = "preview-\(preview.hash).png"
         if let cached = try? storage.read(filename), validPreview(cached, hash: preview.hash) { return cached }
-        if let url = Bundle.main.url(forResource: "preview-\(preview.hash)", withExtension: "png"),
-           let bundled = try? Data(contentsOf: url), validPreview(bundled, hash: preview.hash) { return bundled }
         guard enabled else { throw CatalogError.invalidPreview }
         let data = try await network.get(assetURL(preview.path, revision: preview.publicationRevision), 8_388_608)
         guard validPreview(data, hash: preview.hash) else { throw CatalogError.invalidPreview }
@@ -141,7 +139,7 @@ extension DependencyValues {
 }
 
 nonisolated enum CatalogServiceKey: DependencyKey {
-    static let liveValue = CatalogService(bundled: ShaderCatalog.bundled)
-    static let testValue = CatalogService(bundled: ShaderCatalog.bundled, storage: .disabled, enabled: false)
-    static let previewValue = CatalogService(bundled: ShaderCatalog.bundled, storage: .disabled, enabled: false)
+    static let liveValue = CatalogService()
+    static let testValue = CatalogService(storage: .disabled, enabled: false)
+    static let previewValue = CatalogService(storage: .disabled, enabled: false)
 }

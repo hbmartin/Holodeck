@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A20000000000000000000001 /* TestSupport in unit Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003; };
+		A20000000000000000000002 /* TestSupport in UI Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003; };
 		A10000000000000000000001 /* Dependencies in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000003 /* Dependencies */; };
 		A10000000000000000000002 /* Dependencies in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000004 /* Dependencies */; };
 		A10000000000000000000006 /* IssueReporting in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000008 /* IssueReporting */; };
@@ -32,6 +34,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		A20000000000000000000003 /* TestSupport */ = {isa = PBXFileReference; lastKnownFileType = folder; path = TestSupport; sourceTree = "<group>"; };
 		24051A483076DFD7003E9983 /* Holodeck.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Holodeck.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		24051A603076DFD9003E9983 /* HolodeckTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = HolodeckTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		24051A6A3076DFD9003E9983 /* HolodeckUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = HolodeckUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -96,6 +99,7 @@
 			isa = PBXGroup;
 			children = (
 				24051A4A3076DFD7003E9983 /* Holodeck */,
+				A20000000000000000000003 /* TestSupport */,
 				24051A633076DFD9003E9983 /* HolodeckTests */,
 				24051A6D3076DFD9003E9983 /* HolodeckUITests */,
 				24051A493076DFD7003E9983 /* Products */,
@@ -243,11 +247,13 @@
 		24051A5E3076DFD9003E9983 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
+				A20000000000000000000001 /* TestSupport */,
 			);
 		};
 		24051A683076DFD9003E9983 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
+				A20000000000000000000002 /* TestSupport */,
 			);
 		};
 /* End PBXResourcesBuildPhase section */
@@ -289,8 +295,6 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = "App Icon & Top Shelf Image";
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				COMPRESS_PNG_FILES = NO;
-				STRIP_PNG_TEXT = NO;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = MGPHJKUJSY;
@@ -320,8 +324,6 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = "App Icon & Top Shelf Image";
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				COMPRESS_PNG_FILES = NO;
-				STRIP_PNG_TEXT = NO;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = MGPHJKUJSY;
