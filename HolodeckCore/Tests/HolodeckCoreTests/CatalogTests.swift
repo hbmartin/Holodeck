@@ -5,41 +5,10 @@ import Dependencies
 
 @MainActor
 final class CatalogTests: XCTestCase {
-    func candidate(ninth: Bool = false) -> CatalogSnapshot {
-        var snapshot = TestCatalog.snapshot
-        snapshot.publicationRevision = String(repeating: "a", count: 40)
-        if ninth {
-            var entry = snapshot.manifest.shaders[0]
-            entry.id = "ninth-shader"
-            entry.name = "Ninth Shader"
-            entry.sourcePath = "sources/ninth-shader.metal"
-            entry.previewPath = "previews/ninth-shader.png"
-            snapshot.manifest.shaders.append(entry)
-            snapshot.sources[entry.id] = snapshot.sources["plasma"]
-        }
-        return snapshot
-    }
-
-    func makeService(_ candidate: CatalogSnapshot, box: CatalogTestBox = CatalogTestBox(), cached: Bool = true) throws -> CatalogService {
-        var responses: [String: Data] = [
-            "/git/ref/heads/published": Data("{\"object\":{\"sha\":\"\(candidate.publicationRevision)\"}}".utf8),
-            "/catalog.json": try JSONEncoder().encode(candidate.manifest)
-        ]
-        for entry in candidate.manifest.shaders {
-            responses["/\(entry.sourcePath)"] = candidate.sources[entry.id].map { Data($0.utf8) }
-        }
-        box.setResponses(responses)
-        let storage = CatalogStorage(read: { name in
-            if let value = try box.storage.read(name) { return value }
-            return cached && name == "snapshot.json" ? TestCatalog.data : nil
-        }, write: box.storage.write)
-        return CatalogService(network: box.network, storage: storage, clock: box.clock)
-    }
-
     func testFirstLaunchHasNoCatalogAndCanRetryImmediatelyAfterNetworkFailure() async throws {
         let box = CatalogTestBox()
-        let expected = candidate()
-        let service = try makeService(expected, box: box, cached: false)
+        let expected = CatalogTestFixtures.candidate()
+        let service = try CatalogTestFixtures.makeService(expected, box: box, cached: false)
         XCTAssertNil(service.initialCatalog)
         let responses = box.responseFiles
         box.setResponses([:])
@@ -69,21 +38,21 @@ final class CatalogTests: XCTestCase {
     }
     func testMalformedManifestAndIncompleteSourcesAreRejected() throws {
         var mutations: [CatalogSnapshot] = []
-        var value = candidate(); value.manifest.schemaVersion = 2; mutations.append(value)
-        value = candidate(); value.manifest.defaultShaderID = "missing"; mutations.append(value)
-        value = candidate(); value.manifest.shaders.append(value.manifest.shaders[0]); mutations.append(value)
-        value = candidate(); value.manifest.shaders[0].colors = [[0, 1]]; mutations.append(value)
-        value = candidate(); value.manifest.shaders[0].updatedAt = "yesterday"; mutations.append(value)
-        value = candidate(); value.manifest.shaders[0].sourcePath = "../secret"; mutations.append(value)
-        value = candidate(); value.manifest.shaders[0].previewPath = "https://example.com/image.png"; mutations.append(value)
-        value = candidate(); value.sources["plasma"] = "corrupt"; mutations.append(value)
-        value = candidate(); value.sources.removeValue(forKey: "aurora"); mutations.append(value)
+        var value = CatalogTestFixtures.candidate(); value.manifest.schemaVersion = 2; mutations.append(value)
+        value = CatalogTestFixtures.candidate(); value.manifest.defaultShaderID = "missing"; mutations.append(value)
+        value = CatalogTestFixtures.candidate(); value.manifest.shaders.append(value.manifest.shaders[0]); mutations.append(value)
+        value = CatalogTestFixtures.candidate(); value.manifest.shaders[0].colors = [[0, 1]]; mutations.append(value)
+        value = CatalogTestFixtures.candidate(); value.manifest.shaders[0].updatedAt = "yesterday"; mutations.append(value)
+        value = CatalogTestFixtures.candidate(); value.manifest.shaders[0].sourcePath = "../secret"; mutations.append(value)
+        value = CatalogTestFixtures.candidate(); value.manifest.shaders[0].previewPath = "https://example.com/image.png"; mutations.append(value)
+        value = CatalogTestFixtures.candidate(); value.sources["plasma"] = "corrupt"; mutations.append(value)
+        value = CatalogTestFixtures.candidate(); value.sources.removeValue(forKey: "aurora"); mutations.append(value)
         for invalid in mutations { XCTAssertThrowsError(try invalid.validate()) }
     }
     func testNinthShaderPublishesAtomicallyAndUsesPinnedRevision() async throws {
-        let expected = candidate(ninth: true)
+        let expected = CatalogTestFixtures.candidate(ninth: true)
         let box = CatalogTestBox()
-        let service = try makeService(expected, box: box)
+        let service = try CatalogTestFixtures.makeService(expected, box: box)
         let updated = try await service.refresh()
         XCTAssertEqual(updated?.shaders.count, 9)
         let current = await service.current()
@@ -98,7 +67,7 @@ final class CatalogTests: XCTestCase {
     }
     func testInvalidSourceAndInterruptedWriteRetainPreviousSnapshot() async throws {
         for writeFails in [false, true] {
-            var expected = candidate()
+            var expected = CatalogTestFixtures.candidate()
             if !writeFails { expected.sources["aurora"] = "corrupt download" }
             let box = CatalogTestBox()
             if writeFails {
@@ -106,7 +75,7 @@ final class CatalogTests: XCTestCase {
             }
             let previousFile = box.files["snapshot.json"]
             box.failWrites = writeFails
-            let service = try makeService(expected, box: box)
+            let service = try CatalogTestFixtures.makeService(expected, box: box)
             do { _ = try await service.refresh(); XCTFail("Invalid publication must fail") } catch {}
             let current = await service.current()
             XCTAssertEqual(current?.publicationRevision, TestCatalog.snapshot.publicationRevision)
@@ -114,9 +83,9 @@ final class CatalogTests: XCTestCase {
         }
     }
     func testMissingSourceAndNetworkFailureKeepOfflineCatalog() async throws {
-        var expected = candidate(); expected.sources.removeValue(forKey: "waves")
+        var expected = CatalogTestFixtures.candidate(); expected.sources.removeValue(forKey: "waves")
         let box = CatalogTestBox()
-        let service = try makeService(expected, box: box)
+        let service = try CatalogTestFixtures.makeService(expected, box: box)
         do { _ = try await service.refresh(); XCTFail("Missing source must fail") } catch {}
         let current = await service.current()
         XCTAssertEqual(current?.shaders.count, 8)
@@ -128,7 +97,7 @@ final class CatalogTests: XCTestCase {
         XCTAssertEqual(fallback?.initialShader.id, "plasma")
     }
     func testStartupUsesValidCacheAndRejectsCorruptCache() async throws {
-        let cached = candidate(ninth: true)
+        let cached = CatalogTestFixtures.candidate(ninth: true)
         let box = CatalogTestBox()
         try box.storage.write("snapshot.json", JSONEncoder().encode(cached))
         let service = CatalogService(storage: box.storage, enabled: false)
@@ -141,7 +110,7 @@ final class CatalogTests: XCTestCase {
     }
     func testRefreshThrottlesAndUnchangedPublicationSkipsAssets() async throws {
         let box = CatalogTestBox()
-        let service = try makeService(TestCatalog.snapshot, box: box)
+        let service = try CatalogTestFixtures.makeService(TestCatalog.snapshot, box: box)
         let unchanged = try await service.refresh()
         XCTAssertNil(unchanged)
         XCTAssertEqual(box.urls.count, 1)
@@ -172,7 +141,7 @@ final class CatalogTests: XCTestCase {
     }
     func testForcedRefreshBypassesThrottle() async throws {
         let box = CatalogTestBox()
-        let service = try makeService(TestCatalog.snapshot, box: box)
+        let service = try CatalogTestFixtures.makeService(TestCatalog.snapshot, box: box)
         _ = try await service.refresh()
         _ = try await service.refresh()
         XCTAssertEqual(box.urls.count, 1)
@@ -181,10 +150,10 @@ final class CatalogTests: XCTestCase {
     }
 
     func testConcurrentRefreshCallersReceiveSamePublication() async throws {
-        let expected = candidate()
+        let expected = CatalogTestFixtures.candidate()
         let gate = PreviewRequestGate()
         let box = CatalogTestBox()
-        _ = try makeService(expected, box: box)
+        _ = try CatalogTestFixtures.makeService(expected, box: box)
         let network = box.network
         let service = CatalogService(network: CatalogNetwork { url, limit in
             if url.lastPathComponent == "published" { return await gate.image("published") }
@@ -205,7 +174,7 @@ final class CatalogTests: XCTestCase {
 
     func testFailedRefreshIsAlsoThrottled() async throws {
         let box = CatalogTestBox()
-        let service = try makeService(candidate(), box: box)
+        let service = try CatalogTestFixtures.makeService(CatalogTestFixtures.candidate(), box: box)
         box.setResponses([:])
         do { _ = try await service.refresh(); XCTFail("Expected failure") } catch {}
         let retry = try await service.refresh()
@@ -222,7 +191,7 @@ final class CatalogTests: XCTestCase {
     func testPreviewHashFailureCacheReuseAndUnavailableImage() async throws {
         let box = CatalogTestBox()
         let image = Data([137, 80, 78, 71, 13, 10, 26, 10] + Array("test-image".utf8))
-        let preview = ShaderPreview(path: "previews/test.png", hash: CatalogHash.sha256(image), publicationRevision: candidate().publicationRevision)
+        let preview = ShaderPreview(path: "previews/test.png", hash: CatalogHash.sha256(image), publicationRevision: CatalogTestFixtures.candidate().publicationRevision)
         let service = CatalogService(network: box.network, storage: box.storage)
         box.setResponses(["/previews/test.png": Data("corrupt".utf8)])
         do { _ = try await service.preview(preview); XCTFail("Bad image hash must fail") } catch {}
@@ -253,54 +222,6 @@ final class CatalogTests: XCTestCase {
         XCTAssertFalse(pipeline === updated)
         let reused = try await compiler.pipeline(for: revised)
         XCTAssertTrue(updated === reused)
-    }
-}
-
-nonisolated final class CatalogTestBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var stored: [String: Data] = [:]
-    private var responses: [String: Data] = [:]
-    private var requests: [URL] = []
-    private var reads: [String] = []
-    private var writes: [String] = []
-    private var readOnMain = false
-    let clock = TestClock()
-    private var failing = false
-    var files: [String: Data] { lock.withLock { stored } }
-    var responseFiles: [String: Data] { lock.withLock { responses } }
-    var urls: [URL] { lock.withLock { requests } }
-    var storageReads: [String] { lock.withLock { reads } }
-    var storageWrites: [String] { lock.withLock { writes } }
-    var storageReadOnMain: Bool { lock.withLock { readOnMain } }
-    var failWrites: Bool {
-        get { lock.withLock { failing } }
-        set { lock.withLock { failing = newValue } }
-    }
-    func setResponses(_ values: [String: Data]) { lock.withLock { responses = values } }
-    var network: CatalogNetwork {
-        CatalogNetwork { [self] url, _ in
-            try lock.withLock {
-                requests.append(url)
-                let path = url.host == "raw.githubusercontent.com"
-                    ? "/" + url.path.split(separator: "/").dropFirst(3).joined(separator: "/")
-                    : url.path.replacingOccurrences(of: "/repos/hbmartin/HolodeckShaders", with: "")
-                guard let response = responses[path] else { throw CatalogError.invalidResponse }
-                return response
-            }
-        }
-    }
-    var storage: CatalogStorage {
-        CatalogStorage(read: { [self] name in lock.withLock {
-            reads.append(name)
-            readOnMain = readOnMain || Thread.isMainThread
-            return stored[name]
-        } }, write: { [self] name, data in
-            try lock.withLock {
-                if failing { throw CatalogError.invalidResponse }
-                stored[name] = data
-                writes.append(name)
-            }
-        })
     }
 }
 

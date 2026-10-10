@@ -246,7 +246,7 @@ public actor CatalogService {
     }
 
     private func recordPreviewFailure(_ error: Error, preview: ShaderPreview) {
-        guard !(error is CancellationError), (error as? URLError)?.code != .cancelled else { return }
+        guard !CatalogError.isCancellation(error) else { return }
         let key = PreviewFailureKey(preview)
         let attempts = min((previewFailures.value(for: key)?.attempts ?? 0) + 1, 5)
         let permanent: Bool

@@ -33,12 +33,14 @@ nonisolated public struct UITestConfiguration: Sendable {
         guard hasExplicitStorageSuite, !contains("--ui-test-cleanup-storage-suite"), let storageSuite else { return nil }
         return factory(storageSuite)
     }
+    /// Platform fixture setup invokes cleanup before creating preferences or services.
+    public func cleanupStorageSuite() {
+        guard contains("--ui-test-cleanup-storage-suite"), hasExplicitStorageSuite, let storageSuite else { return }
+        UserDefaults.standard.removePersistentDomain(forName: storageSuite)
+        if let directory = fixtureCacheDirectory { try? FileManager.default.removeItem(at: directory) }
+    }
     public func makeCatalogService() -> CatalogService {
-        if contains("--ui-test-cleanup-storage-suite") {
-            if hasExplicitStorageSuite, let storageSuite { UserDefaults.standard.removePersistentDomain(forName: storageSuite) }
-            if let directory = fixtureCacheDirectory { try? FileManager.default.removeItem(at: directory) }
-            return .offline()
-        }
+        if contains("--ui-test-cleanup-storage-suite") { return .offline() }
         if contains("--ui-test-disk-cache"), let catalog, let directory = fixtureCacheDirectory {
             let storage = CatalogStorage.disk(at: directory)
             if let data = try? JSONEncoder().encode(catalog.snapshot) { try? storage.write("snapshot.json", data) }

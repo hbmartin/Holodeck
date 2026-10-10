@@ -44,6 +44,10 @@ final class LibraryAndQualityTests: XCTestCase {
             environment: ["HOLODECK_UI_TEST_CATALOG": fixture], applicationID: "tests")
         let empty = cleanup.makeCatalogService()
         XCTAssertNil(cleanup.makeUserDefaults())
+        XCTAssertEqual(defaults.string(forKey: "holodeck.lastShaderID"), "waves", "Factories must not delete fixture storage")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
+        cleanup.cleanupStorageSuite()
+        cleanup.cleanupStorageSuite() // Repeated cleanup remains safe.
         XCTAssertNil(defaults.string(forKey: "holodeck.lastShaderID"))
         let session = ViewerSession(catalogService: empty, preferences: .inMemory(), policy: .mac)
         await session.refresh().value

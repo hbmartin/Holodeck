@@ -147,10 +147,8 @@ final class ShaderCardCell: UICollectionViewCell {
                         self.displayedPixels = pixels
                         self.previewImageView.image = UIImage(cgImage: image)
                         return
-                    } catch is CancellationError {
-                        throw CancellationError()
                     } catch {
-                        if (error as? URLError)?.code == .cancelled { throw CancellationError() }
+                        if CatalogError.isCancellation(error) { throw CancellationError() }
                         guard try await catalogService.waitForPreviewRetry(preview) else {
                             guard let self, self.requestID == id else { return }
                             self.failedPreview = preview
@@ -162,7 +160,7 @@ final class ShaderCardCell: UICollectionViewCell {
             } catch {
                 guard let self, self.requestID == id else { return }
                 self.previewTask = nil
-                if !(error is CancellationError), !Task.isCancelled { self.failedPreview = preview }
+                if !CatalogError.isCancellation(error), !Task.isCancelled { self.failedPreview = preview }
             }
         }
     }

@@ -6,7 +6,7 @@ extension CatalogTests {
         for date in ["2026-10-09T17:04:08Z", "2026-10-09T17:04:08.000Z",
                      "2026-10-09T17:04:08.123456+01:00", "2026-10-09T17:04:08-07:00",
                      "2026-10-09T17:04:08+0100", "2026-10-09T17:04:08+01", "2026-10-09T17:04:08z"] {
-            var value = candidate()
+            var value = CatalogTestFixtures.candidate()
             value.manifest.shaders[0].updatedAt = date
             let catalog = try value.validated()
             XCTAssertEqual(catalog.shaders[0].updatedAt, CatalogManifest.date(date))
@@ -19,12 +19,12 @@ extension CatalogTests {
     }
 
     func testBOMDownloadPreservesBytesThroughDiskRoundTrip() async throws {
-        var expected = candidate()
+        var expected = CatalogTestFixtures.candidate()
         let bytes = Data([0xef, 0xbb, 0xbf]) + Data(expected.sources["plasma"]!.utf8)
         expected.sources["plasma"] = String(validating: bytes, as: UTF8.self)!
         expected.manifest.shaders[0].sourceSHA256 = CatalogHash.sha256(bytes)
         let box = CatalogTestBox()
-        let service = try makeService(expected, box: box)
+        let service = try CatalogTestFixtures.makeService(expected, box: box)
         let downloaded = try await service.refresh()
         let result = try XCTUnwrap(downloaded)
         XCTAssertEqual(Data(result.shaders[0].source.utf8), bytes)
@@ -34,11 +34,11 @@ extension CatalogTests {
     }
 
     func testInvalidUTF8WithMatchingHashIsRejected() async throws {
-        var expected = candidate()
+        var expected = CatalogTestFixtures.candidate()
         let bytes = Data([0xff, 0xfe, 0x41])
         expected.manifest.shaders[0].sourceSHA256 = CatalogHash.sha256(bytes)
         let box = CatalogTestBox()
-        let service = try makeService(expected, box: box)
+        let service = try CatalogTestFixtures.makeService(expected, box: box)
         var responses = box.responseFiles
         responses["/sources/plasma.metal"] = bytes
         box.setResponses(responses)
@@ -61,7 +61,7 @@ extension CatalogTests {
     }
 
     func testFullSizeDiskCacheLoadsOffMainAndRejectsAggregateOverflow() async throws {
-        var expected = candidate()
+        var expected = CatalogTestFixtures.candidate()
         let original = expected.manifest.shaders[0]
         let bytes = Data(repeating: 0x20, count: 1_048_576)
         let source = String(validating: bytes, as: UTF8.self)!
@@ -96,7 +96,7 @@ extension CatalogTests {
     }
 
     func testLargeCatalogUsesOnlyOneAPIRequestAndPreviewsAreIndependent() async throws {
-        var expected = candidate()
+        var expected = CatalogTestFixtures.candidate()
         let original = expected.manifest.shaders[0]
         for number in 0..<64 {
             var entry = original
@@ -107,7 +107,7 @@ extension CatalogTests {
             expected.sources[entry.id] = expected.sources[original.id]
         }
         let box = CatalogTestBox()
-        let service = try makeService(expected, box: box)
+        let service = try CatalogTestFixtures.makeService(expected, box: box)
         let downloaded = try await service.refresh()
         let result = try XCTUnwrap(downloaded)
         XCTAssertEqual(result.shaders.count, 72)

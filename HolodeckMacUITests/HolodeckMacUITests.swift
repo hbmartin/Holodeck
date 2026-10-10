@@ -1,22 +1,22 @@
 import AppKit
-import Darwin
 import XCTest
 
 @MainActor
 final class HolodeckMacUITests: XCTestCase {
+    private var cleanups: [ObjectIdentifier: StorageSuiteCleanup] = [:]
     nonisolated override func setUpWithError() throws { continueAfterFailure = false }
 
-    private func app(suite: String = "HolodeckMacUITests-" + UUID().uuidString, arguments: [String] = [], discovery: Bool = false) throws -> XCUIApplication {
+    private func app(suite: String? = "HolodeckMacUITests-" + UUID().uuidString, arguments: [String] = [], discovery: Bool = false) throws -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchArguments = ["--ui-test-storage-suite", suite] + arguments
+        app.launchArguments = (suite.map { ["--ui-test-storage-suite", $0] } ?? []) + arguments
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: discovery ? "DiscoveryFixture" : "CatalogFixture", withExtension: "json", subdirectory: "TestSupport"))
         app.launchEnvironment["HOLODECK_UI_TEST_CATALOG"] = try String(contentsOf: url, encoding: .utf8)
-        addTeardownBlock { @MainActor in
-            app.terminate()
-            app.launchEnvironment.removeAll()
-            app.launchArguments = ["--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite"]
-            app.launch()
-            app.terminate()
+        if let suite {
+            let cleanup = StorageSuiteCleanup(app: app, suite: suite)
+            cleanups[ObjectIdentifier(app)] = cleanup
+            addTeardownBlock { @MainActor in app.terminate(); cleanup.run() }
+        } else {
+            addTeardownBlock { @MainActor in app.terminate() }
         }
         return app
     }
@@ -35,9 +35,20 @@ final class HolodeckMacUITests: XCTestCase {
         XCTAssertTrue(window.buttons[XCUIIdentifierMinimizeWindow].waitForExistence(timeout: 15))
     }
     private func exitFullScreen(in app: XCUIApplication) {
+        let window = app.windows["holodeck-viewer-window"]
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0)).withOffset(CGVector(dx: 0, dy: 1)).hover()
+        openViewMenu(in: app)
         let exit = app.menuItems["Exit Full Screen"]
-        XCTAssertTrue(exit.waitForExistence(timeout: 5))
-        exit.click()
+        XCTAssertTrue(exit.waitForExistence(timeout: 15))
+        // The menu is already open. A coordinate click avoids XCTest reopening the
+        // ancestor menu, which can hide it during a fullscreen transition.
+        exit.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
+        XCTAssertTrue(window.buttons[XCUIIdentifierMinimizeWindow].waitForExistence(timeout: 15))
+    }
+    private func openViewMenu(in app: XCUIApplication) {
+        let view = app.menuBars.menuBarItems["View"]
+        XCTAssertTrue(view.waitForExistence(timeout: 15))
+        view.click()
     }
     private func waitForTitle(_ title: String, in app: XCUIApplication) {
         let label = element("active-scene-title", in: app)
@@ -185,9 +196,10 @@ final class HolodeckMacUITests: XCTestCase {
         launch(app)
         waitForTitle("Plasma", in: app)
         let window = app.windows.firstMatch
-        // XCTest opens the ancestor menu when clicking a native menu item.
-        app.menuItems["Enter Full Screen"].click()
-        XCTAssertTrue(app.menuItems["Exit Full Screen"].waitForExistence(timeout: 5))
+        openViewMenu(in: app)
+        let enter = app.menuItems["Enter Full Screen"]
+        XCTAssertTrue(enter.waitForExistence(timeout: 15))
+        enter.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
         XCTAssertTrue(window.buttons[XCUIIdentifierMinimizeWindow].waitForNonExistence(timeout: 15))
         XCTAssertTrue(element("scene-search", in: app).exists)
         waitForTitle("Plasma", in: app)
@@ -246,6 +258,40 @@ final class HolodeckMacUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Metal rendering is unavailable on this device."].exists)
     }
 
+    func testReactivationRecoveryClosesPendingCatalogSheet() async throws {
+        let app = try app(arguments: ["--ui-test-metal-unavailable", "--ui-test-download-catalog", "--ui-test-fail-catalog-once"])
+        app.launch()
+        XCTAssertTrue(app.staticTexts["Renderer Unavailable"].waitForExistence(timeout: 10))
+        app.windows.firstMatch.buttons["OK"].click()
+        let failure = app.staticTexts["Unable to Load Scenes"]
+        XCTAssertTrue(failure.waitForExistence(timeout: 10))
+        app.typeKey("h", modifierFlags: .command)
+        try await reopen(app)
+        XCTAssertTrue(element("shader-aurora", in: app).waitForExistence(timeout: 10))
+        XCTAssertTrue(failure.waitForNonExistence(timeout: 10))
+        XCTAssertEqual(app.windows.firstMatch.sheets.count, 0)
+        let search = element("scene-search", in: app)
+        XCTAssertTrue(search.isHittable)
+        search.click()
+        search.typeText("aurora")
+        XCTAssertFalse(element("shader-plasma", in: app).exists)
+        XCTAssertTrue(app.staticTexts["Metal rendering is unavailable on this device."].exists)
+    }
+
+    func testRendererAlertSupportsEscapeAndReturn() throws {
+        for key in [XCUIKeyboardKey.escape, .return] {
+            let app = try app(arguments: ["--ui-test-metal-unavailable"])
+            app.launch()
+            let failure = app.staticTexts["Renderer Unavailable"]
+            XCTAssertTrue(failure.waitForExistence(timeout: 10))
+            app.windows.firstMatch.sheets.firstMatch.typeKey(key, modifierFlags: [])
+            XCTAssertTrue(failure.waitForNonExistence(timeout: 10))
+            XCTAssertEqual(app.windows.firstMatch.sheets.count, 0)
+            XCTAssertTrue(app.staticTexts["Metal rendering is unavailable on this device."].exists)
+            app.terminate()
+        }
+    }
+
     func testStaleAlertActionsCannotDismissNewerFailures() throws {
         for action in ["OK", "Retry"] {
             let app = try app(arguments: ["--ui-test-empty-cache", "--ui-test-replace-presented-failure"])
@@ -269,7 +315,7 @@ final class HolodeckMacUITests: XCTestCase {
     func testNamedWindowFramePersistsAndCleanupCannotRecreateIt() throws {
         let suite = "HolodeckMacUITests-" + UUID().uuidString
         let name = "HolodeckViewer-" + suite
-        let live = savedFrame("HolodeckViewer-live")
+        let live = savedFrame("HolodeckViewer-live", allowMissing: true)
         let app = try app(suite: suite)
         launch(app)
         waitForTitle("Plasma", in: app)
@@ -277,7 +323,7 @@ final class HolodeckMacUITests: XCTestCase {
         let resized = app.windows["holodeck-viewer-window"].frame.size
         // Termination flushes AppKit's autosaved preferences before reading their disk copy.
         app.terminate()
-        let saved = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in savedFrame(name) != nil }, object: nil)
+        let saved = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in savedFrame(name, allowMissing: true) != nil }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [saved], timeout: 10), .completed)
         let frame = try XCTUnwrap(savedFrame(name))
         launch(app)
@@ -285,23 +331,30 @@ final class HolodeckMacUITests: XCTestCase {
         XCTAssertEqual(app.windows["holodeck-viewer-window"].frame.height, resized.height, accuracy: 1)
         XCTAssertEqual(savedFrame(name), frame)
         app.terminate()
-        app.launchEnvironment.removeAll()
-        app.launchArguments = ["--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite"]
-        app.launch()
-        XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 10))
-        let removed = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in savedFrame(name) == nil }, object: nil)
-        XCTAssertEqual(XCTWaiter.wait(for: [removed], timeout: 10), .completed)
-        XCTAssertNil(savedFrame(name))
-        app.terminate()
-        XCTAssertNil(savedFrame(name), "Cleanup must not save another frame while terminating")
-        XCTAssertEqual(savedFrame("HolodeckViewer-live"), live)
+        let cleanup = try XCTUnwrap(cleanups[ObjectIdentifier(app)])
+        cleanup.run {
+            let removed = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in savedFrame(name, allowMissing: true) == nil }, object: nil)
+            XCTAssertEqual(XCTWaiter.wait(for: [removed], timeout: 10), .completed)
+            XCTAssertNil(savedFrame(name, allowMissing: true))
+        }
+        XCTAssertNil(savedFrame(name, allowMissing: true), "Cleanup must not save another frame while terminating")
+        XCTAssertEqual(savedFrame("HolodeckViewer-live", allowMissing: true), live)
     }
 
     func testImplicitFixtureDoesNotSaveWindowFrame() throws {
+        let controlSuite = "HolodeckMacUITests-" + UUID().uuidString
+        let controlName = "HolodeckViewer-" + controlSuite
+        let control = try app(suite: controlSuite)
+        launch(control)
+        waitForTitle("Plasma", in: control)
+        resizeWindow(in: control)
+        control.terminate()
+        let saved = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in savedFrame(controlName, allowMissing: true) != nil }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [saved], timeout: 10), .completed)
+        XCTAssertNotNil(savedFrame(controlName), "The reader must observe a frame written by this test build")
         let before = savedViewerFrameNames()
         let live = savedFrame("HolodeckViewer-live")
-        let app = try app()
-        app.launchArguments = [] // The fixture environment alone selects implicit in-memory storage.
+        let app = try app(suite: nil) // The fixture environment alone selects implicit in-memory storage.
         launch(app)
         waitForTitle("Plasma", in: app)
         resizeWindow(in: app)
@@ -309,33 +362,37 @@ final class HolodeckMacUITests: XCTestCase {
         // Earlier cleanup writes may still be flushing; only new frames indicate a leak.
         XCTAssertTrue(savedViewerFrameNames().subtracting(before).isEmpty)
         XCTAssertEqual(savedFrame("HolodeckViewer-live"), live)
+        XCTAssertNotNil(savedFrame(controlName))
     }
 
-    private func savedFrame(_ name: String) -> String? {
-        savedAppDefaults()["NSWindow Frame " + name] as? String
+    func testPreferencesReaderRejectsMissingAndMalformedFiles() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        XCTAssertThrowsError(try AppPreferencesReader.read(at: directory, allowMissing: true))
+        let url = directory.appendingPathComponent("preferences.plist")
+        XCTAssertThrowsError(try AppPreferencesReader.read(at: url))
+        XCTAssertTrue(try AppPreferencesReader.read(at: url, allowMissing: true).isEmpty)
+        try Data("invalid plist".utf8).write(to: url)
+        XCTAssertThrowsError(try AppPreferencesReader.read(at: url, allowMissing: true))
+        try PropertyListSerialization.data(fromPropertyList: ["unexpected root"], format: .binary, options: 0).write(to: url)
+        XCTAssertThrowsError(try AppPreferencesReader.read(at: url))
+    }
+
+    private func savedFrame(_ name: String, allowMissing: Bool = false) -> String? {
+        savedAppDefaults(allowMissing: allowMissing)["NSWindow Frame " + name] as? String
     }
 
     private func savedViewerFrameNames() -> Set<String> {
         Set(savedAppDefaults().keys.filter { $0.hasPrefix("NSWindow Frame HolodeckViewer-") })
     }
 
-    private func savedAppDefaults() -> [String: Any] {
-        // The app is sandboxed; the unsandboxed UI runner's CFPreferences domain is separate.
-        let path = "Library/Containers/me.haroldmartin.HolodeckMac/Data/Library/Preferences/me.haroldmartin.HolodeckMac.plist"
-        // Xcode overrides the runner's home directory with its own test container.
-        guard let directory = getpwuid(getuid())?.pointee.pw_dir else {
-            XCTFail("Unable to locate the current user's home directory")
+    private func savedAppDefaults(allowMissing: Bool = false) -> [String: Any] {
+        do { return try AppPreferencesReader.read(at: AppPreferencesReader.appURL(), allowMissing: allowMissing) }
+        catch {
+            XCTFail("Unable to read viewer preferences: \(error)")
             return [:]
         }
-        let url = URL(fileURLWithPath: String(cString: directory), isDirectory: true).appendingPathComponent(path)
-        // A fresh machine may not have an app preference file yet.
-        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
-        guard let data = try? Data(contentsOf: url),
-              let values = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
-            XCTFail("Unable to read viewer preferences at \(url.path)")
-            return [:]
-        }
-        return values
     }
 
     private func resizeWindow(in app: XCUIApplication) {
@@ -376,5 +433,26 @@ final class HolodeckMacUITests: XCTestCase {
         element("reset-filters", in: app).click()
         XCTAssertTrue(element("shader-plasma", in: app).waitForExistence(timeout: 5))
         XCTAssertTrue(element("active-scene-discovery", in: app).exists)
+    }
+}
+
+@MainActor
+private final class StorageSuiteCleanup {
+    private let app: XCUIApplication
+    private let suite: String
+    private var completed = false
+
+    init(app: XCUIApplication, suite: String) { self.app = app; self.suite = suite }
+
+    func run(verify: () -> Void = {}) {
+        guard !completed else { return }
+        app.terminate()
+        app.launchEnvironment.removeAll()
+        app.launchArguments = ["--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite"]
+        app.launch()
+        XCTAssertTrue(app.windows["holodeck-viewer-window"].waitForExistence(timeout: 15))
+        verify()
+        app.terminate()
+        completed = true
     }
 }
