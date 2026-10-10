@@ -19,9 +19,6 @@ struct HolodeckMacApp: App {
                 Button("Search Scenes") { model.focusSearch() }
                     .keyboardShortcut("f", modifiers: .command)
             }
-            CommandGroup(before: .windowList) {
-                Button("Holodeck") { MacAppDelegate.viewerWindow?.makeKeyAndOrderFront(nil) }
-            }
             CommandGroup(after: .appInfo) {
                 Button("Check for Scene Updates") { model.session.refresh(force: true) }
                     .disabled(model.session.isRefreshing)
@@ -35,7 +32,11 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
     static var viewerWindow: NSWindow?
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag { Self.viewerWindow?.makeKeyAndOrderFront(nil) }
+        if !flag, let window = Self.viewerWindow {
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
+            return false
+        }
         return true
     }
 }

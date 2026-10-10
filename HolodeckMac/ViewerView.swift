@@ -6,9 +6,12 @@ struct ViewerView: View {
     @Bindable var model: MacModel
     private enum FocusTarget: Hashable { case search, library }
     @FocusState private var focus: FocusTarget?
+    @State private var consumedSearchRequest = 0
 
     var body: some View {
         @Bindable var session = model.session
+        let displayedFailure = session.failure
+        let displayedStartupError = model.startupError
         HStack(spacing: 0) {
             if model.sidebarVisible {
                 sidebar.frame(width: 280)
@@ -24,7 +27,7 @@ struct ViewerView: View {
                         if session.activeShader == nil {
                             VStack(spacing: 12) {
                                 if session.pendingSelection != nil || session.isRefreshing { ProgressView().tint(.white) }
-                                Text(session.pendingSelection.map { "Loading \($0.shader.title)…" } ??
+                                Text(model.rendererUnavailableReason ?? session.pendingSelection.map { "Loading \($0.shader.title)…" } ??
                                      (session.isRefreshing ? "Downloading scenes…" : "Choose a scene to begin"))
                                     .foregroundStyle(.white)
                             }
@@ -56,6 +59,16 @@ struct ViewerView: View {
                     HStack { ProgressView().controlSize(.small); Text("Loading \(pending.shader.title)…"); Spacer() }
                         .padding(.horizontal, 20).padding(.bottom, 12)
                 }
+                if let updateFailure = session.catalogUpdateFailure {
+                    HStack {
+                        Image(systemName: "exclamationmark.circle")
+                        Text(updateFailure.message).accessibilityIdentifier("catalog-update-notice")
+                        Spacer()
+                        Button("Retry") { session.retry(updateFailure) }
+                            .accessibilityIdentifier("retry-scene-updates").disabled(session.isRefreshing)
+                    }
+                    .font(.callout).padding(12).background(.quaternary)
+                }
             }
         }
         .background(WindowBridge(model: model).frame(width: 0, height: 0))
@@ -72,14 +85,19 @@ struct ViewerView: View {
         }
         .alert(model.startupError != nil ? "Renderer Unavailable" : "Unable to Load Scenes",
                isPresented: Binding(get: { session.failure != nil || model.startupError != nil }, set: {
-                   if !$0 { session.failure = nil; model.startupError = nil }
+                   if !$0 {
+                       if let displayedFailure { session.dismissFailure(id: displayedFailure.id) }
+                       if model.startupError == displayedStartupError { model.startupError = nil }
+                   }
                })) {
-            if let failure = session.failure {
+            if let failure = displayedFailure {
                 Button("Retry") { session.retry(failure) }
             }
-            Button("OK", role: .cancel) { session.failure = nil; model.startupError = nil }
-        } message: { Text(model.startupError ?? session.failure?.message ?? "") }
-        .onChange(of: model.searchFocusRequest) { focus = .search }
+            Button("OK", role: .cancel) {
+                if let displayedFailure { session.dismissFailure(id: displayedFailure.id) }
+                if model.startupError == displayedStartupError { model.startupError = nil }
+            }
+        } message: { Text(displayedStartupError ?? displayedFailure?.message ?? "") }
         .onChange(of: session.catalog?.publicationRevision) { model.reconcileFilters() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.updateActivity(appActive: true) }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willResignActiveNotification)) { _ in model.updateActivity(appActive: false) }
@@ -96,6 +114,14 @@ struct ViewerView: View {
             TextField("Search scenes", text: $model.query)
                 .textFieldStyle(.roundedBorder).focused($focus, equals: .search)
                 .accessibilityIdentifier("scene-search").padding(12)
+                .task(id: model.searchFocusRequest) {
+                    let request = model.searchFocusRequest
+                    guard request > consumedSearchRequest else { return }
+                    await Task.yield()
+                    guard !Task.isCancelled else { return }
+                    consumedSearchRequest = request
+                    focus = .search
+                }
             VStack(spacing: 8) {
                 Picker("Collection", selection: $model.collectionID) {
                     Text("All").tag("all")
@@ -125,8 +151,8 @@ struct ViewerView: View {
                     .frame(maxHeight: .infinity)
             } else {
                 List(selection: Binding(get: { model.selectedID }, set: {
+                    if let id = $0, id != model.selectedID { focus = .library }
                     model.select($0)
-                    focus = .library
                 })) {
                     ForEach(model.filteredScenes) { shader in
                         HStack(spacing: 10) {
@@ -150,6 +176,7 @@ struct ViewerView: View {
                     }
                 }
                 .listStyle(.sidebar).focused($focus, equals: .library).accessibilityIdentifier("scene-list")
+                .disabled(model.renderer == nil)
             }
         }
     }

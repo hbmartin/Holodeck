@@ -48,7 +48,9 @@ public actor CatalogService {
     private let clock: AnyClock<Duration>
     private let enabled: Bool
     private var lastAttempt: AnyClock<Duration>.Instant?
-    private var refreshTask: Task<ValidatedCatalog?, Error>?
+    private var refreshTask: Task<Void, Never>?
+    private var refreshWaiters: [UUID: CatalogRefreshWaiter] = [:]
+    var refreshWaiterCount: Int { refreshWaiters.count }
     private let repository: String
 
     private var previewData = CatalogLRU<String, Data>(limit: 16_777_216)
@@ -86,16 +88,44 @@ public actor CatalogService {
 
     @discardableResult
     public func refresh(force: Bool = false) async throws -> ValidatedCatalog? {
+        try Task.checkCancellation()
         _ = current()
         guard enabled else { return nil }
-        if let refreshTask { return try await refreshTask.value }
-        let instant = clock.now
-        if !force, snapshot != nil, let lastAttempt, lastAttempt.duration(to: instant) < .seconds(900) { return nil }
-        lastAttempt = instant
-        let task = Task { try await downloadPublication() }
-        refreshTask = task
-        defer { refreshTask = nil }
-        return try await task.value
+        if refreshTask == nil {
+            let instant = clock.now
+            if !force, snapshot != nil, let lastAttempt, lastAttempt.duration(to: instant) < .seconds(900) { return nil }
+            lastAttempt = instant
+            // The service owns this flight, including persistence after its last viewer leaves.
+            refreshTask = Task {
+                let result: Result<ValidatedCatalog?, Error>
+                do { result = .success(try await downloadPublication()) }
+                catch {
+                    Diagnostics.catalog.error("Catalog refresh failed: \(error.localizedDescription, privacy: .public)")
+                    result = .failure(error)
+                }
+                finishRefresh(result)
+            }
+        }
+        let id = UUID()
+        let waiter = CatalogRefreshWaiter()
+        refreshWaiters[id] = waiter
+        let value = try await withTaskCancellationHandler {
+            try await waiter.value()
+        } onCancel: {
+            waiter.resolve(.failure(CancellationError()))
+            Task { await self.removeRefreshWaiter(id) }
+        }
+        try Task.checkCancellation()
+        return value
+    }
+
+    private func removeRefreshWaiter(_ id: UUID) { refreshWaiters[id] = nil }
+
+    private func finishRefresh(_ result: Result<ValidatedCatalog?, Error>) {
+        refreshTask = nil
+        let waiters = Array(refreshWaiters.values)
+        refreshWaiters.removeAll()
+        waiters.forEach { $0.resolve(result) }
     }
 
     private func downloadPublication() async throws -> ValidatedCatalog? {
@@ -114,7 +144,6 @@ public actor CatalogService {
             try builder.addSource(data, for: entry)
         }
         let candidate = try builder.finish(revision: revision)
-        try Task.checkCancellation()
         try storage.write("snapshot.json", JSONEncoder().encode(candidate.snapshot))
         snapshot = candidate
         return candidate
@@ -181,6 +210,34 @@ public actor CatalogService {
 
     private func assetURL(_ path: String, revision: String) -> URL {
         URL(string: "https://raw.githubusercontent.com/\(repository)/\(revision)/\(path)")!
+    }
+}
+
+/// Completion and cancellation may race, including before continuation registration.
+nonisolated private final class CatalogRefreshWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<ValidatedCatalog?, Error>?
+    private var continuation: CheckedContinuation<ValidatedCatalog?, Error>?
+
+    func value() async throws -> ValidatedCatalog? {
+        try await withCheckedThrowingContinuation { continuation in
+            let result: Result<ValidatedCatalog?, Error>? = lock.withLock {
+                if let result { return result }
+                self.continuation = continuation
+                return nil
+            }
+            if let result { continuation.resume(with: result) }
+        }
+    }
+
+    func resolve(_ result: Result<ValidatedCatalog?, Error>) {
+        let continuation = lock.withLock {
+            guard self.result == nil else { return Optional<CheckedContinuation<ValidatedCatalog?, Error>>.none }
+            self.result = result
+            defer { self.continuation = nil }
+            return self.continuation
+        }
+        continuation?.resume(with: result)
     }
 }
 

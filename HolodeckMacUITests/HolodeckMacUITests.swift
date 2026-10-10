@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 
 @MainActor
@@ -14,6 +15,15 @@ final class HolodeckMacUITests: XCTestCase {
     private func element(_ id: String, in app: XCUIApplication) -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: id).firstMatch
     }
+    private func launch(_ app: XCUIApplication) {
+        app.launch()
+        // AppKit restoration is separate from the isolated scene-preferences suite.
+        app.menuBars.menuBarItems["View"].click()
+        let exit = app.menuItems["Exit Full Screen"]
+        if exit.exists { exit.click() }
+        else { app.typeKey(.escape, modifierFlags: []) }
+        XCTAssertTrue(app.windows.firstMatch.buttons[XCUIIdentifierMinimizeWindow].waitForExistence(timeout: 15))
+    }
     private func waitForTitle(_ title: String, in app: XCUIApplication) {
         let label = element("active-scene-title", in: app)
         XCTAssertTrue(label.waitForExistence(timeout: 15))
@@ -29,7 +39,7 @@ final class HolodeckMacUITests: XCTestCase {
 
     func testEverySceneAndArrowSelection() throws {
         let app = try app()
-        app.launch()
+        launch(app)
         waitForTitle("Plasma", in: app)
         select("aurora", title: "Aurora", in: app)
         app.typeKey(.downArrow, modifierFlags: [])
@@ -47,7 +57,7 @@ final class HolodeckMacUITests: XCTestCase {
     func testSearchFavoritesAndPersistenceDoNotInterruptPlayback() throws {
         let suite = "HolodeckMacUITests-" + UUID().uuidString
         let app = try app(suite: suite)
-        app.launch()
+        launch(app)
         waitForTitle("Plasma", in: app)
         element("toggle-favorite", in: app).click()
         let search = element("scene-search", in: app)
@@ -60,7 +70,7 @@ final class HolodeckMacUITests: XCTestCase {
         search.click(); search.typeKey("a", modifierFlags: .command); search.typeKey(.delete, modifierFlags: [])
         XCTAssertTrue(element("shader-plasma", in: app).waitForExistence(timeout: 5))
         XCTAssertFalse(element("shader-aurora", in: app).exists)
-        app.terminate(); app.launch()
+        app.terminate(); launch(app)
         waitForTitle("Plasma", in: app)
         XCTAssertEqual(element("toggle-favorite", in: app).label, "Remove from Favorites")
         element("favorites-filter", in: app).click()
@@ -69,37 +79,106 @@ final class HolodeckMacUITests: XCTestCase {
         waitForTitle("Plasma", in: app)
     }
 
-    func testSidebarRestorationDefaultStartupAndSingleWindowReopening() throws {
+    func testSidebarRestorationDefaultStartupAndSingleWindowReopening() async throws {
         let app = try app()
-        app.launch()
+        launch(app)
         waitForTitle("Plasma", in: app)
         select("aurora", title: "Aurora", in: app)
         element("refresh-scenes", in: app).click()
         waitForTitle("Aurora", in: app)
         element("toggle-sidebar", in: app).click()
         XCTAssertTrue(element("scene-search", in: app).waitForNonExistence(timeout: 5))
-        app.terminate(); app.launch()
+        app.terminate(); launch(app)
         waitForTitle("Plasma", in: app)
         XCTAssertFalse(element("scene-search", in: app).exists)
         element("toggle-sidebar", in: app).click()
         XCTAssertTrue(element("scene-search", in: app).waitForExistence(timeout: 5))
-        app.typeKey("f", modifierFlags: [.command, .control])
-        XCTAssertTrue(element("scene-search", in: app).exists)
-        app.typeKey("f", modifierFlags: [.command, .control])
+        app.typeKey("s", modifierFlags: [.command, .control])
+        XCTAssertTrue(element("scene-search", in: app).waitForNonExistence(timeout: 5))
+        app.typeKey("s", modifierFlags: [.command, .control])
+        XCTAssertTrue(element("scene-search", in: app).waitForExistence(timeout: 5))
         // Hide and reactivate the app; the Window scene must remain singular.
         app.typeKey("h", modifierFlags: .command)
-        app.activate()
+        try await reopen(app)
         XCTAssertEqual(app.windows.count, 1)
         waitForTitle("Plasma", in: app)
+        app.windows.firstMatch.buttons[XCUIIdentifierMinimizeWindow].click()
+        try await reopen(app)
+        XCTAssertTrue(element("toggle-sidebar", in: app).waitForExistence(timeout: 10))
+        XCTAssertTrue(element("toggle-sidebar", in: app).isHittable)
+        XCTAssertEqual(app.windows.count, 1)
         app.windows.firstMatch.buttons[XCUIIdentifierCloseWindow].click()
-        app.activate()
-        if app.windows.count == 0 {
-            app.menuBars.menuBarItems["Window"].click()
-            app.menuItems["Holodeck"].click()
-        }
+        try await reopen(app)
         XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 10))
         XCTAssertEqual(app.windows.count, 1)
         select("aurora", title: "Aurora", in: app)
+        app.menuBars.menuBarItems["Window"].click()
+        XCTAssertLessThanOrEqual(app.menuItems.matching(identifier: "Holodeck").count, 1)
+        app.typeKey(.escape, modifierFlags: [])
+    }
+
+    private func reopen(_ app: XCUIApplication) async throws {
+        let candidates = NSRunningApplication.runningApplications(withBundleIdentifier: "me.haroldmartin.HolodeckMac")
+        XCTAssertEqual(candidates.count, 1, "Only the test build may be running during native reopen checks")
+        let running = try XCTUnwrap(candidates.first)
+        let url = try XCTUnwrap(running.bundleURL)
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        let opened = expectation(description: "Dock-style reopen finishes")
+        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, error in
+            XCTAssertNil(error)
+            opened.fulfill()
+        }
+        await fulfillment(of: [opened], timeout: 10)
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+    }
+
+    func testCommandFRevealsSidebarAndFocusesInsertedSearch() throws {
+        let app = try app()
+        launch(app)
+        waitForTitle("Plasma", in: app)
+        for _ in 0..<2 {
+            element("toggle-sidebar", in: app).click()
+            XCTAssertTrue(element("scene-search", in: app).waitForNonExistence(timeout: 5))
+            app.typeKey("f", modifierFlags: .command)
+            let search = element("scene-search", in: app)
+            XCTAssertTrue(search.waitForExistence(timeout: 5))
+            app.typeText("REFLECTING")
+            XCTAssertTrue(element("shader-plasma", in: app).waitForNonExistence(timeout: 5))
+            XCTAssertTrue(element("shader-chrome", in: app).exists)
+            search.typeKey("a", modifierFlags: .command)
+            search.typeKey(.delete, modifierFlags: [])
+            XCTAssertTrue(element("shader-plasma", in: app).waitForExistence(timeout: 5))
+        }
+        waitForTitle("Plasma", in: app)
+    }
+
+    func testNativeFullScreenPreservesSidebarAndPlayback() throws {
+        let app = try app()
+        launch(app)
+        waitForTitle("Plasma", in: app)
+        let window = app.windows.firstMatch
+        app.menuBars.menuBarItems["View"].click()
+        app.menuItems["Enter Full Screen"].click()
+        app.menuBars.menuBarItems["View"].click()
+        XCTAssertTrue(app.menuItems["Exit Full Screen"].waitForExistence(timeout: 5))
+        XCTAssertTrue(element("scene-search", in: app).exists)
+        waitForTitle("Plasma", in: app)
+        app.menuItems["Exit Full Screen"].click()
+        XCTAssertTrue(window.buttons[XCUIIdentifierMinimizeWindow].waitForExistence(timeout: 15))
+        XCTAssertTrue(element("scene-search", in: app).exists)
+    }
+
+    func testCachedUpdateFailureIsInlineAndRetryRecovers() throws {
+        let app = try app(arguments: ["--ui-test-fail-refresh"])
+        launch(app)
+        waitForTitle("Plasma", in: app)
+        let notice = element("catalog-update-notice", in: app)
+        XCTAssertTrue(notice.waitForExistence(timeout: 10))
+        XCTAssertFalse(app.windows.firstMatch.buttons["OK"].exists)
+        element("retry-scene-updates", in: app).click()
+        XCTAssertTrue(notice.waitForNonExistence(timeout: 10))
+        waitForTitle("Plasma", in: app)
     }
 
     func testDownloadFailureCanRetryAndRendererFailureAlerts() throws {
@@ -117,11 +196,14 @@ final class HolodeckMacUITests: XCTestCase {
         XCTAssertTrue(unavailable.windows.firstMatch.buttons["OK"].firstMatch.waitForExistence(timeout: 10))
         XCTAssertTrue(unavailable.staticTexts["Renderer Unavailable"].exists)
         unavailable.windows.firstMatch.buttons["OK"].firstMatch.click()
+        XCTAssertTrue(unavailable.staticTexts["Metal rendering is unavailable on this device."].exists)
+        XCTAssertFalse(element("shader-aurora", in: unavailable).isEnabled)
+        XCTAssertFalse(unavailable.staticTexts["Loading…"].exists)
     }
 
     func testDiscoveryFiltersSearchAndResetPreservePlayback() throws {
         let app = try app(discovery: true)
-        app.launch()
+        launch(app)
         waitForTitle("Plasma", in: app)
         element("collection-filter", in: app).click()
         app.menuItems["Atmospheric"].click()

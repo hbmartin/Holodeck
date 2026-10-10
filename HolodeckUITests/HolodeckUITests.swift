@@ -390,4 +390,53 @@ final class HolodeckUITests: XCTestCase {
         remote.press(.menu)
         XCTAssertTrue(app.otherElements["shader-picker"].waitForNonExistence(timeout: 5))
     }
+
+    func testRefreshDoesNotRestoreAnOldFilterButtonFocus() {
+        let app = isolatedApp(discovery: true)
+        app.launchArguments.append("--ui-test-refresh-catalog")
+        app.launch()
+        XCTAssertTrue(app.staticTexts["Press Select to choose a shader"].waitForExistence(timeout: 15))
+        openPicker(in: app)
+        remote.press(.up)
+        let collection = app.buttons["collection-filter"]
+        waitForFocus(collection)
+        remote.press(.select)
+        XCTAssertTrue(app.alerts.firstMatch.waitForExistence(timeout: 5))
+        // Select All again so the active card stays visible after the refresh.
+        remote.press(.select)
+        XCTAssertTrue(app.alerts.firstMatch.waitForNonExistence(timeout: 5))
+        waitForFocus(collection)
+        remote.press(.right)
+        let mood = app.buttons["mood-filter"]
+        waitForFocus(mood)
+        remote.press(.playPause)
+        waitForFocus(mood)
+        remote.press(.down)
+        waitForFocus(card("plasma", in: app))
+        remote.press(.playPause)
+        waitForFocus(card("plasma", in: app))
+        XCTAssertEqual(card("plasma", in: app).value as? String, "Now showing")
+    }
+
+    func testCachedUpdateFailureStaysInsidePickerAndRetryRecovers() {
+        let app = isolatedApp()
+        app.launchArguments.append("--ui-test-fail-refresh")
+        app.launch()
+        XCTAssertTrue(app.staticTexts["Press Select to choose a shader"].waitForExistence(timeout: 15))
+        XCTAssertFalse(app.otherElements["shader-picker"].exists)
+        openPicker(in: app)
+        let notice = app.staticTexts["catalog-update-notice"]
+        XCTAssertTrue(notice.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.alerts.firstMatch.exists)
+        remote.press(.up)
+        waitForFocus(app.buttons["collection-filter"])
+        remote.press(.right)
+        let retry = app.buttons["retry-scene-updates"]
+        waitForFocus(retry)
+        XCTAssertTrue(retry.isEnabled)
+        remote.press(.select)
+        XCTAssertTrue(notice.waitForNonExistence(timeout: 10))
+        waitForFocus(app.buttons["collection-filter"])
+        XCTAssertTrue(app.staticTexts["shader-status"].label.hasPrefix("Now showing Plasma"))
+    }
 }

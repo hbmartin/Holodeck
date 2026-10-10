@@ -233,7 +233,7 @@ final class ViewerSessionTests: XCTestCase {
             await settled(session)
             XCTAssertEqual(session.catalog?.publicationRevision, latest.publicationRevision)
             XCTAssertEqual(session.activeShader?.title, "Updated Scene")
-            if scenario == 2 { XCTAssertNotNil(session.failure) }
+            if scenario == 2 { XCTAssertNotNil(session.catalogUpdateFailure); XCTAssertNil(session.failure) }
         }
     }
 
@@ -287,7 +287,80 @@ final class ViewerSessionTests: XCTestCase {
         await settled(failing)
         XCTAssertEqual(failing.shaders.count, 8)
         XCTAssertEqual(failing.activeShader?.id, "plasma")
-        XCTAssertNotNil(failing.failure)
+        XCTAssertNil(failing.failure)
+        XCTAssertNotNil(failing.catalogUpdateFailure)
+    }
+
+    func testSelectionWithoutRendererHasNoSideEffects() async {
+        let session = ViewerSession(catalogService: .offline(initialCatalog: TestCatalog.catalog), preferences: .inMemory(), policy: .mac)
+        let failure = ViewerSession.Failure(message: "Existing error", operation: .catalog)
+        session.failure = failure
+        var events = 0
+        session.onEvent = { _ in events += 1 }
+        await session.select(TestCatalog.initialShader).value
+        XCTAssertNil(session.pendingSelection)
+        XCTAssertNil(session.selectionTask)
+        XCTAssertEqual(session.failure?.id, failure.id)
+        XCTAssertEqual(events, 0)
+        let renderer = FakeRenderer()
+        session.attach(renderer)
+        await settled(session)
+        XCTAssertEqual(session.activeShader?.id, "plasma")
+    }
+
+    func testUserFailureSurvivesRefreshAndAutomaticSourceReplacement() async throws {
+        for automaticFailure in [false, true] {
+            let (session, renderer, _) = session()
+            await settled(session)
+            renderer.failNext = true
+            await session.select(TestCatalog.shaders[1]).value
+            let failure = try XCTUnwrap(session.failure)
+            await session.refresh().value
+            XCTAssertEqual(session.failure?.id, failure.id)
+            renderer.failNext = automaticFailure
+            session.applyCatalog(try changed().validated())
+            await settled(session)
+            XCTAssertEqual(session.failure?.id, failure.id)
+            XCTAssertNil(session.pendingSelection)
+            XCTAssertNotNil(session.activeShader)
+        }
+    }
+
+    func testStaleDismissalAndRetryDoNotReplaceNewFailure() async throws {
+        let (session, renderer, _) = session()
+        await settled(session)
+        renderer.failNext = true
+        await session.select(TestCatalog.shaders[1]).value
+        let old = try XCTUnwrap(session.failure)
+        renderer.failNext = true
+        await session.select(TestCatalog.shaders[2]).value
+        let current = try XCTUnwrap(session.failure)
+        session.dismissFailure(id: old.id)
+        session.retry(old)
+        XCTAssertEqual(session.failure?.id, current.id)
+        XCTAssertNil(session.pendingSelection)
+        session.dismissFailure(id: current.id)
+        XCTAssertNil(session.failure)
+    }
+
+    func testCachedUpdateRetryPreservesSelectionFailureAndClearsNotice() async throws {
+        let box = CatalogTestBox()
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, network: box.network, storage: .disabled)
+        let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
+        let renderer = FakeRenderer()
+        session.attach(renderer)
+        await settled(session)
+        XCTAssertNil(session.failure)
+        let notice = try XCTUnwrap(session.catalogUpdateFailure)
+        renderer.failNext = true
+        await session.select(TestCatalog.shaders[1]).value
+        let failure = try XCTUnwrap(session.failure)
+        box.setResponses(["/git/ref/heads/published": Data("{\"object\":{\"sha\":\"\(TestCatalog.catalog.publicationRevision)\"}}".utf8)])
+        session.retry(notice)
+        await settled(session)
+        XCTAssertNil(session.catalogUpdateFailure)
+        XCTAssertEqual(session.failure?.id, failure.id)
+        XCTAssertEqual(session.activeShader?.id, "plasma")
     }
 }
 

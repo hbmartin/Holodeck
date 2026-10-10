@@ -9,6 +9,7 @@ final class MacModel {
     let session: ViewerSession
     let favorites: SceneFavorites
     let defaults: UserDefaults
+    let windowAutosaveName: String
     var query = ""
     var favoritesOnly = false
     var collectionID = "all"
@@ -19,39 +20,30 @@ final class MacModel {
     }
     var searchFocusRequest = 0
     var startupError: String?
+    private(set) var rendererUnavailableReason: String?
     var sleeping = false
     private(set) var renderer: Renderer?
     @ObservationIgnored weak var window: NSWindow?
     @ObservationIgnored private let device: (any MTLDevice)?
     @ObservationIgnored private let compilerFactory: @Sendable (any MTLDevice, MTLPixelFormat) -> any ShaderCompiling
+    @ObservationIgnored private let filterCache = SceneFilterCache()
 
     init() {
-        let arguments = ProcessInfo.processInfo.arguments
+        var windowNamespace = "live"
         var defaults = UserDefaults.standard
         var service = CatalogService()
         var metalDevice = MTLCreateSystemDefaultDevice()
         #if DEBUG
-        if arguments.contains(where: { $0.hasPrefix("--ui-test-") }) || ProcessInfo.processInfo.environment["HOLODECK_UI_TEST_CATALOG"] != nil {
-            let suite: String
-            if let index = arguments.firstIndex(of: "--ui-test-storage-suite"), index + 1 < arguments.count {
-                suite = arguments[index + 1]
-            } else {
-                suite = "me.haroldmartin.Holodeck.mac-ui-tests." + UUID().uuidString
-            }
+        let configuration = UITestConfiguration(applicationID: "me.haroldmartin.HolodeckMac")
+        if let suite = configuration.storageSuite {
+            windowNamespace = suite
             defaults = UserDefaults(suiteName: suite)!
-            service = .offline()
-            if let json = ProcessInfo.processInfo.environment["HOLODECK_UI_TEST_CATALOG"],
-               let snapshot = try? JSONDecoder().decode(CatalogSnapshot.self, from: Data(json.utf8)),
-               let validated = try? snapshot.validated() {
-                service = .offline(initialCatalog: validated)
-            }
-            if arguments.contains("--ui-test-empty-cache") {
-                service = CatalogService(network: CatalogNetwork { _, _ in throw CatalogError.invalidResponse }, storage: .disabled)
-            }
-            if arguments.contains("--ui-test-metal-unavailable") { metalDevice = nil }
+            service = configuration.makeCatalogService()
+            if configuration.contains("--ui-test-metal-unavailable") { metalDevice = nil }
         }
         #endif
         self.defaults = defaults
+        windowAutosaveName = "HolodeckViewer-" + windowNamespace
         self.device = metalDevice
         compilerFactory = { ShaderCompiler(device: $0, pixelFormat: $1) }
         favorites = SceneFavorites(defaults: defaults)
@@ -60,13 +52,12 @@ final class MacModel {
     }
 
     var filteredScenes: [ShaderDefinition] {
-        SceneLibrary.filter(session.shaders, query: query, favoritesOnly: favoritesOnly, favorites: favorites.ids,
-                            collection: collections.first { $0.id == collectionID },
-                            mood: mood.isEmpty ? nil : mood, motion: motion.isEmpty ? nil : motion)
+        filterCache.filter(session.catalog, query: query, favoritesOnly: favoritesOnly, favorites: favorites.ids,
+                           collectionID: collectionID, mood: mood.isEmpty ? nil : mood, motion: motion.isEmpty ? nil : motion)
     }
     var collections: [CatalogCollection] { session.catalog?.collections ?? [] }
-    var moods: [String] { SceneLibrary.moods(session.shaders) }
-    var motions: [String] { SceneLibrary.motions(session.shaders) }
+    var moods: [String] { session.catalog?.moods ?? [] }
+    var motions: [String] { session.catalog?.motions ?? [] }
     var hasFilters: Bool { collectionID != "all" || !mood.isEmpty || !motion.isEmpty || !query.isEmpty || favoritesOnly }
     func resetFilters() { collectionID = "all"; mood = ""; motion = ""; query = ""; favoritesOnly = false }
     func reconcileFilters() {
@@ -93,10 +84,13 @@ final class MacModel {
             }
             renderer.configure(.mac)
             self.renderer = renderer
+            rendererUnavailableReason = nil
+            startupError = nil
             view.delegate = renderer
             session.attach(renderer)
             updateActivity()
         } catch {
+            rendererUnavailableReason = error.localizedDescription
             startupError = error.localizedDescription
         }
     }
@@ -109,7 +103,7 @@ final class MacModel {
         searchFocusRequest += 1
     }
     func select(_ id: String?) {
-        guard let id, let shader = session.shaders.first(where: { $0.id == id }) else { return }
+        guard renderer != nil, let id, let shader = session.shaders.first(where: { $0.id == id }) else { return }
         // Selecting the active scene again is an explicit restart/retry after a catalog update.
         if session.pendingSelection?.shader.id != id { session.select(shader) }
     }

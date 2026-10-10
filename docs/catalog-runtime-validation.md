@@ -39,3 +39,26 @@ xcodebuild -project Holodeck.xcodeproj -scheme HolodeckMac -destination 'platfor
 ```
 
 Run the shared-core scheme from `HolodeckCore/` for tvOS. Deployment targets remain macOS 15 and tvOS 26. Those minimum versions and a physical Apple TV were unavailable for this check.
+
+## Follow-up review fixes
+
+The follow-up preserves service-owned catalog downloads: callers cancel their own wait promptly, while a download with no remaining viewers can still publish its validated snapshot. Gated tests cover pre-cancellation, one cancelled waiter, all waiters leaving, a new waiter joining, viewer shutdown and twenty cancellation/completion races. Each successful flight writes one snapshot.
+
+Viewer state separates cached update notices from selection failures. Refreshes and automatic source replacements preserve user selection errors, and stale retry/dismissal actions cannot clear newer failures. Selecting without a renderer has no state or event side effects. The Mac retains a renderer-unavailable message after alert dismissal and disables scene selection. Compiler and catalog failures include context in unified logs.
+
+Malformed optional discovery is discarded per shader during decoding and programmatic validation, while core fields, collections and source hashes remain strict. Tests exercise missing motion, wrong types, count/length/empty-value failures, normalization/deduplication, unchanged source bytes, sanitized disk round trips and legacy compatibility.
+
+Both viewers use prepared discovery options and a shared filter cache keyed by publication and all filter inputs. The public filter tolerates duplicate shader IDs and builds a first-wins lookup only when a collection is supplied. An optimized 500-scene comparison over 1,000 repeated redraws took **1,131.09 ms** for repeated filtering and **19.45 ms** for cached results, with one computation. This comparison includes result-ID extraction and equality checks on both paths; it measures local repeated filtering rather than whole-app frame time.
+
+Mac checks cover hidden-sidebar Command-F twice, the Control-Command-S sidebar toggle, native fullscreen entry/exit, inline update retry, unavailable Metal, and single usable windows after hiding, minimizing and closing. Fullscreen tests use the native menu action instead of assuming an OS keyboard mapping or exact display bounds. TV checks cover chooser dismissal on user activation, startup preservation, selection errors after refresh, current-control/card focus after refresh, and inline retry without automatically opening the picker. The existing native chooser and authored All ordering remain in place.
+
+| Follow-up check | Result |
+| --- | --- |
+| Shared-core tests on macOS | 71 passed; four opt-in tests skipped |
+| Shared-core tests on tvOS 27 simulator | 71 passed; four opt-in tests skipped |
+| TV controller/card tests | 29 passed |
+| TV remote UI tests | 19 passed |
+| Mac UI test build | Passed, including the latest window-restoration helpers |
+| Mac UI tests | Final full-suite pass deferred at the user's request. Cached retry, hidden-sidebar Command-F, discovery filtering, renderer/download errors, and every-scene/arrow selection passed in the last partial run. Fullscreen, search/favorites persistence, and window reopening failed in that run. Window-restoration helpers were adjusted afterward; these three checks still need a UI run. |
+| Optimized download, preview and 500-scene filter comparisons | Three passed |
+| Mac and TV Release builds | Passed |

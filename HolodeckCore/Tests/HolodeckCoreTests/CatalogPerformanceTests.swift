@@ -12,6 +12,40 @@ final class CatalogPerformanceTests: XCTestCase {
         }
     }
 
+    func testRepeatedFilteringAtCatalogLimitUsesPreparedResults() throws {
+        try requireOptIn()
+        var snapshot = TestCatalog.snapshot
+        let template = snapshot.manifest.shaders[0]
+        let source = try XCTUnwrap(snapshot.sources[template.id])
+        snapshot.manifest.shaders = (0..<500).map { index in
+            var entry = template
+            entry.id = "scene-\(index)"
+            entry.name = "Scene \(index)"
+            entry.sourcePath = "sources/scene-\(index).metal"
+            entry.previewPath = "previews/scene-\(index).png"
+            entry.discovery = .init(tags: ["color"], moods: ["calm"], motion: "slow")
+            return entry
+        }
+        snapshot.manifest.defaultShaderID = "scene-0"
+        snapshot.sources = Dictionary(uniqueKeysWithValues: snapshot.manifest.shaders.map { ($0.id, source) })
+        let catalog = try snapshot.validated()
+        let cache = SceneFilterCache()
+        let expected = cache.filter(catalog, query: "scene", mood: "calm").map(\.id)
+        let clock = ContinuousClock()
+        var start = clock.now
+        for _ in 0..<1000 {
+            XCTAssertEqual(SceneLibrary.filter(catalog.shaders, query: "scene", favoritesOnly: false, favorites: [], mood: "calm").map(\.id), expected)
+        }
+        let uncached = CatalogBenchmark.milliseconds(start.duration(to: clock.now))
+        start = clock.now
+        for _ in 0..<1000 {
+            XCTAssertEqual(cache.filter(catalog, query: "scene", mood: "calm").map(\.id), expected)
+        }
+        let cached = CatalogBenchmark.milliseconds(start.duration(to: clock.now))
+        XCTAssertEqual(cache.computationCount, 1)
+        print("Scene filter profile: 500 scenes, 1000 repeated redraws; filter \(uncached) ms, prepared results \(cached) ms, 1 computation")
+    }
+
     func testChunkedDownloadComparedWithPreviousByteLoop() async throws {
         try requireOptIn()
         let preview = TestCatalog.shaders[3].preview!

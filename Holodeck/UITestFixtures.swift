@@ -7,16 +7,16 @@ import Dependencies
 /// App-side controls let UI regressions finish startup without timing delays.
 final class UITestFixtures: NSObject {
     private let arguments: [String]
+    private let configuration: UITestConfiguration
     private let gate = InitialShaderGate()
     private weak var controller: GameViewController?
     private var catalogFixture: ValidatedCatalog?
 
     init(arguments: [String] = ProcessInfo.processInfo.arguments) {
+        let configuration = UITestConfiguration(arguments: arguments, applicationID: "me.haroldmartin.Holodeck")
+        self.configuration = configuration
         self.arguments = arguments
-        if let value = ProcessInfo.processInfo.environment["HOLODECK_UI_TEST_CATALOG"],
-           let snapshot = try? JSONDecoder().decode(CatalogSnapshot.self, from: Data(value.utf8)) {
-            catalogFixture = try? snapshot.validated()
-        }
+        catalogFixture = configuration.catalog
     }
 
     func configure(_ dependencies: inout DependencyValues) {
@@ -24,23 +24,10 @@ final class UITestFixtures: NSObject {
         let failsStartup = arguments.contains("--ui-test-fail-initial-shader")
         precondition(!(holdsStartup || failsStartup) || catalogFixture != nil,
                      "Startup UI test controls require a valid HOLODECK_UI_TEST_CATALOG fixture")
-        if catalogFixture != nil || arguments.contains(where: { $0.hasPrefix("--ui-test-") }) {
-            let suite: String
-            if let index = arguments.firstIndex(of: "--ui-test-storage-suite"), index + 1 < arguments.count {
-                suite = arguments[index + 1]
-            } else {
-                suite = "me.haroldmartin.Holodeck.ui-tests." + UUID().uuidString
-            }
+        if let suite = configuration.storageSuite {
             let defaults = UserDefaults(suiteName: suite)!
             dependencies.shaderPreferences = .userDefaults(defaults)
-            if arguments.contains("--ui-test-empty-cache") {
-                dependencies.catalogService = CatalogService(network: CatalogNetwork { _, _ in throw CatalogError.invalidResponse }, storage: .disabled)
-            } else if arguments.contains("--ui-test-download-catalog"), let catalogFixture {
-                let download = CatalogDownloadFixture(snapshot: catalogFixture.snapshot, failFirst: arguments.contains("--ui-test-fail-catalog-once"))
-                dependencies.catalogService = CatalogService(network: CatalogNetwork { url, _ in try await download.get(url) }, storage: .disabled)
-            } else {
-                dependencies.catalogService = .offline(initialCatalog: catalogFixture)
-            }
+            dependencies.catalogService = configuration.makeCatalogService()
         }
         if arguments.contains("--ui-test-metal-unavailable") {
             dependencies.metalDevice = nil
@@ -95,27 +82,6 @@ final class UITestFixtures: NSObject {
         controller?.setSceneActive(false)
         controller?.setSceneActive(true)
         controller?.setSceneActive(true)
-    }
-}
-
-private actor CatalogDownloadFixture {
-    let snapshot: CatalogSnapshot
-    var failFirst: Bool
-    init(snapshot: CatalogSnapshot, failFirst: Bool) {
-        self.snapshot = snapshot
-        self.failFirst = failFirst
-    }
-    func get(_ url: URL) throws -> Data {
-        if failFirst {
-            failFirst = false
-            throw CatalogError.invalidResponse
-        }
-        if url.path.hasSuffix("/published") {
-            return Data("{\"object\":{\"sha\":\"\(snapshot.publicationRevision)\"}}".utf8)
-        }
-        if url.lastPathComponent == "catalog.json" { return try JSONEncoder().encode(snapshot.manifest) }
-        if let source = snapshot.sources[url.deletingPathExtension().lastPathComponent] { return Data(source.utf8) }
-        throw CatalogError.invalidResponse
     }
 }
 

@@ -30,7 +30,7 @@ public final class ViewerSession {
         public let generation: UInt64
     }
     public enum Event {
-        case catalogLoading, catalogChanged, catalogFailed
+        case catalogLoading, catalogChanged, catalogFailed, catalogFinished
         case selectionStarted(SelectionOrigin), activated(SelectionOrigin), selectionFailed
     }
     public struct Failure: Identifiable {
@@ -48,6 +48,7 @@ public final class ViewerSession {
     public private(set) var isRefreshing = false
     public private(set) var requiresExplicitSelection = false
     public var failure: Failure?
+    public private(set) var catalogUpdateFailure: Failure?
     @ObservationIgnored public var onEvent: ((Event) -> Void)?
     @ObservationIgnored public private(set) var selectionTask: Task<Void, Never>?
     @ObservationIgnored public private(set) var refreshTask: Task<Void, Never>?
@@ -97,11 +98,16 @@ public final class ViewerSession {
     public func refresh(force: Bool = false) -> Task<Void, Never> {
         if let refreshTask { return refreshTask }
         isRefreshing = true
+        catalogUpdateFailure = nil
         if case .catalog = failure?.operation { failure = nil }
         onEvent?(.catalogLoading)
         let service = catalogService
         let task = Task { [weak self] in
-            defer { self?.isRefreshing = false; self?.refreshTask = nil }
+            defer {
+                self?.isRefreshing = false
+                self?.refreshTask = nil
+                self?.onEvent?(.catalogFinished)
+            }
             let cached = await service.current()
             guard !Task.isCancelled else { return }
             if let cached { self?.applyCatalog(cached) }
@@ -111,6 +117,7 @@ public final class ViewerSession {
                 guard !Task.isCancelled, let self else { return }
                 if let snapshot = refreshed ?? current {
                     self.applyCatalog(snapshot)
+                    self.catalogUpdateFailure = nil
                 } else {
                     throw CatalogError.invalidManifest
                 }
@@ -118,7 +125,9 @@ public final class ViewerSession {
                 let current = await service.current()
                 guard !Task.isCancelled, let self else { return }
                 if let current { self.applyCatalog(current) }
-                if self.requiresExplicitSelection {
+                if self.catalog != nil {
+                    self.catalogUpdateFailure = Failure(message: "Couldn’t check for scene updates. Cached scenes are still available.", operation: .catalog)
+                } else if self.requiresExplicitSelection {
                     self.failure = self.failure ?? self.recoveryFailure
                 } else if self.failure == nil {
                     self.failure = Failure(message: "Couldn’t download scenes. Check your internet connection and try again.", operation: .catalog)
@@ -135,6 +144,7 @@ public final class ViewerSession {
         let firstCatalog = catalog == nil
         catalog = snapshot
         shaders = snapshot.shaders
+        catalogUpdateFailure = nil
         if case .catalog = failure?.operation { failure = nil }
         startupShader = snapshot.startupShader(savedID: savedID)
         if firstCatalog, activeShader == nil, pendingSelection == nil, !requiresExplicitSelection {
@@ -153,16 +163,16 @@ public final class ViewerSession {
 
     @discardableResult
     public func select(_ shader: ShaderDefinition, origin: SelectionOrigin = .user) -> Task<Void, Never> {
+        guard let renderer else { return Task {} }
         generation &+= 1
         let request = generation
         pendingSelection = PendingSelection(shader: shader, origin: origin, generation: request)
-        failure = nil
+        if origin == .user { failure = nil }
         // Invalidate in-flight renderer requests before this task gets executor time.
-        renderer?.cancelPendingSelection()
+        renderer.cancelPendingSelection()
         onEvent?(.selectionStarted(origin))
-        let renderer = renderer
         let task = Task { [weak self] in
-            guard let self, let renderer, self.generation == request else { return }
+            guard let self, self.generation == request else { return }
             do {
                 guard try await renderer.select(shader), self.generation == request else { return }
                 self.activeShader = self.shaders.first { $0.id == shader.id && $0.sourceHash == shader.sourceHash } ?? shader
@@ -178,10 +188,15 @@ public final class ViewerSession {
                     self.select(updated, origin: .update)
                 }
             } catch {
+                if !(error is CancellationError) {
+                    Diagnostics.selection.error("Scene \(shader.id, privacy: .public) (\(String(describing: origin), privacy: .public)) failed: \(error.localizedDescription, privacy: .public)")
+                }
                 guard self.generation == request else { return }
                 self.pendingSelection = nil
                 if self.activeShader == nil { self.requiresExplicitSelection = true }
-                self.failure = Failure(message: "Couldn’t load \(shader.title). Try again or choose another scene.", operation: .selection(shader, origin))
+                if origin != .update || !self.hasUserSelectionFailure {
+                    self.failure = Failure(message: "Couldn’t load \(shader.title). Try again or choose another scene.", operation: .selection(shader, origin))
+                }
                 if self.requiresExplicitSelection { self.recoveryFailure = self.failure }
                 self.onEvent?(.selectionFailed)
             }
@@ -201,12 +216,22 @@ public final class ViewerSession {
     }
 
     public func retry(_ failure: Failure) {
-        self.failure = nil
+        guard self.failure?.id == failure.id || catalogUpdateFailure?.id == failure.id else { return }
+        dismissFailure(id: failure.id)
         switch failure.operation {
         case .catalog: refresh(force: true)
         case .selection(let shader, let origin):
             select(shaders.first { $0.id == shader.id } ?? shader, origin: origin)
         }
+    }
+
+    public func dismissFailure(id: UUID) {
+        if failure?.id == id { failure = nil }
+    }
+
+    private var hasUserSelectionFailure: Bool {
+        if case .selection(_, .user) = failure?.operation { return true }
+        return false
     }
 
     public func shutdown() {
