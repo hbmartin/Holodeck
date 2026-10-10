@@ -10,8 +10,6 @@ struct ViewerView: View {
 
     var body: some View {
         @Bindable var session = model.session
-        let displayedFailure = session.failure
-        let displayedStartupError = model.startupError
         HStack(spacing: 0) {
             if model.sidebarVisible {
                 sidebar.frame(width: 280)
@@ -83,21 +81,8 @@ struct ViewerView: View {
                     .accessibilityIdentifier("refresh-scenes").disabled(session.isRefreshing)
             }
         }
-        .alert(model.startupError != nil ? "Renderer Unavailable" : "Unable to Load Scenes",
-               isPresented: Binding(get: { session.failure != nil || model.startupError != nil }, set: {
-                   if !$0 {
-                       if let displayedFailure { session.dismissFailure(id: displayedFailure.id) }
-                       if model.startupError == displayedStartupError { model.startupError = nil }
-                   }
-               })) {
-            if let failure = displayedFailure {
-                Button("Retry") { session.retry(failure) }
-            }
-            Button("OK", role: .cancel) {
-                if let displayedFailure { session.dismissFailure(id: displayedFailure.id) }
-                if model.startupError == displayedStartupError { model.startupError = nil }
-            }
-        } message: { Text(displayedStartupError ?? displayedFailure?.message ?? "") }
+        .onChange(of: model.startupError?.id, initial: true) { model.presentFailuresIfNeeded() }
+        .onChange(of: session.failure?.id, initial: true) { model.presentFailuresIfNeeded() }
         .onChange(of: session.catalog?.publicationRevision) { model.reconcileFilters() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.updateActivity(appActive: true) }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willResignActiveNotification)) { _ in model.updateActivity(appActive: false) }

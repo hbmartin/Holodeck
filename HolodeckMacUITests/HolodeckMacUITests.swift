@@ -220,6 +220,105 @@ final class HolodeckMacUITests: XCTestCase {
         XCTAssertFalse(unavailable.staticTexts["Loading…"].exists)
     }
 
+    func testRendererAndCatalogFailuresPresentSeparateAlertsAndCatalogRetryRecovers() throws {
+        let app = try app(arguments: ["--ui-test-metal-unavailable", "--ui-test-download-catalog", "--ui-test-fail-catalog-once"])
+        app.launch()
+        let renderer = app.staticTexts["Renderer Unavailable"]
+        XCTAssertTrue(renderer.waitForExistence(timeout: 10))
+        XCTAssertFalse(app.windows.firstMatch.buttons["Retry"].exists)
+        app.windows.firstMatch.buttons["OK"].click()
+        XCTAssertTrue(app.staticTexts["Unable to Load Scenes"].waitForExistence(timeout: 10))
+        XCTAssertFalse(renderer.exists)
+        let retry = app.windows.firstMatch.buttons["Retry"]
+        XCTAssertTrue(retry.exists)
+        retry.click()
+        XCTAssertTrue(element("shader-aurora", in: app).waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["Unable to Load Scenes"].waitForNonExistence(timeout: 10))
+        XCTAssertFalse(element("shader-aurora", in: app).isEnabled)
+        XCTAssertTrue(app.staticTexts["Metal rendering is unavailable on this device."].exists)
+    }
+
+    func testStaleAlertActionsCannotDismissNewerFailures() throws {
+        for action in ["OK", "Retry"] {
+            let app = try app(arguments: ["--ui-test-empty-cache", "--ui-test-replace-presented-failure"])
+            app.launch()
+            XCTAssertTrue(app.windows.firstMatch.buttons[action].waitForExistence(timeout: 10))
+            XCTAssertFalse(app.staticTexts["A newer scene download failure occurred."].exists)
+            app.windows.firstMatch.buttons[action].click()
+            XCTAssertTrue(app.staticTexts["A newer scene download failure occurred."].waitForExistence(timeout: 10))
+            app.windows.firstMatch.buttons["OK"].click()
+            XCTAssertTrue(app.staticTexts["A newer scene download failure occurred."].waitForNonExistence(timeout: 10))
+            app.terminate()
+        }
+        let renderer = try app(arguments: ["--ui-test-metal-unavailable", "--ui-test-replace-presented-failure"])
+        renderer.launch()
+        XCTAssertTrue(renderer.staticTexts["Renderer Unavailable"].waitForExistence(timeout: 10))
+        renderer.windows.firstMatch.buttons["OK"].click()
+        XCTAssertTrue(renderer.staticTexts["A newer renderer startup failure occurred."].waitForExistence(timeout: 10))
+        XCTAssertFalse(renderer.windows.firstMatch.buttons["Retry"].exists)
+    }
+
+    func testNamedWindowFramePersistsAndCleanupCannotRecreateIt() throws {
+        let suite = "HolodeckMacUITests-" + UUID().uuidString
+        let name = "HolodeckViewer-" + suite
+        let live = savedFrame("HolodeckViewer-live")
+        let app = try app(suite: suite)
+        launch(app)
+        waitForTitle("Plasma", in: app)
+        resizeWindow(in: app)
+        let saved = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in savedFrame(name) != nil }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [saved], timeout: 5), .completed)
+        let frame = try XCTUnwrap(savedFrame(name))
+        app.terminate()
+        launch(app)
+        XCTAssertEqual(savedFrame(name), frame)
+        app.terminate()
+        app.launchEnvironment.removeAll()
+        app.launchArguments = ["--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite"]
+        app.launch()
+        XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 10))
+        XCTAssertNil(savedFrame(name))
+        app.terminate()
+        XCTAssertNil(savedFrame(name), "Cleanup must not save another frame while terminating")
+        XCTAssertEqual(savedFrame("HolodeckViewer-live"), live)
+    }
+
+    func testImplicitFixtureDoesNotSaveWindowFrame() throws {
+        let before = savedViewerFrameNames()
+        let app = try app()
+        app.launchArguments = [] // The fixture environment alone selects implicit in-memory storage.
+        launch(app)
+        waitForTitle("Plasma", in: app)
+        resizeWindow(in: app)
+        app.terminate()
+        XCTAssertEqual(savedViewerFrameNames(), before)
+    }
+
+    private func savedFrame(_ name: String) -> String? {
+        savedAppDefaults()["NSWindow Frame " + name] as? String
+    }
+
+    private func savedViewerFrameNames() -> Set<String> {
+        Set(savedAppDefaults().keys.filter { $0.hasPrefix("NSWindow Frame HolodeckViewer-") })
+    }
+
+    private func savedAppDefaults() -> [String: Any] {
+        // The app is sandboxed; the unsandboxed UI runner's CFPreferences domain is separate.
+        let path = "Library/Containers/me.haroldmartin.HolodeckMac/Data/Library/Preferences/me.haroldmartin.HolodeckMac.plist"
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(path)
+        guard let data = try? Data(contentsOf: url),
+              let values = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else { return [:] }
+        return values
+    }
+
+    private func resizeWindow(in app: XCUIApplication) {
+        let window = app.windows.firstMatch
+        let size = window.frame.size
+        let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 1)).withOffset(CGVector(dx: -2, dy: -2))
+        corner.press(forDuration: 0.1, thenDragTo: corner.withOffset(CGVector(dx: -80, dy: -60)))
+        XCTAssertNotEqual(window.frame.size, size)
+    }
+
     func testDiscoveryFiltersSearchAndResetPreservePlayback() throws {
         let app = try app(discovery: true)
         launch(app)

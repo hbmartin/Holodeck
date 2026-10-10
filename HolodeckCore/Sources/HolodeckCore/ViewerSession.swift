@@ -13,11 +13,14 @@ public protocol SceneRendering: AnyObject {
 nonisolated public struct ViewerPolicy: Sendable {
     public let restoresLastScene: Bool
     public let replacesUpdatedScene: Bool
-    public static let tv = Self(restoresLastScene: true, replacesUpdatedScene: false)
+    /// Whether reactivation checks for updates before a renderer has been attached.
+    public let refreshesWithoutRenderer: Bool
+    public static let tv = Self(restoresLastScene: true, replacesUpdatedScene: false, refreshesWithoutRenderer: false)
     public static let mac = Self(restoresLastScene: false, replacesUpdatedScene: true)
-    public init(restoresLastScene: Bool, replacesUpdatedScene: Bool) {
+    public init(restoresLastScene: Bool, replacesUpdatedScene: Bool, refreshesWithoutRenderer: Bool = true) {
         self.restoresLastScene = restoresLastScene
         self.replacesUpdatedScene = replacesUpdatedScene
+        self.refreshesWithoutRenderer = refreshesWithoutRenderer
     }
 }
 
@@ -38,6 +41,10 @@ public final class ViewerSession {
         public let id = UUID()
         public let message: String
         public let operation: Operation
+        public init(message: String, operation: Operation) {
+            self.message = message
+            self.operation = operation
+        }
     }
 
     public private(set) var catalog: ValidatedCatalog?
@@ -107,14 +114,13 @@ public final class ViewerSession {
         if active { hasBeenActive = true }
         self.active = active
         renderer?.setActive(active)
-        if reactivated { refresh() }
+        if reactivated, renderer != nil || policy.refreshesWithoutRenderer { refresh() }
     }
 
     @discardableResult
     public func refresh(force: Bool = false) -> Task<Void, Never> {
         if let refreshTask { return refreshTask }
         isRefreshing = true
-        catalogFailure = nil
         onEvent?(.catalogLoading)
         let service = catalogService
         let task = Task { [weak self] in
@@ -129,14 +135,21 @@ public final class ViewerSession {
             if let cached { self?.applyCatalog(cached) }
             self?.onEvent?(.catalogCacheChecked)
             do {
-                let refreshed = try await service.refresh(force: force)
+                let outcome = try await service.refreshOutcome(force: force)
                 let current = await service.current()
                 guard !Task.isCancelled, let self else { return }
-                if let snapshot = refreshed ?? current {
-                    self.applyCatalog(snapshot)
+                if let current { self.applyCatalog(current) }
+                switch outcome {
+                case .updated(let snapshot):
+                    self.applyCatalog(current ?? snapshot)
                     self.catalogFailure = nil
-                } else {
-                    throw CatalogError.invalidManifest
+                case .unchanged:
+                    self.catalogFailure = nil
+                case .throttled, .disabled:
+                    if self.catalog == nil {
+                        if self.catalogFailure != nil { self.onEvent?(.catalogFailed) }
+                        else { throw CatalogError.invalidManifest }
+                    }
                 }
             } catch {
                 let current = await service.current()

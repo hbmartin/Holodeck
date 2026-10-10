@@ -3,6 +3,7 @@ import UIKit
 
 final class ShaderCardCell: UICollectionViewCell {
     static let reuseIdentifier = "ShaderCard"
+    private static let focusScale: CGFloat = 1.045
     private let gradient = CAGradientLayer()
     private let previewImageView = UIImageView()
     private let updatedLabel = UILabel()
@@ -11,7 +12,8 @@ final class ShaderCardCell: UICollectionViewCell {
     private var catalogService: CatalogService?
     private var requestedPixels = CGSize.zero
     private var displayedPixels = CGSize.zero
-    private var requestID = UUID()
+    private var failedPreview: ShaderPreview?
+    private(set) var requestID = UUID()
     private let categoryLabel = UILabel()
     private let titleLabel = UILabel()
     private let descriptionLabel = UILabel()
@@ -70,15 +72,20 @@ final class ShaderCardCell: UICollectionViewCell {
         updatedLabel.text = shader.updatedAt.map { "Updated " + $0.formatted(date: .abbreviated, time: .omitted) }
         updatedLabel.isHidden = shader.updatedAt == nil
         let previousHash = representedPreview?.hash
+        let requestChanged = representedPreview != shader.preview || self.catalogService !== catalogService
+        let serviceChanged = self.catalogService !== catalogService
         representedPreview = shader.preview
         self.catalogService = catalogService
-        if previousHash != shader.preview?.hash {
+        if requestChanged {
             previewTask?.cancel()
             previewTask = nil
-            previewImageView.image = nil
+            failedPreview = nil
             requestedPixels = .zero
-            displayedPixels = .zero
             requestID = UUID()
+        }
+        if previousHash != shader.preview?.hash || serviceChanged {
+            previewImageView.image = nil
+            displayedPixels = .zero
         }
         requestPreviewIfNeeded()
         titleLabel.text = shader.title
@@ -104,6 +111,7 @@ final class ShaderCardCell: UICollectionViewCell {
         catalogService = nil
         requestedPixels = .zero
         displayedPixels = .zero
+        failedPreview = nil
         requestID = UUID()
         previewImageView.image = nil
     }
@@ -119,9 +127,10 @@ final class ShaderCardCell: UICollectionViewCell {
     private func requestPreviewIfNeeded() {
         guard let preview = representedPreview, let catalogService,
               contentView.bounds.width > 0, contentView.bounds.height > 0 else { return }
-        let scale = max(1, traitCollection.displayScale) * 1.045
-        let pixels = CGSize(width: min(2048, ceil(contentView.bounds.width * scale / 64) * 64),
-                            height: min(2048, ceil(contentView.bounds.height * scale / 64) * 64))
+        guard failedPreview != preview else { return }
+        let scale = max(1, traitCollection.displayScale) * Self.focusScale
+        guard let pixels = try? PreviewSizing.bucketedTargetPixels(
+            CGSize(width: contentView.bounds.width * scale, height: contentView.bounds.height * scale)) else { return }
         if previewTask != nil, pixels.width <= requestedPixels.width, pixels.height <= requestedPixels.height { return }
         if previewImageView.image != nil, pixels.width <= displayedPixels.width, pixels.height <= displayedPixels.height { return }
         previewTask?.cancel()
@@ -129,12 +138,31 @@ final class ShaderCardCell: UICollectionViewCell {
         let id = UUID()
         requestID = id
         previewTask = Task { [weak self] in
-            let image = try? await catalogService.previewImage(preview, targetPixelSize: pixels)
-            guard !Task.isCancelled, let self, self.requestID == id, self.representedPreview?.hash == preview.hash else { return }
-            self.previewTask = nil
-            if let image {
-                self.displayedPixels = pixels
-                self.previewImageView.image = UIImage(cgImage: image)
+            do {
+                while !Task.isCancelled {
+                    do {
+                        let image = try await catalogService.previewImage(preview, targetPixelSize: pixels)
+                        guard !Task.isCancelled, let self, self.requestID == id, self.representedPreview == preview else { return }
+                        self.previewTask = nil
+                        self.displayedPixels = pixels
+                        self.previewImageView.image = UIImage(cgImage: image)
+                        return
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        if (error as? URLError)?.code == .cancelled { throw CancellationError() }
+                        guard try await catalogService.waitForPreviewRetry(preview) else {
+                            guard let self, self.requestID == id else { return }
+                            self.failedPreview = preview
+                            self.previewTask = nil
+                            return
+                        }
+                    }
+                }
+            } catch {
+                guard let self, self.requestID == id else { return }
+                self.previewTask = nil
+                if !(error is CancellationError), !Task.isCancelled { self.failedPreview = preview }
             }
         }
     }
@@ -145,7 +173,7 @@ final class ShaderCardCell: UICollectionViewCell {
     }
 
     private func updateFocusAppearance() {
-        transform = isFocused ? CGAffineTransform(scaleX: 1.045, y: 1.045) : .identity
+        transform = isFocused ? CGAffineTransform(scaleX: Self.focusScale, y: Self.focusScale) : .identity
         contentView.layer.borderWidth = isFocused ? 3 : 1
         contentView.layer.borderColor = UIColor.white.withAlphaComponent(isFocused ? 1 : 0.18).cgColor
     }

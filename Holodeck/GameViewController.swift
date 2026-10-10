@@ -140,9 +140,8 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             updateCatalogNotice()
             if shaders.isEmpty {
                 catalogErrorMessage = nil
-                statusLabel.text = catalogLoadingMessage
-                hintLabel.text = catalogLoadingMessage
-                hint.isHidden = pickerIsVisible
+                updateStatus()
+                showLoadingHintIfNeeded()
             }
         case .catalogCacheChecked:
             updateStatus()
@@ -154,8 +153,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             guard shaders.isEmpty else { return }
             catalogErrorMessage = "Couldn’t download shaders. Connect to the internet and press Select to retry."
             updateStatus()
-            hintLabel.text = catalogErrorMessage
-            hint.isHidden = pickerIsVisible
+            showLoadingHintIfNeeded()
         case .catalogChanged:
             catalogErrorMessage = nil
             (view as? ShowcaseMetalView)?.acceptsFocus = !pickerIsVisible || unavailableMessage != nil
@@ -374,6 +372,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     private func showLoadingHintIfNeeded() {
+        guard unavailableMessage == nil else { hint.isHidden = true; return }
         if shaders.isEmpty {
             hintLabel.text = catalogErrorMessage ?? catalogLoadingMessage
             hint.isHidden = pickerIsVisible

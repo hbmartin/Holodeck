@@ -4,6 +4,45 @@ import CoreGraphics
 @testable import HolodeckCore
 
 final class PreviewRecoveryTests: XCTestCase {
+    func testRetryWaitUsesCooldownAndCancellationAndRejectsPermanentFailures() async throws {
+        let box = CatalogTestBox()
+        let service = CatalogService(network: box.network, storage: .disabled, clock: box.clock)
+        let preview = TestCatalog.shaders[0].preview!
+        do { _ = try await service.preview(preview); XCTFail() } catch {}
+        let waiting = Task { try await service.waitForPreviewRetry(preview) }
+        try await waitForRetrySleeper(in: service)
+        await box.clock.advance(by: .seconds(29))
+        let sleepers = await service.previewRetryWaiterCount
+        XCTAssertEqual(sleepers, 1)
+        do { _ = try await service.preview(preview); XCTFail() } catch {}
+        XCTAssertEqual(box.urls.count, 1)
+        await box.clock.advance(by: .seconds(1))
+        let retry = try await waiting.value
+        XCTAssertTrue(retry)
+        do { _ = try await service.preview(preview); XCTFail() } catch {}
+        XCTAssertEqual(box.urls.count, 2)
+        let cancelled = Task { try await service.waitForPreviewRetry(preview) }
+        try await waitForRetrySleeper(in: service)
+        cancelled.cancel()
+        do { _ = try await cancelled.value; XCTFail() } catch is CancellationError {} catch { XCTFail("\(error)") }
+        await box.clock.advance(by: .seconds(60))
+        box.setResponses(["/previews/plasma.png": Data("invalid".utf8)])
+        do { _ = try await service.preview(preview); XCTFail() } catch {}
+        let permanent = try await service.waitForPreviewRetry(preview)
+        XCTAssertFalse(permanent)
+        let revised = ShaderPreview(path: preview.path, hash: preview.hash, publicationRevision: String(repeating: "c", count: 40))
+        let fresh = try await service.waitForPreviewRetry(revised)
+        XCTAssertTrue(fresh)
+    }
+
+    private func waitForRetrySleeper(in service: CatalogService) async throws {
+        let deadline = ContinuousClock.now + .seconds(3)
+        while await service.previewRetryWaiterCount != 1 {
+            guard ContinuousClock.now < deadline else { XCTFail("Retry did not enter cooldown"); throw CatalogError.invalidResponse }
+            await Task.yield()
+        }
+    }
+
     func testTransientCooldownBackoffAndSuccessReset() async throws {
         let box = CatalogTestBox()
         let service = CatalogService(network: box.network, storage: .disabled, clock: box.clock)
@@ -86,6 +125,17 @@ final class PreviewRecoveryTests: XCTestCase {
         }
         let capped = try await service.previewImage(preview, targetPixelSize: CGSize(width: 4096, height: 4096))
         XCTAssertLessThanOrEqual(max(capped.width, capped.height), 2048)
+    }
+
+    func testDestinationBucketsReuseDecodedImagesAndRejectInvalidSizes() async throws {
+        let service = CatalogService.offline(storage: TestCatalog.storage)
+        let preview = TestCatalog.shaders[0].preview!
+        let first = try await service.previewImage(preview, targetPixelSize: CGSize(width: 320.1, height: 232))
+        let equivalent = try await service.previewImage(preview, targetPixelSize: CGSize(width: 320.9, height: 232.9))
+        XCTAssertTrue(first === equivalent)
+        for invalid in [CGSize.zero, CGSize(width: -1, height: 1), CGSize(width: CGFloat.infinity, height: 1), CGSize(width: 1, height: CGFloat.nan)] {
+            do { _ = try await service.previewImage(preview, targetPixelSize: invalid); XCTFail("Invalid size must fail") } catch {}
+        }
     }
 
     func testDecoderIsBoundedResponsiveAndTrimDoesNotRepopulateCaches() async throws {
