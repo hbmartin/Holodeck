@@ -38,7 +38,9 @@ final class CatalogTests: XCTestCase {
         await gate.complete("new.png", data: newData)
         await newTask.value
         XCTAssertNotNil(imageView.image)
-        XCTAssertEqual(imageView.image?.pngData(), UIImage(data: newData)?.pngData())
+        let thumbnail = try await service.previewImage(new.preview!, maxPixelSize: 640)
+        XCTAssertEqual(imageView.image?.pngData(), UIImage(cgImage: thumbnail).pngData())
+        XCTAssertEqual(imageView.image?.cgImage?.width, 640)
         XCTAssertEqual(cell.accessibilityIdentifier, "shader-aurora")
     }
 
@@ -59,9 +61,45 @@ final class CatalogTests: XCTestCase {
         cell.configure(shader: missing, active: false, loading: false, catalogService: service)
         XCTAssertNil(image.image)
         XCTAssertFalse(cell.accessibilityLabel?.contains("Updated") == true)
+        XCTAssertEqual(cell.contentView.backgroundColor, .black)
     }
 
+    func testMetadataAndRevisionChangesRetainIdenticalPreviewImage() async throws {
+        let service = CatalogService.offline(storage: TestCatalog.storage)
+        let cell = ShaderCardCell(frame: CGRect(x: 0, y: 0, width: 320, height: 232))
+        var shader = TestCatalog.shaders[0]
+        cell.configure(shader: shader, active: false, loading: false, catalogService: service)
+        await cell.previewTask?.value
+        let imageView = try XCTUnwrap(cell.contentView.subviews.compactMap { $0 as? UIImageView }.first)
+        let image = try XCTUnwrap(imageView.image)
+        shader.preview = ShaderPreview(path: shader.preview!.path, hash: shader.preview!.hash,
+                                       publicationRevision: String(repeating: "c", count: 40))
+        cell.configure(shader: shader, active: true, loading: true, catalogService: service)
+        XCTAssertTrue(imageView.image === image)
+    }
 
+    func testCardCanRetryUnavailablePreviewWithoutClearingALoadedImage() async throws {
+        let gate = PreviewRequestGate()
+        let service = CatalogService(network: CatalogNetwork { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
+        let shader = TestCatalog.shaders[0]
+        let cell = ShaderCardCell(frame: CGRect(x: 0, y: 0, width: 320, height: 232))
+        cell.configure(shader: shader, active: false, loading: false, catalogService: service)
+        let failed = try XCTUnwrap(cell.previewTask)
+        await gate.waitForRequest("plasma.png")
+        await gate.complete("plasma.png", data: Data("unavailable".utf8))
+        await failed.value
+        let imageView = try XCTUnwrap(cell.contentView.subviews.compactMap { $0 as? UIImageView }.first)
+        XCTAssertNil(imageView.image)
+        cell.configure(shader: shader, active: false, loading: false, catalogService: service)
+        let retry = try XCTUnwrap(cell.previewTask)
+        await gate.waitForRequest("plasma.png")
+        await gate.complete("plasma.png", data: try TestCatalog.preview(named: "preview-\(shader.preview!.hash).png"))
+        await retry.value
+        let loaded = try XCTUnwrap(imageView.image)
+        cell.configure(shader: shader, active: true, loading: false, catalogService: service)
+        XCTAssertTrue(imageView.image === loaded)
+        XCTAssertNil(cell.previewTask)
+    }
 }
 
 private actor PreviewRequestGate {

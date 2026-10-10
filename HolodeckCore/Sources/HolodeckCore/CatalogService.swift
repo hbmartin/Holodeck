@@ -1,24 +1,17 @@
 import Foundation
+import Clocks
 import Dependencies
+import CoreGraphics
+import ImageIO
 
 nonisolated public struct CatalogNetwork: Sendable {
     public var get: @Sendable (URL, Int) async throws -> Data
     public init(get: @escaping @Sendable (URL, Int) async throws -> Data) { self.get = get }
-    public static let live = Self { url, limit in
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 30
-        request.setValue(url.path.contains("/contents/") ? "application/vnd.github.raw+json" : "application/vnd.github+json", forHTTPHeaderField: "Accept")
-        request.setValue("Holodeck", forHTTPHeaderField: "User-Agent")
-        request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { throw CatalogError.invalidResponse }
-        if response.expectedContentLength > Int64(limit) { throw CatalogError.oversizedResponse }
-        var data = Data()
-        for try await byte in bytes {
-            guard data.count < limit else { throw CatalogError.oversizedResponse }
-            data.append(byte)
-        }
-        return data
+    public static let live = session(configuration: .default)
+
+    static func session(configuration: URLSessionConfiguration) -> Self {
+        let downloader = CatalogDownloader(configuration: configuration)
+        return Self { url, limit in try await downloader.get(url, limit: limit) }
     }
 }
 
@@ -47,50 +40,65 @@ nonisolated public struct CatalogStorage: Sendable {
 
 /// Refresh downloads and persistence run off the UI executor. Failed refreshes never replace current.
 public actor CatalogService {
-    public nonisolated let initialSnapshot: CatalogSnapshot?
-    private var snapshot: CatalogSnapshot?
+    public nonisolated let initialCatalog: ValidatedCatalog?
+    private var snapshot: ValidatedCatalog?
+    private var loadedCache = false
     private let network: CatalogNetwork
     private let storage: CatalogStorage
-    private let now: @Sendable () -> Date
+    private let clock: AnyClock<Duration>
     private let enabled: Bool
-    private var lastAttempt: Date?
-    private var refreshTask: Task<CatalogSnapshot?, Error>?
+    private var lastAttempt: AnyClock<Duration>.Instant?
+    private var refreshTask: Task<ValidatedCatalog?, Error>?
     private let repository: String
 
-    public init(network: CatalogNetwork = .live, storage: CatalogStorage = .live,
-         now: @escaping @Sendable () -> Date = { Date() }, enabled: Bool = true,
+    private var previewData = CatalogLRU<String, Data>(limit: 16_777_216)
+    private var previewImages = CatalogLRU<PreviewImageKey, CGImage>(limit: 33_554_432)
+    private var previewTasks: [String: Task<Data, Error>] = [:]
+    private var imageTasks: [PreviewImageKey: Task<CGImage, Error>] = [:]
+
+    public init(initialCatalog: ValidatedCatalog? = nil, network: CatalogNetwork = .live, storage: CatalogStorage = .live,
+         clock: any Clock<Duration> = ContinuousClock(), enabled: Bool = true,
          repository: String = "hbmartin/HolodeckShaders") {
-        let cached: CatalogSnapshot? = {
-            guard let data = try? storage.read("snapshot.json"),
-                  let value = try? JSONDecoder().decode(CatalogSnapshot.self, from: data),
-                  (try? value.validate()) != nil else { return nil }
-            return value
-        }()
-        initialSnapshot = cached
-        snapshot = initialSnapshot
+        self.initialCatalog = initialCatalog
+        snapshot = initialCatalog
+        loadedCache = initialCatalog != nil
         self.network = network
         self.storage = storage
-        self.now = now
+        self.clock = AnyClock(clock)
         self.enabled = enabled
         self.repository = repository
     }
 
-    public func current() -> CatalogSnapshot? { snapshot }
+    public nonisolated static func offline(initialCatalog: ValidatedCatalog? = nil, storage: CatalogStorage = .disabled) -> CatalogService {
+        CatalogService(initialCatalog: initialCatalog, storage: storage, enabled: false)
+    }
+
+    public func current() -> ValidatedCatalog? {
+        if !loadedCache {
+            loadedCache = true
+            if let data = try? storage.read("snapshot.json"),
+               let value = try? JSONDecoder().decode(CatalogSnapshot.self, from: data) {
+                snapshot = try? value.validated()
+            }
+        }
+        return snapshot
+    }
 
     @discardableResult
-    public func refresh(force: Bool = false) async throws -> CatalogSnapshot? {
+    public func refresh(force: Bool = false) async throws -> ValidatedCatalog? {
+        _ = current()
         guard enabled else { return nil }
         if let refreshTask { return try await refreshTask.value }
-        let date = now()
-        if !force, snapshot != nil, let lastAttempt, date.timeIntervalSince(lastAttempt) < 900 { return nil }
-        lastAttempt = date
+        let instant = clock.now
+        if !force, snapshot != nil, let lastAttempt, lastAttempt.duration(to: instant) < .seconds(900) { return nil }
+        lastAttempt = instant
         let task = Task { try await downloadPublication() }
         refreshTask = task
         defer { refreshTask = nil }
         return try await task.value
     }
 
-    private func downloadPublication() async throws -> CatalogSnapshot? {
+    private func downloadPublication() async throws -> ValidatedCatalog? {
         struct Commit: Decodable { let sha: String }
         let commitURL = URL(string: "https://api.github.com/repos/\(repository)/git/ref/heads/published")!
         struct Reference: Decodable { let object: Commit }
@@ -99,30 +107,38 @@ public actor CatalogService {
         guard CatalogHash.isSHA(revision, length: 40) else { throw CatalogError.invalidManifest }
         if revision == snapshot?.publicationRevision { return nil }
         let manifest = try JSONDecoder().decode(CatalogManifest.self, from: await network.get(assetURL("catalog.json", revision: revision), 2_097_152))
-        try manifest.validate()
-        var sources: [String: String] = [:]
-        var sourceBytes = 0
+        var builder = try CatalogBuilder(manifest: manifest)
         // Bounded sequential downloads keep memory and GitHub request concurrency predictable.
         for entry in manifest.shaders {
             let data = try await network.get(assetURL(entry.sourcePath, revision: revision), 1_048_576)
-            guard CatalogHash.sha256(data) == entry.sourceSHA256,
-                  let source = String(data: data, encoding: .utf8) else { throw CatalogError.invalidSource }
-            sourceBytes += data.count
-            guard sourceBytes <= 16_777_216 else { throw CatalogError.oversizedResponse }
-            sources[entry.id] = source
+            try builder.addSource(data, for: entry)
         }
-        let candidate = CatalogSnapshot(manifest: manifest, sources: sources, publicationRevision: revision)
-        try candidate.validate()
+        let candidate = try builder.finish(revision: revision)
         try Task.checkCancellation()
-        try storage.write("snapshot.json", JSONEncoder().encode(candidate))
+        try storage.write("snapshot.json", JSONEncoder().encode(candidate.snapshot))
         snapshot = candidate
         return candidate
     }
 
     public func preview(_ preview: ShaderPreview) async throws -> Data {
+        try validatePreview(preview)
+        if let cached = previewData.value(for: preview.hash) { return cached }
+        if let task = previewTasks[preview.hash] { return try await task.value }
+        let task = Task { try await self.downloadPreview(preview) }
+        previewTasks[preview.hash] = task
+        defer { previewTasks[preview.hash] = nil }
+        let data = try await task.value
+        previewData.insert(data, for: preview.hash, cost: data.count)
+        return data
+    }
+
+    private func validatePreview(_ preview: ShaderPreview) throws {
         guard CatalogHash.isSHA(preview.hash), CatalogHash.isSHA(preview.publicationRevision, length: 40),
               preview.path.range(of: "^previews/[a-z0-9]+(-[a-z0-9]+)*\\.png$", options: .regularExpression) != nil
         else { throw CatalogError.invalidPreview }
+    }
+
+    private func downloadPreview(_ preview: ShaderPreview) async throws -> Data {
         let filename = "preview-\(preview.hash).png"
         if let cached = try? storage.read(filename), validPreview(cached, hash: preview.hash) { return cached }
         guard enabled else { throw CatalogError.invalidPreview }
@@ -133,12 +149,38 @@ public actor CatalogService {
         return data
     }
 
+    public func previewImage(_ preview: ShaderPreview, maxPixelSize: Int) async throws -> CGImage {
+        try validatePreview(preview)
+        guard (1...2048).contains(maxPixelSize) else { throw CatalogError.invalidPreview }
+        let key = PreviewImageKey(hash: preview.hash, size: maxPixelSize)
+        if let image = previewImages.value(for: key) { return image }
+        if let task = imageTasks[key] { return try await task.value }
+        let task = Task { try await self.decodePreview(preview, size: maxPixelSize) }
+        imageTasks[key] = task
+        defer { imageTasks[key] = nil }
+        let image = try await task.value
+        previewImages.insert(image, for: key, cost: image.bytesPerRow * image.height)
+        return image
+    }
+
+    private func decodePreview(_ preview: ShaderPreview, size: Int) async throws -> CGImage {
+        let data = try await self.preview(preview)
+        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceThumbnailMaxPixelSize: size
+              ] as CFDictionary) else { throw CatalogError.invalidPreview }
+        return image
+    }
+
     private func validPreview(_ data: Data, hash: String) -> Bool {
         data.count <= 8_388_608 && data.starts(with: [137, 80, 78, 71, 13, 10, 26, 10]) && CatalogHash.sha256(data) == hash
     }
 
     private func assetURL(_ path: String, revision: String) -> URL {
-        URL(string: "https://api.github.com/repos/\(repository)/contents/\(path)?ref=\(revision)")!
+        URL(string: "https://raw.githubusercontent.com/\(repository)/\(revision)/\(path)")!
     }
 }
 
@@ -151,6 +193,11 @@ extension DependencyValues {
 
 nonisolated public enum CatalogServiceKey: DependencyKey {
     public static let liveValue = CatalogService()
-    public static let testValue = CatalogService(storage: .disabled, enabled: false)
-    public static let previewValue = CatalogService(storage: .disabled, enabled: false)
+    public static let testValue = CatalogService.offline()
+    public static let previewValue = CatalogService.offline()
+}
+
+nonisolated private struct PreviewImageKey: Hashable {
+    let hash: String
+    let size: Int
 }

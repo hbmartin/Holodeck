@@ -10,11 +10,11 @@ nonisolated enum TestCatalog {
     }()
     static let snapshot: CatalogSnapshot = {
         let value = try! JSONDecoder().decode(CatalogSnapshot.self, from: data)
-        try! value.validate()
         return value
     }()
-    static var shaders: [ShaderDefinition] { snapshot.shaders }
-    static var initialShader: ShaderDefinition { snapshot.initialShader }
+    static let catalog = try! snapshot.validated()
+    static var shaders: [ShaderDefinition] { catalog.shaders }
+    static var initialShader: ShaderDefinition { catalog.initialShader }
     static let storage = CatalogStorage(read: { name in
         if name == "snapshot.json" { return data }
         return try? preview(named: name)

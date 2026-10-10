@@ -207,6 +207,28 @@ final class HolodeckUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Press Select to choose a shader"].waitForExistence(timeout: 10))
     }
 
+    func testStartupFailureWithoutStorageSuiteKeepsPickerAfterBackAndRecovers() {
+        let app = isolatedApp()
+        app.launchArguments = ["--ui-test-hold-initial-shader", "--ui-test-fail-initial-shader"]
+        app.launch()
+        XCTAssertTrue(app.staticTexts["Loading Plasma…"].waitForExistence(timeout: 10))
+        openPicker(in: app)
+        remote.press(.playPause)
+        let failed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH %@", "Couldn’t load Plasma"),
+                                              object: app.staticTexts["shader-status"])
+        XCTAssertEqual(XCTWaiter.wait(for: [failed], timeout: 10), .completed)
+        remote.press(.menu)
+        XCTAssertTrue(app.otherElements["shader-picker"].exists)
+        XCTAssertTrue(app.staticTexts["shader-status"].label.hasPrefix("Couldn’t load Plasma"))
+        remote.press(.right)
+        waitForFocus(card("aurora", in: app))
+        remote.press(.select)
+        XCTAssertTrue(app.otherElements["shader-picker"].waitForNonExistence(timeout: 10))
+        openPicker(in: app)
+        waitForFocus(card("aurora", in: app))
+        XCTAssertEqual(card("aurora", in: app).value as? String, "Now showing")
+    }
+
     func testPickerOpenBackgroundResumeKeepsBrowsingFocus() {
         let app = launchShowcase()
         openPicker(in: app)

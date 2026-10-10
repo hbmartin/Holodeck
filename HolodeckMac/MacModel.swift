@@ -31,13 +31,19 @@ final class MacModel {
         var service = CatalogService()
         var metalDevice = MTLCreateSystemDefaultDevice()
         #if DEBUG
-        if let index = arguments.firstIndex(of: "--ui-test-storage-suite"), index + 1 < arguments.count {
-            defaults = UserDefaults(suiteName: arguments[index + 1]) ?? .standard
+        if arguments.contains(where: { $0.hasPrefix("--ui-test-") }) || ProcessInfo.processInfo.environment["HOLODECK_UI_TEST_CATALOG"] != nil {
+            let suite: String
+            if let index = arguments.firstIndex(of: "--ui-test-storage-suite"), index + 1 < arguments.count {
+                suite = arguments[index + 1]
+            } else {
+                suite = "me.haroldmartin.Holodeck.mac-ui-tests." + UUID().uuidString
+            }
+            defaults = UserDefaults(suiteName: suite)!
+            service = .offline()
             if let json = ProcessInfo.processInfo.environment["HOLODECK_UI_TEST_CATALOG"],
                let snapshot = try? JSONDecoder().decode(CatalogSnapshot.self, from: Data(json.utf8)),
-               (try? snapshot.validate()) != nil {
-                let data = Data(json.utf8)
-                service = CatalogService(storage: CatalogStorage(read: { name in name == "snapshot.json" ? data : nil }, write: { _, _ in }), enabled: false)
+               let validated = try? snapshot.validated() {
+                service = .offline(initialCatalog: validated)
             }
             if arguments.contains("--ui-test-empty-cache") {
                 service = CatalogService(network: CatalogNetwork { _, _ in throw CatalogError.invalidResponse }, storage: .disabled)

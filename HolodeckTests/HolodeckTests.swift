@@ -22,7 +22,7 @@ final class HolodeckTests: XCTestCase {
         var refreshed = TestCatalog.snapshot
         refreshed.manifest.shaders.reverse()
         refreshed.publicationRevision = String(repeating: "a", count: 40)
-        controller.applyCatalog(refreshed)
+        controller.applyCatalog(try! refreshed.validated())
         XCTAssertEqual(controller.collectionView(collection, numberOfItemsInSection: 0), 8)
         let status: UILabel = try findView("shader-status", in: controller)
         XCTAssertEqual(status.text, "Loading Aurora…")
@@ -53,7 +53,7 @@ final class HolodeckTests: XCTestCase {
         refreshed.manifest.shaders.append(added)
         refreshed.manifest.defaultShaderID = "aurora"
         refreshed.publicationRevision = String(repeating: "a", count: 40)
-        controller.applyCatalog(refreshed)
+        controller.applyCatalog(try! refreshed.validated())
         let status: UILabel = try findView("shader-status", in: controller)
         XCTAssertTrue(status.text?.hasPrefix("Now showing Plasma") == true)
         XCTAssertEqual(preferences.id, "plasma")
@@ -506,6 +506,21 @@ final class HolodeckTests: XCTestCase {
         XCTAssertTrue(preferences.writes.isEmpty)
         let plasmaRequests = await compiler.requestCount("plasma")
         XCTAssertEqual(plasmaRequests, 0)
+        controller.closePickerFromRemote()
+        XCTAssertFalse(picker.isHidden, "Back must keep recovery visible")
+        XCTAssertTrue(status.text?.contains("Couldn’t load Aurora") == true)
+        XCTAssertNil((controller.view as? MTKView)?.delegate.flatMap { ($0 as? Renderer)?.activeShader })
+        XCTAssertEqual(preferences.id, "aurora")
+        controller.collectionView(collection, didSelectItemAt: IndexPath(item: 2, section: 0))
+        try await waitForRequest("waves", in: compiler)
+        let canceled = try XCTUnwrap(controller.shaderSelectionTask)
+        controller.closePickerFromRemote()
+        XCTAssertFalse(picker.isHidden)
+        await compiler.complete("waves", pipeline: pipeline)
+        try await waitForSelection(canceled)
+        let auroraRequests = await compiler.requestCount("aurora")
+        XCTAssertEqual(auroraRequests, 1, "Cancel must not automatically retry the failed startup")
+        XCTAssertTrue(preferences.writes.isEmpty)
         controller.collectionView(collection, didSelectItemAt: IndexPath(item: 2, section: 0))
         try await waitForRequest("waves", in: compiler)
         let recovery = try XCTUnwrap(controller.shaderSelectionTask)
@@ -627,7 +642,7 @@ final class HolodeckTests: XCTestCase {
         let storyboard = UIStoryboard(name: "Main", bundle: Bundle(for: GameViewController.self))
         let controller = try withDependencies {
             $0.context = .test
-            $0.catalogService = CatalogService(storage: TestCatalog.storage, enabled: false)
+            $0.catalogService = CatalogService.offline(initialCatalog: TestCatalog.catalog, storage: TestCatalog.storage)
             $0.rendererFactory = factory
             $0.shaderPreferences = preferences
             $0.continuousClock = clock

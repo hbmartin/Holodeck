@@ -15,30 +15,30 @@ final class DiscoveryTests: XCTestCase {
         let data = try JSONEncoder().encode(snapshot)
         let legacy = try JSONDecoder().decode(LegacyCatalogSnapshot.self, from: data)
         try legacy.validate()
-        XCTAssertEqual(legacy.shaders.map(\.id), snapshot.shaders.map(\.id))
+        XCTAssertEqual(legacy.shaders.map(\.id), try snapshot.validated().shaders.map(\.id))
         XCTAssertEqual(legacy.initialShader.id, "plasma")
-        XCTAssertEqual(legacy.shaders.map(\.source), snapshot.shaders.map(\.source))
+        XCTAssertEqual(legacy.shaders.map(\.source), try snapshot.validated().shaders.map(\.source))
     }
 
     func testOldCacheAndOptionalMetadataRoundTrip() throws {
         XCTAssertNil(TestCatalog.snapshot.manifest.collections)
         XCTAssertTrue(TestCatalog.shaders.allSatisfy { $0.discovery == nil })
-        XCTAssertEqual(TestCatalog.snapshot.collections.map(\.id), ["procedural", "materials"])
+        XCTAssertEqual(TestCatalog.catalog.collections.map(\.id), ["procedural", "materials"])
         let snapshot = try fixture()
         let restored = try JSONDecoder().decode(CatalogSnapshot.self, from: JSONEncoder().encode(snapshot))
         try restored.validate()
-        XCTAssertEqual(restored.collections, snapshot.collections)
-        XCTAssertEqual(restored.shaders.map(\.discovery), snapshot.shaders.map(\.discovery))
+        XCTAssertEqual(try restored.validated().collections, try snapshot.validated().collections)
+        XCTAssertEqual(try restored.validated().shaders.map(\.discovery), try snapshot.validated().shaders.map(\.discovery))
         var future = restored
         future.manifest.shaders[0].discovery = SceneDiscovery(tags: ["future"], moods: ["serene"], motion: "glacial")
         XCTAssertNoThrow(try future.validate())
-        XCTAssertTrue(SceneLibrary.moods(future.shaders).contains("serene"))
+        XCTAssertTrue(SceneLibrary.moods(try future.validated().shaders).contains("serene"))
     }
 
     func testCollectionOrderAndIntersectingFilters() throws {
         let snapshot = try fixture()
-        let collection = snapshot.collections[0]
-        let scenes = snapshot.shaders
+        let collection = (try snapshot.validated()).collections[0]
+        let scenes = try snapshot.validated().shaders
         XCTAssertEqual(SceneLibrary.filter(scenes, query: "", favoritesOnly: false, favorites: [], collection: collection).map(\.id), collection.shaderIDs)
         XCTAssertEqual(SceneLibrary.filter(scenes, query: "", favoritesOnly: true, favorites: ["waves", "aurora", "chrome"], collection: collection, mood: "calm", motion: "slow").map(\.id), ["aurora", "chrome"])
         XCTAssertEqual(SceneLibrary.filter(scenes, query: "material", favoritesOnly: false, favorites: []).map(\.id), ["chrome", "brushed-gold", "iridescent"])
@@ -67,22 +67,24 @@ final class DiscoveryTests: XCTestCase {
         let snapshot = try fixture()
         let box = CatalogTestBox()
         var responses = ["/git/ref/heads/published": Data("{\"object\":{\"sha\":\"\(snapshot.publicationRevision)\"}}".utf8),
-                         "/contents/catalog.json": try JSONEncoder().encode(snapshot.manifest)]
-        for entry in snapshot.manifest.shaders { responses["/contents/\(entry.sourcePath)"] = Data(snapshot.sources[entry.id]!.utf8) }
+                         "/catalog.json": try JSONEncoder().encode(snapshot.manifest)]
+        for entry in snapshot.manifest.shaders { responses["/\(entry.sourcePath)"] = Data(snapshot.sources[entry.id]!.utf8) }
         box.setResponses(responses)
         try box.storage.write("snapshot.json", TestCatalog.data)
-        let service = CatalogService(network: box.network, storage: box.storage, now: { box.date })
+        let service = CatalogService(network: box.network, storage: box.storage, clock: box.clock)
         let refreshed = try await service.refresh(force: true)
-        XCTAssertEqual(refreshed?.collections, snapshot.collections)
+        XCTAssertEqual(refreshed?.collections, try snapshot.validated().collections)
         let cached = CatalogService(storage: box.storage, enabled: false)
-        XCTAssertEqual(cached.initialSnapshot?.shaders.map(\.discovery), snapshot.shaders.map(\.discovery))
+        let current = await cached.current()
+        XCTAssertEqual(current?.shaders.map(\.discovery), try snapshot.validated().shaders.map(\.discovery))
         var bad = snapshot.manifest; bad.collections![0].shaderIDs = ["missing"]
         responses["/git/ref/heads/published"] = Data("{\"object\":{\"sha\":\"\(String(repeating: "f", count: 40))\"}}".utf8)
-        responses["/contents/catalog.json"] = try JSONEncoder().encode(bad)
+        responses["/catalog.json"] = try JSONEncoder().encode(bad)
         box.setResponses(responses)
         do { _ = try await service.refresh(force: true); XCTFail("Invalid collection must fail refresh") } catch {}
         let retained = await service.current()
         XCTAssertEqual(retained?.publicationRevision, snapshot.publicationRevision)
-        XCTAssertEqual(CatalogService(storage: box.storage, enabled: false).initialSnapshot?.collections, snapshot.collections)
+        let reloaded = await CatalogService.offline(storage: box.storage).current()
+        XCTAssertEqual(reloaded?.collections, try snapshot.validated().collections)
     }
 }

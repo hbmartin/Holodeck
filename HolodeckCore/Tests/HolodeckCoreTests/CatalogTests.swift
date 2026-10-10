@@ -1,10 +1,11 @@
 import XCTest
 import Metal
+import Dependencies
 @testable import HolodeckCore
 
 @MainActor
 final class CatalogTests: XCTestCase {
-    private func candidate(ninth: Bool = false) -> CatalogSnapshot {
+    func candidate(ninth: Bool = false) -> CatalogSnapshot {
         var snapshot = TestCatalog.snapshot
         snapshot.publicationRevision = String(repeating: "a", count: 40)
         if ninth {
@@ -19,20 +20,20 @@ final class CatalogTests: XCTestCase {
         return snapshot
     }
 
-    private func makeService(_ candidate: CatalogSnapshot, box: CatalogTestBox = CatalogTestBox(), cached: Bool = true) throws -> CatalogService {
+    func makeService(_ candidate: CatalogSnapshot, box: CatalogTestBox = CatalogTestBox(), cached: Bool = true) throws -> CatalogService {
         var responses: [String: Data] = [
             "/git/ref/heads/published": Data("{\"object\":{\"sha\":\"\(candidate.publicationRevision)\"}}".utf8),
-            "/contents/catalog.json": try JSONEncoder().encode(candidate.manifest)
+            "/catalog.json": try JSONEncoder().encode(candidate.manifest)
         ]
         for entry in candidate.manifest.shaders {
-            responses["/contents/\(entry.sourcePath)"] = candidate.sources[entry.id].map { Data($0.utf8) }
+            responses["/\(entry.sourcePath)"] = candidate.sources[entry.id].map { Data($0.utf8) }
         }
         box.setResponses(responses)
         let storage = CatalogStorage(read: { name in
             if let value = try box.storage.read(name) { return value }
             return cached && name == "snapshot.json" ? TestCatalog.data : nil
         }, write: box.storage.write)
-        return CatalogService(network: box.network, storage: storage, now: { box.date })
+        return CatalogService(network: box.network, storage: storage, clock: box.clock)
     }
 
 
@@ -61,7 +62,7 @@ final class CatalogTests: XCTestCase {
         let box = CatalogTestBox()
         let expected = candidate()
         let service = try makeService(expected, box: box, cached: false)
-        XCTAssertNil(service.initialSnapshot)
+        XCTAssertNil(service.initialCatalog)
         let responses = box.responseFiles
         box.setResponses([:])
         do { _ = try await service.refresh(); XCTFail("Offline first launch must fail") } catch {}
@@ -78,10 +79,11 @@ final class CatalogTests: XCTestCase {
         let snapshot = TestCatalog.snapshot
         try snapshot.validate()
         let service = CatalogService(storage: TestCatalog.storage, enabled: false)
-        XCTAssertEqual(service.initialSnapshot?.shaders.count, 8)
+        let cached = await service.current()
+        XCTAssertEqual(cached?.shaders.count, 8)
         let refreshed = try await service.refresh()
         XCTAssertNil(refreshed)
-        for shader in snapshot.shaders {
+        for shader in try snapshot.validated().shaders {
             let preview = try XCTUnwrap(shader.preview)
             let data = try await service.preview(preview)
             XCTAssertEqual(CatalogHash.sha256(data), preview.hash)
@@ -111,10 +113,10 @@ final class CatalogTests: XCTestCase {
         let data = try XCTUnwrap(box.files["snapshot.json"])
         let persisted = try JSONDecoder().decode(CatalogSnapshot.self, from: data)
         try persisted.validate()
-        XCTAssertEqual(persisted.shaders.last?.id, "ninth-shader")
+        XCTAssertEqual(try persisted.validated().shaders.last?.id, "ninth-shader")
         let urls = box.urls
         XCTAssertEqual(urls.count, 11)
-        XCTAssertTrue(urls.dropFirst().allSatisfy { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems?.first?.value == expected.publicationRevision })
+        XCTAssertTrue(urls.dropFirst().allSatisfy { $0.host == "raw.githubusercontent.com" && $0.path.contains("/" + expected.publicationRevision + "/") })
     }
     func testInvalidSourceAndInterruptedWriteRetainPreviousSnapshot() async throws {
         for writeFails in [false, true] {
@@ -147,15 +149,17 @@ final class CatalogTests: XCTestCase {
         let fallback = await offline.current()
         XCTAssertEqual(fallback?.initialShader.id, "plasma")
     }
-    func testStartupUsesValidCacheAndRejectsCorruptCache() throws {
+    func testStartupUsesValidCacheAndRejectsCorruptCache() async throws {
         let cached = candidate(ninth: true)
         let box = CatalogTestBox()
         try box.storage.write("snapshot.json", JSONEncoder().encode(cached))
         let service = CatalogService(storage: box.storage, enabled: false)
-        XCTAssertEqual(service.initialSnapshot?.shaders.count, 9)
+        let current = await service.current()
+        XCTAssertEqual(current?.shaders.count, 9)
         try box.storage.write("snapshot.json", Data("interrupted JSON".utf8))
         let fallback = CatalogService(storage: box.storage, enabled: false)
-        XCTAssertNil(fallback.initialSnapshot)
+        let missing = await fallback.current()
+        XCTAssertNil(missing)
     }
     func testRefreshThrottlesAndUnchangedPublicationSkipsAssets() async throws {
         let box = CatalogTestBox()
@@ -166,10 +170,10 @@ final class CatalogTests: XCTestCase {
         let throttled = try await service.refresh()
         XCTAssertNil(throttled)
         XCTAssertEqual(box.urls.count, 1)
-        box.advance(899)
+        await box.clock.advance(by: .seconds(899))
         _ = try await service.refresh()
         XCTAssertEqual(box.urls.count, 1)
-        box.advance(1)
+        await box.clock.advance(by: .seconds(1))
         _ = try await service.refresh()
         XCTAssertEqual(box.urls.count, 2)
     }
@@ -229,23 +233,32 @@ final class CatalogTests: XCTestCase {
         let retry = try await service.refresh()
         XCTAssertNil(retry)
         XCTAssertEqual(box.urls.count, 1)
+        await box.clock.advance(by: .seconds(899))
+        let stillThrottled = try await service.refresh()
+        XCTAssertNil(stillThrottled)
+        XCTAssertEqual(box.urls.count, 1)
+        await box.clock.advance(by: .seconds(1))
+        do { _ = try await service.refresh(); XCTFail("Eligible failed attempts must check again") } catch {}
+        XCTAssertEqual(box.urls.count, 2)
     }
     func testPreviewHashFailureCacheReuseAndUnavailableImage() async throws {
         let box = CatalogTestBox()
         let image = Data([137, 80, 78, 71, 13, 10, 26, 10] + Array("test-image".utf8))
         let preview = ShaderPreview(path: "previews/test.png", hash: CatalogHash.sha256(image), publicationRevision: candidate().publicationRevision)
         let service = CatalogService(network: box.network, storage: box.storage)
-        box.setResponses(["/contents/previews/test.png": Data("corrupt".utf8)])
+        box.setResponses(["/previews/test.png": Data("corrupt".utf8)])
         do { _ = try await service.preview(preview); XCTFail("Bad image hash must fail") } catch {}
         XCTAssertTrue(box.files.isEmpty)
-        box.setResponses(["/contents/previews/test.png": image])
+        box.setResponses(["/previews/test.png": image])
         let downloaded = try await service.preview(preview)
         XCTAssertEqual(downloaded, image)
         let count = box.urls.count
+        let reads = box.storageReads.count
         box.setResponses([:])
         let cached = try await service.preview(preview)
         XCTAssertEqual(cached, image)
         XCTAssertEqual(box.urls.count, count)
+        XCTAssertEqual(box.storageReads.count, reads, "Memory hits must skip disk validation")
         let missing = ShaderPreview(path: "previews/missing.png", hash: String(repeating: "b", count: 64), publicationRevision: preview.publicationRevision)
         do { _ = try await service.preview(missing); XCTFail("Missing image must fail") } catch {}
     }
@@ -269,30 +282,38 @@ nonisolated final class CatalogTestBox: @unchecked Sendable {
     private var stored: [String: Data] = [:]
     private var responses: [String: Data] = [:]
     private var requests: [URL] = []
-    private var clock = Date(timeIntervalSince1970: 0)
+    private var reads: [String] = []
+    private var readOnMain = false
+    let clock = TestClock()
     private var failing = false
     var files: [String: Data] { lock.withLock { stored } }
     var responseFiles: [String: Data] { lock.withLock { responses } }
     var urls: [URL] { lock.withLock { requests } }
-    var date: Date { lock.withLock { clock } }
+    var storageReads: [String] { lock.withLock { reads } }
+    var storageReadOnMain: Bool { lock.withLock { readOnMain } }
     var failWrites: Bool {
         get { lock.withLock { failing } }
         set { lock.withLock { failing = newValue } }
     }
-    func advance(_ seconds: TimeInterval) { lock.withLock { clock.addTimeInterval(seconds) } }
     func setResponses(_ values: [String: Data]) { lock.withLock { responses = values } }
     var network: CatalogNetwork {
         CatalogNetwork { [self] url, _ in
             try lock.withLock {
                 requests.append(url)
-                let path = url.path.replacingOccurrences(of: "/repos/hbmartin/HolodeckShaders", with: "")
+                let path = url.host == "raw.githubusercontent.com"
+                    ? "/" + url.path.split(separator: "/").dropFirst(3).joined(separator: "/")
+                    : url.path.replacingOccurrences(of: "/repos/hbmartin/HolodeckShaders", with: "")
                 guard let response = responses[path] else { throw CatalogError.invalidResponse }
                 return response
             }
         }
     }
     var storage: CatalogStorage {
-        CatalogStorage(read: { [self] name in lock.withLock { stored[name] } }, write: { [self] name, data in
+        CatalogStorage(read: { [self] name in lock.withLock {
+            reads.append(name)
+            readOnMain = readOnMain || Thread.isMainThread
+            return stored[name]
+        } }, write: { [self] name, data in
             try lock.withLock {
                 if failing { throw CatalogError.invalidResponse }
                 stored[name] = data
@@ -301,11 +322,13 @@ nonisolated final class CatalogTestBox: @unchecked Sendable {
     }
 }
 
-private actor PreviewRequestGate {
+actor PreviewRequestGate {
+    private(set) var requestCount = 0
     private var requests: [String: CheckedContinuation<Data, Never>] = [:]
     private var observers: [String: CheckedContinuation<Void, Never>] = [:]
     func image(_ path: String) async -> Data {
-        await withCheckedContinuation { continuation in
+        requestCount += 1
+        return await withCheckedContinuation { continuation in
             requests[path] = continuation
             observers.removeValue(forKey: path)?.resume()
         }
