@@ -38,6 +38,22 @@ nonisolated public struct CatalogStorage: Sendable {
     public static let disabled = Self(read: { _ in nil }, write: { _, _ in })
 }
 
+nonisolated public enum CatalogRefreshOutcome: Sendable {
+    case updated(ValidatedCatalog)
+    case unchanged, throttled, disabled
+}
+
+nonisolated public enum PreviewSizing {
+    /// Shared destination buckets keep layout requests and decoded cache keys in agreement.
+    public static func bucketedTargetPixels(_ size: CGSize) throws -> CGSize {
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else {
+            throw CatalogError.invalidPreview
+        }
+        return CGSize(width: min(2048, ceil(size.width / 64) * 64),
+                      height: min(2048, ceil(size.height / 64) * 64))
+    }
+}
+
 /// Refresh downloads and persistence run off the UI executor. Failed refreshes never replace current.
 public actor CatalogService {
     public nonisolated let initialCatalog: ValidatedCatalog?
@@ -67,6 +83,7 @@ public actor CatalogService {
 
     func setBeforePreviewDecode(_ hook: (@Sendable () -> Void)?) { beforePreviewDecode = hook }
     var previewFailureCount: Int { previewFailures.cost }
+    private(set) var previewRetryWaiterCount = 0
 
     public func trimPreviewCaches() {
         cacheEpoch &+= 1
@@ -104,17 +121,27 @@ public actor CatalogService {
 
     @discardableResult
     public func refresh(force: Bool = false) async throws -> ValidatedCatalog? {
+        if case .updated(let catalog) = try await refreshOutcome(force: force) { return catalog }
+        return nil
+    }
+
+    /// Separates successful checks from skips; only updated and unchanged performed a network check.
+    @discardableResult
+    public func refreshOutcome(force: Bool = false) async throws -> CatalogRefreshOutcome {
         try Task.checkCancellation()
         _ = current()
-        guard enabled else { return nil }
+        guard enabled else { return .disabled }
         if refreshTask == nil {
             let instant = clock.now
-            if !force, snapshot != nil, let lastAttempt, lastAttempt.duration(to: instant) < .seconds(900) { return nil }
+            if !force, snapshot != nil, let lastAttempt, lastAttempt.duration(to: instant) < .seconds(900) { return .throttled }
             lastAttempt = instant
             // The service owns this flight, including persistence after its last viewer leaves.
             refreshTask = Task {
-                let result: Result<ValidatedCatalog?, Error>
-                do { result = .success(try await downloadPublication()) }
+                let result: Result<CatalogRefreshOutcome, Error>
+                do {
+                    if let catalog = try await downloadPublication() { result = .success(.updated(catalog)) }
+                    else { result = .success(.unchanged) }
+                }
                 catch {
                     Diagnostics.catalog.error("Catalog refresh failed: \(error.localizedDescription, privacy: .public)")
                     result = .failure(error)
@@ -137,7 +164,7 @@ public actor CatalogService {
 
     private func removeRefreshWaiter(_ id: UUID) { refreshWaiters[id] = nil }
 
-    private func finishRefresh(_ result: Result<ValidatedCatalog?, Error>) {
+    private func finishRefresh(_ result: Result<CatalogRefreshOutcome, Error>) {
         refreshTask = nil
         let waiters = Array(refreshWaiters.values)
         refreshWaiters.removeAll()
@@ -201,6 +228,23 @@ public actor CatalogService {
            failure.retryAt == nil || clock.now < failure.retryAt! { throw failure.error }
     }
 
+    /// Returns when a retry is eligible, or false for a permanent failure. This does not fetch an image.
+    public func waitForPreviewRetry(_ preview: ShaderPreview) async throws -> Bool {
+        try Task.checkCancellation()
+        try validatePreview(preview)
+        while let failure = previewFailures.value(for: PreviewFailureKey(preview)) {
+            guard let retryAt = failure.retryAt else { return false }
+            if clock.now >= retryAt { return true }
+            do {
+                previewRetryWaiterCount += 1
+                defer { previewRetryWaiterCount -= 1 }
+                try await clock.sleep(until: retryAt)
+            }
+            try Task.checkCancellation()
+        }
+        return true
+    }
+
     private func recordPreviewFailure(_ error: Error, preview: ShaderPreview) {
         guard !(error is CancellationError), (error as? URLError)?.code != .cancelled else { return }
         let key = PreviewFailureKey(preview)
@@ -235,12 +279,9 @@ public actor CatalogService {
 
     /// Target dimensions are pixels, including any display scale and focus enlargement.
     public func previewImage(_ preview: ShaderPreview, targetPixelSize: CGSize) async throws -> CGImage {
-        guard targetPixelSize.width.isFinite, targetPixelSize.height.isFinite,
-              targetPixelSize.width > 0, targetPixelSize.height > 0 else { throw CatalogError.invalidPreview }
         // Bucket destinations as well as decoded sizes to avoid a cache entry per layout fluctuation.
-        let width = Int(min(2048, ceil(targetPixelSize.width / 64) * 64))
-        let height = Int(min(2048, ceil(targetPixelSize.height / 64) * 64))
-        return try await previewImage(preview, request: .fill(width, height))
+        let pixels = try PreviewSizing.bucketedTargetPixels(targetPixelSize)
+        return try await previewImage(preview, request: .fill(Int(pixels.width), Int(pixels.height)))
     }
 
     private func previewImage(_ preview: ShaderPreview, request: PreviewSize) async throws -> CGImage {
@@ -286,12 +327,12 @@ public actor CatalogService {
 /// Completion and cancellation may race, including before continuation registration.
 nonisolated private final class CatalogRefreshWaiter: @unchecked Sendable {
     private let lock = NSLock()
-    private var result: Result<ValidatedCatalog?, Error>?
-    private var continuation: CheckedContinuation<ValidatedCatalog?, Error>?
+    private var result: Result<CatalogRefreshOutcome, Error>?
+    private var continuation: CheckedContinuation<CatalogRefreshOutcome, Error>?
 
-    func value() async throws -> ValidatedCatalog? {
+    func value() async throws -> CatalogRefreshOutcome {
         try await withCheckedThrowingContinuation { continuation in
-            let result: Result<ValidatedCatalog?, Error>? = lock.withLock {
+            let result: Result<CatalogRefreshOutcome, Error>? = lock.withLock {
                 if let result { return result }
                 self.continuation = continuation
                 return nil
@@ -300,9 +341,9 @@ nonisolated private final class CatalogRefreshWaiter: @unchecked Sendable {
         }
     }
 
-    func resolve(_ result: Result<ValidatedCatalog?, Error>) {
+    func resolve(_ result: Result<CatalogRefreshOutcome, Error>) {
         let continuation = lock.withLock {
-            guard self.result == nil else { return Optional<CheckedContinuation<ValidatedCatalog?, Error>>.none }
+            guard self.result == nil else { return Optional<CheckedContinuation<CatalogRefreshOutcome, Error>>.none }
             self.result = result
             defer { self.continuation = nil }
             return self.continuation

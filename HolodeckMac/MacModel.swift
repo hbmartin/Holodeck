@@ -6,10 +6,14 @@ import Observation
 
 @MainActor @Observable
 final class MacModel {
+    struct RendererFailure: Identifiable {
+        let id = UUID()
+        let message: String
+    }
     let session: ViewerSession
     let favorites: SceneFavorites
     let defaults: UserDefaults?
-    let windowAutosaveName: String
+    let windowAutosaveName: String?
     var query = ""
     var favoritesOnly = false
     var collectionID = "all"
@@ -19,38 +23,49 @@ final class MacModel {
         didSet { defaults?.set(sidebarVisible, forKey: "holodeck.sidebarVisible") }
     }
     var searchFocusRequest = 0
-    var startupError: String?
+    var startupError: RendererFailure?
     private(set) var rendererUnavailableReason: String?
     var sleeping = false
     private(set) var renderer: Renderer?
+    private(set) var hasAttemptedRendererInstallation = false
     @ObservationIgnored weak var window: NSWindow?
     @ObservationIgnored private let device: (any MTLDevice)?
     @ObservationIgnored private let compilerFactory: @Sendable (any MTLDevice, MTLPixelFormat) -> any ShaderCompiling
     @ObservationIgnored private let filterCache = SceneFilterCache()
+    @ObservationIgnored private let alerts = MacAlertCoordinator()
+    #if DEBUG
+    @ObservationIgnored private var replacesPresentedFailureForTesting = false
+    #endif
 
     @ObservationIgnored private var memoryPressure: (any DispatchSourceMemoryPressure)?
 
     init() {
-        var windowNamespace = "live"
+        var autosaveName: String? = "HolodeckViewer-live"
         var defaults: UserDefaults? = UserDefaults.standard
         var service = CatalogService()
         var metalDevice = MTLCreateSystemDefaultDevice()
         #if DEBUG
         let configuration = UITestConfiguration(applicationID: "me.haroldmartin.HolodeckMac")
         if let suite = configuration.storageSuite {
-            windowNamespace = suite
+            let name = "HolodeckViewer-" + suite
+            let cleanup = configuration.contains("--ui-test-cleanup-storage-suite")
+            autosaveName = configuration.hasExplicitStorageSuite && !cleanup ? name : nil
+            if cleanup, configuration.hasExplicitStorageSuite { NSWindow.removeFrame(usingName: name) }
             defaults = configuration.makeUserDefaults()
             service = configuration.makeCatalogService()
             if configuration.contains("--ui-test-metal-unavailable") { metalDevice = nil }
         }
         #endif
         self.defaults = defaults
-        windowAutosaveName = "HolodeckViewer-" + windowNamespace
+        windowAutosaveName = autosaveName
         self.device = metalDevice
         compilerFactory = { ShaderCompiler(device: $0, pixelFormat: $1) }
         favorites = defaults.map { SceneFavorites(defaults: $0) } ?? .inMemory()
         sidebarVisible = defaults?.object(forKey: "holodeck.sidebarVisible") as? Bool ?? true
         session = ViewerSession(catalogService: service, preferences: defaults.map(ShaderPreferences.userDefaults) ?? .inMemory(), policy: .mac)
+        #if DEBUG
+        replacesPresentedFailureForTesting = configuration.contains("--ui-test-replace-presented-failure")
+        #endif
         session.refresh()
         let previewService = service
         let pressure = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .global())
@@ -78,6 +93,10 @@ final class MacModel {
     var selectedID: String? { session.pendingSelection?.shader.id ?? session.activeShader?.id }
 
     func installRenderer(in view: MTKView) {
+        defer {
+            hasAttemptedRendererInstallation = true
+            presentFailuresIfNeeded()
+        }
         if let renderer {
             renderer.bind(to: view)
             updateActivity()
@@ -101,13 +120,25 @@ final class MacModel {
             updateActivity()
         } catch {
             rendererUnavailableReason = error.localizedDescription
-            startupError = error.localizedDescription
+            startupError = RendererFailure(message: error.localizedDescription)
         }
     }
 
     func updateActivity(appActive: Bool? = nil) {
         session.setActive((appActive ?? NSApp.isActive) && !sleeping && window?.isMiniaturized != true && window?.isVisible == true)
+        presentFailuresIfNeeded()
     }
+    func presentFailuresIfNeeded() { alerts.presentNextFailure(in: self) }
+    #if DEBUG
+    func didPresentFailureForTesting() {
+        guard replacesPresentedFailureForTesting else { return }
+        replacesPresentedFailureForTesting = false
+        if startupError != nil { startupError = RendererFailure(message: "A newer renderer startup failure occurred.") }
+        else if let failure = session.failure {
+            session.failure = ViewerSession.Failure(message: "A newer scene download failure occurred.", operation: failure.operation)
+        }
+    }
+    #endif
     func focusSearch() {
         sidebarVisible = true
         searchFocusRequest += 1

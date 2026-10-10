@@ -70,9 +70,12 @@ final class WindowObserverView: NSView {
         window.isReleasedWhenClosed = false
         MacAppDelegate.viewerWindow = window
         // Namespace test windows so UI tests never change real window preferences.
-        let name = model.windowAutosaveName
-        window.setFrameAutosaveName(name)
-        window.setFrameUsingName(name)
+        if let name = model.windowAutosaveName {
+            window.setFrameAutosaveName(name)
+            window.setFrameUsingName(name)
+        } else {
+            window.setFrameAutosaveName("")
+        }
         window.setAccessibilityIdentifier("holodeck-viewer-window")
         for notification in [NSWindow.didMiniaturizeNotification, NSWindow.didDeminiaturizeNotification,
                              NSWindow.didBecomeKeyNotification, NSWindow.didResizeNotification] {

@@ -87,3 +87,30 @@ Implicit fixture preferences and favorites now stay in memory. Named suites reta
 | Mac and TV Release builds | Passed |
 
 The preview comparison uses the preserved 640-pixel API to compare against the earlier full-decode path; production TV sizing now depends on the destination. Measurements exclude real network latency and are local to this machine. Deployment-target OS versions and a physical Apple TV remain unavailable. Service-owned downloads, injected clocks, both strict memory budgets and the existing LRU implementation are retained. There is no catalog/disk-format migration.
+
+## Catalog notices, retry scheduling and window storage
+
+Checked on October 10, 2026 with the same Mac and tvOS 27 simulator. `CatalogService.refreshOutcome(force:)` distinguishes updated and unchanged checks from throttled and disabled checks. The existing optional-returning `refresh(force:)` remains available. Viewer sessions retain catalog failures through refresh startup and skipped checks, clearing them after a successful check, a newly applied publication, or an explicit dismissal/retry. Coalesced callers still cancel independently while the service owns publication and persistence.
+
+TV reactivation requires an attached renderer; Mac and custom policies retain the permissive default. Catalog-loading and failure events respect the renderer-unavailable warning and suppress loading hints. Native Mac alert sheets capture one immutable failure each, present renderer errors first with only OK, and then present session errors with Retry and OK. Their completion handlers act on the captured identity, preserving newer failures and waiting for a usable viewer window.
+
+TV cells retain one request task during transient preview cooldowns. `waitForPreviewRetry(_:)` uses the injected service clock and existing backoff records; permanent failures stay suppressed until reuse, service replacement or a changed full preview descriptor. Publication changes can retry an unchanged image hash. Shared pixel bucketing validates positive finite dimensions and retains the 64-pixel buckets and 2048 cap. A single focus-scale constant supplies both destination sizing and appearance.
+
+Named UI-test suites still persist window geometry across relaunches. Implicit fixture launches and cleanup launches disable frame autosave. Explicit cleanup removes only its named AppKit frame, defaults suite and cache; its cleanup window cannot recreate that frame. The live window frame and historical preferences are preserved.
+
+Mac UI helpers leave native menus closed during normal-window launches, use mouse resize events and read the app's sandboxed preferences from the real user home rather than Xcode's redirected runner home. Storage assertions wait for writes/removals to reach disk, verify restored dimensions and detect added frame entries while allowing prior cleanup writes to finish.
+
+| Check | Result |
+| --- | --- |
+| Core tests on macOS | 89 passed; four opt-in tests skipped |
+| Core tests on tvOS 27 simulator | 89 passed; four opt-in tests skipped |
+| TV controller/card tests | 36 passed |
+| TV remote UI tests | 19 passed |
+| Repeated preview recovery and remote focus checks | Four preview tests and both chooser-return/stale-filter-focus tests each passed three consecutive iterations |
+| Mac UI test compilation | Passed, including sequential alerts, stale actions and frame-storage regressions |
+| Mac UI execution | Serial full suite on macOS 27.0.1 / Xcode 27.0: 12 passed and one failed. Sequential renderer/catalog alerts, stale actions, explicit frame persistence/cleanup, implicit fixture storage, cached retry, discovery, scene selection, search/favorites and window reopening passed. The existing fullscreen exit check timed out waiting for its menu to open. |
+| Mac and TV Release builds | Passed |
+
+The remaining Mac failure is `testNativeFullScreenPreservesSidebarAndPlayback`: XCTest times out waiting for the Exit Full Screen menu-open notification. A separate native fixture inspection confirmed fullscreen entry and exit, but automated fullscreen exit remains unverified. This failure is recorded separately; no fullscreen implementation change is included. The final serial run executed all 13 tests with one failure.
+
+Focus restoration, cache insertion after trimming and discovery sanitization are unchanged. The repeated remote focus checks passed without an implementation change. Catalog JSON, disk formats, retry intervals, cache budgets and deployment targets are unchanged; no storage migration or broad preferences cleanup is introduced.

@@ -382,6 +382,32 @@ final class HolodeckTests: XCTestCase {
         }
     }
 
+    func testUnavailableRendererWithEmptyAndCachedCatalogNeverRefreshesOnReactivation() async throws {
+        for cached in [false, true] {
+            let counter = ControllerNetworkCounter()
+            let service = CatalogService(initialCatalog: cached ? TestCatalog.catalog : nil,
+                network: CatalogNetwork { url, _ in
+                    if url.host == "api.github.com" { await counter.record() }
+                    throw CatalogError.invalidResponse
+                }, storage: .disabled)
+            let controller = try await hostController(dependencies: { $0.catalogService = service },
+                factory: { _ in throw RendererStartupError.metalUnavailable })
+            let status: UILabel = try findView("shader-status", in: controller)
+            let hint: UIView = try findView("shader-hint", in: controller)
+            let spinner: UIActivityIndicatorView = try findView("shader-loading", in: controller)
+            for _ in 0..<3 {
+                controller.setSceneActive(false)
+                controller.setSceneActive(true)
+                XCTAssertEqual(status.text, RendererStartupError.metalUnavailable.localizedDescription)
+                XCTAssertTrue(hint.isHidden)
+                XCTAssertFalse(spinner.isAnimating)
+                controller.openPickerFromRemote()
+            }
+            let requests = await counter.count
+            XCTAssertEqual(requests, 0)
+        }
+    }
+
     func testUnavailableErrorsSurvivePickerUpdates() async throws {
         for error in [RendererStartupError.metalUnavailable, .initializationFailed] {
             let controller = try await hostController(factory: { view in
@@ -922,6 +948,11 @@ private extension UIView {
 }
 
 private enum ControllerTestError: Error { case timedOut }
+
+private actor ControllerNetworkCounter {
+    private(set) var count = 0
+    func record() { count += 1 }
+}
 
 @MainActor
 private final class PreferenceSpy {
