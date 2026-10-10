@@ -27,6 +27,88 @@ final class ViewerSessionTests: XCTestCase {
         return snapshot
     }
 
+    func testDismissedRecoveryErrorNeverReturnsAndSuccessfulSelectionClearsPreviousError() async throws {
+        let (session, renderer, _) = session()
+        renderer.failNext = true
+        await settled(session)
+        let startup = try XCTUnwrap(session.failure)
+        session.dismissFailure(id: startup.id)
+        await session.refresh().value
+        XCTAssertNil(session.selectionFailure)
+        XCTAssertTrue(session.requiresExplicitSelection)
+        renderer.held = true
+        let pending = session.select(TestCatalog.shaders[1])
+        await renderer.waitForRequest("aurora")
+        session.cancelPendingSelection(resumeStartup: true)
+        renderer.finish("aurora")
+        await pending.value
+        XCTAssertNil(session.failure)
+        renderer.held = false
+        renderer.failNext = true
+        await session.select(TestCatalog.shaders[1]).value
+        let previous = try XCTUnwrap(session.failure)
+        renderer.held = true
+        let canceled = session.select(TestCatalog.shaders[2])
+        XCTAssertNil(session.failure)
+        await renderer.waitForRequest("waves")
+        session.cancelPendingSelection()
+        XCTAssertEqual(session.failure?.id, previous.id)
+        renderer.finish("waves")
+        await canceled.value
+        renderer.held = false
+        await session.select(TestCatalog.shaders[2]).value
+        XCTAssertNil(session.selectionFailure)
+        session.retry(previous)
+        XCTAssertEqual(session.activeShader?.id, "waves")
+        XCTAssertNil(session.pendingSelection)
+    }
+
+    func testLazyCacheRefreshWithoutRendererJoinsOnAttachmentAndNeverSignalsEmptyCache() async throws {
+        let gate = PreviewRequestGate()
+        let service = CatalogService(network: CatalogNetwork { _, _ in await gate.image("published") }, storage: TestCatalog.storage)
+        let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
+        var checkedWithCache = false
+        session.onEvent = { event in
+            if case .catalogCacheChecked = event { checkedWithCache = session.hasCheckedCache && !session.shaders.isEmpty }
+        }
+        XCTAssertFalse(session.hasCheckedCache)
+        let refresh = session.refresh()
+        await gate.waitForRequest("published")
+        XCTAssertEqual(session.shaders.count, 8)
+        XCTAssertTrue(checkedWithCache)
+        XCTAssertNil(session.activeShader)
+        session.attach(FakeRenderer())
+        await session.selectionTask?.value
+        XCTAssertEqual(session.activeShader?.id, "plasma")
+        let requests = await gate.requestCount
+        XCTAssertEqual(requests, 1)
+        await gate.complete("published", data: Data())
+        await refresh.value
+        session.onEvent = nil
+    }
+
+    func testRecoveryCatalogFailureKeepsBothOperationsAndRetriesDownload() async throws {
+        let counter = NetworkCounter()
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, network: CatalogNetwork { _, _ in
+            await counter.record(); throw CatalogError.invalidResponse
+        }, storage: .disabled)
+        let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
+        let renderer = FakeRenderer()
+        renderer.failNext = true
+        session.attach(renderer)
+        await settled(session)
+        let selection = try XCTUnwrap(session.selectionFailure)
+        let download = try XCTUnwrap(session.catalogUpdateFailure)
+        session.dismissFailure(id: selection.id)
+        session.retry(download)
+        await settled(session)
+        XCTAssertNil(session.failure)
+        XCTAssertEqual(renderer.selections.count, 1)
+        let requests = await counter.count
+        XCTAssertEqual(requests, 2)
+        XCTAssertTrue(session.requiresExplicitSelection)
+    }
+
     func testMacStartsDefaultAndDoesNotPersistSelectionWhileTVRestoresAndPersists() async {
         let (mac, macRenderer, macPrefs) = session()
         await settled(mac)
@@ -132,6 +214,21 @@ final class ViewerSessionTests: XCTestCase {
         XCTAssertNil(session.failure)
     }
 
+    func testSuccessfulAutomaticReplacementClearsOnlyItsOwnFailure() async throws {
+        let (session, renderer, _) = session()
+        await settled(session)
+        renderer.failNext = true
+        session.applyCatalog(try changed().validated())
+        await settled(session)
+        XCTAssertNotNil(session.selectionFailure)
+        var newer = changed()
+        newer.publicationRevision = String(repeating: "e", count: 40)
+        session.applyCatalog(try newer.validated())
+        await settled(session)
+        XCTAssertNil(session.selectionFailure)
+        XCTAssertEqual(session.activeShader?.title, "Updated Scene")
+    }
+
     func testRemovedActiveSceneKeepsPlayingAndFilteringNeverSelects() async {
         let (session, renderer, _) = session()
         await settled(session)
@@ -233,7 +330,7 @@ final class ViewerSessionTests: XCTestCase {
             await settled(session)
             XCTAssertEqual(session.catalog?.publicationRevision, latest.publicationRevision)
             XCTAssertEqual(session.activeShader?.title, "Updated Scene")
-            if scenario == 2 { XCTAssertNotNil(session.failure) }
+            if scenario == 2 { XCTAssertNotNil(session.catalogUpdateFailure); XCTAssertNil(session.failure) }
         }
     }
 
@@ -287,7 +384,80 @@ final class ViewerSessionTests: XCTestCase {
         await settled(failing)
         XCTAssertEqual(failing.shaders.count, 8)
         XCTAssertEqual(failing.activeShader?.id, "plasma")
-        XCTAssertNotNil(failing.failure)
+        XCTAssertNil(failing.failure)
+        XCTAssertNotNil(failing.catalogUpdateFailure)
+    }
+
+    func testSelectionWithoutRendererHasNoSideEffects() async {
+        let session = ViewerSession(catalogService: .offline(initialCatalog: TestCatalog.catalog), preferences: .inMemory(), policy: .mac)
+        let failure = ViewerSession.Failure(message: "Existing error", operation: .catalog)
+        session.failure = failure
+        var events = 0
+        session.onEvent = { _ in events += 1 }
+        await session.select(TestCatalog.initialShader).value
+        XCTAssertNil(session.pendingSelection)
+        XCTAssertNil(session.selectionTask)
+        XCTAssertEqual(session.catalogUpdateFailure?.id, failure.id)
+        XCTAssertEqual(events, 0)
+        let renderer = FakeRenderer()
+        session.attach(renderer)
+        await settled(session)
+        XCTAssertEqual(session.activeShader?.id, "plasma")
+    }
+
+    func testUserFailureSurvivesRefreshAndAutomaticSourceReplacement() async throws {
+        for automaticFailure in [false, true] {
+            let (session, renderer, _) = session()
+            await settled(session)
+            renderer.failNext = true
+            await session.select(TestCatalog.shaders[1]).value
+            let failure = try XCTUnwrap(session.failure)
+            await session.refresh().value
+            XCTAssertEqual(session.failure?.id, failure.id)
+            renderer.failNext = automaticFailure
+            session.applyCatalog(try changed().validated())
+            await settled(session)
+            XCTAssertEqual(session.failure?.id, failure.id)
+            XCTAssertNil(session.pendingSelection)
+            XCTAssertNotNil(session.activeShader)
+        }
+    }
+
+    func testStaleDismissalAndRetryDoNotReplaceNewFailure() async throws {
+        let (session, renderer, _) = session()
+        await settled(session)
+        renderer.failNext = true
+        await session.select(TestCatalog.shaders[1]).value
+        let old = try XCTUnwrap(session.failure)
+        renderer.failNext = true
+        await session.select(TestCatalog.shaders[2]).value
+        let current = try XCTUnwrap(session.failure)
+        session.dismissFailure(id: old.id)
+        session.retry(old)
+        XCTAssertEqual(session.failure?.id, current.id)
+        XCTAssertNil(session.pendingSelection)
+        session.dismissFailure(id: current.id)
+        XCTAssertNil(session.failure)
+    }
+
+    func testCachedUpdateRetryPreservesSelectionFailureAndClearsNotice() async throws {
+        let box = CatalogTestBox()
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, network: box.network, storage: .disabled)
+        let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
+        let renderer = FakeRenderer()
+        session.attach(renderer)
+        await settled(session)
+        XCTAssertNil(session.failure)
+        let notice = try XCTUnwrap(session.catalogUpdateFailure)
+        renderer.failNext = true
+        await session.select(TestCatalog.shaders[1]).value
+        let failure = try XCTUnwrap(session.failure)
+        box.setResponses(["/git/ref/heads/published": Data("{\"object\":{\"sha\":\"\(TestCatalog.catalog.publicationRevision)\"}}".utf8)])
+        session.retry(notice)
+        await settled(session)
+        XCTAssertNil(session.catalogUpdateFailure)
+        XCTAssertEqual(session.failure?.id, failure.id)
+        XCTAssertEqual(session.activeShader?.id, "plasma")
     }
 }
 

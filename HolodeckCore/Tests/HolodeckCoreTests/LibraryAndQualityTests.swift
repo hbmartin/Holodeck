@@ -3,6 +3,55 @@ import XCTest
 
 @MainActor
 final class LibraryAndQualityTests: XCTestCase {
+    #if DEBUG
+    func testFixtureStorageIsImplicitlyInMemoryAndDefaultsFailureFallsBack() throws {
+        let fixture = String(decoding: TestCatalog.data, as: UTF8.self)
+        let implicit = UITestConfiguration(arguments: [], environment: ["HOLODECK_UI_TEST_CATALOG": fixture], applicationID: "tests")
+        XCTAssertNotNil(implicit.storageSuite)
+        XCTAssertFalse(implicit.hasExplicitStorageSuite)
+        XCTAssertNil(implicit.makeUserDefaults { _ in XCTFail("Implicit fixtures must not open a suite"); return nil })
+        let suite = "HolodeckFixtureTests-" + UUID().uuidString
+        let named = UITestConfiguration(arguments: ["--ui-test-storage-suite", suite], environment: [:], applicationID: "tests")
+        XCTAssertTrue(named.hasExplicitStorageSuite)
+        XCTAssertNil(named.makeUserDefaults { _ in nil })
+        let preferences = named.makeUserDefaults { _ in nil }.map(ShaderPreferences.userDefaults) ?? .inMemory()
+        preferences.setLastShaderID("aurora")
+        XCTAssertEqual(preferences.lastShaderID(), "aurora")
+        let first = SceneFavorites.inMemory()
+        first.toggle("plasma")
+        XCTAssertTrue(SceneFavorites.inMemory().ids.isEmpty)
+    }
+
+    func testNamedFixturePersistsAndCleanupCannotRecreateStorage() async throws {
+        let suite = "HolodeckFixtureTests-" + UUID().uuidString
+        let fixture = String(decoding: TestCatalog.data, as: UTF8.self)
+        let named = UITestConfiguration(arguments: ["--ui-test-storage-suite", suite, "--ui-test-disk-cache"],
+            environment: ["HOLODECK_UI_TEST_CATALOG": fixture], applicationID: "tests")
+        defer {
+            UserDefaults.standard.removePersistentDomain(forName: suite)
+            if let directory = named.fixtureCacheDirectory { try? FileManager.default.removeItem(at: directory) }
+        }
+        let defaults = try XCTUnwrap(named.makeUserDefaults())
+        ShaderPreferences.userDefaults(defaults).setLastShaderID("waves")
+        XCTAssertEqual(ShaderPreferences.userDefaults(try XCTUnwrap(named.makeUserDefaults())).lastShaderID(), "waves")
+        let service = named.makeCatalogService()
+        XCTAssertNil(service.initialCatalog)
+        let cached = await service.current()
+        XCTAssertEqual(cached?.shaders.count, 8)
+        let directory = try XCTUnwrap(named.fixtureCacheDirectory)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
+        let cleanup = UITestConfiguration(arguments: ["--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite", "--ui-test-disk-cache"],
+            environment: ["HOLODECK_UI_TEST_CATALOG": fixture], applicationID: "tests")
+        let empty = cleanup.makeCatalogService()
+        XCTAssertNil(cleanup.makeUserDefaults())
+        XCTAssertNil(defaults.string(forKey: "holodeck.lastShaderID"))
+        let session = ViewerSession(catalogService: empty, preferences: .inMemory(), policy: .mac)
+        await session.refresh().value
+        XCTAssertTrue(session.shaders.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+    #endif
+
     func testSearchAndFavoritesComposeAndPreserveOrder() {
         let scenes = TestCatalog.shaders
         XCTAssertEqual(SceneLibrary.filter(scenes, query: "LIGHT", favoritesOnly: false, favorites: []).map(\.id),

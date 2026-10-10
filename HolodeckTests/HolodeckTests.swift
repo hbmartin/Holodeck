@@ -8,6 +8,69 @@ import ConcurrencyExtras
 
 @MainActor
 final class HolodeckTests: XCTestCase {
+    func testUserActivationDismissesOpenChooserButStartupLeavesItOpen() async throws {
+        for userSelection in [false, true] {
+            let (controller, compiler, pipeline) = try await controlledController()
+            try await waitForRequest("plasma", in: compiler)
+            var selection = try XCTUnwrap(controller.shaderSelectionTask)
+            controller.openPickerFromRemote()
+            if userSelection {
+                await compiler.complete("plasma", pipeline: pipeline)
+                try await waitForSelection(selection)
+                let cards: UICollectionView = try findView("shader-cards", in: controller)
+                controller.collectionView(cards, didSelectItemAt: IndexPath(item: 1, section: 0))
+                try await waitForRequest("aurora", in: compiler)
+                selection = try XCTUnwrap(controller.shaderSelectionTask)
+            }
+            let button: UIButton = try findView("collection-filter", in: controller)
+            button.sendActions(for: .primaryActionTriggered)
+            let presented = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                controller.presentedViewController is UIAlertController && controller.presentedViewController?.isBeingPresented == false
+            }, object: controller)
+            try await waitForExpectation(presented)
+            await compiler.complete(userSelection ? "aurora" : "plasma", pipeline: pipeline)
+            try await waitForSelection(selection)
+            let picker: UIView = try findView("shader-picker", in: controller)
+            XCTAssertEqual(picker.isHidden, userSelection)
+            if userSelection {
+                let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                    controller.presentedViewController == nil
+                }, object: controller)
+                try await waitForExpectation(dismissed)
+            }
+            else {
+                XCTAssertTrue(controller.presentedViewController is UIAlertController)
+                controller.closePickerFromRemote()
+                let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                    controller.presentedViewController == nil
+                }, object: controller)
+                try await waitForExpectation(dismissed)
+            }
+        }
+    }
+
+    func testRefreshKeepsUserSelectionFailureVisibleOverPlayback() async throws {
+        let (controller, compiler, pipeline) = try await controlledController()
+        try await waitForRequest("plasma", in: compiler)
+        let initial = try XCTUnwrap(controller.shaderSelectionTask)
+        await compiler.complete("plasma", pipeline: pipeline)
+        try await waitForSelection(initial)
+        controller.openPickerFromRemote()
+        let cards: UICollectionView = try findView("shader-cards", in: controller)
+        controller.collectionView(cards, didSelectItemAt: IndexPath(item: 1, section: 0))
+        try await waitForRequest("aurora", in: compiler)
+        let selection = try XCTUnwrap(controller.shaderSelectionTask)
+        await compiler.fail("aurora")
+        try await waitForSelection(selection)
+        var snapshot = TestCatalog.snapshot
+        snapshot.manifest.shaders.reverse()
+        snapshot.publicationRevision = String(repeating: "a", count: 40)
+        controller.applyCatalog(try snapshot.validated())
+        let status: UILabel = try findView("shader-status", in: controller)
+        XCTAssertEqual(status.text, "Couldn’t load Aurora. Choose another shader.")
+        XCTAssertEqual((controller.view as? MTKView)?.delegate.flatMap { ($0 as? Renderer)?.activeShader?.id }, "plasma")
+    }
+
     func testRefreshDuringSelectionKeepsPendingShaderAndCurrentPlayback() async throws {
         let (controller, compiler, pipeline) = try await controlledController()
         try await waitForRequest("plasma", in: compiler)
@@ -64,16 +127,6 @@ final class HolodeckTests: XCTestCase {
         try await waitForSelection(selection)
         XCTAssertEqual(preferences.id, "ninth-shader")
     }
-
-
-
-
-
-
-
-
-
-
 
     func testInvalidSourceAndMissingEntryPointPreserveActiveShader() async throws {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
@@ -506,15 +559,19 @@ final class HolodeckTests: XCTestCase {
         XCTAssertTrue(preferences.writes.isEmpty)
         let plasmaRequests = await compiler.requestCount("plasma")
         XCTAssertEqual(plasmaRequests, 0)
+        let menu = try XCTUnwrap(controller.view.gestureRecognizers?.first { $0.allowedPressTypes.contains(NSNumber(value: UIPress.PressType.menu.rawValue)) })
+        XCTAssertFalse(menu.isEnabled, "Idle recovery must pass Back to the system")
         controller.closePickerFromRemote()
-        XCTAssertFalse(picker.isHidden, "Back must keep recovery visible")
+        XCTAssertFalse(picker.isHidden, "Recovery remains visible if invoked directly")
         XCTAssertTrue(status.text?.contains("Couldn’t load Aurora") == true)
         XCTAssertNil((controller.view as? MTKView)?.delegate.flatMap { ($0 as? Renderer)?.activeShader })
         XCTAssertEqual(preferences.id, "aurora")
         controller.collectionView(collection, didSelectItemAt: IndexPath(item: 2, section: 0))
         try await waitForRequest("waves", in: compiler)
         let canceled = try XCTUnwrap(controller.shaderSelectionTask)
+        XCTAssertTrue(menu.isEnabled, "Pending recovery selection handles the first Back")
         controller.closePickerFromRemote()
+        XCTAssertFalse(menu.isEnabled)
         XCTAssertFalse(picker.isHidden)
         await compiler.complete("waves", pipeline: pipeline)
         try await waitForSelection(canceled)
@@ -584,6 +641,8 @@ final class HolodeckTests: XCTestCase {
         XCTAssertTrue(hint.subviewsRecursive.contains { ($0 as? UILabel)?.text == "Loading Waves…" })
         XCTAssertTrue(preferences.writes.isEmpty)
         controller.openPickerFromRemote()
+        let spinner: UIActivityIndicatorView = try findView("shader-loading", in: controller)
+        XCTAssertTrue(spinner.isAnimating, "Resumed startup keeps its spinner when reopened")
         collection.scrollToItem(at: IndexPath(item: 5, section: 0), at: .centeredHorizontally, animated: false)
         collection.layoutIfNeeded()
         let offset = collection.contentOffset
@@ -760,7 +819,6 @@ final class HolodeckTests: XCTestCase {
         XCTAssertTrue(activated)
         return (renderer, compiler, pipeline)
     }
-
 
 }
 

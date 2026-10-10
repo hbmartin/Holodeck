@@ -20,7 +20,7 @@ The changes are grouped into three reviewable stages:
 | Separate live publication check | Passed: downloaded, compiled, rendered and animated eight scenes and verified all preview hashes at publication `2df7c725215cff13b39b2d3b6c0245a775d79360` |
 | Optimized performance comparisons | Both passed |
 
-The ordinary skipped tests are the live publication check and two performance comparisons. Their separate opt-in runs passed. Cache read instrumentation verifies that loading runs off the main thread; validation and ImageIO decoding are isolated to the catalog actor. Successful repeated thumbnail requests return the same decoded image. Evicting decoded images reuses encoded memory without disk reads. The existing publication and disk formats require no migration, publisher changes or credentials.
+The ordinary skipped tests are the live publication check and two performance comparisons. Their separate opt-in runs passed. Cache read instrumentation verifies that loading runs off the main thread; validation is isolated to the catalog actor; ImageIO decoding now runs on a separate bounded worker queue. Successful repeated thumbnail requests return the same decoded image. Evicting decoded images reuses encoded memory without disk reads. The existing publication and disk formats require no migration, publisher changes or credentials.
 
 ## Optimized measurements
 
@@ -39,3 +39,51 @@ xcodebuild -project Holodeck.xcodeproj -scheme HolodeckMac -destination 'platfor
 ```
 
 Run the shared-core scheme from `HolodeckCore/` for tvOS. Deployment targets remain macOS 15 and tvOS 26. Those minimum versions and a physical Apple TV were unavailable for this check.
+
+## Follow-up review fixes
+
+The follow-up preserves service-owned catalog downloads: callers cancel their own wait promptly, while a download with no remaining viewers can still publish its validated snapshot. Gated tests cover pre-cancellation, one cancelled waiter, all waiters leaving, a new waiter joining, viewer shutdown and twenty cancellation/completion races. Each successful flight writes one snapshot.
+
+Viewer state separates cached update notices from selection failures. Refreshes and automatic source replacements preserve user selection errors, and stale retry/dismissal actions cannot clear newer failures. Selecting without a renderer has no state or event side effects. The Mac retains a renderer-unavailable message after alert dismissal and disables scene selection. Compiler and catalog failures include context in unified logs.
+
+Malformed optional discovery is discarded per shader during decoding and programmatic validation, while core fields, collections and source hashes remain strict. Tests exercise missing motion, wrong types, count/length/empty-value failures, normalization/deduplication, unchanged source bytes, sanitized disk round trips and legacy compatibility.
+
+Both viewers use prepared discovery options and a shared filter cache keyed by publication and all filter inputs. The public filter tolerates duplicate shader IDs and builds a first-wins lookup only when a collection is supplied. An optimized 500-scene comparison over 1,000 repeated redraws took **1,131.09 ms** for repeated filtering and **19.45 ms** for cached results, with one computation. This comparison includes result-ID extraction and equality checks on both paths; it measures local repeated filtering rather than whole-app frame time.
+
+Mac checks cover hidden-sidebar Command-F twice, the Control-Command-S sidebar toggle, native fullscreen entry/exit, inline update retry, unavailable Metal, and single usable windows after hiding, minimizing and closing. Fullscreen tests use the native menu action instead of assuming an OS keyboard mapping or exact display bounds. TV checks cover chooser dismissal on user activation, startup preservation, selection errors after refresh, current-control/card focus after refresh, and inline retry without automatically opening the picker. The existing native chooser and authored All ordering remain in place.
+
+| Follow-up check | Result |
+| --- | --- |
+| Shared-core tests on macOS | 71 passed; four opt-in tests skipped |
+| Shared-core tests on tvOS 27 simulator | 71 passed; four opt-in tests skipped |
+| TV controller/card tests | 29 passed |
+| TV remote UI tests | 19 passed |
+| Mac UI test build | Passed, including the latest window-restoration helpers |
+| Mac UI tests | Final full-suite pass deferred at the user's request. Cached retry, hidden-sidebar Command-F, discovery filtering, renderer/download errors, and every-scene/arrow selection passed in the last partial run. Fullscreen, search/favorites persistence, and window reopening failed in that run. Window-restoration helpers were adjusted afterward; these three checks still need a UI run. |
+| Optimized download, preview and 500-scene filter comparisons | Three passed |
+| Mac and TV Release builds | Passed |
+
+## Catalog recovery and destination-sized previews
+
+The latest follow-up replaces recovery-error copy-back with canonical catalog and selection failures. Pending explicit selection temporarily hides its preceding error; cancellation reveals only an undismissed error. Successful explicit selection clears it, while automatic replacement preserves unrelated failures. Retry/dismissal match operation IDs. Mac catalog inspection starts at model initialization independently of Metal, and attachment joins the existing refresh. Cache inspection uses “Loading scenes…”; downloading text begins only when no valid cache was found.
+
+TV idle startup recovery disables Menu interception so Back reaches Home immediately. A pending recovery selection consumes the first Back to cancel, then releases subsequent Back presses. Spinner state comes from pending selection or initial catalog loading, including resumed startup. Picker layout restores its intended opening focus after UIKit layout callbacks and requests focus through the collection view itself, including immediate close/reopen transitions.
+
+TV thumbnails account for aspect fill, card bounds, display scale and the 1.045 focus margin. Destination and thumbnail dimensions round upward in 64-pixel buckets, with a 2048-pixel cap. ImageIO source dimensions and orientation determine the decode size. Cards retain their displayed image while larger requests run or fail, and check both request identity and hash on completion.
+
+ImageIO runs on an internal queue with two concurrent operations. Gated tests hold both workers, confirm catalog calls remain responsive, and verify concurrency and coalescing. Preview failure records are bounded at 500 and keyed by publication, path and hash. Injected-clock tests cover the 30/60/120/240/300-second retry progression, cooldown boundaries and success reset. Validation/decode failures are suppressed until a new publication or instance; cancellation creates no failure record. Memory trimming preserves disk/catalog/retry state and prevents flights started before a trim from repopulating either cache while still returning their results.
+
+Implicit fixture preferences and favorites now stay in memory. Named suites retain relaunch persistence, and failed suite creation falls back to memory. A cleanup-only launch deletes the named defaults domain and fixture disk cache, then uses empty offline/in-memory services to prevent recreation. Both UI suites invoke it in teardown after their final relaunch. Core tests verify fallback, persistence and cleanup with the fixture disk-cache path.
+
+| Latest check | Result |
+| --- | --- |
+| Core tests on macOS | 83 passed; four opt-in tests skipped |
+| Core tests on tvOS 27 simulator | 83 passed; four opt-in tests skipped |
+| TV controller/card tests | 31 passed, including resize failures, same-hash stale completion, scale changes, Menu recognition and resumed startup spinner. Immediate close/reopen focus regression also passed ten consecutive iterations. |
+| TV remote UI tests | 19 passed, including idle recovery Back to Home and recovery after resuming. Default-launch focus and startup recovery passed again after the final focus refinement. |
+| Mac UI test compilation | Passed, including cached rows without Metal and cleanup teardown |
+| Mac UI execution | Deferred as previously agreed. The earlier fullscreen, favorites-persistence and window-reopen checks remain unverified after helper changes. |
+| Optimized comparisons | All three passed: download 18.736 ms → 0.536 ms; repeated filtering 613.140 ms → 8.567 ms; 50 warm preview requests 528.859 ms → 1.512 ms |
+| Mac and TV Release builds | Passed |
+
+The preview comparison uses the preserved 640-pixel API to compare against the earlier full-decode path; production TV sizing now depends on the destination. Measurements exclude real network latency and are local to this machine. Deployment-target OS versions and a physical Apple TV remain unavailable. Service-owned downloads, injected clocks, both strict memory budgets and the existing LRU implementation are retained. There is no catalog/disk-format migration.

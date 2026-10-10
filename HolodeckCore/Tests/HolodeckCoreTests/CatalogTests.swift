@@ -36,28 +36,6 @@ final class CatalogTests: XCTestCase {
         return CatalogService(network: box.network, storage: storage, clock: box.clock)
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     func testFirstLaunchHasNoCatalogAndCanRetryImmediatelyAfterNetworkFailure() async throws {
         let box = CatalogTestBox()
         let expected = candidate()
@@ -250,7 +228,8 @@ final class CatalogTests: XCTestCase {
         do { _ = try await service.preview(preview); XCTFail("Bad image hash must fail") } catch {}
         XCTAssertTrue(box.files.isEmpty)
         box.setResponses(["/previews/test.png": image])
-        let downloaded = try await service.preview(preview)
+        let revised = ShaderPreview(path: preview.path, hash: preview.hash, publicationRevision: String(repeating: "d", count: 40))
+        let downloaded = try await service.preview(revised)
         XCTAssertEqual(downloaded, image)
         let count = box.urls.count
         let reads = box.storageReads.count
@@ -283,6 +262,7 @@ nonisolated final class CatalogTestBox: @unchecked Sendable {
     private var responses: [String: Data] = [:]
     private var requests: [URL] = []
     private var reads: [String] = []
+    private var writes: [String] = []
     private var readOnMain = false
     let clock = TestClock()
     private var failing = false
@@ -290,6 +270,7 @@ nonisolated final class CatalogTestBox: @unchecked Sendable {
     var responseFiles: [String: Data] { lock.withLock { responses } }
     var urls: [URL] { lock.withLock { requests } }
     var storageReads: [String] { lock.withLock { reads } }
+    var storageWrites: [String] { lock.withLock { writes } }
     var storageReadOnMain: Bool { lock.withLock { readOnMain } }
     var failWrites: Bool {
         get { lock.withLock { failing } }
@@ -317,6 +298,7 @@ nonisolated final class CatalogTestBox: @unchecked Sendable {
             try lock.withLock {
                 if failing { throw CatalogError.invalidResponse }
                 stored[name] = data
+                writes.append(name)
             }
         })
     }

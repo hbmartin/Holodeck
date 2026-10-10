@@ -9,6 +9,18 @@ nonisolated public struct SceneDiscovery: Codable, Sendable, Equatable {
         self.tags = tags; self.moods = moods; self.motion = motion
     }
     public var summary: String { (moods.map { $0.capitalized } + [motion.capitalized + " motion"]).joined(separator: " · ") }
+    public static func normalized(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+    func sanitized() throws -> Self {
+        func unique(_ values: [String]) -> [String] {
+            var seen: Set<String> = []
+            return values.map(Self.normalized).filter { seen.insert($0).inserted }
+        }
+        let value = Self(tags: unique(tags), moods: unique(moods), motion: Self.normalized(motion))
+        try value.validate()
+        return value
+    }
     public func validate() throws {
         guard tags.count <= 32, moods.count <= 8, Set(tags).count == tags.count,
               Set(moods).count == moods.count,
@@ -95,6 +107,29 @@ nonisolated public struct CatalogManifest: Codable, Sendable {
         public var previewPath: String
         public var previewSHA256: String
         public var discovery: SceneDiscovery? = nil
+        private enum CodingKeys: String, CodingKey {
+            case id, name, category, description, colors, updatedAt, sourcePath, sourceSHA256, previewPath, previewSHA256, discovery
+        }
+        public init(from decoder: any Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            id = try values.decode(String.self, forKey: .id)
+            name = try values.decode(String.self, forKey: .name)
+            category = try values.decode(ShaderDefinition.Category.self, forKey: .category)
+            description = try values.decode(String.self, forKey: .description)
+            colors = try values.decode([[Float]].self, forKey: .colors)
+            updatedAt = try values.decode(String.self, forKey: .updatedAt)
+            sourcePath = try values.decode(String.self, forKey: .sourcePath)
+            sourceSHA256 = try values.decode(String.self, forKey: .sourceSHA256)
+            previewPath = try values.decode(String.self, forKey: .previewPath)
+            previewSHA256 = try values.decode(String.self, forKey: .previewSHA256)
+            do {
+                discovery = try values.decodeIfPresent(SceneDiscovery.self, forKey: .discovery)?.sanitized()
+            } catch {
+                let shaderID = id
+                Diagnostics.catalog.warning("Discarding discovery for \(shaderID, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                discovery = nil
+            }
+        }
     }
     public var schemaVersion: Int
     public var defaultShaderID: String
@@ -126,7 +161,6 @@ nonisolated public struct CatalogManifest: Codable, Sendable {
               Set(shaders.map(\.id)).count == shaders.count,
               shaders.contains(where: { $0.id == defaultShaderID }) else { throw CatalogError.invalidManifest }
         for shader in shaders {
-            try shader.discovery?.validate()
             guard !shader.id.isEmpty, shader.id.count <= 100,
                   shader.id.range(of: "^[a-z0-9]+(-[a-z0-9]+)*$", options: .regularExpression) != nil,
                   !shader.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -155,6 +189,19 @@ nonisolated public struct CatalogManifest: Codable, Sendable {
             }
         }
         return dates
+    }
+
+    fileprivate func sanitizingDiscovery() -> Self {
+        var value = self
+        for index in value.shaders.indices {
+            guard let discovery = value.shaders[index].discovery else { continue }
+            do { value.shaders[index].discovery = try discovery.sanitized() }
+            catch {
+                Diagnostics.catalog.warning("Discarding discovery for \(value.shaders[index].id, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                value.shaders[index].discovery = nil
+            }
+        }
+        return value
     }
 }
 
@@ -188,6 +235,8 @@ nonisolated public struct ValidatedCatalog: Sendable {
     public let shaders: [ShaderDefinition]
     public let initialShader: ShaderDefinition
     public let collections: [CatalogCollection]
+    public let moods: [String]
+    public let motions: [String]
     public var publicationRevision: String { snapshot.publicationRevision }
 
     fileprivate init(snapshot: CatalogSnapshot, shaders: [ShaderDefinition]) {
@@ -195,6 +244,8 @@ nonisolated public struct ValidatedCatalog: Sendable {
         self.shaders = shaders
         initialShader = shaders.first { $0.id == snapshot.manifest.defaultShaderID }!
         collections = SceneLibrary.collections(snapshot.manifest.collections, shaders: shaders)
+        moods = SceneLibrary.moods(shaders)
+        motions = SceneLibrary.motions(shaders)
     }
 
     public func startupShader(savedID: String?) -> ShaderDefinition {
@@ -210,7 +261,7 @@ nonisolated struct CatalogBuilder {
     private var sourceBytes = 0
 
     init(manifest: CatalogManifest) throws {
-        self.manifest = manifest
+        self.manifest = manifest.sanitizingDiscovery()
         dates = try manifest.validatedDates()
     }
 

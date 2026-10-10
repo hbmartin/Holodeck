@@ -5,16 +5,25 @@ import SwiftUI
 
 struct MetalSurface: NSViewRepresentable {
     let model: MacModel
+    final class Coordinator {
+        var installation: Task<Void, Never>?
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
     func makeNSView(context: Context) -> MacMetalView {
         let view = MacMetalView()
         view.setAccessibilityIdentifier("shader-surface")
-        model.installRenderer(in: view)
+        context.coordinator.installation = Task { @MainActor [weak model, weak view] in
+            guard !Task.isCancelled, let model, let view else { return }
+            model.installRenderer(in: view)
+            view.updateBackingSize()
+        }
         view.onResize = { [weak model] size in model?.renderer?.resize(nativeSize: size) }
         view.updateBackingSize()
         return view
     }
     func updateNSView(_ nsView: MacMetalView, context: Context) { nsView.updateBackingSize() }
-    static func dismantleNSView(_ nsView: MacMetalView, coordinator: ()) {
+    static func dismantleNSView(_ nsView: MacMetalView, coordinator: Coordinator) {
+        coordinator.installation?.cancel()
         nsView.isPaused = true
         nsView.delegate = nil
         nsView.onResize = nil
@@ -61,10 +70,7 @@ final class WindowObserverView: NSView {
         window.isReleasedWhenClosed = false
         MacAppDelegate.viewerWindow = window
         // Namespace test windows so UI tests never change real window preferences.
-        let arguments = ProcessInfo.processInfo.arguments
-        let suite = arguments.firstIndex(of: "--ui-test-storage-suite")
-            .flatMap { $0 + 1 < arguments.count ? arguments[$0 + 1] : nil } ?? "live"
-        let name = "HolodeckViewer-" + suite
+        let name = model.windowAutosaveName
         window.setFrameAutosaveName(name)
         window.setFrameUsingName(name)
         window.setAccessibilityIdentifier("holodeck-viewer-window")
@@ -77,7 +83,7 @@ final class WindowObserverView: NSView {
         tokens.append(NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak model] _ in
             Task { @MainActor in model?.session.setActive(false) }
         })
-        model.updateActivity()
+        Task { @MainActor [weak model] in model?.updateActivity() }
     }
     isolated deinit { tokens.forEach { NotificationCenter.default.removeObserver($0) } }
 }

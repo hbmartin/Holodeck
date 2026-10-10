@@ -18,6 +18,12 @@ nonisolated struct CatalogLRU<Key: Hashable, Value> {
         return entry.value
     }
 
+    mutating func removeValue(for key: Key) {
+        if let previous = entries.removeValue(forKey: key) { cost -= previous.cost }
+    }
+
+    mutating func removeAll() { entries.removeAll(); cost = 0 }
+
     mutating func insert(_ value: Value, for key: Key, cost newCost: Int) {
         if let previous = entries.removeValue(forKey: key) { cost -= previous.cost }
         guard newCost <= limit else { return }
