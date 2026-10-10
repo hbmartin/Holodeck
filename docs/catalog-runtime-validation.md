@@ -106,7 +106,7 @@ Named UI-test suites still persist window geometry across relaunches. Implicit f
 | TV remote UI tests | 19 passed |
 | Repeated preview recovery and remote focus checks | Four preview tests and both chooser-return/stale-filter-focus tests each passed three consecutive iterations |
 | Mac UI test compilation | Passed, including sequential alerts, stale actions and frame-storage regressions |
-| Mac UI execution | Awaiting an unlocked desktop. The first run was stopped after application-activation/window failures while Computer Use confirmed that the Mac was locked. |
+| Mac UI execution | Cached inline update/retry recovery passed after unlocking. The full suite remains pending: runs encountered an external window-restoration dialog and later window/activation failures while Computer Use confirmed that the desktop had locked again. Native alert ordering, stale actions and frame-storage checks still require an uninterrupted unlocked run. |
 | Mac and TV Release builds | Passed |
 
 Focus restoration, cache insertion after trimming and discovery sanitization are unchanged. The repeated remote focus checks passed without an implementation change. Catalog JSON, disk formats, retry intervals, cache budgets and deployment targets are unchanged; no storage migration or broad preferences cleanup is introduced.
