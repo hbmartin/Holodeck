@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import XCTest
 
 @MainActor
@@ -24,12 +25,19 @@ final class HolodeckMacUITests: XCTestCase {
     }
     private func launch(_ app: XCUIApplication) {
         app.launch()
-        // AppKit restoration is separate from the isolated scene-preferences suite.
-        app.menuBars.menuBarItems["View"].click()
+        let window = app.windows["holodeck-viewer-window"]
+        XCTAssertTrue(window.waitForExistence(timeout: 15))
+        // Avoid leaving a menu open during normal-window tests. Native restoration can
+        // still resume fullscreen independently of the isolated scene-preferences suite.
+        if !window.buttons[XCUIIdentifierMinimizeWindow].exists {
+            exitFullScreen(in: app)
+        }
+        XCTAssertTrue(window.buttons[XCUIIdentifierMinimizeWindow].waitForExistence(timeout: 15))
+    }
+    private func exitFullScreen(in app: XCUIApplication) {
         let exit = app.menuItems["Exit Full Screen"]
-        if exit.exists { exit.click() }
-        else { app.typeKey(.escape, modifierFlags: []) }
-        XCTAssertTrue(app.windows.firstMatch.buttons[XCUIIdentifierMinimizeWindow].waitForExistence(timeout: 15))
+        XCTAssertTrue(exit.waitForExistence(timeout: 5))
+        exit.click()
     }
     private func waitForTitle(_ title: String, in app: XCUIApplication) {
         let label = element("active-scene-title", in: app)
@@ -177,13 +185,13 @@ final class HolodeckMacUITests: XCTestCase {
         launch(app)
         waitForTitle("Plasma", in: app)
         let window = app.windows.firstMatch
-        app.menuBars.menuBarItems["View"].click()
+        // XCTest opens the ancestor menu when clicking a native menu item.
         app.menuItems["Enter Full Screen"].click()
-        app.menuBars.menuBarItems["View"].click()
         XCTAssertTrue(app.menuItems["Exit Full Screen"].waitForExistence(timeout: 5))
+        XCTAssertTrue(window.buttons[XCUIIdentifierMinimizeWindow].waitForNonExistence(timeout: 15))
         XCTAssertTrue(element("scene-search", in: app).exists)
         waitForTitle("Plasma", in: app)
-        app.menuItems["Exit Full Screen"].click()
+        exitFullScreen(in: app)
         XCTAssertTrue(window.buttons[XCUIIdentifierMinimizeWindow].waitForExistence(timeout: 15))
         XCTAssertTrue(element("scene-search", in: app).exists)
     }
@@ -266,17 +274,23 @@ final class HolodeckMacUITests: XCTestCase {
         launch(app)
         waitForTitle("Plasma", in: app)
         resizeWindow(in: app)
-        let saved = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in savedFrame(name) != nil }, object: nil)
-        XCTAssertEqual(XCTWaiter.wait(for: [saved], timeout: 5), .completed)
-        let frame = try XCTUnwrap(savedFrame(name))
+        let resized = app.windows["holodeck-viewer-window"].frame.size
+        // Termination flushes AppKit's autosaved preferences before reading their disk copy.
         app.terminate()
+        let saved = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in savedFrame(name) != nil }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [saved], timeout: 10), .completed)
+        let frame = try XCTUnwrap(savedFrame(name))
         launch(app)
+        XCTAssertEqual(app.windows["holodeck-viewer-window"].frame.width, resized.width, accuracy: 1)
+        XCTAssertEqual(app.windows["holodeck-viewer-window"].frame.height, resized.height, accuracy: 1)
         XCTAssertEqual(savedFrame(name), frame)
         app.terminate()
         app.launchEnvironment.removeAll()
         app.launchArguments = ["--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite"]
         app.launch()
         XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 10))
+        let removed = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in savedFrame(name) == nil }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [removed], timeout: 10), .completed)
         XCTAssertNil(savedFrame(name))
         app.terminate()
         XCTAssertNil(savedFrame(name), "Cleanup must not save another frame while terminating")
@@ -285,13 +299,16 @@ final class HolodeckMacUITests: XCTestCase {
 
     func testImplicitFixtureDoesNotSaveWindowFrame() throws {
         let before = savedViewerFrameNames()
+        let live = savedFrame("HolodeckViewer-live")
         let app = try app()
         app.launchArguments = [] // The fixture environment alone selects implicit in-memory storage.
         launch(app)
         waitForTitle("Plasma", in: app)
         resizeWindow(in: app)
         app.terminate()
-        XCTAssertEqual(savedViewerFrameNames(), before)
+        // Earlier cleanup writes may still be flushing; only new frames indicate a leak.
+        XCTAssertTrue(savedViewerFrameNames().subtracting(before).isEmpty)
+        XCTAssertEqual(savedFrame("HolodeckViewer-live"), live)
     }
 
     private func savedFrame(_ name: String) -> String? {
@@ -305,17 +322,27 @@ final class HolodeckMacUITests: XCTestCase {
     private func savedAppDefaults() -> [String: Any] {
         // The app is sandboxed; the unsandboxed UI runner's CFPreferences domain is separate.
         let path = "Library/Containers/me.haroldmartin.HolodeckMac/Data/Library/Preferences/me.haroldmartin.HolodeckMac.plist"
-        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(path)
+        // Xcode overrides the runner's home directory with its own test container.
+        guard let directory = getpwuid(getuid())?.pointee.pw_dir else {
+            XCTFail("Unable to locate the current user's home directory")
+            return [:]
+        }
+        let url = URL(fileURLWithPath: String(cString: directory), isDirectory: true).appendingPathComponent(path)
+        // A fresh machine may not have an app preference file yet.
+        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
         guard let data = try? Data(contentsOf: url),
-              let values = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else { return [:] }
+              let values = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
+            XCTFail("Unable to read viewer preferences at \(url.path)")
+            return [:]
+        }
         return values
     }
 
     private func resizeWindow(in app: XCUIApplication) {
-        let window = app.windows.firstMatch
+        let window = app.windows["holodeck-viewer-window"]
         let size = window.frame.size
-        let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 1)).withOffset(CGVector(dx: -2, dy: -2))
-        corner.press(forDuration: 0.1, thenDragTo: corner.withOffset(CGVector(dx: -80, dy: -60)))
+        let edge = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5)).withOffset(CGVector(dx: -1, dy: 0))
+        edge.click(forDuration: 0.1, thenDragTo: edge.withOffset(CGVector(dx: -80, dy: 0)))
         XCTAssertNotEqual(window.frame.size, size)
     }
 
