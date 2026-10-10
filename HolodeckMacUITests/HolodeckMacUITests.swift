@@ -8,7 +8,7 @@ final class HolodeckMacUITests: XCTestCase {
 
     private func app(suite: String? = "HolodeckMacUITests-" + UUID().uuidString, arguments: [String] = [], discovery: Bool = false) throws -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchArguments = (suite.map { ["--ui-test-storage-suite", $0] } ?? []) + arguments
+        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"] + (suite.map { ["--ui-test-storage-suite", $0] } ?? []) + arguments
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: discovery ? "DiscoveryFixture" : "CatalogFixture", withExtension: "json", subdirectory: "TestSupport"))
         app.launchEnvironment["HOLODECK_UI_TEST_CATALOG"] = try String(contentsOf: url, encoding: .utf8)
         if let suite {
@@ -36,13 +36,19 @@ final class HolodeckMacUITests: XCTestCase {
     }
     private func exitFullScreen(in app: XCUIApplication) {
         let window = app.windows["holodeck-viewer-window"]
-        window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0)).withOffset(CGVector(dx: 0, dy: 1)).hover()
+        // Fullscreen menu revelation depends on WindowServer receiving mouse movement;
+        // XCTest's window-targeted hover can leave the menu bar hidden.
+        let point = CGPoint(x: window.frame.midX, y: window.frame.minY)
+        XCTAssertTrue(CGPreflightPostEventAccess(), "Mac UI test runner needs permission to post physical input")
+        guard let hover = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) else {
+            XCTFail("Unable to create fullscreen menu-bar hover")
+            return
+        }
+        hover.post(tap: .cghidEventTap)
         openViewMenu(in: app)
         let exit = app.menuItems["Exit Full Screen"]
         XCTAssertTrue(exit.waitForExistence(timeout: 15))
-        // The menu is already open. A coordinate click avoids XCTest reopening the
-        // ancestor menu, which can hide it during a fullscreen transition.
-        exit.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
+        exit.click()
         XCTAssertTrue(window.buttons[XCUIIdentifierMinimizeWindow].waitForExistence(timeout: 15))
     }
     private func openViewMenu(in app: XCUIApplication) {
@@ -199,7 +205,7 @@ final class HolodeckMacUITests: XCTestCase {
         openViewMenu(in: app)
         let enter = app.menuItems["Enter Full Screen"]
         XCTAssertTrue(enter.waitForExistence(timeout: 15))
-        enter.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
+        enter.click()
         XCTAssertTrue(window.buttons[XCUIIdentifierMinimizeWindow].waitForNonExistence(timeout: 15))
         XCTAssertTrue(element("scene-search", in: app).exists)
         waitForTitle("Plasma", in: app)
@@ -266,6 +272,10 @@ final class HolodeckMacUITests: XCTestCase {
         let failure = app.staticTexts["Unable to Load Scenes"]
         XCTAssertTrue(failure.waitForExistence(timeout: 10))
         app.typeKey("h", modifierFlags: .command)
+        let hidden = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            NSRunningApplication.runningApplications(withBundleIdentifier: "me.haroldmartin.HolodeckMac").first?.isHidden == true
+        }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [hidden], timeout: 10), .completed)
         try await reopen(app)
         XCTAssertTrue(element("shader-aurora", in: app).waitForExistence(timeout: 10))
         XCTAssertTrue(failure.waitForNonExistence(timeout: 10))
@@ -279,12 +289,26 @@ final class HolodeckMacUITests: XCTestCase {
     }
 
     func testRendererAlertSupportsEscapeAndReturn() throws {
-        for key in [XCUIKeyboardKey.escape, .return] {
+        for key in [XCUIKeyboardKey.return, .escape] {
             let app = try app(arguments: ["--ui-test-metal-unavailable"])
             app.launch()
             let failure = app.staticTexts["Renderer Unavailable"]
             XCTAssertTrue(failure.waitForExistence(timeout: 10))
-            app.windows.firstMatch.sheets.firstMatch.typeKey(key, modifierFlags: [])
+            XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+            failure.click()
+            if key == .escape {
+                // Exercise physical Escape delivery; XCTest's special-key synthesis
+                // does not deliver this key to native sheets on this test host.
+                XCTAssertTrue(CGPreflightPostEventAccess(), "Mac UI test runner needs permission to post physical input")
+                let down = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: true))
+                let up = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: false))
+                down.flags = []
+                up.flags = []
+                down.post(tap: .cghidEventTap)
+                up.post(tap: .cghidEventTap)
+            } else {
+                app.typeKey(key, modifierFlags: [])
+            }
             XCTAssertTrue(failure.waitForNonExistence(timeout: 10))
             XCTAssertEqual(app.windows.firstMatch.sheets.count, 0)
             XCTAssertTrue(app.staticTexts["Metal rendering is unavailable on this device."].exists)
@@ -448,7 +472,7 @@ private final class StorageSuiteCleanup {
         guard !completed else { return }
         app.terminate()
         app.launchEnvironment.removeAll()
-        app.launchArguments = ["--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite"]
+        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES", "--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite"]
         app.launch()
         XCTAssertTrue(app.windows["holodeck-viewer-window"].waitForExistence(timeout: 15))
         verify()
