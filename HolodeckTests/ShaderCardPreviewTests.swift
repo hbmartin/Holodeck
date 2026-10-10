@@ -7,6 +7,25 @@ import ConcurrencyExtras
 
 @MainActor
 final class ShaderCardPreviewTests: XCTestCase {
+    func testTransportCancellationDoesNotSuppressCurrentCellRecovery() async throws {
+        for urlCancellation in [false, true] {
+            let network = CellPreviewNetwork(cancels: true, urlCancellation: urlCancellation)
+            let service = CatalogService(network: CatalogNetwork { _, _ in try await network.get() }, storage: .disabled)
+            let cell = cell(service: service)
+            defer { cell.prepareForReuse() }
+            try await waitUntil { cell.previewTask == nil }
+            XCTAssertNil(image(in: cell))
+            let failures = await service.previewFailureCount
+            XCTAssertEqual(failures, 0)
+            await network.setResponse(try previewData())
+            cell.configure(shader: TestCatalog.initialShader, active: false, loading: false, catalogService: service)
+            try await waitUntil { cell.previewTask == nil }
+            XCTAssertNotNil(image(in: cell))
+            let attempts = await network.attempts
+            XCTAssertEqual(attempts, 2)
+        }
+    }
+
     func testLayoutsKeepOneWaitingRequestAndTransientFailureRecovers() async throws {
         try await withMainSerialExecutor {
             let clock = TestClock()
@@ -113,11 +132,21 @@ private enum CellPreviewTestError: Error { case timedOut }
 
 private actor CellPreviewNetwork {
     private var response: Data?
+    private var cancels: Bool
+    private let urlCancellation: Bool
     private(set) var attempts = 0
-    init(response: Data? = nil) { self.response = response }
-    func setResponse(_ response: Data) { self.response = response }
+    init(response: Data? = nil, cancels: Bool = false, urlCancellation: Bool = false) {
+        self.response = response
+        self.cancels = cancels
+        self.urlCancellation = urlCancellation
+    }
+    func setResponse(_ response: Data) { self.response = response; cancels = false }
     func get() throws -> Data {
         attempts += 1
+        if cancels {
+            if urlCancellation { throw URLError(.cancelled) }
+            throw CancellationError()
+        }
         guard let response else { throw CatalogError.invalidResponse }
         return response
     }

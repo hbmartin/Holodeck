@@ -6,8 +6,8 @@ import XCTest
 final class CatalogCancellationTests: XCTestCase {
     private func flight() throws -> (CatalogService, CatalogTestBox, RefreshGate, XCTestExpectation) {
         let box = CatalogTestBox()
-        let candidate = CatalogTests().candidate(ninth: true)
-        _ = try CatalogTests().makeService(candidate, box: box)
+        let candidate = CatalogTestFixtures.candidate(ninth: true)
+        _ = try CatalogTestFixtures.makeService(candidate, box: box)
         let started = expectation(description: "Service download starts")
         let gate = RefreshGate(started: started)
         addTeardownBlock { await gate.release() }
@@ -46,7 +46,7 @@ final class CatalogCancellationTests: XCTestCase {
 
     func testAlreadyCancelledCallerDoesNotStartDownload() async throws {
         let box = CatalogTestBox()
-        let service = try CatalogTests().makeService(CatalogTests().candidate(), box: box)
+        let service = try CatalogTestFixtures.makeService(CatalogTestFixtures.candidate(), box: box)
         let task = Task {
             withUnsafeCurrentTask { $0?.cancel() }
             return try await service.refresh()
@@ -139,20 +139,3 @@ final class CatalogCancellationTests: XCTestCase {
 }
 
 private enum CancellationTestError: Error { case timedOut }
-
-private actor RefreshGate {
-    let started: XCTestExpectation
-    private var continuation: CheckedContinuation<Void, Never>?
-    private var open = false
-    init(started: XCTestExpectation) { self.started = started }
-    func hold() async {
-        started.fulfill()
-        guard !open else { return }
-        await withCheckedContinuation { continuation = $0 }
-    }
-    func release() {
-        open = true
-        continuation?.resume()
-        continuation = nil
-    }
-}

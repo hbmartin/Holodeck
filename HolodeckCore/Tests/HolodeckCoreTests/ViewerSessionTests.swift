@@ -440,6 +440,23 @@ final class ViewerSessionTests: XCTestCase {
         XCTAssertNil(session.failure)
     }
 
+    func testRepeatedSelectionFailuresHaveDistinctAttemptIdentities() async throws {
+        let (session, renderer, _) = session()
+        await settled(session)
+        renderer.failNext = true
+        await session.select(TestCatalog.shaders[1]).value
+        let first = try XCTUnwrap(session.selectionFailure)
+        renderer.failNext = true
+        await session.select(TestCatalog.shaders[1]).value
+        let second = try XCTUnwrap(session.selectionFailure)
+        XCTAssertEqual(second.message, first.message)
+        XCTAssertNotEqual(second.id, first.id)
+        session.dismissFailure(id: first.id)
+        session.retry(first)
+        XCTAssertEqual(session.selectionFailure?.id, second.id)
+        XCTAssertNil(session.pendingSelection)
+    }
+
     func testCachedUpdateRetryPreservesSelectionFailureAndClearsNotice() async throws {
         let box = CatalogTestBox()
         let service = CatalogService(initialCatalog: TestCatalog.catalog, network: box.network, storage: .disabled)

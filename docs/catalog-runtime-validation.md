@@ -114,3 +114,24 @@ Mac UI helpers leave native menus closed during normal-window launches, use mous
 The remaining Mac failure is `testNativeFullScreenPreservesSidebarAndPlayback`: XCTest times out waiting for the Exit Full Screen menu-open notification. A separate native fixture inspection confirmed fullscreen entry and exit, but automated fullscreen exit remains unverified. This failure is recorded separately; no fullscreen implementation change is included. The final serial run executed all 13 tests with one failure.
 
 Focus restoration, cache insertion after trimming and discovery sanitization are unchanged. The repeated remote focus checks passed without an implementation change. Catalog JSON, disk formats, retry intervals, cache budgets and deployment targets are unchanged; no storage migration or broad preferences cleanup is introduced.
+
+## Alert recovery and fixture infrastructure
+
+Checked on October 10, 2026 with macOS 27.0.1, Xcode 27.0 and the tvOS 27 Apple TV 4K (3rd generation) simulator. Native sheets now reconcile their captured operation against canonical failure state and abort when that operation clears or no longer qualifies for a modal alert. Presentation remains owned until the completion handler runs, and captured retry/dismissal actions retain their identity checks. Repeated unresolved catalog failures reuse their identity when the message is unchanged; explicit dismissal/retry, changed content and successful recovery reset that lifecycle. Selection failures retain separate identities for separate attempts, including identical error messages.
+
+Successful refresh outcomes apply the service's current catalog once and share their failure-clearing branch. The public outcome cases and optional-return compatibility API remain available. Cancellation classification is shared by the service and TV cell for both `CancellationError` and `URLError.cancelled`; retry keys, cooldowns, immediate retry after transport cancellation and the post-sleep cancellation check are unchanged.
+
+Mac presentation injection lives in a DEBUG-only driver and reaches the coordinator through an injected observer. Fixture factories no longer delete storage. Mac and TV setup invoke explicit shared cleanup before creating preferences/services; Mac setup also removes its named AppKit frame. Mac UI teardown shares an idempotent cleanup handle with explicit cleanup assertions and waits for the cleanup viewer window before terminating. Preferences reads reject missing files by default and propagate unreadable or malformed files; the implicit-storage check retains a verified named frame as a positive control. Core catalog fixtures and refresh gates are shared within the existing core test target.
+
+| Check | Result |
+| --- | --- |
+| Core tests on macOS | 91 passed; four opt-in tests skipped |
+| Core tests on tvOS 27 simulator | 91 passed; four opt-in tests skipped |
+| TV controller/card tests | 37 passed, including current-cell recovery after both cancellation representations |
+| TV remote UI tests | 19 passed |
+| New Mac reactivation recovery regression | Passed: unavailable Metal plus fail-once catalog recovery closes the pending sheet and restores usable catalog controls |
+| Preferences-reader errors | Passed with final code: missing files require explicit permission, malformed/non-dictionary plists fail, and unreadable-directory errors propagate even when missing files are allowed |
+| Mac UI full suite and three consecutive fullscreen iterations | Pending: focused fullscreen/keyboard runs encountered a system SecurityAgent dialog intercepting native input. The dialog requires user handling before acceptance can be established. |
+| Mac and TV Release builds | Passed |
+
+The fullscreen helpers explicitly open View, reveal the menu bar at the display's top edge and wait up to 15 seconds for menu and window transitions. They use coordinate clicks inside the already-open menu to avoid XCTest reopening the ancestor menu. Renderer Return retains the AppKit default button; a sheet-scoped Escape handler invokes the same OK action. Keyboard dismissal and fullscreen acceptance remain unverified until native input is available. No deployment target, persisted format, renderer refresh policy or preview retry policy changed.

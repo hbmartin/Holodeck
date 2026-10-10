@@ -92,6 +92,10 @@ nonisolated public enum CatalogHash {
 
 nonisolated public enum CatalogError: Error {
     case invalidManifest, invalidSource, invalidPreview, invalidResponse, oversizedResponse
+
+    public static func isCancellation(_ error: any Error) -> Bool {
+        error is CancellationError || (error as? URLError)?.code == .cancelled
+    }
 }
 
 nonisolated public struct CatalogManifest: Codable, Sendable {

@@ -3,9 +3,45 @@ import XCTest
 
 @MainActor
 final class CatalogRefreshOutcomeTests: XCTestCase {
+    func testRepeatedCatalogFailuresRetainIdentityUntilDismissalRetryOrRecovery() async throws {
+        for cached in [false, true] {
+            let box = CatalogTestBox()
+            let service = CatalogService(initialCatalog: cached ? TestCatalog.catalog : nil,
+                                         network: box.network, storage: .disabled, clock: box.clock)
+            let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
+            await session.refresh().value
+            let first = try XCTUnwrap(session.catalogFailure)
+            for _ in 0..<3 {
+                await session.refresh(force: true).value
+                XCTAssertEqual(session.catalogFailure?.id, first.id)
+            }
+            session.dismissFailure(id: first.id)
+            await session.refresh(force: true).value
+            let second = try XCTUnwrap(session.catalogFailure)
+            XCTAssertNotEqual(second.id, first.id)
+            session.retry(second)
+            await session.refreshTask?.value
+            let retried = try XCTUnwrap(session.catalogFailure)
+            XCTAssertNotEqual(retried.id, second.id)
+            session.dismissFailure(id: second.id)
+            session.retry(second)
+            XCTAssertEqual(session.catalogFailure?.id, retried.id)
+            XCTAssertNil(session.refreshTask)
+
+            session.failure = ViewerSession.Failure(message: "A different catalog failure", operation: .catalog)
+            let replaced = session.catalogFailure?.id
+            await session.refresh(force: true).value
+            XCTAssertNotEqual(session.catalogFailure?.id, replaced, "Changed failure content gets its own identity")
+            _ = try CatalogTestFixtures.makeService(TestCatalog.snapshot, box: box)
+            await session.refresh(force: true).value
+            XCTAssertNil(session.catalogFailure)
+            XCTAssertEqual(session.catalog?.publicationRevision, TestCatalog.catalog.publicationRevision)
+        }
+    }
+
     func testExplicitOutcomesAndCompatibilityWrapper() async throws {
         let box = CatalogTestBox()
-        let service = try CatalogTests().makeService(TestCatalog.snapshot, box: box)
+        let service = try CatalogTestFixtures.makeService(TestCatalog.snapshot, box: box)
         guard case .unchanged = try await service.refreshOutcome() else { return XCTFail("Expected checked publication") }
         guard case .throttled = try await service.refreshOutcome() else { return XCTFail("Expected skipped check") }
         XCTAssertEqual(box.urls.count, 1)
@@ -15,8 +51,8 @@ final class CatalogRefreshOutcomeTests: XCTestCase {
         XCTAssertNil(compatible)
         guard case .disabled = try await CatalogService.offline().refreshOutcome(force: true) else { return XCTFail("Expected disabled") }
 
-        let expected = CatalogTests().candidate()
-        _ = try CatalogTests().makeService(expected, box: box)
+        let expected = CatalogTestFixtures.candidate()
+        _ = try CatalogTestFixtures.makeService(expected, box: box)
         guard case .updated(let updated) = try await service.refreshOutcome(force: true) else { return XCTFail("Expected update") }
         XCTAssertEqual(updated.publicationRevision, expected.publicationRevision)
         let persisted = try JSONDecoder().decode(CatalogSnapshot.self, from: XCTUnwrap(box.files["snapshot.json"]))
@@ -47,8 +83,8 @@ final class CatalogRefreshOutcomeTests: XCTestCase {
         box.setResponses([:])
         await session.refresh(force: true).value
         XCTAssertNotNil(session.catalogUpdateFailure)
-        let expected = CatalogTests().candidate()
-        _ = try CatalogTests().makeService(expected, box: box)
+        let expected = CatalogTestFixtures.candidate()
+        _ = try CatalogTestFixtures.makeService(expected, box: box)
         await session.refresh(force: true).value
         XCTAssertNil(session.catalogUpdateFailure)
         XCTAssertEqual(session.catalog?.publicationRevision, expected.publicationRevision)
@@ -83,7 +119,7 @@ final class CatalogRefreshOutcomeTests: XCTestCase {
 
     func testOutcomeCallersCoalesceAndCancelIndependently() async throws {
         let started = expectation(description: "One shared check begins")
-        let gate = OutcomeRefreshGate(started: started)
+        let gate = RefreshGate(started: started)
         addTeardownBlock { await gate.release() }
         let service = CatalogService(initialCatalog: TestCatalog.catalog, network: CatalogNetwork { _, _ in
             await gate.hold()
@@ -101,24 +137,5 @@ final class CatalogRefreshOutcomeTests: XCTestCase {
         do { _ = try await first.value; XCTFail("Expected cancellation") } catch is CancellationError {} catch { XCTFail("\(error)") }
         await gate.release()
         guard case .unchanged = try await second.value else { return XCTFail("Surviving caller must receive checked outcome") }
-    }
-}
-
-private actor OutcomeRefreshGate {
-    let started: XCTestExpectation
-    private var continuation: CheckedContinuation<Void, Never>?
-    private var released = false
-    init(started: XCTestExpectation) { self.started = started }
-    func hold() async {
-        guard !released else { return }
-        await withCheckedContinuation { continuation in
-            self.continuation = continuation
-            started.fulfill()
-        }
-    }
-    func release() {
-        released = true
-        continuation?.resume()
-        continuation = nil
     }
 }

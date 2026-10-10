@@ -98,18 +98,22 @@ final class PreviewRecoveryTests: XCTestCase {
     }
 
     func testCanceledNetworkFailureCreatesNoRetryRecord() async throws {
-        let counter = CancellationCounter()
-        let service = CatalogService(network: CatalogNetwork { _, _ in
-            await counter.record(); throw CancellationError()
-        }, storage: .disabled)
-        for _ in 0..<2 { do { _ = try await service.preview(TestCatalog.shaders[0].preview!) } catch {} }
-        let count = await counter.count
-        let failures = await service.previewFailureCount
-        XCTAssertEqual(count, 2)
-        XCTAssertEqual(failures, 0)
-        let canceled = Task { try await service.preview(TestCatalog.shaders[1].preview!) }
-        canceled.cancel()
-        do { _ = try await canceled.value; XCTFail() } catch is CancellationError {} catch { XCTFail("\(error)") }
+        for urlCancellation in [false, true] {
+            let counter = CancellationCounter()
+            let service = CatalogService(network: CatalogNetwork { _, _ in
+                await counter.record()
+                if urlCancellation { throw URLError(.cancelled) }
+                throw CancellationError()
+            }, storage: .disabled)
+            for _ in 0..<2 { do { _ = try await service.preview(TestCatalog.shaders[0].preview!) } catch {} }
+            let count = await counter.count
+            let failures = await service.previewFailureCount
+            XCTAssertEqual(count, 2)
+            XCTAssertEqual(failures, 0)
+            let canceled = Task { try await service.preview(TestCatalog.shaders[1].preview!) }
+            canceled.cancel()
+            do { _ = try await canceled.value; XCTFail() } catch is CancellationError {} catch { XCTFail("\(error)") }
+        }
     }
 
     func testAspectFillAtOneAndTwoTimesIncludingFocusMargin() async throws {

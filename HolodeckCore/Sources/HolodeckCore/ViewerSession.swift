@@ -140,10 +140,7 @@ public final class ViewerSession {
                 guard !Task.isCancelled, let self else { return }
                 if let current { self.applyCatalog(current) }
                 switch outcome {
-                case .updated(let snapshot):
-                    self.applyCatalog(current ?? snapshot)
-                    self.catalogFailure = nil
-                case .unchanged:
+                case .updated, .unchanged:
                     self.catalogFailure = nil
                 case .throttled, .disabled:
                     if self.catalog == nil {
@@ -155,9 +152,12 @@ public final class ViewerSession {
                 let current = await service.current()
                 guard !Task.isCancelled, let self else { return }
                 if let current { self.applyCatalog(current) }
-                self.catalogFailure = Failure(message: self.catalog != nil
+                let message = self.catalog != nil
                     ? "Couldn’t check for scene updates. Cached scenes are still available."
-                    : "Couldn’t download scenes. Check your internet connection and try again.", operation: .catalog)
+                    : "Couldn’t download scenes. Check your internet connection and try again."
+                if self.catalogFailure?.message != message {
+                    self.catalogFailure = Failure(message: message, operation: .catalog)
+                }
                 self.onEvent?(.catalogFailed)
             }
         }

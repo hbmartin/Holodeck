@@ -32,10 +32,7 @@ final class MacModel {
     @ObservationIgnored private let device: (any MTLDevice)?
     @ObservationIgnored private let compilerFactory: @Sendable (any MTLDevice, MTLPixelFormat) -> any ShaderCompiling
     @ObservationIgnored private let filterCache = SceneFilterCache()
-    @ObservationIgnored private let alerts = MacAlertCoordinator()
-    #if DEBUG
-    @ObservationIgnored private var replacesPresentedFailureForTesting = false
-    #endif
+    @ObservationIgnored private let alerts: MacAlertCoordinator
 
     @ObservationIgnored private var memoryPressure: (any DispatchSourceMemoryPressure)?
 
@@ -46,11 +43,12 @@ final class MacModel {
         var metalDevice = MTLCreateSystemDefaultDevice()
         #if DEBUG
         let configuration = UITestConfiguration(applicationID: "me.haroldmartin.HolodeckMac")
+        let driver = MacUITestDriver(configuration: configuration)
+        driver.prepareStorage()
         if let suite = configuration.storageSuite {
             let name = "HolodeckViewer-" + suite
             let cleanup = configuration.contains("--ui-test-cleanup-storage-suite")
             autosaveName = configuration.hasExplicitStorageSuite && !cleanup ? name : nil
-            if cleanup, configuration.hasExplicitStorageSuite { NSWindow.removeFrame(usingName: name) }
             defaults = configuration.makeUserDefaults()
             service = configuration.makeCatalogService()
             if configuration.contains("--ui-test-metal-unavailable") { metalDevice = nil }
@@ -64,7 +62,9 @@ final class MacModel {
         sidebarVisible = defaults?.object(forKey: "holodeck.sidebarVisible") as? Bool ?? true
         session = ViewerSession(catalogService: service, preferences: defaults.map(ShaderPreferences.userDefaults) ?? .inMemory(), policy: .mac)
         #if DEBUG
-        replacesPresentedFailureForTesting = configuration.contains("--ui-test-replace-presented-failure")
+        alerts = MacAlertCoordinator(didPresent: driver.didPresentFailure)
+        #else
+        alerts = MacAlertCoordinator()
         #endif
         session.refresh()
         let previewService = service
@@ -129,16 +129,6 @@ final class MacModel {
         presentFailuresIfNeeded()
     }
     func presentFailuresIfNeeded() { alerts.presentNextFailure(in: self) }
-    #if DEBUG
-    func didPresentFailureForTesting() {
-        guard replacesPresentedFailureForTesting else { return }
-        replacesPresentedFailureForTesting = false
-        if startupError != nil { startupError = RendererFailure(message: "A newer renderer startup failure occurred.") }
-        else if let failure = session.failure {
-            session.failure = ViewerSession.Failure(message: "A newer scene download failure occurred.", operation: failure.operation)
-        }
-    }
-    #endif
     func focusSearch() {
         sidebarVisible = true
         searchFocusRequest += 1
