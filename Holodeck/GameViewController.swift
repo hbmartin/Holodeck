@@ -134,23 +134,25 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     private func handleSessionEvent(_ event: ViewerSession.Event) {
+        defer { updateInteractionState() }
         switch event {
         case .catalogLoading:
             updateCatalogNotice()
             if shaders.isEmpty {
                 catalogErrorMessage = nil
-                statusLabel.text = "Downloading shaders…"
-                hintLabel.text = "Downloading shaders…"
+                statusLabel.text = catalogLoadingMessage
+                hintLabel.text = catalogLoadingMessage
                 hint.isHidden = pickerIsVisible
-                spinner.startAnimating()
             }
+        case .catalogCacheChecked:
+            updateStatus()
+            showLoadingHintIfNeeded()
         case .catalogFinished:
             updateCatalogNotice()
         case .catalogFailed:
             updateCatalogNotice()
             guard shaders.isEmpty else { return }
             catalogErrorMessage = "Couldn’t download shaders. Connect to the internet and press Select to retry."
-            spinner.stopAnimating()
             updateStatus()
             hintLabel.text = catalogErrorMessage
             hint.isHidden = pickerIsVisible
@@ -163,10 +165,8 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             hint.isHidden = true
             showLoadingHintIfNeeded()
             updateStatus()
-            spinner.startAnimating()
             updateVisibleCards()
         case .activated(let origin):
-            spinner.stopAnimating()
             updateStatus()
             updateVisibleCards()
             if origin == .startup {
@@ -175,7 +175,6 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
                 hidePicker(cancelSelection: false)
             }
         case .selectionFailed:
-            spinner.stopAnimating()
             showPicker()
             updateStatus()
         }
@@ -263,7 +262,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         hint.accessibilityIdentifier = "shader-hint"
         hint.layer.cornerRadius = 18
         hint.clipsToBounds = true
-        hintLabel.text = startupShader.map(loadingMessage) ?? "Downloading shaders…"
+        hintLabel.text = startupShader.map(loadingMessage) ?? catalogLoadingMessage
         hintLabel.font = .systemFont(ofSize: 23, weight: .medium)
         hintLabel.textColor = .white
         hintLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -279,13 +278,28 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         ])
     }
 
+    private var catalogLoadingMessage: String { session.hasCheckedCache ? "Downloading shaders…" : "Loading scenes…" }
+
+    private func updateInteractionState() {
+        if unavailableMessage == nil && (pendingSelection != nil || (shaders.isEmpty && session.isRefreshing)) {
+            spinner.startAnimating()
+        } else { spinner.stopAnimating() }
+        let idleRecovery = session.requiresExplicitSelection && session.activeShader == nil && pendingSelection == nil
+        menuGesture.isEnabled = pickerIsVisible && unavailableMessage == nil && !idleRecovery
+    }
+
+    override func didReceiveMemoryWarning() {
+        super.didReceiveMemoryWarning()
+        Task { await catalogService.trimPreviewCaches() }
+    }
+
     private func showPicker() {
         let wasVisible = pickerIsVisible
         selectGesture.isEnabled = false
-        menuGesture.isEnabled = unavailableMessage == nil
         hintTask?.cancel()
         hint.isHidden = true
         pickerIsVisible = true
+        updateInteractionState()
         (view as? ShowcaseMetalView)?.acceptsFocus = unavailableMessage != nil || shaders.isEmpty
         picker.isHidden = false
         updateFilterControls()
@@ -293,22 +307,28 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         updateVisibleCards()
         guard !wasVisible else { return }
         returnFocusButton = nil
-        browsingIndexPath = preferredShaderIndexPath
+        let openingIndexPath = preferredShaderIndexPath
+        browsingIndexPath = openingIndexPath
         browsingShaderID = visibleShaders.indices.contains(preferredShaderIndexPath.item) ? visibleShaders[preferredShaderIndexPath.item].id : nil
         view.layoutIfNeeded()
         if unavailableMessage == nil, !visibleShaders.isEmpty {
             collectionView.scrollToItem(at: preferredShaderIndexPath, at: .centeredHorizontally, animated: false)
             collectionView.layoutIfNeeded()
         }
+        // Layout can deliver focus callbacks for the previously visible item.
+        browsingIndexPath = openingIndexPath
+        browsingShaderID = visibleShaders.indices.contains(openingIndexPath.item) ? visibleShaders[openingIndexPath.item].id : nil
+        collectionView.setNeedsFocusUpdate()
+        collectionView.updateFocusIfNeeded()
         setNeedsFocusUpdate()
         updateFocusIfNeeded()
     }
 
     private func hidePicker(cancelSelection: Bool = true) {
+        defer { updateInteractionState() }
         guard unavailableMessage == nil else { return }
         if cancelSelection, pendingSelection?.origin == .user {
             session.cancelPendingSelection(resumeStartup: true)
-            spinner.stopAnimating()
             updateVisibleCards()
         }
         // Back can reveal a loading startup, but never an empty viewer after a compile failure.
@@ -355,7 +375,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     private func showLoadingHintIfNeeded() {
         if shaders.isEmpty {
-            hintLabel.text = catalogErrorMessage ?? "Downloading shaders…"
+            hintLabel.text = catalogErrorMessage ?? catalogLoadingMessage
             hint.isHidden = pickerIsVisible
             return
         }
@@ -382,7 +402,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         if let unavailableMessage {
             statusLabel.text = unavailableMessage
         } else if shaders.isEmpty {
-            statusLabel.text = catalogErrorMessage ?? "Downloading shaders…"
+            statusLabel.text = catalogErrorMessage ?? catalogLoadingMessage
         } else if let pendingSelection {
             statusLabel.text = loadingMessage(pendingSelection.shader)
         } else if case .selection(let shader, _) = session.failure?.operation {

@@ -24,9 +24,8 @@ final class UITestFixtures: NSObject {
         let failsStartup = arguments.contains("--ui-test-fail-initial-shader")
         precondition(!(holdsStartup || failsStartup) || catalogFixture != nil,
                      "Startup UI test controls require a valid HOLODECK_UI_TEST_CATALOG fixture")
-        if let suite = configuration.storageSuite {
-            let defaults = UserDefaults(suiteName: suite)!
-            dependencies.shaderPreferences = .userDefaults(defaults)
+        if configuration.storageSuite != nil {
+            dependencies.shaderPreferences = configuration.makeUserDefaults().map(ShaderPreferences.userDefaults) ?? .inMemory()
             dependencies.catalogService = configuration.makeCatalogService()
         }
         if arguments.contains("--ui-test-metal-unavailable") {

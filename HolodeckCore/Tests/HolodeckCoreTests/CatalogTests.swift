@@ -228,7 +228,8 @@ final class CatalogTests: XCTestCase {
         do { _ = try await service.preview(preview); XCTFail("Bad image hash must fail") } catch {}
         XCTAssertTrue(box.files.isEmpty)
         box.setResponses(["/previews/test.png": image])
-        let downloaded = try await service.preview(preview)
+        let revised = ShaderPreview(path: preview.path, hash: preview.hash, publicationRevision: String(repeating: "d", count: 40))
+        let downloaded = try await service.preview(revised)
         XCTAssertEqual(downloaded, image)
         let count = box.urls.count
         let reads = box.storageReads.count

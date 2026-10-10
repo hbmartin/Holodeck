@@ -38,9 +38,9 @@ final class CatalogTests: XCTestCase {
         await gate.complete("new.png", data: newData)
         await newTask.value
         XCTAssertNotNil(imageView.image)
-        let thumbnail = try await service.previewImage(new.preview!, maxPixelSize: 640)
+        let thumbnail = try await service.previewImage(new.preview!, targetPixelSize: CGSize(width: 320 * max(1, cell.traitCollection.displayScale) * 1.045, height: 232 * max(1, cell.traitCollection.displayScale) * 1.045))
         XCTAssertEqual(imageView.image?.pngData(), UIImage(cgImage: thumbnail).pngData())
-        XCTAssertEqual(imageView.image?.cgImage?.width, 640)
+        XCTAssertGreaterThan(imageView.image!.cgImage!.width, 320 * Int(max(1, cell.traitCollection.displayScale)))
         XCTAssertEqual(cell.accessibilityIdentifier, "shader-aurora")
     }
 
@@ -64,6 +64,51 @@ final class CatalogTests: XCTestCase {
         XCTAssertEqual(cell.contentView.backgroundColor, .black)
     }
 
+    func testResizeDuringPendingRequestIgnoresSameHashStaleCompletion() async throws {
+        let gate = PreviewRequestGate()
+        let service = CatalogService(network: CatalogNetwork { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
+        let cell = ShaderCardCell(frame: CGRect(x: 0, y: 0, width: 160, height: 116))
+        let shader = TestCatalog.shaders[0]
+        cell.configure(shader: shader, active: false, loading: false, catalogService: service)
+        let original = try XCTUnwrap(cell.previewTask)
+        await gate.waitForRequest("plasma.png")
+        cell.frame.size = CGSize(width: 320, height: 232)
+        cell.setNeedsLayout(); cell.layoutIfNeeded()
+        let replacement = try XCTUnwrap(cell.previewTask)
+        await gate.complete("plasma.png", data: try TestCatalog.preview(named: "preview-\(shader.preview!.hash).png"))
+        await replacement.value
+        await original.value
+        let view = try XCTUnwrap(cell.contentView.subviews.compactMap { $0 as? UIImageView }.first)
+        let expected = try await service.previewImage(shader.preview!, targetPixelSize: CGSize(
+            width: 320 * max(1, cell.traitCollection.displayScale) * 1.045,
+            height: 232 * max(1, cell.traitCollection.displayScale) * 1.045))
+        XCTAssertEqual(view.image?.cgImage?.width, expected.width)
+        XCTAssertNil(cell.previewTask)
+    }
+
+    func testCardResizeKeepsImageUntilLargerReplacementAndScaleChangesReload() async throws {
+        let service = CatalogService.offline(storage: TestCatalog.storage)
+        let cell = ShaderCardCell(frame: CGRect(x: 0, y: 0, width: 320, height: 232))
+        cell.traitOverrides.displayScale = 1
+        cell.updateTraitsIfNeeded()
+        cell.configure(shader: TestCatalog.shaders[0], active: false, loading: false, catalogService: service)
+        await cell.previewTask?.value
+        let imageView = try XCTUnwrap(cell.contentView.subviews.compactMap { $0 as? UIImageView }.first)
+        let original = try XCTUnwrap(imageView.image)
+        cell.frame.size = CGSize(width: 400, height: 300)
+        cell.setNeedsLayout(); cell.layoutIfNeeded()
+        XCTAssertTrue(imageView.image === original)
+        await cell.previewTask?.value
+        let larger = try XCTUnwrap(imageView.image)
+        XCTAssertGreaterThan(larger.cgImage!.width, original.cgImage!.width)
+        cell.traitOverrides.displayScale = 2
+        cell.updateTraitsIfNeeded()
+        cell.setNeedsLayout(); cell.layoutIfNeeded()
+        XCTAssertTrue(imageView.image === larger)
+        await cell.previewTask?.value
+        XCTAssertGreaterThan(imageView.image!.cgImage!.width, larger.cgImage!.width)
+    }
+
     func testMetadataAndRevisionChangesRetainIdenticalPreviewImage() async throws {
         let service = CatalogService.offline(storage: TestCatalog.storage)
         let cell = ShaderCardCell(frame: CGRect(x: 0, y: 0, width: 320, height: 232))
@@ -78,10 +123,10 @@ final class CatalogTests: XCTestCase {
         XCTAssertTrue(imageView.image === image)
     }
 
-    func testCardCanRetryUnavailablePreviewWithoutClearingALoadedImage() async throws {
+    func testCardRetriesValidationFailureOnlyAfterPublicationChangeAndKeepsImageOnResizeFailure() async throws {
         let gate = PreviewRequestGate()
         let service = CatalogService(network: CatalogNetwork { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
-        let shader = TestCatalog.shaders[0]
+        var shader = TestCatalog.shaders[0]
         let cell = ShaderCardCell(frame: CGRect(x: 0, y: 0, width: 320, height: 232))
         cell.configure(shader: shader, active: false, loading: false, catalogService: service)
         let failed = try XCTUnwrap(cell.previewTask)
@@ -91,6 +136,11 @@ final class CatalogTests: XCTestCase {
         let imageView = try XCTUnwrap(cell.contentView.subviews.compactMap { $0 as? UIImageView }.first)
         XCTAssertNil(imageView.image)
         cell.configure(shader: shader, active: false, loading: false, catalogService: service)
+        await cell.previewTask?.value
+        XCTAssertNil(imageView.image)
+        shader.preview = ShaderPreview(path: shader.preview!.path, hash: shader.preview!.hash,
+                                       publicationRevision: String(repeating: "c", count: 40))
+        cell.configure(shader: shader, active: false, loading: false, catalogService: service)
         let retry = try XCTUnwrap(cell.previewTask)
         await gate.waitForRequest("plasma.png")
         await gate.complete("plasma.png", data: try TestCatalog.preview(named: "preview-\(shader.preview!.hash).png"))
@@ -99,6 +149,15 @@ final class CatalogTests: XCTestCase {
         cell.configure(shader: shader, active: true, loading: false, catalogService: service)
         XCTAssertTrue(imageView.image === loaded)
         XCTAssertNil(cell.previewTask)
+        await service.trimPreviewCaches()
+        cell.frame.size = CGSize(width: 640, height: 464)
+        cell.setNeedsLayout(); cell.layoutIfNeeded()
+        let replacement = try XCTUnwrap(cell.previewTask)
+        await gate.waitForRequest("plasma.png")
+        XCTAssertTrue(imageView.image === loaded)
+        await gate.complete("plasma.png", data: Data("invalid replacement".utf8))
+        await replacement.value
+        XCTAssertTrue(imageView.image === loaded, "A failed larger request retains the displayed image")
     }
 }
 

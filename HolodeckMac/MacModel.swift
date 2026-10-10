@@ -8,7 +8,7 @@ import Observation
 final class MacModel {
     let session: ViewerSession
     let favorites: SceneFavorites
-    let defaults: UserDefaults
+    let defaults: UserDefaults?
     let windowAutosaveName: String
     var query = ""
     var favoritesOnly = false
@@ -16,7 +16,7 @@ final class MacModel {
     var mood = ""
     var motion = ""
     var sidebarVisible: Bool {
-        didSet { defaults.set(sidebarVisible, forKey: "holodeck.sidebarVisible") }
+        didSet { defaults?.set(sidebarVisible, forKey: "holodeck.sidebarVisible") }
     }
     var searchFocusRequest = 0
     var startupError: String?
@@ -28,16 +28,18 @@ final class MacModel {
     @ObservationIgnored private let compilerFactory: @Sendable (any MTLDevice, MTLPixelFormat) -> any ShaderCompiling
     @ObservationIgnored private let filterCache = SceneFilterCache()
 
+    @ObservationIgnored private var memoryPressure: (any DispatchSourceMemoryPressure)?
+
     init() {
         var windowNamespace = "live"
-        var defaults = UserDefaults.standard
+        var defaults: UserDefaults? = UserDefaults.standard
         var service = CatalogService()
         var metalDevice = MTLCreateSystemDefaultDevice()
         #if DEBUG
         let configuration = UITestConfiguration(applicationID: "me.haroldmartin.HolodeckMac")
         if let suite = configuration.storageSuite {
             windowNamespace = suite
-            defaults = UserDefaults(suiteName: suite)!
+            defaults = configuration.makeUserDefaults()
             service = configuration.makeCatalogService()
             if configuration.contains("--ui-test-metal-unavailable") { metalDevice = nil }
         }
@@ -46,10 +48,18 @@ final class MacModel {
         windowAutosaveName = "HolodeckViewer-" + windowNamespace
         self.device = metalDevice
         compilerFactory = { ShaderCompiler(device: $0, pixelFormat: $1) }
-        favorites = SceneFavorites(defaults: defaults)
-        sidebarVisible = defaults.object(forKey: "holodeck.sidebarVisible") as? Bool ?? true
-        session = ViewerSession(catalogService: service, preferences: .userDefaults(defaults), policy: .mac)
+        favorites = defaults.map { SceneFavorites(defaults: $0) } ?? .inMemory()
+        sidebarVisible = defaults?.object(forKey: "holodeck.sidebarVisible") as? Bool ?? true
+        session = ViewerSession(catalogService: service, preferences: defaults.map(ShaderPreferences.userDefaults) ?? .inMemory(), policy: .mac)
+        session.refresh()
+        let previewService = service
+        let pressure = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .global())
+        pressure.setEventHandler { Task { await previewService.trimPreviewCaches() } }
+        memoryPressure = pressure
+        pressure.resume()
     }
+
+    deinit { memoryPressure?.cancel() }
 
     var filteredScenes: [ShaderDefinition] {
         filterCache.filter(session.catalog, query: query, favoritesOnly: favoritesOnly, favorites: favorites.ids,

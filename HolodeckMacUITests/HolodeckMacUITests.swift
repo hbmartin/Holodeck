@@ -10,6 +10,13 @@ final class HolodeckMacUITests: XCTestCase {
         app.launchArguments = ["--ui-test-storage-suite", suite] + arguments
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: discovery ? "DiscoveryFixture" : "CatalogFixture", withExtension: "json", subdirectory: "TestSupport"))
         app.launchEnvironment["HOLODECK_UI_TEST_CATALOG"] = try String(contentsOf: url, encoding: .utf8)
+        addTeardownBlock { @MainActor in
+            app.terminate()
+            app.launchEnvironment.removeAll()
+            app.launchArguments = ["--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite"]
+            app.launch()
+            app.terminate()
+        }
         return app
     }
     private func element(_ id: String, in app: XCUIApplication) -> XCUIElement {
@@ -35,6 +42,18 @@ final class HolodeckMacUITests: XCTestCase {
         XCTAssertTrue(row.waitForExistence(timeout: 10))
         row.click()
         waitForTitle(title, in: app)
+    }
+
+    func testDiskCachedScenesRemainVisibleWithUnavailableRenderer() throws {
+        let app = try app(arguments: ["--ui-test-disk-cache", "--ui-test-metal-unavailable"])
+        app.launch()
+        XCTAssertTrue(app.windows.firstMatch.buttons["OK"].firstMatch.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["Renderer Unavailable"].exists)
+        app.windows.firstMatch.buttons["OK"].firstMatch.click()
+        let row = element("shader-plasma", in: app)
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        XCTAssertFalse(row.isEnabled)
+        XCTAssertFalse(app.staticTexts["No Scenes Yet"].exists)
     }
 
     func testEverySceneAndArrowSelection() throws {

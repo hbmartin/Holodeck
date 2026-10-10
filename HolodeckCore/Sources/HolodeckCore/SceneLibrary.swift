@@ -4,16 +4,18 @@ import Observation
 @MainActor @Observable
 public final class SceneFavorites {
     public private(set) var ids: Set<String>
-    @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private let defaults: UserDefaults?
     private static let key = "holodeck.favoriteSceneIDs"
 
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         ids = Set(defaults.stringArray(forKey: Self.key) ?? [])
     }
+    private init() { defaults = nil; ids = [] }
+    public static func inMemory() -> SceneFavorites { SceneFavorites() }
     public func toggle(_ id: String) {
         if !ids.insert(id).inserted { ids.remove(id) }
-        defaults.set(ids.sorted(), forKey: Self.key)
+        defaults?.set(ids.sorted(), forKey: Self.key)
     }
 }
 

@@ -8,6 +8,10 @@ final class ShaderCardCell: UICollectionViewCell {
     private let updatedLabel = UILabel()
     private(set) var previewTask: Task<Void, Never>?
     private var representedPreview: ShaderPreview?
+    private var catalogService: CatalogService?
+    private var requestedPixels = CGSize.zero
+    private var displayedPixels = CGSize.zero
+    private var requestID = UUID()
     private let categoryLabel = UILabel()
     private let titleLabel = UILabel()
     private let descriptionLabel = UILabel()
@@ -54,6 +58,9 @@ final class ShaderCardCell: UICollectionViewCell {
         ])
         isAccessibilityElement = true
         updateFocusAppearance()
+        registerForTraitChanges([UITraitDisplayScale.self]) { (cell: ShaderCardCell, _: UITraitCollection) in
+            cell.requestPreviewIfNeeded()
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("Shader cards are created programmatically.") }
@@ -64,19 +71,16 @@ final class ShaderCardCell: UICollectionViewCell {
         updatedLabel.isHidden = shader.updatedAt == nil
         let previousHash = representedPreview?.hash
         representedPreview = shader.preview
+        self.catalogService = catalogService
         if previousHash != shader.preview?.hash {
             previewTask?.cancel()
             previewTask = nil
             previewImageView.image = nil
+            requestedPixels = .zero
+            displayedPixels = .zero
+            requestID = UUID()
         }
-        if previewImageView.image == nil, previewTask == nil, let preview = shader.preview, let catalogService {
-            previewTask = Task { [weak self] in
-                let image = try? await catalogService.previewImage(preview, maxPixelSize: 640)
-                guard !Task.isCancelled, let self, self.representedPreview?.hash == preview.hash else { return }
-                self.previewTask = nil
-                if let image { self.previewImageView.image = UIImage(cgImage: image) }
-            }
-        }
+        requestPreviewIfNeeded()
         titleLabel.text = shader.title
         descriptionLabel.text = shader.description
         stateLabel.text = loading ? "LOADING…" : (active ? "NOW SHOWING" : " ")
@@ -97,6 +101,10 @@ final class ShaderCardCell: UICollectionViewCell {
         previewTask?.cancel()
         previewTask = nil
         representedPreview = nil
+        catalogService = nil
+        requestedPixels = .zero
+        displayedPixels = .zero
+        requestID = UUID()
         previewImageView.image = nil
     }
 
@@ -104,7 +112,31 @@ final class ShaderCardCell: UICollectionViewCell {
         super.layoutSubviews()
         previewImageView.frame = contentView.bounds
         gradient.frame = contentView.bounds
+        requestPreviewIfNeeded()
         layer.shadowPath = UIBezierPath(roundedRect: bounds, cornerRadius: 18).cgPath
+    }
+
+    private func requestPreviewIfNeeded() {
+        guard let preview = representedPreview, let catalogService,
+              contentView.bounds.width > 0, contentView.bounds.height > 0 else { return }
+        let scale = max(1, traitCollection.displayScale) * 1.045
+        let pixels = CGSize(width: min(2048, ceil(contentView.bounds.width * scale / 64) * 64),
+                            height: min(2048, ceil(contentView.bounds.height * scale / 64) * 64))
+        if previewTask != nil, pixels.width <= requestedPixels.width, pixels.height <= requestedPixels.height { return }
+        if previewImageView.image != nil, pixels.width <= displayedPixels.width, pixels.height <= displayedPixels.height { return }
+        previewTask?.cancel()
+        requestedPixels = pixels
+        let id = UUID()
+        requestID = id
+        previewTask = Task { [weak self] in
+            let image = try? await catalogService.previewImage(preview, targetPixelSize: pixels)
+            guard !Task.isCancelled, let self, self.requestID == id, self.representedPreview?.hash == preview.hash else { return }
+            self.previewTask = nil
+            if let image {
+                self.displayedPixels = pixels
+                self.previewImageView.image = UIImage(cgImage: image)
+            }
+        }
     }
 
     override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {

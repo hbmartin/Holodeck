@@ -58,6 +58,22 @@ public actor CatalogService {
     private var previewTasks: [String: Task<Data, Error>] = [:]
     private var imageTasks: [PreviewImageKey: Task<CGImage, Error>] = [:]
 
+    private let decoder = PreviewDecoder()
+    private var cacheEpoch: UInt64 = 0
+    private var previewFailures = CatalogLRU<PreviewFailureKey, PreviewFailure>(limit: 500)
+    var previewCacheCosts: (encoded: Int, decoded: Int) { (previewData.cost, previewImages.cost) }
+    // A test hook runs on the same bounded worker queue as ImageIO.
+    private var beforePreviewDecode: (@Sendable () -> Void)?
+
+    func setBeforePreviewDecode(_ hook: (@Sendable () -> Void)?) { beforePreviewDecode = hook }
+    var previewFailureCount: Int { previewFailures.cost }
+
+    public func trimPreviewCaches() {
+        cacheEpoch &+= 1
+        previewData.removeAll()
+        previewImages.removeAll()
+    }
+
     public init(initialCatalog: ValidatedCatalog? = nil, network: CatalogNetwork = .live, storage: CatalogStorage = .live,
          clock: any Clock<Duration> = ContinuousClock(), enabled: Bool = true,
          repository: String = "hbmartin/HolodeckShaders") {
@@ -150,15 +166,49 @@ public actor CatalogService {
     }
 
     public func preview(_ preview: ShaderPreview) async throws -> Data {
+        try await self.preview(preview, epoch: cacheEpoch)
+    }
+
+    private func preview(_ preview: ShaderPreview, epoch: UInt64) async throws -> Data {
+        try Task.checkCancellation()
         try validatePreview(preview)
         if let cached = previewData.value(for: preview.hash) { return cached }
-        if let task = previewTasks[preview.hash] { return try await task.value }
-        let task = Task { try await self.downloadPreview(preview) }
-        previewTasks[preview.hash] = task
-        defer { previewTasks[preview.hash] = nil }
+        try checkPreviewFailure(preview)
+        let task: Task<Data, Error>
+        if let existing = previewTasks[preview.hash] { task = existing }
+        else {
+            task = Task {
+                defer { previewTasks[preview.hash] = nil }
+                do {
+                    let data = try await downloadPreview(preview)
+                    previewFailures.removeValue(for: PreviewFailureKey(preview))
+                    if epoch == cacheEpoch { previewData.insert(data, for: preview.hash, cost: data.count) }
+                    return data
+                } catch {
+                    recordPreviewFailure(error, preview: preview)
+                    throw error
+                }
+            }
+            previewTasks[preview.hash] = task
+        }
         let data = try await task.value
-        previewData.insert(data, for: preview.hash, cost: data.count)
+        try Task.checkCancellation()
         return data
+    }
+
+    private func checkPreviewFailure(_ preview: ShaderPreview) throws {
+        if let failure = previewFailures.value(for: PreviewFailureKey(preview)),
+           failure.retryAt == nil || clock.now < failure.retryAt! { throw failure.error }
+    }
+
+    private func recordPreviewFailure(_ error: Error, preview: ShaderPreview) {
+        guard !(error is CancellationError), (error as? URLError)?.code != .cancelled else { return }
+        let key = PreviewFailureKey(preview)
+        let attempts = min((previewFailures.value(for: key)?.attempts ?? 0) + 1, 5)
+        let permanent: Bool
+        if case CatalogError.invalidPreview = error { permanent = true } else { permanent = false }
+        let retryAt = permanent ? nil : clock.now.advanced(by: .seconds(min(30 * (1 << (attempts - 1)), 300)))
+        previewFailures.insert(PreviewFailure(error: error, attempts: attempts, retryAt: retryAt), for: key, cost: 1)
     }
 
     private func validatePreview(_ preview: ShaderPreview) throws {
@@ -179,28 +229,48 @@ public actor CatalogService {
     }
 
     public func previewImage(_ preview: ShaderPreview, maxPixelSize: Int) async throws -> CGImage {
-        try validatePreview(preview)
         guard (1...2048).contains(maxPixelSize) else { throw CatalogError.invalidPreview }
-        let key = PreviewImageKey(hash: preview.hash, size: maxPixelSize)
-        if let image = previewImages.value(for: key) { return image }
-        if let task = imageTasks[key] { return try await task.value }
-        let task = Task { try await self.decodePreview(preview, size: maxPixelSize) }
-        imageTasks[key] = task
-        defer { imageTasks[key] = nil }
-        let image = try await task.value
-        previewImages.insert(image, for: key, cost: image.bytesPerRow * image.height)
-        return image
+        return try await previewImage(preview, request: .maximum(maxPixelSize))
     }
 
-    private func decodePreview(_ preview: ShaderPreview, size: Int) async throws -> CGImage {
-        let data = try await self.preview(preview)
-        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
-              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceShouldCacheImmediately: true,
-                kCGImageSourceThumbnailMaxPixelSize: size
-              ] as CFDictionary) else { throw CatalogError.invalidPreview }
+    /// Target dimensions are pixels, including any display scale and focus enlargement.
+    public func previewImage(_ preview: ShaderPreview, targetPixelSize: CGSize) async throws -> CGImage {
+        guard targetPixelSize.width.isFinite, targetPixelSize.height.isFinite,
+              targetPixelSize.width > 0, targetPixelSize.height > 0 else { throw CatalogError.invalidPreview }
+        // Bucket destinations as well as decoded sizes to avoid a cache entry per layout fluctuation.
+        let width = Int(min(2048, ceil(targetPixelSize.width / 64) * 64))
+        let height = Int(min(2048, ceil(targetPixelSize.height / 64) * 64))
+        return try await previewImage(preview, request: .fill(width, height))
+    }
+
+    private func previewImage(_ preview: ShaderPreview, request: PreviewSize) async throws -> CGImage {
+        try Task.checkCancellation()
+        try validatePreview(preview)
+        let key = PreviewImageKey(hash: preview.hash, size: request)
+        if let image = previewImages.value(for: key) { return image }
+        try checkPreviewFailure(preview)
+        let task: Task<CGImage, Error>
+        if let existing = imageTasks[key] { task = existing }
+        else {
+            let epoch = cacheEpoch
+            let hook = beforePreviewDecode
+            task = Task {
+                defer { imageTasks[key] = nil }
+                let data = try await self.preview(preview, epoch: epoch)
+                do {
+                    let image = try await decoder.decode(data, size: request, beforeDecode: hook)
+                    previewFailures.removeValue(for: PreviewFailureKey(preview))
+                    if epoch == cacheEpoch { previewImages.insert(image, for: key, cost: image.bytesPerRow * image.height) }
+                    return image
+                } catch {
+                    recordPreviewFailure(error, preview: preview)
+                    throw error
+                }
+            }
+            imageTasks[key] = task
+        }
+        let image = try await task.value
+        try Task.checkCancellation()
         return image
     }
 
@@ -256,5 +326,70 @@ nonisolated public enum CatalogServiceKey: DependencyKey {
 
 nonisolated private struct PreviewImageKey: Hashable {
     let hash: String
-    let size: Int
+    let size: PreviewSize
+}
+
+nonisolated private struct PreviewFailureKey: Hashable {
+    let revision: String
+    let path: String
+    let hash: String
+    init(_ preview: ShaderPreview) { revision = preview.publicationRevision; path = preview.path; hash = preview.hash }
+}
+
+nonisolated private struct PreviewFailure {
+    let error: Error
+    let attempts: Int
+    let retryAt: AnyClock<Duration>.Instant?
+}
+
+nonisolated private enum PreviewSize: Hashable, Sendable {
+    case maximum(Int)
+    case fill(Int, Int)
+}
+
+/// Blocking ImageIO work never occupies the catalog actor; only two decodes run at once.
+nonisolated private final class PreviewDecoder: Sendable {
+    private let queue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "Holodeck.preview-decoder"
+        queue.qualityOfService = .userInitiated
+        queue.maxConcurrentOperationCount = 2
+        return queue
+    }()
+
+    func decode(_ data: Data, size: PreviewSize, beforeDecode: (@Sendable () -> Void)?) async throws -> CGImage {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.addOperation {
+                beforeDecode?()
+                do { continuation.resume(returning: try Self.image(data, size: size)) }
+                catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
+    private static func image(_ data: Data, size: PreviewSize) throws -> CGImage {
+        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary)
+        else { throw CatalogError.invalidPreview }
+        let maximum: Int
+        switch size {
+        case .maximum(let value): maximum = value
+        case .fill(let targetWidth, let targetHeight):
+            guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+                  let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+                  let height = properties[kCGImagePropertyPixelHeight] as? NSNumber,
+                  width.doubleValue > 0, height.doubleValue > 0 else { throw CatalogError.invalidPreview }
+            let rotated = (5...8).contains((properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1)
+            let w = rotated ? height.doubleValue : width.doubleValue
+            let h = rotated ? width.doubleValue : height.doubleValue
+            let required = max(w, h) * max(Double(targetWidth) / w, Double(targetHeight) / h)
+            maximum = Int(min(2048, ceil(required / 64) * 64))
+        }
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maximum
+        ] as CFDictionary) else { throw CatalogError.invalidPreview }
+        return image
+    }
 }

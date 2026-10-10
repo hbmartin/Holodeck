@@ -207,7 +207,7 @@ final class HolodeckUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Press Select to choose a shader"].waitForExistence(timeout: 10))
     }
 
-    func testStartupFailureWithoutStorageSuiteKeepsPickerAfterBackAndRecovers() {
+    func testStartupFailureWithoutStorageSuiteBackReturnsHomeAndResumeRecovers() {
         let app = isolatedApp()
         app.launchArguments = ["--ui-test-hold-initial-shader", "--ui-test-fail-initial-shader"]
         app.launch()
@@ -218,7 +218,9 @@ final class HolodeckUITests: XCTestCase {
                                               object: app.staticTexts["shader-status"])
         XCTAssertEqual(XCTWaiter.wait(for: [failed], timeout: 10), .completed)
         remote.press(.menu)
-        XCTAssertTrue(app.otherElements["shader-picker"].exists)
+        waitForBackground(app)
+        app.activate()
+        XCTAssertTrue(app.otherElements["shader-picker"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["shader-status"].label.hasPrefix("Couldn’t load Plasma"))
         remote.press(.right)
         waitForFocus(card("aurora", in: app))
@@ -303,7 +305,15 @@ final class HolodeckUITests: XCTestCase {
         let app = XCUIApplication()
         let url = Bundle(for: HolodeckUITests.self).url(forResource: discovery ? "DiscoveryFixture" : "CatalogFixture", withExtension: "json", subdirectory: "TestSupport")!
         app.launchEnvironment["HOLODECK_UI_TEST_CATALOG"] = try! String(contentsOf: url, encoding: .utf8)
-        app.launchArguments = ["--ui-test-storage-suite", "me.haroldmartin.Holodeck.ui-tests." + UUID().uuidString]
+        let suite = "me.haroldmartin.Holodeck.ui-tests." + UUID().uuidString
+        app.launchArguments = ["--ui-test-storage-suite", suite]
+        addTeardownBlock { @MainActor in
+            app.terminate()
+            app.launchEnvironment.removeAll()
+            app.launchArguments = ["--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite"]
+            app.launch()
+            app.terminate()
+        }
         return app
     }
 

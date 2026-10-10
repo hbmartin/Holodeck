@@ -28,7 +28,7 @@ struct ViewerView: View {
                             VStack(spacing: 12) {
                                 if session.pendingSelection != nil || session.isRefreshing { ProgressView().tint(.white) }
                                 Text(model.rendererUnavailableReason ?? session.pendingSelection.map { "Loading \($0.shader.title)…" } ??
-                                     (session.isRefreshing ? "Downloading scenes…" : "Choose a scene to begin"))
+                                     (session.isRefreshing ? (session.hasCheckedCache ? "Downloading scenes…" : "Loading scenes…") : "Choose a scene to begin"))
                                     .foregroundStyle(.white)
                             }
                         }
