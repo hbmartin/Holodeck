@@ -83,8 +83,6 @@ struct ViewerView: View {
         }
         .onChange(of: model.startupError?.id, initial: true) { model.presentFailuresIfNeeded() }
         .onChange(of: session.failure?.id, initial: true) { model.presentFailuresIfNeeded() }
-        .onChange(of: session.catalogFailure?.id) { model.presentFailuresIfNeeded() }
-        .onChange(of: session.selectionFailure?.id) { model.presentFailuresIfNeeded() }
         .onChange(of: session.catalog?.publicationRevision) { model.reconcileFilters() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.updateActivity(appActive: true) }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willResignActiveNotification)) { _ in model.updateActivity(appActive: false) }

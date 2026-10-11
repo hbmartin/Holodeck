@@ -139,3 +139,22 @@ Mac presentation injection lives in a DEBUG-only driver and reaches the coordina
 AppKit finishes ordering out an alert after its completion handler returns. The coordinator now marks the presentation as ending and defers releasing ownership and presenting the next failure until the next main-actor turn. Its Escape monitor is removed once. Test launches ignore saved application state while retaining the explicit named AppKit frame autosave used by the persistence regressions.
 
 The fullscreen helpers explicitly open View and wait up to 15 seconds for menu and window transitions. Renderer Return retains the AppKit default button; a sheet-scoped Escape handler invokes the same OK action. The approved physical Escape and top-edge mouse-event helpers were executed, but macOS denied event-posting access. The final focused `test-without-building` run fails explicitly before posting: macOS reports that its stored permission matches an older runner code signature. Further permission handling and Mac UI acceptance runs were deferred at the user's request. Keyboard dismissal, a final full-suite rerun and three consecutive fullscreen passes remain incomplete. The latest Mac Release build and final UI test compilation passed after the sheet-handoff change. No deployment target, persisted format, renderer refresh policy or preview retry policy changed.
+
+## Current failure sheets and reliable cleanup
+
+Updated on October 10, 2026 with macOS 27.0.1 and Xcode 27.0. Sheet eligibility now follows the captured failure UUID: renderer sheets compare against `startupError`, and session sheets compare against the canonical modal `session.failure`. Replacing a failure automatically aborts its old sheet and presents the current failure after AppKit finishes teardown. Abort responses perform no retry or dismissal, and button actions retain their captured-identity guards. Renderer failures have priority when choosing the next sheet; an unchanged current session failure remains eligible if a renderer failure arrives. The existing ending flag and deferred handoff remain in place.
+
+Repeated renderer installation errors retain the pending failure identity while their message is unchanged. Changed messages, dismissal and successful recovery end that lifecycle. Catalog identity reuse and separate selection-attempt identities are unchanged. The viewer observes the canonical failure UUID, AppKit supplies the default Return button, and DEBUG fixture initialization and cleanup share their window-autosave naming helper.
+
+Storage cleanup waits up to 15 seconds for its viewer window, terminates the application, and then throws a typed readiness error if the window did not appear. A failed attempt remains retryable; only successful readiness and termination mark the handle completed. Storage assertions run after cleanup returns. The separately registered final-termination block runs after the cleanup block in XCTest's reverse teardown order, including when cleanup is interrupted.
+
+UI regressions cover automatic catalog/renderer sheet replacement, Retry recovery, a newer selection failure retrying Waves instead of Aurora, repeated actual renderer initialization preserving its original sheet, cleanup timeout/retry/idempotence, and named-frame removal after termination. DEBUG selection failures are injected after startup activation; the repeated-renderer fixture identifies the original sheet so replacement with identical text is detectable.
+
+| Check | Result |
+| --- | --- |
+| Core tests on macOS | 91 passed; four opt-in tests skipped; zero failures |
+| Mac Debug build for testing | Passed, including all current-failure and cleanup regressions; UI tests compiled only |
+| Mac Release build | Passed for macOS arm64 |
+| Mac UI regression execution | Deferred at the user's request; compilation does not establish runtime acceptance |
+
+The core run preserves coverage for stale retry/dismissal actions, repeated catalog-error content and separate selection-attempt identities. No Mac UI tests are executed for this change. The earlier fullscreen and physical Escape permission blockers remain deferred, and the fullscreen helper and system permissions are unchanged.

@@ -8,15 +8,15 @@ final class HolodeckMacUITests: XCTestCase {
 
     private func app(suite: String? = "HolodeckMacUITests-" + UUID().uuidString, arguments: [String] = [], discovery: Bool = false) throws -> XCUIApplication {
         let app = XCUIApplication()
+        // Teardown is LIFO: this runs after cleanup, even if cleanup is interrupted.
+        addTeardownBlock { @MainActor in app.terminate() }
         app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"] + (suite.map { ["--ui-test-storage-suite", $0] } ?? []) + arguments
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: discovery ? "DiscoveryFixture" : "CatalogFixture", withExtension: "json", subdirectory: "TestSupport"))
         app.launchEnvironment["HOLODECK_UI_TEST_CATALOG"] = try String(contentsOf: url, encoding: .utf8)
         if let suite {
             let cleanup = StorageSuiteCleanup(app: app, suite: suite)
             cleanups[ObjectIdentifier(app)] = cleanup
-            addTeardownBlock { @MainActor in app.terminate(); cleanup.run() }
-        } else {
-            addTeardownBlock { @MainActor in app.terminate() }
+            addTeardownBlock { @MainActor in try cleanup.run() }
         }
         return app
     }
@@ -316,24 +316,91 @@ final class HolodeckMacUITests: XCTestCase {
         }
     }
 
-    func testStaleAlertActionsCannotDismissNewerFailures() throws {
+    func testReplacedCatalogAndRendererFailuresShowCurrentSheet() throws {
         for action in ["OK", "Retry"] {
-            let app = try app(arguments: ["--ui-test-empty-cache", "--ui-test-replace-presented-failure"])
+            let arguments = action == "Retry"
+                ? ["--ui-test-download-catalog", "--ui-test-fail-catalog-once"]
+                : ["--ui-test-empty-cache"]
+            let app = try app(arguments: arguments + ["--ui-test-replace-presented-failure"])
             app.launch()
-            XCTAssertTrue(app.windows.firstMatch.buttons[action].waitForExistence(timeout: 10))
-            XCTAssertFalse(app.staticTexts["A newer scene download failure occurred."].exists)
-            app.windows.firstMatch.buttons[action].click()
-            XCTAssertTrue(app.staticTexts["A newer scene download failure occurred."].waitForExistence(timeout: 10))
-            app.windows.firstMatch.buttons["OK"].click()
-            XCTAssertTrue(app.staticTexts["A newer scene download failure occurred."].waitForNonExistence(timeout: 10))
+            let replacement = app.staticTexts["A newer scene download failure occurred."]
+            XCTAssertTrue(replacement.waitForExistence(timeout: 10))
+            XCTAssertEqual(app.windows.firstMatch.sheets.count, 1)
+            let sheet = app.windows.firstMatch.sheets.firstMatch
+            XCTAssertTrue(sheet.staticTexts["A newer scene download failure occurred."].exists)
+            XCTAssertFalse(sheet.staticTexts["Couldn’t download scenes. Check your internet connection and try again."].exists)
+            sheet.buttons[action].click()
+            XCTAssertTrue(replacement.waitForNonExistence(timeout: 10))
+            if action == "Retry" { waitForTitle("Plasma", in: app) }
+            else { XCTAssertTrue(app.staticTexts["No Scenes Yet"].exists) }
+            XCTAssertEqual(app.windows.firstMatch.sheets.count, 0)
             app.terminate()
         }
         let renderer = try app(arguments: ["--ui-test-metal-unavailable", "--ui-test-replace-presented-failure"])
         renderer.launch()
-        XCTAssertTrue(renderer.staticTexts["Renderer Unavailable"].waitForExistence(timeout: 10))
-        renderer.windows.firstMatch.buttons["OK"].click()
-        XCTAssertTrue(renderer.staticTexts["A newer renderer startup failure occurred."].waitForExistence(timeout: 10))
-        XCTAssertFalse(renderer.windows.firstMatch.buttons["Retry"].exists)
+        let replacement = renderer.staticTexts["A newer renderer startup failure occurred."]
+        XCTAssertTrue(replacement.waitForExistence(timeout: 10))
+        XCTAssertEqual(renderer.windows.firstMatch.sheets.count, 1)
+        let sheet = renderer.windows.firstMatch.sheets.firstMatch
+        XCTAssertTrue(sheet.staticTexts["A newer renderer startup failure occurred."].exists)
+        XCTAssertFalse(sheet.buttons["Retry"].exists)
+        sheet.buttons["OK"].click()
+        XCTAssertTrue(replacement.waitForNonExistence(timeout: 10))
+        XCTAssertTrue(renderer.staticTexts["Renderer Unavailable"].waitForNonExistence(timeout: 10))
+        XCTAssertEqual(renderer.windows.firstMatch.sheets.count, 0)
+        XCTAssertTrue(renderer.staticTexts["Metal rendering is unavailable on this device."].exists)
+    }
+
+    func testReplacedSelectionFailureRetriesTheNewerScene() throws {
+        let app = try app(arguments: ["--ui-test-selection-failure", "--ui-test-replace-presented-failure"])
+        app.launch()
+        let replacement = app.staticTexts["A newer Waves selection failure occurred."]
+        XCTAssertTrue(replacement.waitForExistence(timeout: 10))
+        XCTAssertFalse(app.staticTexts["An older Aurora selection failure occurred."].exists)
+        XCTAssertEqual(app.windows.firstMatch.sheets.count, 1)
+        waitForTitle("Plasma", in: app)
+        app.windows.firstMatch.sheets.firstMatch.buttons["Retry"].click()
+        waitForTitle("Waves", in: app)
+        XCTAssertTrue(replacement.waitForNonExistence(timeout: 10))
+        XCTAssertEqual(app.windows.firstMatch.sheets.count, 0)
+    }
+
+    func testRepeatedRendererInstallationKeepsThePendingSheet() throws {
+        let app = try app(arguments: ["--ui-test-metal-unavailable", "--ui-test-repeat-renderer-installation"])
+        app.launch()
+        let sheet = app.windows.firstMatch.sheets["renderer-reinstallation-sheet"]
+        XCTAssertTrue(sheet.waitForExistence(timeout: 10))
+        XCTAssertTrue(sheet.staticTexts["Renderer Unavailable"].exists)
+        XCTAssertEqual(app.windows.firstMatch.sheets.count, 1)
+        sheet.buttons["OK"].click()
+        XCTAssertTrue(app.staticTexts["Renderer Unavailable"].waitForNonExistence(timeout: 10))
+        XCTAssertEqual(app.windows.firstMatch.sheets.count, 0)
+        XCTAssertTrue(app.staticTexts["Metal rendering is unavailable on this device."].exists)
+    }
+
+    func testCleanupReadinessTimeoutTerminatesAndCanRetry() throws {
+        let suite = "HolodeckMacUITests-" + UUID().uuidString
+        let app = try app(suite: suite)
+        let cleanup = try XCTUnwrap(cleanups[ObjectIdentifier(app)])
+        var readinessChecks = 0
+        XCTAssertThrowsError(try cleanup.run(waitForWindow: { _ in
+            readinessChecks += 1
+            return false
+        })) { error in
+            XCTAssertEqual(error as? StorageSuiteCleanup.ReadinessError, .windowNotReady(suite: suite))
+        }
+        XCTAssertEqual(app.state, .notRunning)
+        try cleanup.run(waitForWindow: { application in
+            readinessChecks += 1
+            return application.windows["holodeck-viewer-window"].waitForExistence(timeout: 15)
+        })
+        XCTAssertEqual(app.state, .notRunning)
+        try cleanup.run(waitForWindow: { _ in
+            readinessChecks += 1
+            return false
+        })
+        XCTAssertEqual(readinessChecks, 2, "Completed cleanup must not launch or wait again")
+        XCTAssertEqual(app.state, .notRunning)
     }
 
     func testNamedWindowFramePersistsAndCleanupCannotRecreateIt() throws {
@@ -356,11 +423,9 @@ final class HolodeckMacUITests: XCTestCase {
         XCTAssertEqual(savedFrame(name), frame)
         app.terminate()
         let cleanup = try XCTUnwrap(cleanups[ObjectIdentifier(app)])
-        cleanup.run {
-            let removed = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in savedFrame(name, allowMissing: true) == nil }, object: nil)
-            XCTAssertEqual(XCTWaiter.wait(for: [removed], timeout: 10), .completed)
-            XCTAssertNil(savedFrame(name, allowMissing: true))
-        }
+        try cleanup.run()
+        let removed = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in savedFrame(name, allowMissing: true) == nil }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [removed], timeout: 10), .completed)
         XCTAssertNil(savedFrame(name, allowMissing: true), "Cleanup must not save another frame while terminating")
         XCTAssertEqual(savedFrame("HolodeckViewer-live", allowMissing: true), live)
     }
@@ -462,21 +527,31 @@ final class HolodeckMacUITests: XCTestCase {
 
 @MainActor
 private final class StorageSuiteCleanup {
+    enum ReadinessError: LocalizedError, Equatable {
+        case windowNotReady(suite: String)
+
+        var errorDescription: String? {
+            switch self {
+            case .windowNotReady(let suite): "Cleanup viewer window did not appear for storage suite \(suite)."
+            }
+        }
+    }
+
     private let app: XCUIApplication
     private let suite: String
     private var completed = false
 
     init(app: XCUIApplication, suite: String) { self.app = app; self.suite = suite }
 
-    func run(verify: () -> Void = {}) {
+    func run(waitForWindow: ((XCUIApplication) -> Bool)? = nil) throws {
         guard !completed else { return }
         app.terminate()
         app.launchEnvironment.removeAll()
         app.launchArguments = ["-ApplePersistenceIgnoreState", "YES", "--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite"]
         app.launch()
-        XCTAssertTrue(app.windows["holodeck-viewer-window"].waitForExistence(timeout: 15))
-        verify()
+        let ready = waitForWindow?(app) ?? app.windows["holodeck-viewer-window"].waitForExistence(timeout: 15)
         app.terminate()
+        guard ready else { throw ReadinessError.windowNotReady(suite: suite) }
         completed = true
     }
 }

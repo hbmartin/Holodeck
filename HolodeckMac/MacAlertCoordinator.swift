@@ -10,16 +10,10 @@ final class MacAlertCoordinator {
 
         func isEligible(in model: MacModel) -> Bool {
             switch self {
-            case .renderer:
-                return model.startupError != nil
+            case .renderer(let failure):
+                return model.startupError?.id == failure.id
             case .session(let failure):
-                switch failure.operation {
-                case .catalog:
-                    return model.session.catalog == nil && model.session.catalogFailure != nil
-                case .selection:
-                    if case .selection = model.session.failure?.operation { return true }
-                    return false
-                }
+                return model.session.failure?.id == failure.id
             }
         }
     }
@@ -62,10 +56,9 @@ final class MacAlertCoordinator {
         case .renderer(let failure):
             alert.messageText = "Renderer Unavailable"
             alert.informativeText = failure.message
-            let button = alert.addButton(withTitle: "OK")
-            alert.window.defaultButtonCell = button.cell as? NSButtonCell
-            // Replacing the default button's key equivalent also removes its Return
-            // behavior. Route Escape to that button without changing its default cell.
+            alert.addButton(withTitle: "OK")
+            // AppKit gives the first button Return. Route Escape to the same action
+            // without replacing that key equivalent.
             escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak alert] event in
                 guard let alert, event.window === alert.window || event.window?.attachedSheet === alert.window,
                       event.charactersIgnoringModifiers == "\u{1b}",
