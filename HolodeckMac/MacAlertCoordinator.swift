@@ -10,23 +10,17 @@ final class MacAlertCoordinator {
 
         func isEligible(in model: MacModel) -> Bool {
             switch self {
-            case .renderer:
-                return model.startupError != nil
+            case .renderer(let failure):
+                return model.startupError?.id == failure.id
             case .session(let failure):
-                switch failure.operation {
-                case .catalog:
-                    return model.session.catalog == nil && model.session.catalogFailure != nil
-                case .selection:
-                    if case .selection = model.session.failure?.operation { return true }
-                    return false
-                }
+                return model.session.failure?.id == failure.id
             }
         }
     }
     private struct Presentation {
         let alert: NSAlert
         let payload: Payload
-        let escapeMonitor: Any?
+        var escapeMonitor: Any?
         var isEnding = false
     }
     private var presentation: Presentation?
@@ -62,10 +56,9 @@ final class MacAlertCoordinator {
         case .renderer(let failure):
             alert.messageText = "Renderer Unavailable"
             alert.informativeText = failure.message
-            let button = alert.addButton(withTitle: "OK")
-            alert.window.defaultButtonCell = button.cell as? NSButtonCell
-            // Replacing the default button's key equivalent also removes its Return
-            // behavior. Route Escape to that button without changing its default cell.
+            alert.addButton(withTitle: "OK")
+            // AppKit gives the first button Return. Route Escape to the same action
+            // without replacing that key equivalent.
             escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak alert] event in
                 guard let alert, event.window === alert.window || event.window?.attachedSheet === alert.window,
                       event.charactersIgnoringModifiers == "\u{1b}",
@@ -82,7 +75,11 @@ final class MacAlertCoordinator {
         presentation = Presentation(alert: alert, payload: payload, escapeMonitor: escapeMonitor)
         alert.beginSheetModal(for: window) { [weak self, weak model, weak alert] response in
             guard let self, let alert, self.presentation?.alert === alert else { return }
-            if let monitor = self.presentation?.escapeMonitor { NSEvent.removeMonitor(monitor) }
+            self.presentation?.isEnding = true
+            if let monitor = self.presentation?.escapeMonitor {
+                NSEvent.removeMonitor(monitor)
+                self.presentation?.escapeMonitor = nil
+            }
             guard let model else { self.presentation = nil; return }
             // Aborted sheets (for example, a closing window) leave their errors pending.
             switch payload {
@@ -92,9 +89,13 @@ final class MacAlertCoordinator {
                 if response == .alertFirstButtonReturn { model.session.retry(failure) }
                 else if response == .alertSecondButtonReturn { model.session.dismissFailure(id: failure.id) }
             }
-            self.presentation = nil
-            // The completion runs after this sheet closes, so the next error gets its own presentation.
-            self.presentNextFailure(in: model)
+            // NSAlert orders out its sheet after this completion returns. Retain its
+            // ownership until then so a new sheet cannot race the old sheet's teardown.
+            Task { @MainActor [weak self, weak model, weak alert] in
+                guard let self, let model, let alert, self.presentation?.alert === alert else { return }
+                self.presentation = nil
+                self.presentNextFailure(in: model)
+            }
         }
         didPresent?(model)
     }
