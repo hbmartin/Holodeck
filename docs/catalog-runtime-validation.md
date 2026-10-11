@@ -158,3 +158,24 @@ UI regressions cover automatic catalog/renderer sheet replacement, Retry recover
 | Mac UI regression execution | Deferred at the user's request; compilation does not establish runtime acceptance |
 
 The core run preserves coverage for stale retry/dismissal actions, repeated catalog-error content and separate selection-attempt identities. No Mac UI tests are executed for this change. The earlier fullscreen and physical Escape permission blockers remain deferred, and the fullscreen helper and system permissions are unchanged.
+
+## Mac UI test prerequisites and transition helpers
+
+Updated on October 11, 2026 with macOS 27.0.1 and Xcode 27.0 (27A266a). Physical-input helpers now use `XCTSkipIf` to skip when the runner lacks event-posting access. The fullscreen test checks before launching, and launch recovery checks only when it needs to leave fullscreen. Renderer Return and Escape are separate tests with shared dismissal assertions; Escape checks permission before launching while Return uses XCTest input without that prerequisite.
+
+Fullscreen helpers wait up to 15 seconds for View and Enter/Exit Full Screen to exist, have nonempty geometry and be hittable. Menu readiness failures name the unmet condition and include the element's diagnostics. Enter and Exit again use coordinate clicks within the already-open menu; pointer revelation and native transitions use observed conditions rather than fixed sleeps.
+
+Both hide/reopen regressions share a helper that resolves one running app before Command-H and retains its PID. The ten-second hidden-state wait ends early on termination, a missing or duplicate instance, or a changed PID, reporting that condition rather than a generic timeout. Reopening after hide, minimize or close uses the same validated lookup and verifies process identity after the native reopen callback. The bundle identifier, saved-state-ignore launch arguments and physical-input permission check are shared within the UI-test file.
+
+| Check | Result |
+| --- | --- |
+| Core tests on macOS | 91 passed; four opt-in tests skipped; zero failures |
+| Mac Debug build for testing | Passed for macOS arm64; all UI tests compiled, including separate Return/Escape tests and transition helpers |
+| Mac Release build | Passed for macOS arm64 |
+| Mac UI execution and permission skips | Deferred at the user's request; neither runtime passes nor prerequisite skips were observed in this change |
+
+Runtime acceptance remains pending. Without event-posting permission, verify that `testNativeFullScreenPreservesSidebarAndPlayback` and `testRendererAlertSupportsEscape` skip before dependent actions, while `testRendererAlertSupportsReturn` and ordinary normal-window tests run. Normal tests that encounter fullscreen launch restoration must skip before posting their recovery input.
+
+With permission, require three consecutive passes of `testNativeFullScreenPreservesSidebarAndPlayback`, `testSidebarRestorationDefaultStartupAndSingleWindowReopening` and `testReactivationRecoveryClosesPendingCatalogSheet`. Then run Return, Escape, `testRendererAndCatalogFailuresPresentSeparateAlertsAndCatalogRetryRecovers`, `testReplacedCatalogAndRendererFailuresShowCurrentSheet` and `testReplacedSelectionFailureRetriesTheNewerScene`, followed by the serial full suite. Use the existing HolodeckMac scheme and macOS arm64 destination with parallel testing disabled; prerequisite skips do not establish runtime acceptance.
+
+The alert coordinator and system permissions remain unchanged. If sequential or replacement-alert validation stalls, capture whether the outgoing sheet is still attached when the deferred main-actor task runs, whether the next failure remains pending, and whether a later state/activity trigger resumes presentation. A reproduced handoff failure requires a separate lifecycle-based fix and regression test; compilation alone does not validate the suspected race.
