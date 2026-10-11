@@ -1,6 +1,16 @@
 import AppKit
 import XCTest
 
+private enum MacUITestSettings {
+    static let bundleIdentifier = "me.haroldmartin.HolodeckMac"
+    static let ignoreSavedStateArguments = ["-ApplePersistenceIgnoreState", "YES"]
+}
+
+private struct TestHelperError: LocalizedError, CustomStringConvertible {
+    let description: String
+    var errorDescription: String? { description }
+}
+
 @MainActor
 final class HolodeckMacUITests: XCTestCase {
     private var cleanups: [ObjectIdentifier: StorageSuiteCleanup] = [:]
@@ -10,7 +20,7 @@ final class HolodeckMacUITests: XCTestCase {
         let app = XCUIApplication()
         // Teardown is LIFO: this runs after cleanup, even if cleanup is interrupted.
         addTeardownBlock { @MainActor in app.terminate() }
-        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"] + (suite.map { ["--ui-test-storage-suite", $0] } ?? []) + arguments
+        app.launchArguments = MacUITestSettings.ignoreSavedStateArguments + (suite.map { ["--ui-test-storage-suite", $0] } ?? []) + arguments
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: discovery ? "DiscoveryFixture" : "CatalogFixture", withExtension: "json", subdirectory: "TestSupport"))
         app.launchEnvironment["HOLODECK_UI_TEST_CATALOG"] = try String(contentsOf: url, encoding: .utf8)
         if let suite {
@@ -23,38 +33,56 @@ final class HolodeckMacUITests: XCTestCase {
     private func element(_ id: String, in app: XCUIApplication) -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: id).firstMatch
     }
-    private func launch(_ app: XCUIApplication) {
+    private func requirePhysicalInputAccess(file: StaticString = #filePath, line: UInt = #line) throws {
+        try XCTSkipIf(!CGPreflightPostEventAccess(), "Mac UI test runner needs permission to post physical input", file: file, line: line)
+    }
+    private func launch(_ app: XCUIApplication) throws {
         app.launch()
         let window = app.windows["holodeck-viewer-window"]
         XCTAssertTrue(window.waitForExistence(timeout: 15))
         // Avoid leaving a menu open during normal-window tests. Native restoration can
         // still resume fullscreen independently of the isolated scene-preferences suite.
         if !window.buttons[XCUIIdentifierMinimizeWindow].exists {
-            exitFullScreen(in: app)
+            try exitFullScreen(in: app)
         }
         XCTAssertTrue(window.buttons[XCUIIdentifierMinimizeWindow].waitForExistence(timeout: 15))
     }
-    private func exitFullScreen(in app: XCUIApplication) {
+    private func exitFullScreen(in app: XCUIApplication) throws {
+        try requirePhysicalInputAccess()
         let window = app.windows["holodeck-viewer-window"]
         // Fullscreen menu revelation depends on WindowServer receiving mouse movement;
         // XCTest's window-targeted hover can leave the menu bar hidden.
         let point = CGPoint(x: window.frame.midX, y: window.frame.minY)
-        XCTAssertTrue(CGPreflightPostEventAccess(), "Mac UI test runner needs permission to post physical input")
-        guard let hover = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) else {
-            XCTFail("Unable to create fullscreen menu-bar hover")
-            return
-        }
+        let hover = try XCTUnwrap(CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left),
+                                  "Unable to create fullscreen menu-bar hover")
         hover.post(tap: .cghidEventTap)
-        openViewMenu(in: app)
+        try openViewMenu(in: app)
         let exit = app.menuItems["Exit Full Screen"]
-        XCTAssertTrue(exit.waitForExistence(timeout: 15))
-        exit.click()
+        try waitForMenuElement(exit, named: "Exit Full Screen")
+        // The menu is already open. Avoid XCTest reopening its ancestor menu.
+        exit.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
         XCTAssertTrue(window.buttons[XCUIIdentifierMinimizeWindow].waitForExistence(timeout: 15))
     }
-    private func openViewMenu(in app: XCUIApplication) {
+    private func openViewMenu(in app: XCUIApplication) throws {
         let view = app.menuBars.menuBarItems["View"]
-        XCTAssertTrue(view.waitForExistence(timeout: 15))
+        try waitForMenuElement(view, named: "View menu bar item")
         view.click()
+    }
+    private func menuReadinessIssue(_ element: XCUIElement) -> String? {
+        guard element.exists else { return "element does not exist" }
+        guard !element.frame.isEmpty else { return "element has an empty frame: \(element.frame)" }
+        guard element.isHittable else { return "element is not hittable (frame: \(element.frame))" }
+        return nil
+    }
+    private func waitForMenuElement(_ element: XCUIElement, named name: String) throws {
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            menuReadinessIssue(element) == nil
+        }, object: nil)
+        let result = XCTWaiter.wait(for: [ready], timeout: 15)
+        guard result == .completed else {
+            let reason = menuReadinessIssue(element) ?? "waiter returned \(result)"
+            throw TestHelperError(description: "\(name) was not ready within 15 seconds: \(reason).\n\(element.debugDescription)")
+        }
     }
     private func waitForTitle(_ title: String, in app: XCUIApplication) {
         let label = element("active-scene-title", in: app)
@@ -83,7 +111,7 @@ final class HolodeckMacUITests: XCTestCase {
 
     func testEverySceneAndArrowSelection() throws {
         let app = try app()
-        launch(app)
+        try launch(app)
         waitForTitle("Plasma", in: app)
         select("aurora", title: "Aurora", in: app)
         app.typeKey(.downArrow, modifierFlags: [])
@@ -101,7 +129,7 @@ final class HolodeckMacUITests: XCTestCase {
     func testSearchFavoritesAndPersistenceDoNotInterruptPlayback() throws {
         let suite = "HolodeckMacUITests-" + UUID().uuidString
         let app = try app(suite: suite)
-        launch(app)
+        try launch(app)
         waitForTitle("Plasma", in: app)
         element("toggle-favorite", in: app).click()
         let search = element("scene-search", in: app)
@@ -114,7 +142,7 @@ final class HolodeckMacUITests: XCTestCase {
         search.click(); search.typeKey("a", modifierFlags: .command); search.typeKey(.delete, modifierFlags: [])
         XCTAssertTrue(element("shader-plasma", in: app).waitForExistence(timeout: 5))
         XCTAssertFalse(element("shader-aurora", in: app).exists)
-        app.terminate(); launch(app)
+        app.terminate(); try launch(app)
         waitForTitle("Plasma", in: app)
         XCTAssertEqual(element("toggle-favorite", in: app).label, "Remove from Favorites")
         element("favorites-filter", in: app).click()
@@ -125,14 +153,14 @@ final class HolodeckMacUITests: XCTestCase {
 
     func testSidebarRestorationDefaultStartupAndSingleWindowReopening() async throws {
         let app = try app()
-        launch(app)
+        try launch(app)
         waitForTitle("Plasma", in: app)
         select("aurora", title: "Aurora", in: app)
         element("refresh-scenes", in: app).click()
         waitForTitle("Aurora", in: app)
         element("toggle-sidebar", in: app).click()
         XCTAssertTrue(element("scene-search", in: app).waitForNonExistence(timeout: 5))
-        app.terminate(); launch(app)
+        app.terminate(); try launch(app)
         waitForTitle("Plasma", in: app)
         XCTAssertFalse(element("scene-search", in: app).exists)
         element("toggle-sidebar", in: app).click()
@@ -142,8 +170,7 @@ final class HolodeckMacUITests: XCTestCase {
         app.typeKey("s", modifierFlags: [.command, .control])
         XCTAssertTrue(element("scene-search", in: app).waitForExistence(timeout: 5))
         // Hide and reactivate the app; the Window scene must remain singular.
-        app.typeKey("h", modifierFlags: .command)
-        try await reopen(app)
+        try await hideAndReopen(app)
         XCTAssertEqual(app.windows.count, 1)
         waitForTitle("Plasma", in: app)
         app.windows.firstMatch.buttons[XCUIIdentifierMinimizeWindow].click()
@@ -161,10 +188,52 @@ final class HolodeckMacUITests: XCTestCase {
         app.typeKey(.escape, modifierFlags: [])
     }
 
-    private func reopen(_ app: XCUIApplication) async throws {
-        let candidates = NSRunningApplication.runningApplications(withBundleIdentifier: "me.haroldmartin.HolodeckMac")
-        XCTAssertEqual(candidates.count, 1, "Only the test build may be running during native reopen checks")
-        let running = try XCTUnwrap(candidates.first)
+    private func runningApplication(for app: XCUIApplication, expectedPID: Int32? = nil) throws -> NSRunningApplication {
+        guard app.state != .notRunning else {
+            throw TestHelperError(description: "The test app is not running during native hide/reopen checks (expected PID: \(expectedPID.map(String.init) ?? "unspecified")).")
+        }
+        let candidates = NSRunningApplication.runningApplications(withBundleIdentifier: MacUITestSettings.bundleIdentifier)
+        guard !candidates.isEmpty else {
+            throw TestHelperError(description: "No running application matches \(MacUITestSettings.bundleIdentifier) (expected PID: \(expectedPID.map(String.init) ?? "unspecified")).")
+        }
+        guard candidates.count == 1 else {
+            throw TestHelperError(description: "Expected only the test build for native hide/reopen checks; found \(candidates.count) instances of \(MacUITestSettings.bundleIdentifier) with PIDs \(candidates.map(\.processIdentifier)).")
+        }
+        let running = candidates[0]
+        guard !running.isTerminated else {
+            throw TestHelperError(description: "The test app terminated during native hide/reopen checks (PID: \(running.processIdentifier)).")
+        }
+        if let expectedPID, running.processIdentifier != expectedPID {
+            throw TestHelperError(description: "The test app PID changed from \(expectedPID) to \(running.processIdentifier) during native hide/reopen checks.")
+        }
+        return running
+    }
+    private func hideAndReopen(_ app: XCUIApplication) async throws {
+        let running = try runningApplication(for: app)
+        let pid = running.processIdentifier
+        app.typeKey("h", modifierFlags: .command)
+        var processError: Error?
+        let hidden = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            do {
+                guard !running.isTerminated else {
+                    throw TestHelperError(description: "The test app terminated while waiting to hide (PID: \(pid)).")
+                }
+                return try runningApplication(for: app, expectedPID: pid).isHidden
+            } catch {
+                processError = error
+                return true // Stop waiting immediately when the expected process becomes invalid.
+            }
+        }, object: nil)
+        let result = await XCTWaiter.fulfillment(of: [hidden], timeout: 10)
+        if let processError { throw processError }
+        let current = try runningApplication(for: app, expectedPID: pid)
+        guard result == .completed, current.isHidden else {
+            throw TestHelperError(description: "The test app did not finish hiding within 10 seconds (PID: \(pid), hidden: \(current.isHidden), active: \(current.isActive), state: \(app.state), waiter: \(result)).")
+        }
+        try await reopen(app, expectedPID: pid)
+    }
+    private func reopen(_ app: XCUIApplication, expectedPID: Int32? = nil) async throws {
+        let running = try runningApplication(for: app, expectedPID: expectedPID)
         let url = try XCTUnwrap(running.bundleURL)
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
@@ -174,12 +243,13 @@ final class HolodeckMacUITests: XCTestCase {
             opened.fulfill()
         }
         await fulfillment(of: [opened], timeout: 10)
+        _ = try runningApplication(for: app, expectedPID: running.processIdentifier)
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
     }
 
     func testCommandFRevealsSidebarAndFocusesInsertedSearch() throws {
         let app = try app()
-        launch(app)
+        try launch(app)
         waitForTitle("Plasma", in: app)
         for _ in 0..<2 {
             element("toggle-sidebar", in: app).click()
@@ -198,25 +268,26 @@ final class HolodeckMacUITests: XCTestCase {
     }
 
     func testNativeFullScreenPreservesSidebarAndPlayback() throws {
+        try requirePhysicalInputAccess()
         let app = try app()
-        launch(app)
+        try launch(app)
         waitForTitle("Plasma", in: app)
         let window = app.windows.firstMatch
-        openViewMenu(in: app)
+        try openViewMenu(in: app)
         let enter = app.menuItems["Enter Full Screen"]
-        XCTAssertTrue(enter.waitForExistence(timeout: 15))
-        enter.click()
+        try waitForMenuElement(enter, named: "Enter Full Screen")
+        enter.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
         XCTAssertTrue(window.buttons[XCUIIdentifierMinimizeWindow].waitForNonExistence(timeout: 15))
         XCTAssertTrue(element("scene-search", in: app).exists)
         waitForTitle("Plasma", in: app)
-        exitFullScreen(in: app)
+        try exitFullScreen(in: app)
         XCTAssertTrue(window.buttons[XCUIIdentifierMinimizeWindow].waitForExistence(timeout: 15))
         XCTAssertTrue(element("scene-search", in: app).exists)
     }
 
     func testCachedUpdateFailureIsInlineAndRetryRecovers() throws {
         let app = try app(arguments: ["--ui-test-fail-refresh"])
-        launch(app)
+        try launch(app)
         waitForTitle("Plasma", in: app)
         let notice = element("catalog-update-notice", in: app)
         XCTAssertTrue(notice.waitForExistence(timeout: 10))
@@ -271,12 +342,7 @@ final class HolodeckMacUITests: XCTestCase {
         app.windows.firstMatch.buttons["OK"].click()
         let failure = app.staticTexts["Unable to Load Scenes"]
         XCTAssertTrue(failure.waitForExistence(timeout: 10))
-        app.typeKey("h", modifierFlags: .command)
-        let hidden = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            NSRunningApplication.runningApplications(withBundleIdentifier: "me.haroldmartin.HolodeckMac").first?.isHidden == true
-        }, object: nil)
-        XCTAssertEqual(XCTWaiter.wait(for: [hidden], timeout: 10), .completed)
-        try await reopen(app)
+        try await hideAndReopen(app)
         XCTAssertTrue(element("shader-aurora", in: app).waitForExistence(timeout: 10))
         XCTAssertTrue(failure.waitForNonExistence(timeout: 10))
         XCTAssertEqual(app.windows.firstMatch.sheets.count, 0)
@@ -288,32 +354,38 @@ final class HolodeckMacUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Metal rendering is unavailable on this device."].exists)
     }
 
-    func testRendererAlertSupportsEscapeAndReturn() throws {
-        for key in [XCUIKeyboardKey.return, .escape] {
-            let app = try app(arguments: ["--ui-test-metal-unavailable"])
-            app.launch()
-            let failure = app.staticTexts["Renderer Unavailable"]
-            XCTAssertTrue(failure.waitForExistence(timeout: 10))
-            XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
-            failure.click()
-            if key == .escape {
-                // Exercise physical Escape delivery; XCTest's special-key synthesis
-                // does not deliver this key to native sheets on this test host.
-                XCTAssertTrue(CGPreflightPostEventAccess(), "Mac UI test runner needs permission to post physical input")
-                let down = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: true))
-                let up = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: false))
-                down.flags = []
-                up.flags = []
-                down.post(tap: .cghidEventTap)
-                up.post(tap: .cghidEventTap)
-            } else {
-                app.typeKey(key, modifierFlags: [])
-            }
-            XCTAssertTrue(failure.waitForNonExistence(timeout: 10))
-            XCTAssertEqual(app.windows.firstMatch.sheets.count, 0)
-            XCTAssertTrue(app.staticTexts["Metal rendering is unavailable on this device."].exists)
-            app.terminate()
+    func testRendererAlertSupportsReturn() throws {
+        try assertRendererAlertDismissal(using: .return)
+    }
+
+    func testRendererAlertSupportsEscape() throws {
+        try assertRendererAlertDismissal(using: .escape)
+    }
+
+    private func assertRendererAlertDismissal(using key: XCUIKeyboardKey) throws {
+        if key == .escape { try requirePhysicalInputAccess() }
+        let app = try app(arguments: ["--ui-test-metal-unavailable"])
+        app.launch()
+        let failure = app.staticTexts["Renderer Unavailable"]
+        XCTAssertTrue(failure.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+        failure.click()
+        if key == .escape {
+            // Exercise physical Escape delivery; XCTest's special-key synthesis
+            // does not deliver this key to native sheets on this test host.
+            let down = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: true))
+            let up = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: false))
+            down.flags = []
+            up.flags = []
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+        } else {
+            app.typeKey(key, modifierFlags: [])
         }
+        XCTAssertTrue(failure.waitForNonExistence(timeout: 10))
+        XCTAssertEqual(app.windows.firstMatch.sheets.count, 0)
+        XCTAssertTrue(app.staticTexts["Metal rendering is unavailable on this device."].exists)
+        app.terminate()
     }
 
     func testReplacedCatalogAndRendererFailuresShowCurrentSheet() throws {
@@ -408,7 +480,7 @@ final class HolodeckMacUITests: XCTestCase {
         let name = "HolodeckViewer-" + suite
         let live = savedFrame("HolodeckViewer-live", allowMissing: true)
         let app = try app(suite: suite)
-        launch(app)
+        try launch(app)
         waitForTitle("Plasma", in: app)
         resizeWindow(in: app)
         let resized = app.windows["holodeck-viewer-window"].frame.size
@@ -417,7 +489,7 @@ final class HolodeckMacUITests: XCTestCase {
         let saved = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in savedFrame(name, allowMissing: true) != nil }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [saved], timeout: 10), .completed)
         let frame = try XCTUnwrap(savedFrame(name))
-        launch(app)
+        try launch(app)
         XCTAssertEqual(app.windows["holodeck-viewer-window"].frame.width, resized.width, accuracy: 1)
         XCTAssertEqual(app.windows["holodeck-viewer-window"].frame.height, resized.height, accuracy: 1)
         XCTAssertEqual(savedFrame(name), frame)
@@ -434,7 +506,7 @@ final class HolodeckMacUITests: XCTestCase {
         let controlSuite = "HolodeckMacUITests-" + UUID().uuidString
         let controlName = "HolodeckViewer-" + controlSuite
         let control = try app(suite: controlSuite)
-        launch(control)
+        try launch(control)
         waitForTitle("Plasma", in: control)
         resizeWindow(in: control)
         control.terminate()
@@ -444,7 +516,7 @@ final class HolodeckMacUITests: XCTestCase {
         let before = savedViewerFrameNames()
         let live = savedFrame("HolodeckViewer-live")
         let app = try app(suite: nil) // The fixture environment alone selects implicit in-memory storage.
-        launch(app)
+        try launch(app)
         waitForTitle("Plasma", in: app)
         resizeWindow(in: app)
         app.terminate()
@@ -494,7 +566,7 @@ final class HolodeckMacUITests: XCTestCase {
 
     func testDiscoveryFiltersSearchAndResetPreservePlayback() throws {
         let app = try app(discovery: true)
-        launch(app)
+        try launch(app)
         waitForTitle("Plasma", in: app)
         element("collection-filter", in: app).click()
         app.menuItems["Atmospheric"].click()
@@ -547,7 +619,7 @@ private final class StorageSuiteCleanup {
         guard !completed else { return }
         app.terminate()
         app.launchEnvironment.removeAll()
-        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES", "--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite"]
+        app.launchArguments = MacUITestSettings.ignoreSavedStateArguments + ["--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite"]
         app.launch()
         let ready = waitForWindow?(app) ?? app.windows["holodeck-viewer-window"].waitForExistence(timeout: 15)
         app.terminate()
