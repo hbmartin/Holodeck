@@ -46,7 +46,7 @@ final class MacModel {
         let driver = MacUITestDriver(configuration: configuration)
         driver.prepareStorage()
         if let suite = configuration.storageSuite {
-            let name = "HolodeckViewer-" + suite
+            let name = MacUITestDriver.windowAutosaveName(for: suite)
             let cleanup = configuration.contains("--ui-test-cleanup-storage-suite")
             autosaveName = configuration.hasExplicitStorageSuite && !cleanup ? name : nil
             defaults = configuration.makeUserDefaults()
@@ -63,6 +63,7 @@ final class MacModel {
         session = ViewerSession(catalogService: service, preferences: defaults.map(ShaderPreferences.userDefaults) ?? .inMemory(), policy: .mac)
         #if DEBUG
         alerts = MacAlertCoordinator(didPresent: driver.didPresentFailure)
+        driver.observeStartupActivation(in: self)
         #else
         alerts = MacAlertCoordinator()
         #endif
@@ -119,8 +120,11 @@ final class MacModel {
             session.attach(renderer)
             updateActivity()
         } catch {
-            rendererUnavailableReason = error.localizedDescription
-            startupError = RendererFailure(message: error.localizedDescription)
+            let message = error.localizedDescription
+            rendererUnavailableReason = message
+            if startupError?.message != message {
+                startupError = RendererFailure(message: message)
+            }
         }
     }
 
