@@ -1,0 +1,17 @@
+{
+  "reference_page": "https://chatgpt.com/space/page_4e87d833e3a081918edd4d96439ca2ca",
+  "created_on": "2026-10-12",
+  "generation_tool": "built-in image_gen.imagegen",
+  "prompt_set": "prompts.json",
+  "source_layers": ["back.png", "middle.png", "front.png"],
+  "source_layer_canvas": [1600, 960],
+  "top_shelf_generated_canvas": [2222, 707],
+  "top_shelf_export_method": "Centered aspect fill to 4640x1440; downsample wide 1x and center-crop standard variants. The 2x export is resampled from the generated source.",
+  "export_command": "swift artwork/apple-tv/export.swift",
+  "icon_layer_sizes": [[400, 240], [800, 480], [1280, 768]],
+  "top_shelf_sizes": [[2320, 720], [4640, 1440], [1920, 720], [3840, 1440]],
+  "asset_count": 13,
+  "color_space": "sRGB",
+  "background_alpha": false,
+  "upper_layer_alpha": true
+}

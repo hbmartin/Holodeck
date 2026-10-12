@@ -1,0 +1,28 @@
+{
+  "checked_on": "2026-10-12",
+  "xcode": "27.0 (27A266a)",
+  "simulator": "Apple TV 4K (3rd generation), tvOS 27.0",
+  "asset_validation": {
+    "png_count": 13,
+    "dimensions": "passed",
+    "embedded_srgb": "passed",
+    "opaque_backgrounds": "passed",
+    "transparent_upper_layers": "passed",
+    "catalog_filename_references": "passed"
+  },
+  "build": {
+    "command": "xcodebuild -project Holodeck.xcodeproj -scheme Holodeck -sdk appletvsimulator -destination 'platform=tvOS Simulator,id=73CAAA2D-7B80-420F-B33F-EF4B8F036AAE' -derivedDataPath DerivedData/ArtworkValidation CODE_SIGNING_ALLOWED=NO build",
+    "result": "BUILD SUCCEEDED",
+    "compiler_warnings": 0,
+    "compiled_image_stack": "App Icon",
+    "compiled_top_shelf_assets": ["Top Shelf Image", "Top Shelf Image Wide"]
+  },
+  "visual_checks": {
+    "small_composite_preview": "passed",
+    "xcode_layered_preview": "passed",
+    "home_screen_focused": "passed",
+    "home_screen_unfocused": "passed",
+    "top_shelf_portal_and_wordmark_visible": "passed"
+  },
+  "captures": ["home-focused.png", "home-unfocused.png"]
+}
