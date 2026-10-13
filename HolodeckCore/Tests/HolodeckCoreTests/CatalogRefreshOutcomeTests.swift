@@ -7,7 +7,7 @@ final class CatalogRefreshOutcomeTests: XCTestCase {
         for cached in [false, true] {
             let box = CatalogTestBox()
             let service = CatalogService(initialCatalog: cached ? TestCatalog.catalog : nil,
-                                         network: box.network, storage: .disabled, clock: box.clock)
+                                         source: box.source, storage: .disabled, clock: box.clock)
             let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
             await session.refresh().value
             let first = try XCTUnwrap(session.catalogFailure)
@@ -61,11 +61,11 @@ final class CatalogRefreshOutcomeTests: XCTestCase {
 
     func testFailedCheckNoticeSurvivesThrottleAndClearsOnlyAfterSuccessfulCheck() async throws {
         let box = CatalogTestBox()
-        let service = CatalogService(initialCatalog: TestCatalog.catalog, network: box.network, storage: .disabled, clock: box.clock)
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: box.source, storage: .disabled, clock: box.clock)
         let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
         await session.refresh().value
         let failure = try XCTUnwrap(session.catalogUpdateFailure)
-        box.setResponses(["/git/ref/heads/published": Data("{\"object\":{\"sha\":\"\(TestCatalog.catalog.publicationRevision)\"}}".utf8)])
+        box.setResponses(["/head": Data("{\"revision\":\"\(TestCatalog.catalog.publicationRevision)\"}".utf8)])
         let skipped = session.refresh()
         XCTAssertEqual(session.catalogUpdateFailure?.id, failure.id, "Starting a refresh must retain the notice")
         await skipped.value
@@ -105,7 +105,7 @@ final class CatalogRefreshOutcomeTests: XCTestCase {
         for cached in [false, true] {
             for policy in [ViewerPolicy.tv, .mac, ViewerPolicy(restoresLastScene: false, replacesUpdatedScene: false)] {
                 let box = CatalogTestBox()
-                let service = CatalogService(initialCatalog: cached ? TestCatalog.catalog : nil, network: box.network, storage: .disabled)
+                let service = CatalogService(initialCatalog: cached ? TestCatalog.catalog : nil, source: box.source, storage: .disabled)
                 let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: policy)
                 session.setActive(true)
                 XCTAssertNil(session.refreshTask)
@@ -121,9 +121,9 @@ final class CatalogRefreshOutcomeTests: XCTestCase {
         let started = expectation(description: "One shared check begins")
         let gate = RefreshGate(started: started)
         addTeardownBlock { await gate.release() }
-        let service = CatalogService(initialCatalog: TestCatalog.catalog, network: CatalogNetwork { _, _ in
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource { _, _ in
             await gate.hold()
-            return Data("{\"object\":{\"sha\":\"\(TestCatalog.catalog.publicationRevision)\"}}".utf8)
+            return Data("{\"revision\":\"\(TestCatalog.catalog.publicationRevision)\"}".utf8)
         }, storage: .disabled)
         let first = Task { try await service.refreshOutcome() }
         await fulfillment(of: [started], timeout: 3)

@@ -386,8 +386,8 @@ final class HolodeckTests: XCTestCase {
         for cached in [false, true] {
             let counter = ControllerNetworkCounter()
             let service = CatalogService(initialCatalog: cached ? TestCatalog.catalog : nil,
-                network: CatalogNetwork { url, _ in
-                    if url.host == "api.github.com" { await counter.record() }
+                source: CatalogSource { url, _ in
+                    if url.isHead { await counter.record() }
                     throw CatalogError.invalidResponse
                 }, storage: .disabled)
             let controller = try await hostController(dependencies: { $0.catalogService = service },

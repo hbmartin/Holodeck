@@ -152,9 +152,9 @@ public final class ViewerSession {
                 let current = await service.current()
                 guard !Task.isCancelled, let self else { return }
                 if let current { self.applyCatalog(current) }
-                let message = self.catalog != nil
+                let message = (error as? LocalCatalogError)?.localizedDescription ?? (self.catalog != nil
                     ? "Couldn’t check for scene updates. Cached scenes are still available."
-                    : "Couldn’t download scenes. Check your internet connection and try again."
+                    : "Couldn’t load scenes. Check your connection to the Mac and try again.")
                 if self.catalogFailure?.message != message {
                     self.catalogFailure = Failure(message: message, operation: .catalog)
                 }

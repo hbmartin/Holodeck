@@ -10,6 +10,7 @@ final class MacModel {
         let id = UUID()
         let message: String
     }
+    let library: MacLibraryModel?
     let session: ViewerSession
     let favorites: SceneFavorites
     let defaults: UserDefaults?
@@ -39,7 +40,12 @@ final class MacModel {
     init() {
         var autosaveName: String? = "HolodeckViewer-live"
         var defaults: UserDefaults? = UserDefaults.standard
-        var service = CatalogService()
+        var directoryCatalog = DirectoryCatalog()
+        let localCache = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Holodeck/LocalViewerCache")
+        var service = CatalogService(source: directoryCatalog.source, storage: .disk(at: localCache))
+        var usesDirectory = true
+        var libraryTestNamespace: String?
+        var testingAdvertises = false
         var metalDevice = MTLCreateSystemDefaultDevice()
         #if DEBUG
         let configuration = UITestConfiguration(applicationID: "me.haroldmartin.HolodeckMac")
@@ -51,6 +57,14 @@ final class MacModel {
             autosaveName = configuration.hasExplicitStorageSuite && !cleanup ? name : nil
             defaults = configuration.makeUserDefaults()
             service = configuration.makeCatalogService()
+            usesDirectory = false
+            if configuration.contains("--ui-test-local-library"), !cleanup, let cache = configuration.fixtureCacheDirectory {
+                directoryCatalog = DirectoryCatalog(directory: cache.appendingPathComponent("publications"))
+                service = CatalogService(source: directoryCatalog.source, storage: .disk(at: cache.appendingPathComponent("viewer")))
+                usesDirectory = true
+                libraryTestNamespace = suite
+                testingAdvertises = configuration.contains("--ui-test-local-network")
+            }
             if configuration.contains("--ui-test-metal-unavailable") { metalDevice = nil }
         }
         #endif
@@ -61,13 +75,14 @@ final class MacModel {
         favorites = defaults.map { SceneFavorites(defaults: $0) } ?? .inMemory()
         sidebarVisible = defaults?.object(forKey: "holodeck.sidebarVisible") as? Bool ?? true
         session = ViewerSession(catalogService: service, preferences: defaults.map(ShaderPreferences.userDefaults) ?? .inMemory(), policy: .mac)
+        library = usesDirectory ? MacLibraryModel(catalog: directoryCatalog, session: session, defaults: defaults, testingNamespace: libraryTestNamespace, testingAdvertises: testingAdvertises) : nil
         #if DEBUG
         alerts = MacAlertCoordinator(didPresent: driver.didPresentFailure)
         driver.observeStartupActivation(in: self)
         #else
         alerts = MacAlertCoordinator()
         #endif
-        session.refresh()
+        if !usesDirectory { session.refresh() }
         let previewService = service
         let pressure = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .global())
         pressure.setEventHandler { Task { await previewService.trimPreviewCaches() } }

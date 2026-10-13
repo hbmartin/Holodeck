@@ -6,7 +6,7 @@ import CoreGraphics
 final class PreviewRecoveryTests: XCTestCase {
     func testRetryWaitUsesCooldownAndCancellationAndRejectsPermanentFailures() async throws {
         let box = CatalogTestBox()
-        let service = CatalogService(network: box.network, storage: .disabled, clock: box.clock)
+        let service = CatalogService(source: box.source, storage: .disabled, clock: box.clock)
         let preview = TestCatalog.shaders[0].preview!
         do { _ = try await service.preview(preview); XCTFail() } catch {}
         let waiting = Task { try await service.waitForPreviewRetry(preview) }
@@ -45,7 +45,7 @@ final class PreviewRecoveryTests: XCTestCase {
 
     func testTransientCooldownBackoffAndSuccessReset() async throws {
         let box = CatalogTestBox()
-        let service = CatalogService(network: box.network, storage: .disabled, clock: box.clock)
+        let service = CatalogService(source: box.source, storage: .disabled, clock: box.clock)
         let preview = TestCatalog.shaders[0].preview!
         for (attempt, delay) in [30, 60, 120, 240, 300, 300].enumerated() {
             do { _ = try await service.preview(preview); XCTFail("Offline request must fail") } catch {}
@@ -70,7 +70,7 @@ final class PreviewRecoveryTests: XCTestCase {
 
     func testValidationAndDecodeFailuresWaitForNewPublicationAndAreBounded() async throws {
         let box = CatalogTestBox()
-        let service = CatalogService(network: box.network, storage: .disabled, clock: box.clock)
+        let service = CatalogService(source: box.source, storage: .disabled, clock: box.clock)
         let preview = TestCatalog.shaders[0].preview!
         box.setResponses(["/previews/plasma.png": Data("invalid".utf8)])
         do { _ = try await service.previewImage(preview, maxPixelSize: 64); XCTFail() } catch {}
@@ -100,7 +100,7 @@ final class PreviewRecoveryTests: XCTestCase {
     func testCanceledNetworkFailureCreatesNoRetryRecord() async throws {
         for urlCancellation in [false, true] {
             let counter = CancellationCounter()
-            let service = CatalogService(network: CatalogNetwork { _, _ in
+            let service = CatalogService(source: CatalogSource { _, _ in
                 await counter.record()
                 if urlCancellation { throw URLError(.cancelled) }
                 throw CancellationError()
@@ -183,7 +183,7 @@ final class PreviewRecoveryTests: XCTestCase {
     func testTrimDuringDownloadServesCallerWithoutCaching() async throws {
         let gate = PreviewRequestGate()
         let preview = TestCatalog.shaders[0].preview!
-        let service = CatalogService(network: CatalogNetwork { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
+        let service = CatalogService(source: CatalogSource { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
         let task = Task { try await service.previewImage(preview, maxPixelSize: 640) }
         await gate.waitForRequest("plasma.png")
         await service.trimPreviewCaches()

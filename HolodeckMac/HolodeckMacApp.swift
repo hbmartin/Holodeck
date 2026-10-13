@@ -20,9 +20,14 @@ struct HolodeckMacApp: App {
                     .keyboardShortcut("f", modifiers: .command)
             }
             CommandGroup(after: .appInfo) {
-                Button("Check for Scene Updates") { model.session.refresh(force: true) }
+                Button(model.library == nil ? "Check for Scene Updates" : "Reload Shaders") {
+                    if let library = model.library { library.reload() } else { model.session.refresh(force: true) }
+                }
                     .disabled(model.session.isRefreshing)
             }
+        }
+        Settings {
+            if let library = model.library { ShaderLibrarySettings(library: library) }
         }
     }
 }

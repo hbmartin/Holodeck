@@ -6,11 +6,69 @@ final class HolodeckUITests: XCTestCase {
 
     override func setUpWithError() throws { continueAfterFailure = false }
 
+    /// Opt in with TEST_RUNNER_HOLODECK_PHYSICAL_LAN_TEST=1 and a Mac advertising
+    /// its configured library. Approval remains a real action in the Mac's UI.
+    func testPhysicalLocalNetworkPairingAndRememberedPlayback() throws {
+        guard ProcessInfo.processInfo.environment["HOLODECK_PHYSICAL_LAN_TEST"] == "1" else {
+            throw XCTSkip("Requires an awake Apple TV and the Mac's Shader Library approval UI")
+        }
+        let app = XCUIApplication()
+        let suite = "Holodeck.physical-lan-validation"
+        app.launchArguments = ["--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite"]
+        app.launch()
+        app.terminate()
+        defer {
+            app.terminate()
+            app.launchArguments = ["--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite"]
+            app.launch()
+            app.terminate()
+        }
+        app.launchArguments = ["--ui-test-storage-suite", suite, "--ui-test-local-network"]
+        app.launch()
+        if !app.otherElements["shader-picker"].waitForExistence(timeout: 5) { openPicker(in: app) }
+        let systemUI = XCUIApplication(bundleIdentifier: "com.apple.TVSystemUIService")
+        let home = XCUIApplication(bundleIdentifier: "com.apple.PineBoard")
+        let focusedProfile = systemUI.buttons.matching(NSPredicate(format: "hasFocus == YES AND label != %@", "Add Profile")).firstMatch
+        if home.windows["PBProfilePickerWindow"].exists, focusedProfile.exists { remote.press(.select) }
+        let status = app.staticTexts["mac-connection-status"]
+        let pairing = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH %@", "Pairing code:"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [pairing], timeout: 45), .completed, app.debugDescription)
+        print("Physical TV approval request: \(status.label)")
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Physical TV TLS pairing code"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        let plasma = card("plasma", in: app)
+        XCTAssertTrue(plasma.waitForExistence(timeout: 120), app.debugDescription)
+        let playing = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", "Now showing"), object: plasma)
+        XCTAssertEqual(XCTWaiter.wait(for: [playing], timeout: 30), .completed)
+        XCTAssertTrue(status.label.hasPrefix("Connected to"))
+        remote.press(.menu)
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(app.staticTexts["Press Select to choose a shader"].waitForExistence(timeout: 30))
+        openPicker(in: app)
+        let connected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH %@", "Connected to"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [connected], timeout: 30), .completed)
+        XCTAssertEqual(card("plasma", in: app).value as? String, "Now showing")
+        if ProcessInfo.processInfo.environment["HOLODECK_PHYSICAL_OFFLINE_TEST"] == "1" {
+            print("Physical TV offline check: stop the Mac validation server now")
+            let disconnected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH %@", "Open Holodeck on your Mac"), object: status)
+            XCTAssertEqual(XCTWaiter.wait(for: [disconnected], timeout: 90), .completed)
+            app.terminate()
+            app.launch()
+            XCTAssertTrue(app.staticTexts["Press Select to choose a shader"].waitForExistence(timeout: 30))
+            openPicker(in: app)
+            XCTAssertEqual(card("plasma", in: app).value as? String, "Now showing")
+            XCTAssertFalse(status.label.hasPrefix("Connected to"))
+        }
+    }
+
     func testFirstLaunchDownloadsCatalogAfterConnectionRetry() {
         let app = isolatedApp()
         app.launchArguments += ["--ui-test-download-catalog", "--ui-test-fail-catalog-once"]
         app.launch()
-        let message = "Couldn’t download shaders. Connect to the internet and press Select to retry."
+        let message = "Couldn’t load shaders. Check your Mac connection and press Select to retry."
         XCTAssertTrue(app.staticTexts[message].firstMatch.waitForExistence(timeout: 10))
         remote.press(.select)
         let plasma = card("plasma", in: app)
@@ -26,7 +84,7 @@ final class HolodeckUITests: XCTestCase {
         let app = isolatedApp()
         app.launchArguments.append("--ui-test-empty-cache")
         app.launch()
-        let message = "Couldn’t download shaders. Connect to the internet and press Select to retry."
+        let message = "Couldn’t load shaders. Check your Mac connection and press Select to retry."
         XCTAssertTrue(app.staticTexts[message].firstMatch.waitForExistence(timeout: 10))
         remote.press(.select)
         XCTAssertTrue(app.otherElements["shader-picker"].waitForExistence(timeout: 5))

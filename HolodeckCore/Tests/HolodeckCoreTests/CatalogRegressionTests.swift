@@ -111,8 +111,10 @@ extension CatalogTests {
         let downloaded = try await service.refresh()
         let result = try XCTUnwrap(downloaded)
         XCTAssertEqual(result.shaders.count, 72)
-        XCTAssertEqual(box.urls.filter { $0.host == "api.github.com" }.count, 1)
-        XCTAssertTrue(box.urls.dropFirst().allSatisfy { $0.path.hasPrefix("/hbmartin/HolodeckShaders/\(expected.publicationRevision)/") })
+        XCTAssertEqual(box.urls.filter { $0.isHead }.count, 1)
+        XCTAssertTrue(box.urls.dropFirst().allSatisfy { request in
+            if case .asset(let revision, _) = request { return revision == expected.publicationRevision }; return false
+        })
         do { _ = try await service.preview(result.shaders[0].preview!); XCTFail("Preview is unavailable") } catch {}
         let current = await service.current()
         XCTAssertEqual(current?.publicationRevision, result.publicationRevision)
@@ -139,7 +141,7 @@ extension CatalogTests {
         let hash = CatalogHash.sha256(bytes)
         let firstPreview = ShaderPreview(path: "previews/first.png", hash: hash, publicationRevision: String(repeating: "a", count: 40))
         let secondPreview = ShaderPreview(path: "previews/second.png", hash: hash, publicationRevision: String(repeating: "b", count: 40))
-        let service = CatalogService(network: CatalogNetwork { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
+        let service = CatalogService(source: CatalogSource { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
         let first = Task { try await service.preview(firstPreview) }
         await gate.waitForRequest("first.png")
         let second = Task { try await service.preview(secondPreview) }
@@ -188,7 +190,7 @@ extension CatalogTests {
         let gate = PreviewRequestGate()
         let preview = TestCatalog.shaders[0].preview!
         let bytes = try TestCatalog.preview(named: "preview-\(preview.hash).png")
-        let service = CatalogService(network: CatalogNetwork { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
+        let service = CatalogService(source: CatalogSource { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
         let first = Task { try await service.previewImage(preview, maxPixelSize: 640) }
         await gate.waitForRequest("plasma.png")
         let second = Task { try await service.previewImage(preview, maxPixelSize: 640) }

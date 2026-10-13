@@ -11,9 +11,9 @@ final class CatalogCancellationTests: XCTestCase {
         let started = expectation(description: "Service download starts")
         let gate = RefreshGate(started: started)
         addTeardownBlock { await gate.release() }
-        let network = box.network
-        let service = CatalogService(initialCatalog: TestCatalog.catalog, network: .init { url, limit in
-            if url.host == "api.github.com" { await gate.hold() }
+        let network = box.source
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: .init { url, limit in
+            if url.isHead { await gate.hold() }
             return try await network.get(url, limit)
         }, storage: box.storage)
         return (service, box, gate, started)
@@ -68,7 +68,7 @@ final class CatalogCancellationTests: XCTestCase {
         await gate.release()
         let downloaded = try await result(of: survivor).get()
         XCTAssertEqual(downloaded?.shaders.count, 9)
-        XCTAssertEqual(box.urls.filter { $0.host == "api.github.com" }.count, 1)
+        XCTAssertEqual(box.urls.filter { $0.isHead }.count, 1)
         XCTAssertEqual(box.storageWrites, ["snapshot.json"])
     }
 
@@ -84,7 +84,7 @@ final class CatalogCancellationTests: XCTestCase {
         await gate.release()
         let downloaded = try await result(of: later).get()
         XCTAssertEqual(downloaded?.shaders.count, 9)
-        XCTAssertEqual(box.urls.filter { $0.host == "api.github.com" }.count, 1)
+        XCTAssertEqual(box.urls.filter { $0.isHead }.count, 1)
         XCTAssertEqual(box.storageWrites, ["snapshot.json"])
     }
 

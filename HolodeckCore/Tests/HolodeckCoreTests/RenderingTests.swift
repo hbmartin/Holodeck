@@ -57,13 +57,16 @@ final class RenderingTests: XCTestCase {
         XCTAssertNotEqual(materials[1], materials[2])
         XCTAssertNotEqual(materials[0], materials[2])
     }
-    func testLivePublishedCatalogCompilesRendersAndAnimates() async throws {
-        guard ProcessInfo.processInfo.environment["HOLODECK_LIVE_CATALOG"] == "1" else {
-            throw XCTSkip("Set HOLODECK_LIVE_CATALOG=1 to verify the current published repository.")
+    func testLocalAuthoringCatalogCompilesRendersAndAnimates() async throws {
+        #if os(macOS)
+        guard let path = ProcessInfo.processInfo.environment["HOLODECK_AUTHORING_FIXTURE"] else {
+            throw XCTSkip("Set HOLODECK_AUTHORING_FIXTURE to a local authoring directory.")
         }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let service = CatalogService(storage: .disk(at: directory))
+        let local = DirectoryCatalog(directory: directory.appendingPathComponent("publications"))
+        _ = try await local.reload(from: URL(fileURLWithPath: path))
+        let service = CatalogService(source: local.source, storage: .disk(at: directory.appendingPathComponent("viewer")))
         let downloaded = try await service.refresh(force: true)
         let snapshot = try XCTUnwrap(downloaded)
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
@@ -79,9 +82,15 @@ final class RenderingTests: XCTestCase {
             let preview = try XCTUnwrap(shader.preview)
             let image = try await service.preview(preview)
             XCTAssertEqual(CatalogHash.sha256(image), preview.hash)
-            attachImage(first, name: "Published-" + shader.title)
+            attachImage(first, name: "Local-" + shader.title)
         }
-        print("Verified \(snapshot.shaders.count) published scenes at \(snapshot.publicationRevision)")
+        let offline = CatalogService.offline(storage: .disk(at: directory.appendingPathComponent("viewer")))
+        let cached = await offline.current()
+        XCTAssertEqual(cached?.publicationRevision, snapshot.publicationRevision)
+        print("Verified \(snapshot.shaders.count) local scenes at \(snapshot.publicationRevision)")
+        #else
+        throw XCTSkip("Native authoring verification runs on Mac; TV uses injected local fixtures.")
+        #endif
     }
 
     func testPipelineCache() async throws {

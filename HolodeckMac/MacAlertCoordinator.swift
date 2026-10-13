@@ -41,7 +41,8 @@ final class MacAlertCoordinator {
             }
             return
         }
-        guard model.hasAttemptedRendererInstallation,
+        guard model.library == nil || (model.library?.folder != nil && model.library?.isReloading == false && model.session.catalog != nil),
+              model.hasAttemptedRendererInstallation,
               let window = model.window, window.isVisible, !window.isMiniaturized,
               window.attachedSheet == nil else { return }
         let payload: Payload

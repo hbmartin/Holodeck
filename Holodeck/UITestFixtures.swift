@@ -26,6 +26,9 @@ final class UITestFixtures: NSObject {
                      "Startup UI test controls require a valid HOLODECK_UI_TEST_CATALOG fixture")
         if configuration.storageSuite != nil {
             configuration.cleanupStorageSuite()
+            if configuration.contains("--ui-test-cleanup-storage-suite"), let suite = configuration.storageSuite {
+                try? LocalCatalogClient.removeTestingSecrets(namespace: suite)
+            }
             dependencies.shaderPreferences = configuration.makeUserDefaults().map(ShaderPreferences.userDefaults) ?? .inMemory()
             dependencies.catalogService = configuration.makeCatalogService()
         }

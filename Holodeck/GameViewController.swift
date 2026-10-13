@@ -22,6 +22,15 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
                            mood: mood.isEmpty ? nil : mood, motion: motion.isEmpty ? nil : motion)
     }
     private let filterControls = UIStackView()
+    private let localStatusLabel = UILabel()
+    private let localControls = UIStackView()
+    private let changeMacButton = UIButton(type: .system)
+    private let checkUpdatesButton = UIButton(type: .system)
+    private var localUpdatesTask: Task<Void, Never>?
+    private var localActivityTask: Task<Void, Never>?
+    private var localState = LocalClientState()
+    private var localGeneration: UInt64 = 0
+    private var offeredMacChoice = false
     private let collectionButton = UIButton(type: .system)
     private let moodButton = UIButton(type: .system)
     private let motionButton = UIButton(type: .system)
@@ -62,12 +71,15 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     deinit {
         hintTask?.cancel()
+        localUpdatesTask?.cancel()
+        localActivityTask?.cancel()
     }
 
     override var canBecomeFirstResponder: Bool { true }
     override var preferredFocusEnvironments: [any UIFocusEnvironment] {
-        guard pickerIsVisible, unavailableMessage == nil, !shaders.isEmpty else { return [view] }
+        guard pickerIsVisible, unavailableMessage == nil else { return [view] }
         if let returnFocusButton, !returnFocusButton.isHidden { return [returnFocusButton] }
+        if shaders.isEmpty { return catalogService.usesLocalNetwork ? [changeMacButton] : [view] }
         if visibleShaders.isEmpty { return [resetButton] }
         if let cell = collectionView.cellForItem(at: browsingIndexPath ?? preferredShaderIndexPath) { return [cell] }
         return [collectionView]
@@ -86,6 +98,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         session.onEvent = { [weak self] event in self?.handleSessionEvent(event) }
         buildPicker()
         buildHint()
+        if catalogService.usesLocalNetwork { observeLocalConnection() }
         selectGesture.allowedPressTypes = [NSNumber(value: UIPress.PressType.select.rawValue)]
         view.addGestureRecognizer(selectGesture)
         menuGesture.allowedPressTypes = [NSNumber(value: UIPress.PressType.menu.rawValue)]
@@ -109,11 +122,21 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         becomeFirstResponder()
-        setSceneActive(view.window?.windowScene?.activationState == .foregroundActive)
+        if catalogService.usesLocalNetwork {
+            if view.window?.windowScene?.activationState == .foregroundActive { setSceneActive(true) }
+        } else { setSceneActive(view.window?.windowScene?.activationState == .foregroundActive) }
     }
 
     func setSceneActive(_ active: Bool) {
         session.setActive(active)
+        if catalogService.usesLocalNetwork {
+            localActivityTask?.cancel()
+            localActivityTask = Task {
+                guard !Task.isCancelled else { return }
+                if active { await LocalCatalogClient.shared.start(deviceName: UIDevice.current.name) }
+                else { await LocalCatalogClient.shared.stop() }
+            }
+        }
         if unavailableMessage != nil { (view as? MTKView)?.isPaused = true }
         if active {
             // UIKit may clear the first responder when the app leaves the foreground.
@@ -133,6 +156,61 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         session.refresh()
     }
 
+    private func observeLocalConnection() {
+        localUpdatesTask = Task { [weak self] in
+            let stream = await LocalCatalogClient.shared.updates()
+            for await state in stream {
+                guard let self, !Task.isCancelled else { return }
+                self.localState = state
+                self.localStatusLabel.text = state.status.message
+                if self.shaders.isEmpty {
+                    self.catalogErrorMessage = state.status.message
+                    self.updateStatus()
+                    self.showLoadingHintIfNeeded()
+                }
+                if state.generation != self.localGeneration {
+                    self.localGeneration = state.generation
+                    Task { [weak self] in
+                        await self?.session.refreshTask?.value
+                        self?.session.refresh(force: true)
+                    }
+                }
+                if state.status == .chooseMac, !self.offeredMacChoice {
+                    self.offeredMacChoice = true
+                    self.showMacChooser()
+                }
+            }
+        }
+    }
+
+    @objc private func checkLocalUpdates() {
+        Task { await LocalCatalogClient.shared.retry() }
+        session.refresh(force: true)
+    }
+
+    @objc private func changeMac() {
+        offeredMacChoice = true
+        Task { await LocalCatalogClient.shared.changeMac() }
+        showMacChooser()
+    }
+
+    private func showMacChooser() {
+        guard presentedViewController == nil else { offeredMacChoice = false; return }
+        let alert = UIAlertController(title: "Choose a Mac", message: localState.macs.isEmpty
+            ? "Open Holodeck on your Mac and configure its shader folder, then search again." : nil, preferredStyle: .alert)
+        for mac in localState.macs {
+            alert.addAction(UIAlertAction(title: mac.name, style: .default) { _ in
+                Task { await LocalCatalogClient.shared.choose(mac.id) }
+            })
+        }
+        alert.addAction(UIAlertAction(title: "Search Again", style: .default) { [weak self] _ in
+            self?.offeredMacChoice = false
+            Task { await LocalCatalogClient.shared.retry() }
+        })
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        present(alert, animated: true)
+    }
+
     private func handleSessionEvent(_ event: ViewerSession.Event) {
         defer { updateInteractionState() }
         switch event {
@@ -144,6 +222,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
                 showLoadingHintIfNeeded()
             }
         case .catalogCacheChecked:
+            if shaders.isEmpty, catalogService.usesLocalNetwork { showPicker() }
             updateStatus()
             showLoadingHintIfNeeded()
         case .catalogFinished:
@@ -151,7 +230,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         case .catalogFailed:
             updateCatalogNotice()
             guard shaders.isEmpty else { return }
-            catalogErrorMessage = "Couldn’t download shaders. Connect to the internet and press Select to retry."
+            catalogErrorMessage = catalogService.usesLocalNetwork ? localState.status.message : "Couldn’t load shaders. Check your Mac connection and press Select to retry."
             updateStatus()
             showLoadingHintIfNeeded()
         case .catalogChanged:
@@ -210,7 +289,22 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         updateNotice.textColor = UIColor.white.withAlphaComponent(0.7)
         updateNotice.accessibilityIdentifier = "catalog-update-notice"
         updateNotice.isHidden = true
-        let heading = UIStackView(arrangedSubviews: [eyebrow, title, statusRow, updateNotice, filterControls])
+        localStatusLabel.font = .systemFont(ofSize: 18)
+        localStatusLabel.textColor = UIColor.white.withAlphaComponent(0.75)
+        localStatusLabel.numberOfLines = 2
+        localStatusLabel.accessibilityIdentifier = "mac-connection-status"
+        localStatusLabel.isHidden = !catalogService.usesLocalNetwork
+        changeMacButton.setTitle("Change Mac", for: .normal)
+        changeMacButton.accessibilityIdentifier = "change-mac"
+        changeMacButton.addTarget(self, action: #selector(changeMac), for: .primaryActionTriggered)
+        checkUpdatesButton.setTitle("Check for Scene Updates", for: .normal)
+        checkUpdatesButton.accessibilityIdentifier = "check-scene-updates"
+        checkUpdatesButton.addTarget(self, action: #selector(checkLocalUpdates), for: .primaryActionTriggered)
+        localControls.addArrangedSubview(changeMacButton)
+        localControls.addArrangedSubview(checkUpdatesButton)
+        localControls.spacing = 24
+        localControls.isHidden = !catalogService.usesLocalNetwork
+        let heading = UIStackView(arrangedSubviews: [eyebrow, title, statusRow, updateNotice, localStatusLabel, localControls, filterControls])
         heading.axis = .vertical
         heading.spacing = 8
         heading.translatesAutoresizingMaskIntoConstraints = false
@@ -276,7 +370,10 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         ])
     }
 
-    private var catalogLoadingMessage: String { session.hasCheckedCache ? "Downloading shaders…" : "Loading scenes…" }
+    private var catalogLoadingMessage: String {
+        if catalogService.usesLocalNetwork, shaders.isEmpty { return localState.status.message }
+        return session.hasCheckedCache ? "Downloading shaders…" : "Loading scenes…"
+    }
 
     private func updateInteractionState() {
         if unavailableMessage == nil && (pendingSelection != nil || (shaders.isEmpty && session.isRefreshing)) {
@@ -298,7 +395,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         hint.isHidden = true
         pickerIsVisible = true
         updateInteractionState()
-        (view as? ShowcaseMetalView)?.acceptsFocus = unavailableMessage != nil || shaders.isEmpty
+        (view as? ShowcaseMetalView)?.acceptsFocus = unavailableMessage != nil || (shaders.isEmpty && !catalogService.usesLocalNetwork)
         picker.isHidden = false
         updateFilterControls()
         if pendingSelection == nil { updateStatus() }
@@ -518,7 +615,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     private func updateCardsFocusGuide(focused: UIView?) {
         cardsFocusGuide.isEnabled = pickerIsVisible && unavailableMessage == nil && !visibleShaders.isEmpty
-            && focused?.isDescendant(of: filterControls) == true
+            && (focused?.isDescendant(of: filterControls) == true || focused?.isDescendant(of: localControls) == true)
     }
 
     @objc private func retryUpdates() {
@@ -527,7 +624,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     private func refreshBrowsing(returningTo button: UIButton? = nil) {
         let focused = UIFocusSystem.focusSystem(for: view)?.focusedItem as? UIButton
-        let focusedControl = focused?.isDescendant(of: filterControls) == true ? focused : nil
+        let focusedControl = focused?.isDescendant(of: filterControls) == true || focused?.isDescendant(of: localControls) == true ? focused : nil
         if !collections.contains(where: { $0.id == collectionID }) { collectionID = "all" }
         if catalog?.moods.contains(mood) != true { mood = "" }
         if catalog?.motions.contains(motion) != true { motion = "" }

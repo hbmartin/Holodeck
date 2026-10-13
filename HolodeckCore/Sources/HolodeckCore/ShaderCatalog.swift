@@ -85,6 +85,9 @@ nonisolated public enum CatalogHash {
     public static func sha256(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
+    public static func isRevision(_ value: String) -> Bool {
+        isSHA(value, length: 40) || isSHA(value, length: 64)
+    }
     public static func isSHA(_ value: String, length: Int = 64) -> Bool {
         value.count == length && value.allSatisfy { "0123456789abcdef".contains($0) }
     }
@@ -161,7 +164,7 @@ nonisolated public struct CatalogManifest: Codable, Sendable {
     fileprivate func validatedDates() throws -> [String: Date] {
         var dates: [String: Date] = [:]
         guard schemaVersion == 1, !shaders.isEmpty, shaders.count <= 500,
-              CatalogHash.isSHA(sourceRevision, length: 40),
+              CatalogHash.isRevision(sourceRevision),
               Set(shaders.map(\.id)).count == shaders.count,
               shaders.contains(where: { $0.id == defaultShaderID }) else { throw CatalogError.invalidManifest }
         for shader in shaders {
@@ -279,7 +282,7 @@ nonisolated struct CatalogBuilder {
     }
 
     func finish(revision: String) throws -> ValidatedCatalog {
-        guard CatalogHash.isSHA(revision, length: 40), sources.count == manifest.shaders.count else {
+        guard CatalogHash.isRevision(revision), sources.count == manifest.shaders.count else {
             throw CatalogError.invalidManifest
         }
         let shaders = manifest.shaders.map {

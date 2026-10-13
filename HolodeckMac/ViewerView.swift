@@ -22,7 +22,14 @@ struct ViewerView: View {
                         Color.black
                         MetalSurface(model: model)
                             .frame(width: width, height: width * 9 / 16)
-                        if session.activeShader == nil {
+                        if let library = model.library, library.folder == nil {
+                            VStack(spacing: 16) {
+                                Text("Choose your shader folder to begin").foregroundStyle(.white)
+                                Button("Choose Shader Folder…", action: library.chooseFolder)
+                                    .buttonStyle(.borderedProminent)
+                                    .accessibilityIdentifier("choose-shader-folder")
+                            }
+                        } else if session.activeShader == nil {
                             VStack(spacing: 12) {
                                 if session.pendingSelection != nil || session.isRefreshing { ProgressView().tint(.white) }
                                 Text(model.rendererUnavailableReason ?? session.pendingSelection.map { "Loading \($0.shader.title)…" } ??
@@ -57,6 +64,10 @@ struct ViewerView: View {
                     HStack { ProgressView().controlSize(.small); Text("Loading \(pending.shader.title)…"); Spacer() }
                         .padding(.horizontal, 20).padding(.bottom, 12)
                 }
+                if let error = model.library?.error {
+                    Text(error).foregroundStyle(.red).textSelection(.enabled).padding(12)
+                        .accessibilityIdentifier("shader-library-error")
+                }
                 if let updateFailure = session.catalogUpdateFailure {
                     HStack {
                         Image(systemName: "exclamationmark.circle")
@@ -76,9 +87,15 @@ struct ViewerView: View {
                     .help("Toggle Sidebar").accessibilityLabel("Toggle Sidebar").accessibilityIdentifier("toggle-sidebar")
             }
             ToolbarItem {
-                Button { session.refresh(force: true) } label: { Image(systemName: "arrow.clockwise") }
-                    .help("Check for Scene Updates").accessibilityLabel("Check for Scene Updates")
+                Button { if let library = model.library { library.reload() } else { session.refresh(force: true) } } label: { Image(systemName: "arrow.clockwise") }
+                    .help(model.library == nil ? "Check for Scene Updates" : "Reload Shaders").accessibilityLabel(model.library == nil ? "Check for Scene Updates" : "Reload Shaders")
                     .accessibilityIdentifier("refresh-scenes").disabled(session.isRefreshing)
+            }
+            ToolbarItem {
+                if model.library != nil {
+                    SettingsLink { Label("Shader Library", systemImage: "externaldrive.connected.to.line.below") }
+                        .help("Shader Library").accessibilityIdentifier("shader-library-settings")
+                }
             }
         }
         .onChange(of: model.startupError?.id, initial: true) { model.presentFailuresIfNeeded() }

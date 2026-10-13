@@ -65,7 +65,7 @@ final class ViewerSessionTests: XCTestCase {
 
     func testLazyCacheRefreshWithoutRendererJoinsOnAttachmentAndNeverSignalsEmptyCache() async throws {
         let gate = PreviewRequestGate()
-        let service = CatalogService(network: CatalogNetwork { _, _ in await gate.image("published") }, storage: TestCatalog.storage)
+        let service = CatalogService(source: CatalogSource { _, _ in await gate.image("head") }, storage: TestCatalog.storage)
         let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
         var checkedWithCache = false
         session.onEvent = { event in
@@ -73,7 +73,7 @@ final class ViewerSessionTests: XCTestCase {
         }
         XCTAssertFalse(session.hasCheckedCache)
         let refresh = session.refresh()
-        await gate.waitForRequest("published")
+        await gate.waitForRequest("head")
         XCTAssertEqual(session.shaders.count, 8)
         XCTAssertTrue(checkedWithCache)
         XCTAssertNil(session.activeShader)
@@ -82,14 +82,14 @@ final class ViewerSessionTests: XCTestCase {
         XCTAssertEqual(session.activeShader?.id, "plasma")
         let requests = await gate.requestCount
         XCTAssertEqual(requests, 1)
-        await gate.complete("published", data: Data())
+        await gate.complete("head", data: Data())
         await refresh.value
         session.onEvent = nil
     }
 
     func testRecoveryCatalogFailureKeepsBothOperationsAndRetriesDownload() async throws {
         let counter = NetworkCounter()
-        let service = CatalogService(initialCatalog: TestCatalog.catalog, network: CatalogNetwork { _, _ in
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource { _, _ in
             await counter.record(); throw CatalogError.invalidResponse
         }, storage: .disabled)
         let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
@@ -316,11 +316,11 @@ final class ViewerSessionTests: XCTestCase {
         let latest = changed()
         let box = CatalogTestBox()
         try box.storage.write("snapshot.json", TestCatalog.data)
-        var responses = ["/git/ref/heads/published": Data("{\"object\":{\"sha\":\"\(latest.publicationRevision)\"}}".utf8),
+        var responses = ["/head": Data("{\"revision\":\"\(latest.publicationRevision)\"}".utf8),
                          "/catalog.json": try JSONEncoder().encode(latest.manifest)]
         for entry in latest.manifest.shaders { responses["/\(entry.sourcePath)"] = Data(latest.sources[entry.id]!.utf8) }
         box.setResponses(responses)
-        let service = CatalogService(network: box.network, storage: box.storage, clock: box.clock)
+        let service = CatalogService(source: box.source, storage: box.storage, clock: box.clock)
         _ = try await service.refresh()
         for scenario in 0..<3 {
             if scenario > 0 { await box.clock.advance(by: .seconds(900)) }
@@ -336,7 +336,7 @@ final class ViewerSessionTests: XCTestCase {
 
     func testFirstActivationDoesNotRetryFailedInitialDownload() async {
         let counter = NetworkCounter()
-        let service = CatalogService(network: CatalogNetwork { _, _ in
+        let service = CatalogService(source: CatalogSource { _, _ in
             await counter.record()
             throw CatalogError.invalidResponse
         }, storage: .disabled)
@@ -358,14 +358,14 @@ final class ViewerSessionTests: XCTestCase {
 
     func testCachedStartupActivatesBeforeTheNetworkRefreshCompletes() async {
         let gate = PreviewRequestGate()
-        let service = CatalogService(network: CatalogNetwork { _, _ in await gate.image("published") }, storage: TestCatalog.storage)
+        let service = CatalogService(source: CatalogSource { _, _ in await gate.image("head") }, storage: TestCatalog.storage)
         let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .tv)
         session.attach(FakeRenderer())
-        await gate.waitForRequest("published")
+        await gate.waitForRequest("head")
         await session.selectionTask?.value
         XCTAssertEqual(session.activeShader?.id, "plasma")
         XCTAssertTrue(session.isRefreshing)
-        await gate.complete("published", data: Data("{\"object\":{\"sha\":\"\(TestCatalog.catalog.publicationRevision)\"}}".utf8))
+        await gate.complete("head", data: Data("{\"revision\":\"\(TestCatalog.catalog.publicationRevision)\"}".utf8))
         await settled(session)
         XCTAssertFalse(session.isRefreshing)
     }
@@ -377,7 +377,7 @@ final class ViewerSessionTests: XCTestCase {
         XCTAssertTrue(renderer.isActive)
         session.setActive(false)
         XCTAssertFalse(renderer.isActive)
-        let failing = ViewerSession(catalogService: CatalogService(network: CatalogNetwork { _, _ in throw CatalogError.invalidResponse }, storage: TestCatalog.storage),
+        let failing = ViewerSession(catalogService: CatalogService(source: CatalogSource { _, _ in throw CatalogError.invalidResponse }, storage: TestCatalog.storage),
                                     preferences: .inMemory(), policy: .mac)
         let working = FakeRenderer()
         failing.attach(working)
@@ -459,7 +459,7 @@ final class ViewerSessionTests: XCTestCase {
 
     func testCachedUpdateRetryPreservesSelectionFailureAndClearsNotice() async throws {
         let box = CatalogTestBox()
-        let service = CatalogService(initialCatalog: TestCatalog.catalog, network: box.network, storage: .disabled)
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: box.source, storage: .disabled)
         let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
         let renderer = FakeRenderer()
         session.attach(renderer)
@@ -469,7 +469,7 @@ final class ViewerSessionTests: XCTestCase {
         renderer.failNext = true
         await session.select(TestCatalog.shaders[1]).value
         let failure = try XCTUnwrap(session.failure)
-        box.setResponses(["/git/ref/heads/published": Data("{\"object\":{\"sha\":\"\(TestCatalog.catalog.publicationRevision)\"}}".utf8)])
+        box.setResponses(["/head": Data("{\"revision\":\"\(TestCatalog.catalog.publicationRevision)\"}".utf8)])
         session.retry(notice)
         await settled(session)
         XCTAssertNil(session.catalogUpdateFailure)

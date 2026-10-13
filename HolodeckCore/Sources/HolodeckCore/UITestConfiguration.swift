@@ -41,19 +41,22 @@ nonisolated public struct UITestConfiguration: Sendable {
     }
     public func makeCatalogService() -> CatalogService {
         if contains("--ui-test-cleanup-storage-suite") { return .offline() }
+        if contains("--ui-test-local-network"), let directory = fixtureCacheDirectory {
+            return CatalogService(source: LocalCatalogClient.shared.source, storage: .disk(at: directory), usesLocalNetwork: true)
+        }
         if contains("--ui-test-disk-cache"), let catalog, let directory = fixtureCacheDirectory {
             let storage = CatalogStorage.disk(at: directory)
             if let data = try? JSONEncoder().encode(catalog.snapshot) { try? storage.write("snapshot.json", data) }
             return .offline(storage: storage)
         }
         if contains("--ui-test-empty-cache") {
-            return CatalogService(network: CatalogNetwork { _, _ in throw CatalogError.invalidResponse }, storage: .disabled)
+            return CatalogService(source: CatalogSource { _, _ in throw CatalogError.invalidResponse }, storage: .disabled)
         }
         if let catalog, contains("--ui-test-download-catalog") || contains("--ui-test-fail-refresh") {
             let fixture = CatalogDownloadFixture(snapshot: catalog.snapshot,
                 failFirst: contains("--ui-test-fail-catalog-once") || contains("--ui-test-fail-refresh"))
             return CatalogService(initialCatalog: contains("--ui-test-fail-refresh") ? catalog : nil,
-                                  network: CatalogNetwork { url, _ in try await fixture.get(url) }, storage: .disabled)
+                                  source: CatalogSource { url, _ in try await fixture.get(url) }, storage: .disabled)
         }
         return .offline(initialCatalog: catalog)
     }
@@ -68,14 +71,14 @@ private actor CatalogDownloadFixture {
     let snapshot: CatalogSnapshot
     var failFirst: Bool
     init(snapshot: CatalogSnapshot, failFirst: Bool) { self.snapshot = snapshot; self.failFirst = failFirst }
-    func get(_ url: URL) throws -> Data {
-        if url.host == "api.github.com" {
+    func get(_ url: CatalogRequest) throws -> Data {
+        if url.isHead {
             if failFirst { failFirst = false; throw CatalogError.invalidResponse }
-            return Data("{\"object\":{\"sha\":\"\(snapshot.publicationRevision)\"}}".utf8)
+            return Data("{\"revision\":\"\(snapshot.publicationRevision)\"}".utf8)
         }
         if url.lastPathComponent == "catalog.json" { return try JSONEncoder().encode(snapshot.manifest) }
-        let id = url.deletingPathExtension().lastPathComponent
-        if let source = snapshot.sources[id], url.pathExtension == "metal" { return Data(source.utf8) }
+        let id = String(url.lastPathComponent.split(separator: ".")[0])
+        if let source = snapshot.sources[id], url.lastPathComponent.hasSuffix(".metal") { return Data(source.utf8) }
         throw CatalogError.invalidResponse
     }
 }

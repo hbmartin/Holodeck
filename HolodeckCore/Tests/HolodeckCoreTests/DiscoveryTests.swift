@@ -135,12 +135,12 @@ final class DiscoveryTests: XCTestCase {
         snapshot.manifest.shaders[0].discovery!.moods = (0..<9).map { "mood\($0)" }
         snapshot.manifest.shaders[1].discovery = .init(tags: [" NIGHT ", "night"], moods: [" Calm ", "calm"], motion: " Slow ")
         let box = CatalogTestBox()
-        var responses = ["/git/ref/heads/published": Data("{\"object\":{\"sha\":\"\(snapshot.publicationRevision)\"}}".utf8),
+        var responses = ["/head": Data("{\"revision\":\"\(snapshot.publicationRevision)\"}".utf8),
                          "/catalog.json": try JSONEncoder().encode(snapshot.manifest)]
         for entry in snapshot.manifest.shaders { responses["/\(entry.sourcePath)"] = Data(snapshot.sources[entry.id]!.utf8) }
         box.setResponses(responses)
         try box.storage.write("snapshot.json", TestCatalog.data)
-        let service = CatalogService(network: box.network, storage: box.storage, clock: box.clock)
+        let service = CatalogService(source: box.source, storage: box.storage, clock: box.clock)
         let refreshed = try await service.refresh(force: true)
         XCTAssertEqual(refreshed?.collections, try snapshot.validated().collections)
         let cached = CatalogService(storage: box.storage, enabled: false)
@@ -149,7 +149,7 @@ final class DiscoveryTests: XCTestCase {
         XCTAssertNil(current?.shaders[0].discovery)
         XCTAssertEqual(current?.shaders[1].discovery, .init(tags: ["night"], moods: ["calm"], motion: "slow"))
         var bad = snapshot.manifest; bad.collections![0].shaderIDs = ["missing"]
-        responses["/git/ref/heads/published"] = Data("{\"object\":{\"sha\":\"\(String(repeating: "f", count: 40))\"}}".utf8)
+        responses["/head"] = Data("{\"revision\":\"\(String(repeating: "f", count: 40))\"}".utf8)
         responses["/catalog.json"] = try JSONEncoder().encode(bad)
         box.setResponses(responses)
         do { _ = try await service.refresh(force: true); XCTFail("Invalid collection must fail refresh") } catch {}
