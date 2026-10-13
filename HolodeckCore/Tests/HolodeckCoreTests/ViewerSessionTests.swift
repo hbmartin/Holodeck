@@ -530,3 +530,111 @@ private actor NetworkCounter {
     private(set) var count = 0
     func record() { count += 1 }
 }
+
+@MainActor
+extension ViewerSessionTests {
+    func testForcedRefreshDrainsOneFollowupAfterAnOlderPassIncludingFailure() async throws {
+        for initialForce in [false, true] {
+            for firstFails in [false, true] {
+                let updated = changed()
+                let gate = RecoveryGate()
+                let source = HeldRefreshSource(old: TestCatalog.snapshot, updated: updated, gate: gate, firstFails: firstFails)
+                let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource { request, limit in
+                    try await source.get(request, limit: limit)
+                }, storage: .disabled)
+                let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
+                var finishes = 0
+                session.onEvent = { if case .catalogFinished = $0 { finishes += 1 } }
+                let first = session.refresh(force: initialForce)
+                let deadline = ContinuousClock.now + .seconds(3)
+                while !(await gate.hasEntered) {
+                    guard ContinuousClock.now < deadline else { throw LocalCatalogError.timeout }
+                    await Task.yield()
+                }
+                let forced = session.refresh(force: true)
+                for _ in 0..<10 { session.refresh(force: true) }
+                XCTAssertTrue(session.isRefreshing)
+                await gate.release()
+                await forced.value; await first.value
+                let heads = await source.headRequests
+                XCTAssertEqual(heads, 2, "Overlapping force requests should share one followup")
+                XCTAssertEqual(session.catalog?.publicationRevision, updated.publicationRevision)
+                XCTAssertNil(session.catalogFailure); XCTAssertFalse(session.isRefreshing)
+                XCTAssertEqual(finishes, 1)
+            }
+        }
+    }
+    func testShutdownDiscardsQueuedForcedPassWithoutCancelingServiceWork() async throws {
+        let gate = RecoveryGate()
+        let source = HeldRefreshSource(old: TestCatalog.snapshot, updated: changed(), gate: gate, firstFails: false)
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource { request, limit in
+            try await source.get(request, limit: limit)
+        }, storage: .disabled)
+        let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
+        let first = session.refresh()
+        let deadline = ContinuousClock.now + .seconds(3)
+        while !(await gate.hasEntered) {
+            guard ContinuousClock.now < deadline else { throw LocalCatalogError.timeout }
+            await Task.yield()
+        }
+        session.refresh(force: true); session.shutdown(); await first.value
+        XCTAssertFalse(session.isRefreshing)
+        let joining = Task { try await service.refreshOutcome(force: true) }
+        while await service.refreshWaiterCount != 1 {
+            guard ContinuousClock.now < deadline else { throw LocalCatalogError.timeout }
+            await Task.yield()
+        }
+        await gate.release()
+        _ = try await joining.value
+        let heads = await source.headRequests
+        XCTAssertEqual(heads, 1, "Shutdown should discard the queued viewer pass")
+    }
+    func testCatalogErrorContextIsPlatformSpecificAndPreservesFileDiagnostics() async throws {
+        for policy in [ViewerPolicy.mac, .tv, .init(restoresLastScene: false, replacesUpdatedScene: false)] {
+            let service = CatalogService(source: .unavailable, storage: .disabled)
+            let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: policy)
+            await session.refresh().value
+            let message = try XCTUnwrap(session.catalogFailure?.message)
+            switch policy.catalogErrorContext {
+            case .macLibrary: XCTAssertEqual(message, "Couldn’t load scenes. Choose or reload your shader folder and try again.")
+            case .tvConnection: XCTAssertEqual(message, LocalCatalogError.disconnected.localizedDescription)
+            case .generic: XCTAssertEqual(message, "Couldn’t load scenes. Try again.")
+            }
+            let fileService = CatalogService(source: CatalogSource { _, _ in
+                throw LocalCatalogError.invalidFile("index.json", "Broken file")
+            }, storage: .disabled)
+            let fileSession = ViewerSession(catalogService: fileService, preferences: .inMemory(), policy: policy)
+            await fileSession.refresh().value
+            XCTAssertEqual(fileSession.catalogFailure?.message, "index.json: Broken file")
+        }
+    }
+}
+
+private actor HeldRefreshSource {
+    let old: CatalogSnapshot
+    let updated: CatalogSnapshot
+    let gate: RecoveryGate
+    let firstFails: Bool
+    private(set) var headRequests = 0
+    init(old: CatalogSnapshot, updated: CatalogSnapshot, gate: RecoveryGate, firstFails: Bool) {
+        self.old = old; self.updated = updated; self.gate = gate; self.firstFails = firstFails
+    }
+    func get(_ request: CatalogRequest, limit: Int) async throws -> Data {
+        switch request {
+        case .head:
+            headRequests += 1
+            let first = headRequests == 1
+            let revision = first ? old.publicationRevision : updated.publicationRevision
+            if first {
+                try await gate.wait()
+                if firstFails { throw CatalogError.invalidResponse }
+            }
+            return try JSONEncoder().encode(CatalogHead(revision: revision))
+        case .asset(let revision, let path):
+            let snapshot = revision == old.publicationRevision ? old : updated
+            if path == "catalog.json" { return try JSONEncoder().encode(snapshot.manifest) }
+            let id = String(path.split(separator: "/").last!.split(separator: ".")[0])
+            return Data(snapshot.sources[id]!.utf8)
+        }
+    }
+}

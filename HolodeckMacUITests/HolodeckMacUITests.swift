@@ -2,7 +2,8 @@ import AppKit
 import XCTest
 
 private enum MacUITestSettings {
-    static let bundleIdentifier = "me.haroldmartin.HolodeckMac"
+    static let bundleIdentifier = (Bundle(for: HolodeckMacUITests.self).bundleIdentifier ?? "me.haroldmartin.HolodeckMacUITests")
+        .replacingOccurrences(of: "HolodeckMacUITests", with: "HolodeckMac")
     static let ignoreSavedStateArguments = ["-ApplePersistenceIgnoreState", "YES"]
 }
 
@@ -86,6 +87,54 @@ final class HolodeckMacUITests: XCTestCase {
         waitForTitle("Edited Plasma", in: app)
         XCTAssertFalse(element("choose-shader-folder", in: app).exists)
     }
+    private func authoringFolderWithInvalidShader() throws -> URL {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("HolodeckBrokenShader-" + UUID().uuidString)
+        let shader = root.appendingPathComponent("shaders/plasma")
+        try FileManager.default.createDirectory(at: shader, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("shared"), withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let fixtureURL = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "CatalogFixture", withExtension: "json", subdirectory: "TestSupport"))
+        let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: fixtureURL)) as? [String: Any])
+        let manifest = try XCTUnwrap(fixture["manifest"] as? [String: Any])
+        let entries = try XCTUnwrap(manifest["shaders"] as? [[String: Any]])
+        var metadata = try XCTUnwrap(entries.first { $0["id"] as? String == "plasma" })
+        metadata["shared"] = ["common", "fragment"]
+        try JSONSerialization.data(withJSONObject: metadata).write(to: shader.appendingPathComponent("metadata.json"))
+        try Data("THIS IS NOT METAL;".utf8).write(to: shader.appendingPathComponent("body.metal"))
+        for name in ["common", "fragment"] { try Data().write(to: root.appendingPathComponent("shared/\(name).metal")) }
+        try JSONSerialization.data(withJSONObject: ["shaders": ["plasma"], "defaultShaderID": "plasma"]).write(to: root.appendingPathComponent("index.json"))
+        let previewURL = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "preview-" + (metadata["previewSHA256"] as! String), withExtension: "png", subdirectory: "TestSupport"))
+        try Data(contentsOf: previewURL).write(to: shader.appendingPathComponent("preview.png"))
+        return root
+    }
+    func testStartupSelectionErrorDeferredDuringReloadPresentsWhenReloadFinishes() throws {
+        let root = try authoringFolderWithInvalidShader()
+        let app = try app(arguments: ["--ui-test-local-library", "--ui-test-hold-library-reload"])
+        app.launch()
+        let choose = element("choose-shader-folder", in: app)
+        XCTAssertTrue(choose.waitForExistence(timeout: 10)); choose.click()
+        app.typeKey("g", modifierFlags: [.command, .shift])
+        app.typeText(root.path); app.typeKey(.return, modifierFlags: [])
+        let confirm = app.windows["open-panel"].buttons["OKButton"].firstMatch
+        XCTAssertTrue(confirm.waitForExistence(timeout: 10)); confirm.click()
+        element("shader-library-settings", in: app).click()
+        let pending = element("test-reload-selection-failure", in: app)
+        XCTAssertTrue(pending.waitForExistence(timeout: 15), app.debugDescription)
+        XCTAssertFalse(app.staticTexts["Unable to Load Scenes"].exists)
+        element("finish-test-library-reload", in: app).click()
+        XCTAssertTrue(app.staticTexts["Unable to Load Scenes"].waitForExistence(timeout: 10), app.debugDescription)
+        let viewer = app.windows["holodeck-viewer-window"]
+        XCTAssertTrue(viewer.buttons["Retry"].firstMatch.exists)
+        viewer.buttons["OK"].firstMatch.click()
+    }
+    func testRendererFailurePresentsWithoutConfiguredShaderFolder() throws {
+        let app = try app(arguments: ["--ui-test-local-library", "--ui-test-metal-unavailable"])
+        app.launch()
+        XCTAssertTrue(app.staticTexts["Renderer Unavailable"].waitForExistence(timeout: 10), app.debugDescription)
+        app.windows["holodeck-viewer-window"].buttons["OK"].firstMatch.click()
+        XCTAssertTrue(element("choose-shader-folder", in: app).exists)
+    }
+
     private func requirePhysicalInputAccess(file: StaticString = #filePath, line: UInt = #line) throws {
         try XCTSkipIf(!CGPreflightPostEventAccess(), "Mac UI test runner needs permission to post physical input", file: file, line: line)
     }
@@ -354,7 +403,7 @@ final class HolodeckMacUITests: XCTestCase {
         let offline = try app(arguments: ["--ui-test-empty-cache"])
         offline.launch()
         XCTAssertTrue(offline.windows.firstMatch.buttons["Retry"].firstMatch.waitForExistence(timeout: 10), offline.debugDescription)
-        XCTAssertTrue(offline.staticTexts["Couldn’t load scenes. Check your connection to the Mac and try again."].exists)
+        XCTAssertTrue(offline.staticTexts["Couldn’t load scenes. Choose or reload your shader folder and try again."].exists)
         offline.windows.firstMatch.buttons["Retry"].firstMatch.click()
         XCTAssertTrue(offline.windows.firstMatch.buttons["Retry"].firstMatch.waitForExistence(timeout: 10), offline.debugDescription)
         offline.windows.firstMatch.buttons["OK"].firstMatch.click()
@@ -453,7 +502,7 @@ final class HolodeckMacUITests: XCTestCase {
             XCTAssertEqual(app.windows.firstMatch.sheets.count, 1)
             let sheet = app.windows.firstMatch.sheets.firstMatch
             XCTAssertTrue(sheet.staticTexts["A newer scene download failure occurred."].exists)
-            XCTAssertFalse(sheet.staticTexts["Couldn’t load scenes. Check your connection to the Mac and try again."].exists)
+            XCTAssertFalse(sheet.staticTexts["Couldn’t load scenes. Choose or reload your shader folder and try again."].exists)
             sheet.buttons[action].click()
             XCTAssertTrue(replacement.waitForNonExistence(timeout: 10))
             if action == "Retry" { waitForTitle("Plasma", in: app) }
@@ -602,7 +651,7 @@ final class HolodeckMacUITests: XCTestCase {
     }
 
     private func savedAppDefaults(allowMissing: Bool = false) -> [String: Any] {
-        do { return try AppPreferencesReader.read(at: AppPreferencesReader.appURL(), allowMissing: allowMissing) }
+        do { return try AppPreferencesReader.read(at: AppPreferencesReader.appURL(bundleIdentifier: MacUITestSettings.bundleIdentifier), allowMissing: allowMissing) }
         catch {
             XCTFail("Unable to read viewer preferences: \(error)")
             return [:]

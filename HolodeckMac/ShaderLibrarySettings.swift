@@ -18,11 +18,18 @@ final class MacLibraryModel {
     @ObservationIgnored private var ready = false
     @ObservationIgnored private var sleeping = false
     @ObservationIgnored private var sleepObservers: [NSObjectProtocol] = []
+    #if DEBUG
+    var isTestingReloadHeld = false
+    @ObservationIgnored private var testingReloadContinuation: CheckedContinuation<Void, Never>?
+    @ObservationIgnored private var holdsNextReloadForTesting = false
+    var testingSelectionFailure: String? { session.selectionFailure?.message }
+    #endif
 
     init(catalog: DirectoryCatalog, session: ViewerSession, defaults: UserDefaults?, testingNamespace: String? = nil, testingAdvertises: Bool = false) {
         self.catalog = catalog; self.session = session; self.defaults = defaults
         #if DEBUG
         server = testingNamespace.map { LocalCatalogServer.testing(catalog: catalog, namespace: $0, advertise: testingAdvertises) } ?? LocalCatalogServer(catalog: catalog)
+        holdsNextReloadForTesting = testingNamespace != nil && UITestConfiguration(applicationID: "me.haroldmartin.HolodeckMac").contains("--ui-test-hold-library-reload")
         #else
         server = LocalCatalogServer(catalog: catalog)
         #endif
@@ -96,6 +103,14 @@ final class MacLibraryModel {
                 }
                 folder = url; ready = true
                 await session.refresh(force: true).value
+                #if DEBUG
+                if holdsNextReloadForTesting {
+                    holdsNextReloadForTesting = false
+                    await withCheckedContinuation { continuation in
+                        testingReloadContinuation = continuation; isTestingReloadHeld = true
+                    }
+                }
+                #endif
                 if !sleeping { try await server.start() }
             } catch { self.error = error.localizedDescription }
         }
@@ -107,6 +122,12 @@ final class MacLibraryModel {
             else if ready { do { try await server.start() } catch { self.error = error.localizedDescription } }
         }
     }
+    #if DEBUG
+    func finishTestingReload() {
+        isTestingReloadHeld = false
+        testingReloadContinuation?.resume(); testingReloadContinuation = nil
+    }
+    #endif
     func approve(_ id: UUID) { Task { do { try await server.approve(id) } catch { self.error = error.localizedDescription } } }
     func decline(_ id: UUID) { Task { await server.decline(id) } }
     func revoke(_ id: String) { Task { do { try await server.revoke(id) } catch { self.error = error.localizedDescription } } }
@@ -133,6 +154,15 @@ struct ShaderLibrarySettings: View {
                 }
                 Text("Changes are shared after Reload Shaders. Preview images come from the shader folder.")
                     .font(.caption).foregroundStyle(.secondary)
+                #if DEBUG
+                if library.isTestingReloadHeld {
+                    if let failure = library.testingSelectionFailure {
+                        Text(failure).accessibilityIdentifier("test-reload-selection-failure")
+                    }
+                    Button("Finish Test Reload", action: library.finishTestingReload)
+                        .accessibilityIdentifier("finish-test-library-reload")
+                }
+                #endif
             }
             Section("Requests from Apple TV") {
                 if library.serverState.pending.isEmpty { Text("No pending requests.").foregroundStyle(.secondary) }
