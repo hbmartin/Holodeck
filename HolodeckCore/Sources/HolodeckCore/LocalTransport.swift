@@ -8,6 +8,14 @@ nonisolated public enum LocalProtocol {
     public static let serviceType = "_holodeck._tcp"
     public static let maximumHeader = 65_536
     public static let maximumPayload = 8_388_608
+    static func tcpOptions() -> NWProtocolTCP.Options {
+        let options = NWProtocolTCP.Options()
+        options.enableKeepalive = true
+        options.keepaliveIdle = 30
+        options.keepaliveInterval = 10
+        options.keepaliveCount = 3
+        return options
+    }
     static func chooseMacID(available: [String], remembered: String?) -> String? {
         if let remembered { return available.contains(remembered) ? remembered : nil }
         return available.count == 1 ? available.first : nil
@@ -128,7 +136,14 @@ nonisolated final class LocalTrust: @unchecked Sendable {
 }
 
 /// Serializes client exchanges; the server uses receive/send in one sequential loop.
-actor LocalConnection {
+protocol LocalRequestConnection: AnyObject, Sendable {
+    func start() async throws
+    func exchange(_ packet: LocalPacket) async throws -> LocalPacket
+    func pairingCode() async throws -> String
+    func cancel()
+}
+
+actor LocalConnection: LocalRequestConnection {
     nonisolated let connection: NWConnection
     private nonisolated let onClosed: @Sendable () -> Void
     private var tail: Task<Void, Never>?
@@ -248,10 +263,11 @@ nonisolated private final class ConnectionReady: @unchecked Sendable {
     }
 }
 
-nonisolated func withLocalTimeout<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) async throws -> T {
+nonisolated func withLocalTimeout<T: Sendable>(clock: any Clock<Duration> = ContinuousClock(),
+    _ operation: @escaping @Sendable () async throws -> T) async throws -> T {
     try await withThrowingTaskGroup(of: T.self) { group in
         group.addTask(operation: operation)
-        group.addTask { try await Task.sleep(for: .seconds(30)); throw LocalCatalogError.timeout }
+        group.addTask { try await clock.sleep(for: .seconds(30)); throw LocalCatalogError.timeout }
         defer { group.cancelAll() }
         return try await group.next()!
     }

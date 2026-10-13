@@ -5,6 +5,7 @@ import Security
 import CryptoKit
 import X509
 import SystemConfiguration
+import Clocks
 
 nonisolated public struct TVApproval: Identifiable, Sendable {
     public let id: UUID
@@ -32,7 +33,12 @@ public actor LocalCatalogServer {
     private var listener: NWListener?
     private var listenerID: UUID?
     private var sessions: [UUID: LocalConnection] = [:]
-    private struct Pending { let deviceID: String; let approval: TVApproval; let created: Date }
+    private let readAsset: @Sendable (CatalogRequest, Int, UUID) async throws -> Data
+    private let clock: AnyClock<Duration>
+    private var deadlines: [UUID: AnyClock<Duration>.Instant] = [:]
+    private var deadlineTasks: [UUID: Task<Void, Never>] = [:]
+    private var closing: Set<UUID> = []
+    private struct Pending { let deviceID: String; let approval: TVApproval }
     private var pending: [UUID: Pending] = [:]
     private var issued: [UUID: String] = [:]
     private var declined: Set<UUID> = []
@@ -44,10 +50,16 @@ public actor LocalCatalogServer {
 
     public init(catalog: DirectoryCatalog) {
         self.catalog = catalog; self.allowLoopback = false; self.secretNamespace = Self.productionNamespace; self.advertise = true
+        clock = AnyClock(ContinuousClock())
+        readAsset = { try await catalog.get($0, limit: $1, pinFor: $2) }
     }
-    init(catalog: DirectoryCatalog, testingNamespace: String, advertise: Bool = false) {
+    init(catalog: DirectoryCatalog, testingNamespace: String, advertise: Bool = false,
+         clock: any Clock<Duration> = ContinuousClock(),
+         readAsset: (@Sendable (CatalogRequest, Int, UUID) async throws -> Data)? = nil) {
         precondition(testingNamespace != Self.productionNamespace)
         self.catalog = catalog; self.allowLoopback = !advertise; self.secretNamespace = testingNamespace; self.advertise = advertise
+        self.clock = AnyClock(clock)
+        self.readAsset = readAsset ?? { try await catalog.get($0, limit: $1, pinFor: $2) }
     }
     #if DEBUG
     public static func testing(catalog: DirectoryCatalog, namespace: String, advertise: Bool = false) -> LocalCatalogServer {
@@ -61,6 +73,7 @@ public actor LocalCatalogServer {
     var listeningPort: UInt16? { listener?.port?.rawValue }
     var serverID: String? { identity?.id }
     var currentState: LocalServerState { state }
+    var sessionCount: Int { sessions.count }
 
     public func updates() -> AsyncStream<LocalServerState> {
         let id = UUID()
@@ -90,7 +103,7 @@ public actor LocalCatalogServer {
         let options = NWProtocolTLS.Options()
         sec_protocol_options_set_min_tls_protocol_version(options.securityProtocolOptions, .TLSv13)
         sec_protocol_options_set_local_identity(options.securityProtocolOptions, sec_identity_create(identity.value)!)
-        let parameters = NWParameters(tls: options, tcp: .init())
+        let parameters = NWParameters(tls: options, tcp: LocalProtocol.tcpOptions())
         if allowLoopback { parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any) }
         let listener = try NWListener(using: parameters, on: .any)
         let name = String(((SCDynamicStoreCopyComputerName(nil, nil) as String?) ?? ProcessInfo.processInfo.hostName).prefix(100))
@@ -98,8 +111,8 @@ public actor LocalCatalogServer {
             listener.service = NWListener.Service(name: "Holodeck \(identity.id)", type: LocalProtocol.serviceType, domain: "local.",
                 txtRecord: NWTXTRecord(["id": identity.id, "name": name, "version": String(LocalProtocol.version)]).data)
         }
-        listener.newConnectionHandler = { [weak self] connection in Task { await self?.accept(connection) } }
         let listenerID = UUID()
+        listener.newConnectionHandler = { [weak self] connection in Task { await self?.accept(connection, listenerID: listenerID) } }
         listener.stateUpdateHandler = { [weak self] status in Task { await self?.listenerState(status, id: listenerID) } }
         self.listener = listener; self.listenerID = listenerID
         listener.start(queue: DispatchQueue(label: "Holodeck.shader-server"))
@@ -108,8 +121,7 @@ public actor LocalCatalogServer {
 
     public func stop() {
         listenerID = nil; listener?.cancel(); listener = nil
-        for channel in sessions.values { channel.cancel() }
-        pending.removeAll(); issued.removeAll(); authenticated.removeAll()
+        for id in sessions.keys { cancelSession(id) }
         publish("Local sharing is stopped.")
     }
     func clearTestSecrets() throws {
@@ -136,12 +148,14 @@ public actor LocalCatalogServer {
     }
 
     public func approve(_ id: UUID) throws {
-        guard let request = pending[id], sessions[id] != nil else { return }
+        guard let request = pending[id], sessions[id] != nil, !closing.contains(id) else { return }
+        guard let deadline = deadlines[id], clock.now < deadline else { cancelSession(id); publish(); return }
         let token = try LocalSecrets.token()
         let record = ApprovedTV(id: request.deviceID, name: request.approval.name, tokenHash: CatalogHash.sha256(Data(token.utf8)))
         var candidate = approved; candidate[record.id] = record
         try persist(candidate)
         approved = candidate; issued[id] = token; pending[id] = nil; authenticated[id] = record
+        deadlineTasks.removeValue(forKey: id)?.cancel(); deadlines[id] = nil
         publish()
     }
     public func decline(_ id: UUID) { pending[id] = nil; declined.insert(id); publish() }
@@ -149,8 +163,7 @@ public actor LocalCatalogServer {
         var candidate = approved; candidate[id] = nil
         try persist(candidate); approved = candidate
         for (session, record) in authenticated where record.id == id {
-            authenticated[session] = nil
-            sessions[session]?.cancel()
+            cancelSession(session)
         }
         publish()
     }
@@ -158,31 +171,60 @@ public actor LocalCatalogServer {
         try LocalSecrets.write(JSONEncoder().encode(Array(records.values)), account: secretNamespace + "-approved-tvs")
     }
     private func authorized(_ id: UUID) -> Bool {
-        guard let record = authenticated[id] else { return false }
+        guard !closing.contains(id), let record = authenticated[id] else { return false }
         return approved[record.id]?.tokenHash == record.tokenHash
     }
 
-    private func accept(_ connection: NWConnection) {
-        guard sessions.count < 16, case .hostPort(let host, _) = connection.endpoint,
+    private func accept(_ connection: NWConnection, listenerID: UUID) {
+        guard self.listenerID == listenerID, sessions.count < 16, case .hostPort(let host, _) = connection.endpoint,
               LocalProtocol.isLocalAddress("\(host)", allowLoopback: allowLoopback) else { connection.cancel(); return }
         let id = UUID(), channel = LocalConnection(connection)
         sessions[id] = channel
+        let deadline = clock.now.advanced(by: .seconds(300))
+        deadlines[id] = deadline
+        deadlineTasks[id] = Task { [weak self, clock] in
+            do { try await clock.sleep(until: deadline) } catch { return }
+            await self?.expire(id)
+        }
         Task { [self] in
             do {
                 try await channel.start()
-                while !Task.isCancelled {
+                while !Task.isCancelled, !closing.contains(id) {
                     let request = try await channel.receive(idleAllowed: authorized(id))
                     let response = try await respond(request, id: id, channel: channel)
                     try await withLocalTimeout { try await channel.send(response) }
                 }
             } catch { channel.cancel() }
-            await catalog.release(id)
-            sessions[id] = nil; pending[id] = nil; issued[id] = nil; authenticated[id] = nil; declined.remove(id)
-            publish()
+            await finishSession(id)
         }
     }
 
+    private func expire(_ id: UUID) {
+        guard !authorized(id), let deadline = deadlines[id], clock.now >= deadline else { return }
+        cancelSession(id); publish()
+    }
+
+    private func cancelSession(_ id: UUID) {
+        guard let channel = sessions[id] else { return }
+        closing.insert(id)
+        deadlineTasks.removeValue(forKey: id)?.cancel()
+        pending[id] = nil; issued[id] = nil; authenticated[id] = nil
+        channel.cancel()
+    }
+
+    /// Only the connection loop finalizes, after its last catalog read has drained.
+    private func finishSession(_ id: UUID) async {
+        cancelSession(id)
+        await catalog.release(id)
+        sessions[id] = nil; deadlines[id] = nil; declined.remove(id); closing.remove(id)
+        publish()
+    }
+
     private func respond(_ packet: LocalPacket, id: UUID, channel: LocalConnection) async throws -> LocalPacket {
+        guard !closing.contains(id) else { throw LocalCatalogError.disconnected }
+        if let deadline = deadlines[id], clock.now >= deadline {
+            cancelSession(id); throw LocalCatalogError.timeout
+        }
         guard packet.payload.isEmpty else { throw LocalCatalogError.protocolViolation }
         let message = packet.message
         var response = LocalMessage(operation: "ok")
@@ -194,23 +236,25 @@ public actor LocalCatalogServer {
                 response.error = "revoked"; break
             }
             authenticated[id] = record
+            deadlineTasks.removeValue(forKey: id)?.cancel(); deadlines[id] = nil
         case "pair":
             guard authenticated[id] == nil, pending[id] == nil, let deviceID = message.deviceID, UUID(uuidString: deviceID) != nil,
                   let name = message.name, !name.isEmpty, name.count <= 200 else { throw LocalCatalogError.protocolViolation }
             let code = try await channel.pairingCode()
-            pending[id] = Pending(deviceID: deviceID, approval: TVApproval(id: id, name: name, code: code), created: Date())
+            guard !closing.contains(id) else { throw LocalCatalogError.disconnected }
+            pending[id] = Pending(deviceID: deviceID, approval: TVApproval(id: id, name: name, code: code))
             response.operation = "pending"; publish()
         case "pairStatus":
             if declined.contains(id) { response.error = "rejected" }
             else if let token = issued.removeValue(forKey: id), authorized(id) { response.token = token }
-            else if let pending = pending[id], Date().timeIntervalSince(pending.created) < 300 { response.operation = "pending" }
+            else if pending[id] != nil { response.operation = "pending" }
             else { response.error = "rejected"; self.pending[id] = nil; publish() }
         case "asset":
             guard authorized(id) else { response.error = "revoked"; break }
             guard let request = message.request, let limit = message.limit,
                   (0...LocalProtocol.maximumPayload).contains(limit) else { throw LocalCatalogError.protocolViolation }
             do {
-                let data = try await catalog.get(request, limit: limit, pinFor: id)
+                let data = try await readAsset(request, limit, id)
                 guard authorized(id) else { response.error = "revoked"; break }
                 return LocalPacket(message: response, payload: data)
             } catch { response.error = "invalidAsset" }

@@ -3,6 +3,7 @@ import Foundation
 import XCTest
 import Network
 import Metal
+import Clocks
 @testable import HolodeckCore
 
 @MainActor
@@ -270,6 +271,140 @@ final class DirectoryCatalogTests: XCTestCase {
         await store.release(connection)
         do { _ = try await store.get(.asset(revision: first.publicationRevision, path: "sources/plasma.metal"), limit: 1_048_576); XCTFail("Unleased old revision retained") }
         catch CatalogError.invalidResponse {}
+    }
+}
+
+@MainActor
+extension DirectoryCatalogTests {
+    private func waitForSessionCount(_ count: Int, server: LocalCatalogServer) async throws {
+        let deadline = ContinuousClock.now + .seconds(3)
+        while await server.sessionCount != count {
+            guard ContinuousClock.now < deadline else { XCTFail("Session cleanup timed out"); throw LocalCatalogError.timeout }
+            await Task.yield()
+        }
+    }
+    func testAbsoluteApprovalDeadlineReclaimsAllSlotsDespiteRepeatedHello() async throws {
+        let (root, store) = try fixture(); _ = try await store.reload(from: root)
+        let clock = TestClock()
+        let server = LocalCatalogServer(catalog: store, testingNamespace: "test-" + UUID().uuidString, clock: clock)
+        addTeardownBlock { try await server.clearTestSecrets() }
+        try await server.start()
+        var clients: [LocalConnection] = []
+        for _ in 0..<16 { clients.append(try await tlsClient(server).0) }
+        try await waitForSessionCount(16, server: server)
+        do { _ = try await tlsClient(server); XCTFail("Seventeenth session accepted") } catch {}
+        for _ in 0..<10 {
+            _ = try await clients[0].exchange(LocalPacket(message: .init(operation: "hello")))
+            await clock.advance(by: .seconds(29))
+        }
+        let count = await server.sessionCount
+        XCTAssertEqual(count, 16)
+        await clock.advance(by: .seconds(10))
+        try await waitForSessionCount(0, server: server)
+        let replacement = try await tlsClient(server).0
+        let response = try await replacement.exchange(LocalPacket(message: .init(operation: "hello")))
+        XCTAssertNotNil(response.message.serverID)
+    }
+    func testApprovedIdleSessionOutlivesDeadlineAndEveryClosureReleasesItsPublication() async throws {
+        for mode in ["close", "revoke", "stop"] {
+            let (root, store) = try fixture(); let first = try await store.reload(from: root)
+            let clock = TestClock()
+            let server = LocalCatalogServer(catalog: store, testingNamespace: "test-" + UUID().uuidString, clock: clock)
+            addTeardownBlock { try await server.clearTestSecrets() }
+            try await server.start()
+            let client = try await tlsClient(server).0
+            let deviceID = UUID().uuidString
+            var pair = LocalMessage(operation: "pair"); pair.deviceID = deviceID; pair.name = "Idle TV"
+            _ = try await client.exchange(LocalPacket(message: pair))
+            let pending = await server.currentState.pending.first
+            try await server.approve(XCTUnwrap(pending).id)
+            _ = try await client.exchange(LocalPacket(message: .init(operation: "pairStatus")))
+            var asset = LocalMessage(operation: "asset"); asset.request = .head; asset.limit = 65_536
+            _ = try await client.exchange(LocalPacket(message: asset))
+            await clock.advance(by: .seconds(600))
+            let count = await server.sessionCount
+            XCTAssertEqual(count, 1, "Approved healthy idle connection expired")
+            for body in ["SECOND", "THIRD", "FOURTH"] {
+                try Data(body.utf8).write(to: root.appendingPathComponent("shaders/plasma/body.metal"))
+                _ = try await store.reload(from: root)
+            }
+            _ = try await store.get(.asset(revision: first.publicationRevision, path: "sources/plasma.metal"), limit: 1_048_576)
+            switch mode {
+            case "revoke": try await server.revoke(deviceID)
+            case "stop": await server.stop()
+            default: client.cancel()
+            }
+            try await waitForSessionCount(0, server: server)
+            do {
+                _ = try await store.get(.asset(revision: first.publicationRevision, path: "sources/plasma.metal"), limit: 1_048_576)
+                XCTFail("Closed connection retained its publication")
+            } catch CatalogError.invalidResponse {}
+        }
+    }
+    func testApprovalDeadlineRemovesPendingRequestWithoutPolling() async throws {
+        let (root, store) = try fixture(); _ = try await store.reload(from: root)
+        let clock = TestClock()
+        let server = LocalCatalogServer(catalog: store, testingNamespace: "test-" + UUID().uuidString, clock: clock)
+        addTeardownBlock { try await server.clearTestSecrets() }
+        try await server.start()
+        let client = try await tlsClient(server).0
+        var pair = LocalMessage(operation: "pair"); pair.deviceID = UUID().uuidString; pair.name = "Absent TV"
+        _ = try await client.exchange(LocalPacket(message: pair))
+        let request = await server.currentState.pending.first
+        let id = try XCTUnwrap(request).id
+        await clock.advance(by: .seconds(300))
+        try await waitForSessionCount(0, server: server)
+        try await server.approve(id)
+        let state = await server.currentState
+        XCTAssertTrue(state.pending.isEmpty); XCTAssertTrue(state.approved.isEmpty)
+    }
+
+    func testClosureWaitsForLateCatalogReadBeforeReleasingItsLease() async throws {
+        for mode in ["close", "revoke", "stop"] {
+            let (root, store) = try fixture(); let first = try await store.reload(from: root)
+            let gate = RecoveryGate()
+            let server = LocalCatalogServer(catalog: store, testingNamespace: "test-" + UUID().uuidString,
+                readAsset: { request, limit, id in
+                    try await gate.wait()
+                    return try await store.get(request, limit: limit, pinFor: id)
+                })
+            addTeardownBlock { await gate.release(); try await server.clearTestSecrets() }
+            try await server.start()
+            let client = try await tlsClient(server).0
+            let deviceID = UUID().uuidString
+            var pair = LocalMessage(operation: "pair"); pair.deviceID = deviceID; pair.name = "Reading TV"
+            _ = try await client.exchange(LocalPacket(message: pair))
+            let pending = await server.currentState.pending.first
+            try await server.approve(XCTUnwrap(pending).id)
+            _ = try await client.exchange(LocalPacket(message: .init(operation: "pairStatus")))
+            let request = Task {
+                var asset = LocalMessage(operation: "asset"); asset.request = .head; asset.limit = 65_536
+                return try await client.exchange(LocalPacket(message: asset))
+            }
+            let deadline = ContinuousClock.now + .seconds(3)
+            while !(await gate.hasEntered) {
+                guard ContinuousClock.now < deadline else { XCTFail("Catalog read did not start"); throw LocalCatalogError.timeout }
+                await Task.yield()
+            }
+            switch mode {
+            case "revoke": try await server.revoke(deviceID)
+            case "stop": await server.stop()
+            default: client.cancel()
+            }
+            let count = await server.sessionCount
+            XCTAssertEqual(count, 1, "Read was finalized before draining")
+            await gate.release()
+            _ = await request.result
+            try await waitForSessionCount(0, server: server)
+            for body in ["SECOND", "THIRD", "FOURTH"] {
+                try Data(body.utf8).write(to: root.appendingPathComponent("shaders/plasma/body.metal"))
+                _ = try await store.reload(from: root)
+            }
+            do {
+                _ = try await store.get(.asset(revision: first.publicationRevision, path: "sources/plasma.metal"), limit: 1_048_576)
+                XCTFail("Late catalog read recreated an orphaned lease")
+            } catch CatalogError.invalidResponse {}
+        }
     }
 }
 #endif
