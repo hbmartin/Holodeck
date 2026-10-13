@@ -218,6 +218,15 @@ public actor CatalogService {
         try Task.checkCancellation()
         try validatePreview(preview)
         while let failure = previewFailures.value(for: PreviewFailureKey(preview)) {
+            if failure.waitsForAvailability, let wait = source.waitForAvailability {
+                previewRetryWaiterCount += 1
+                defer { previewRetryWaiterCount -= 1 }
+                try await wait()
+                try Task.checkCancellation()
+                let key = PreviewFailureKey(preview)
+                if previewFailures.value(for: key)?.id == failure.id { previewFailures.removeValue(for: key) }
+                continue
+            }
             guard let retryAt = failure.retryAt else { return false }
             if clock.now >= retryAt { return true }
             do {
@@ -236,8 +245,10 @@ public actor CatalogService {
         let attempts = min((previewFailures.value(for: key)?.attempts ?? 0) + 1, 5)
         let permanent: Bool
         if case CatalogError.invalidPreview = error { permanent = true } else { permanent = false }
-        let retryAt = permanent ? nil : clock.now.advanced(by: .seconds(min(30 * (1 << (attempts - 1)), 300)))
-        previewFailures.insert(PreviewFailure(error: error, attempts: attempts, retryAt: retryAt), for: key, cost: 1)
+        let waitsForAvailability = source.waitForAvailability != nil && (error as? LocalCatalogError)?.isConnectivityFailure == true
+        let retryAt = permanent || waitsForAvailability ? nil : clock.now.advanced(by: .seconds(min(30 * (1 << (attempts - 1)), 300)))
+        previewFailures.insert(PreviewFailure(error: error, attempts: attempts, retryAt: retryAt,
+            waitsForAvailability: waitsForAvailability), for: key, cost: 1)
     }
 
     private func validatePreview(_ preview: ShaderPreview) throws {
@@ -345,7 +356,8 @@ extension DependencyValues {
 nonisolated public enum CatalogServiceKey: DependencyKey {
     public static var liveValue: CatalogService {
         #if os(tvOS)
-        return CatalogService(source: LocalCatalogClient.shared.source, usesLocalNetwork: true)
+        @Dependency(\.localCatalogClient) var client
+        return CatalogService(source: client.source, usesLocalNetwork: true)
         #else
         return CatalogService()
         #endif
@@ -367,9 +379,11 @@ nonisolated private struct PreviewFailureKey: Hashable {
 }
 
 nonisolated private struct PreviewFailure {
+    let id = UUID()
     let error: Error
     let attempts: Int
     let retryAt: AnyClock<Duration>.Instant?
+    let waitsForAvailability: Bool
 }
 
 nonisolated private enum PreviewSize: Hashable, Sendable {

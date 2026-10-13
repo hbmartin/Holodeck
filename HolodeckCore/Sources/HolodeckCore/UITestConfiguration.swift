@@ -41,6 +41,11 @@ nonisolated public struct UITestConfiguration: Sendable {
     }
     public func makeCatalogService() -> CatalogService {
         if contains("--ui-test-cleanup-storage-suite") { return .offline() }
+        #if DEBUG
+        if contains("--ui-test-pending-pairing") {
+            return CatalogService(initialCatalog: catalog, storage: .disabled, enabled: false, usesLocalNetwork: true)
+        }
+        #endif
         if contains("--ui-test-local-network"), let directory = fixtureCacheDirectory {
             return CatalogService(source: LocalCatalogClient.shared.source, storage: .disk(at: directory), usesLocalNetwork: true)
         }
@@ -60,6 +65,24 @@ nonisolated public struct UITestConfiguration: Sendable {
         }
         return .offline(initialCatalog: catalog)
     }
+    #if DEBUG
+    public func makePendingPairingClient() -> LocalCatalogClient? {
+        guard contains("--ui-test-pending-pairing"), let storageSuite else { return nil }
+        let mac = LocalMac(id: UUID().uuidString, name: "Test Mac", endpoint: .service(name: "Test",
+            type: LocalProtocol.serviceType, domain: "local.", interface: nil), interface: nil, version: LocalProtocol.version)
+        let attempts = LocalDiscoverySequence()
+        var dependencies = LocalClientDependencies()
+        dependencies.usesSystemBrowser = false; dependencies.initialMacs = [mac]
+        dependencies.readSecret = { _ in nil }; dependencies.writeSecret = { _, _ in }; dependencies.removeSecret = { _ in }
+        dependencies.resolve = { _ in ResolvedMac(address: "192.168.1.2", port: 1234) }
+        dependencies.transport = { mac, _, _, _ in
+            let code = String(format: "%06llu", attempts.next())
+            return LocalClientTransport(channel: PendingPairingTestChannel(id: mac.id, code: code),
+                fingerprint: { "test-pin" }, identityChanged: { false })
+        }
+        return LocalCatalogClient(testingNamespace: "ui-" + storageSuite, dependencies: dependencies)
+    }
+    #endif
     private static func value(for flag: String, in arguments: [String]) -> String? {
         guard let index = arguments.firstIndex(of: flag), index + 1 < arguments.count,
               !arguments[index + 1].hasPrefix("--") else { return nil }
@@ -80,6 +103,23 @@ private actor CatalogDownloadFixture {
         let id = String(url.lastPathComponent.split(separator: ".")[0])
         if let source = snapshot.sources[id], url.lastPathComponent.hasSuffix(".metal") { return Data(source.utf8) }
         throw CatalogError.invalidResponse
+    }
+}
+#endif
+
+#if DEBUG
+/// Every new channel has a different code, exposing unintended pairing restarts.
+private actor PendingPairingTestChannel: LocalRequestConnection {
+    let id: String
+    let code: String
+    init(id: String, code: String) { self.id = id; self.code = code }
+    func start() {}
+    nonisolated func cancel() {}
+    func pairingCode() -> String { code }
+    func exchange(_ packet: LocalPacket) -> LocalPacket {
+        var response = LocalMessage(operation: "pending")
+        if packet.message.operation == "hello" { response.operation = "ok"; response.serverID = id }
+        return LocalPacket(message: response)
     }
 }
 #endif

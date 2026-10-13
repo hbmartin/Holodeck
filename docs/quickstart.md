@@ -56,7 +56,7 @@ Use **Change Mac** in the TV picker to switch hosts and approve the new connecti
 
 ## When the Mac is unavailable
 
-Cached scenes play while the Mac app is closed or the Mac is asleep. New downloads need the Mac. Missing previews use color gradients. A remembered Mac stays selected until you choose another.
+Cached scenes play while the Mac app is closed or the Mac is asleep. New downloads need the Mac. Missing previews use color gradients. A remembered Mac stays selected until you choose another. If it is unavailable and other Macs appear, the TV opens the chooser after five seconds. Brief interruptions, such as Control Center, preserve pairing and the connection.
 
 With no usable cache, the TV needs the configured Mac app and approval if it has not paired yet. tvOS can evict caches; an available Mac lets it download again.
 

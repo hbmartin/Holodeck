@@ -22,7 +22,7 @@ final class UITestFixtures: NSObject {
     func configure(_ dependencies: inout DependencyValues) {
         let holdsStartup = arguments.contains("--ui-test-hold-initial-shader")
         let failsStartup = arguments.contains("--ui-test-fail-initial-shader")
-        precondition(!(holdsStartup || failsStartup) || catalogFixture != nil,
+        precondition(!(holdsStartup || failsStartup || arguments.contains("--ui-test-pending-pairing")) || catalogFixture != nil,
                      "Startup UI test controls require a valid HOLODECK_UI_TEST_CATALOG fixture")
         if configuration.storageSuite != nil {
             configuration.cleanupStorageSuite()
@@ -31,6 +31,7 @@ final class UITestFixtures: NSObject {
             }
             dependencies.shaderPreferences = configuration.makeUserDefaults().map(ShaderPreferences.userDefaults) ?? .inMemory()
             dependencies.catalogService = configuration.makeCatalogService()
+            if let client = configuration.makePendingPairingClient() { dependencies.localCatalogClient = client }
         }
         if arguments.contains("--ui-test-metal-unavailable") {
             dependencies.metalDevice = nil

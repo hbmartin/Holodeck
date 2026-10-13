@@ -221,3 +221,58 @@ nonisolated private final class DecodeGate: @unchecked Sendable {
     }
     func releaseAll() { for _ in 0..<3 { semaphore.signal() } }
 }
+
+extension PreviewRecoveryTests {
+    func testConnectivityRecoveryWakesImmediatelyWithoutCooldownAndWaitersCancelIndependently() async throws {
+        let box = CatalogTestBox(); let gate = RecoveryGate()
+        let preview = TestCatalog.shaders[0].preview!
+        box.setResponses(["/previews/plasma.png": try TestCatalog.preview(named: "preview-\(preview.hash).png")])
+        let connection = PreviewConnectionGate(gate: gate, source: box.source)
+        let service = CatalogService(source: CatalogSource(waitForAvailability: { try await gate.wait() }) { request, limit in
+            try await connection.get(request, limit: limit)
+        }, storage: .disabled, clock: box.clock)
+        do { _ = try await service.preview(preview); XCTFail() } catch LocalCatalogError.disconnected {}
+        let canceled = Task { try await service.waitForPreviewRetry(preview) }
+        let survivor = Task { try await service.waitForPreviewRetry(preview) }
+        let deadline = ContinuousClock.now + .seconds(3)
+        while await service.previewRetryWaiterCount != 2 {
+            guard ContinuousClock.now < deadline else { throw LocalCatalogError.timeout }; await Task.yield()
+        }
+        canceled.cancel()
+        do { _ = try await canceled.value; XCTFail() } catch is CancellationError {}
+        await connection.connect(); await gate.release()
+        let retry = try await survivor.value
+        XCTAssertTrue(retry)
+        let data = try await service.preview(preview)
+        XCTAssertFalse(data.isEmpty)
+        let failures = await service.previewFailureCount
+        let waiters = await service.previewRetryWaiterCount
+        XCTAssertEqual(failures, 0); XCTAssertEqual(waiters, 0)
+        XCTAssertEqual(box.urls.count, 1)
+    }
+    func testAvailabilityHookDoesNotBypassOrdinaryAssetCooldown() async throws {
+        let box = CatalogTestBox(); let gate = RecoveryGate()
+        let service = CatalogService(source: CatalogSource(waitForAvailability: { try await gate.wait() }, get: box.source.get),
+            storage: .disabled, clock: box.clock)
+        let preview = TestCatalog.shaders[0].preview!
+        do { _ = try await service.preview(preview); XCTFail() } catch CatalogError.invalidResponse {}
+        let waiting = Task { try await service.waitForPreviewRetry(preview) }
+        try await waitForRetrySleeper(in: service)
+        await box.clock.advance(by: .seconds(30))
+        let retry = try await waiting.value
+        XCTAssertTrue(retry)
+        let entered = await gate.hasEntered
+        XCTAssertFalse(entered)
+    }
+}
+private actor PreviewConnectionGate {
+    let gate: RecoveryGate
+    let source: CatalogSource
+    private var connected = false
+    init(gate: RecoveryGate, source: CatalogSource) { self.gate = gate; self.source = source }
+    func connect() { connected = true }
+    func get(_ request: CatalogRequest, limit: Int) async throws -> Data {
+        guard connected else { throw LocalCatalogError.disconnected }
+        return try await source.get(request, limit)
+    }
+}

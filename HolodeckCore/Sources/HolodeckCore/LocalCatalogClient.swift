@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import Clocks
 
 nonisolated public struct LocalClientState: Sendable {
     public enum Status: Sendable, Equatable {
@@ -23,6 +24,7 @@ nonisolated public struct LocalClientState: Sendable {
     }
     public var status: Status = .searching
     public var macs: [LocalMac] = []
+    public var macChoiceID: UUID?
     public var generation: UInt64 = 0
     public init() {}
 }
@@ -44,11 +46,19 @@ public actor LocalCatalogClient {
     }
     #endif
     private let secretNamespace: String
-    private struct Pairing: Codable, Sendable { let id: String; let name: String; let pin: String; let token: String }
+    private let dependencies: LocalClientDependencies
+    private let clock: AnyClock<Duration>
+    private struct Pairing: Codable, Sendable {
+        let id: String; let name: String; let pin: String; var token: String?
+    }
     private var browser: NWBrowser?
+    private var browserID: UUID?
+    private var browserReady = false
+    private var discoverySequence: UInt64 = 0
+    private var browserStateSequence: UInt64 = 0
     private var state = LocalClientState()
     private var observers: [UUID: AsyncStream<LocalClientState>.Continuation] = [:]
-    private var connection: LocalConnection?
+    private var connection: (any LocalRequestConnection)?
     private var connecting: Task<Void, Never>?
     private var attemptID: UUID?
     private var pairing: Pairing?
@@ -56,97 +66,176 @@ public actor LocalCatalogClient {
     private var deviceID = ""
     private var deviceName = "Apple TV"
     private var loaded = false
-    private var connectionID: String?
     private var connectionTag: UUID?
     private var repairID: String?
+    private var recoveryID: UUID?
+    private var recoveryTask: Task<Void, Never>?
+    private var manualChoice = false
+    private var choicePreviousStatus: LocalClientState.Status?
+    private var reconnectTask: Task<Void, Never>?
+    private var reconnectAttempts = 0
 
-    public init() { secretNamespace = "tv" }
-    init(testingNamespace: String) { precondition(testingNamespace != "tv"); secretNamespace = testingNamespace }
+    public init() {
+        secretNamespace = "tv"; dependencies = LocalClientDependencies(); clock = AnyClock(ContinuousClock())
+    }
+    init(testingNamespace: String, dependencies: LocalClientDependencies = LocalClientDependencies(),
+         clock: any Clock<Duration> = ContinuousClock()) {
+        precondition(testingNamespace != "tv")
+        secretNamespace = testingNamespace; self.dependencies = dependencies; self.clock = AnyClock(clock)
+    }
     func clearTestSecrets() throws {
         precondition(secretNamespace != "tv")
         stop()
-        try LocalSecrets.remove(secretNamespace + "-identity")
-        try LocalSecrets.remove(secretNamespace + "-pairing")
+        try dependencies.removeSecret(secretNamespace + "-identity")
+        try dependencies.removeSecret(secretNamespace + "-pairing")
     }
     var currentState: LocalClientState { state }
-    public nonisolated var source: CatalogSource { CatalogSource { [self] request, limit in try await fetch(request, limit: limit) } }
+    var currentBrowserID: UUID? { browserID }
+    var observerCount: Int { observers.count }
+    public nonisolated var source: CatalogSource {
+        CatalogSource(waitForAvailability: { [self] in try await waitForAvailability() }) {
+            [self] request, limit in try await fetch(request, limit: limit)
+        }
+    }
 
-    public func updates() -> AsyncStream<LocalClientState> {
-        let id = UUID()
-        return AsyncStream { continuation in
+    public func updates() -> AsyncStream<LocalClientState> { makeUpdates(id: UUID()) }
+    private func makeUpdates(id: UUID) -> AsyncStream<LocalClientState> {
+        AsyncStream { continuation in
             observers[id] = continuation; continuation.yield(state)
             continuation.onTermination = { [weak self] _ in Task { await self?.removeObserver(id) } }
         }
     }
-    private func removeObserver(_ id: UUID) { observers[id] = nil }
+    private func removeObserver(_ id: UUID) { observers.removeValue(forKey: id)?.finish() }
     private func publish(_ status: LocalClientState.Status? = nil) {
         if let status { state.status = status }
         for observer in observers.values { observer.yield(state) }
     }
 
+    /// Checks cancellation on the actor, so a queued obsolete lifecycle event cannot win.
+    public func setForeground(_ foreground: Bool, deviceName: String = "Apple TV") {
+        guard !Task.isCancelled else { return }
+        if foreground { start(deviceName: deviceName) } else { stop() }
+    }
+
     public func start(deviceName: String = "Apple TV") {
         diagnose("Starting local discovery")
         self.deviceName = String(deviceName.prefix(200))
-        guard browser == nil else { return }
+        guard browserID == nil else { return }
         do {
             if !loaded {
-                if let data = try LocalSecrets.read(secretNamespace + "-identity"), let id = String(data: data, encoding: .utf8) { deviceID = id }
-                else { deviceID = UUID().uuidString; try LocalSecrets.write(Data(deviceID.utf8), account: secretNamespace + "-identity") }
-                if let data = try LocalSecrets.read(secretNamespace + "-pairing") { pairing = try JSONDecoder().decode(Pairing.self, from: data) }
-                rememberedID = pairing?.id
-                loaded = true
+                if let data = try dependencies.readSecret(secretNamespace + "-identity"),
+                   let id = String(data: data, encoding: .utf8) { deviceID = id }
+                else {
+                    deviceID = UUID().uuidString
+                    try dependencies.writeSecret(Data(deviceID.utf8), secretNamespace + "-identity")
+                }
+                if let data = try dependencies.readSecret(secretNamespace + "-pairing") {
+                    pairing = try JSONDecoder().decode(Pairing.self, from: data)
+                }
+                rememberedID = pairing?.id; loaded = true
             }
         } catch { publish(.failed(error.localizedDescription)); return }
-        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: LocalProtocol.serviceType, domain: "local."), using: .tcp)
-        browser.stateUpdateHandler = { [weak self] status in
-            if case .waiting(let error) = status { Task { await self?.browserError(error) } }
-            if case .failed(let error) = status { Task { await self?.browserError(error) } }
+        let id = UUID(); browserID = id
+        discoverySequence = 0; browserStateSequence = 0
+        browserReady = !dependencies.usesSystemBrowser
+        if dependencies.usesSystemBrowser {
+            let browser = NWBrowser(for: .bonjourWithTXTRecord(type: LocalProtocol.serviceType, domain: "local."), using: .tcp)
+            let sequence = LocalDiscoverySequence()
+            browser.stateUpdateHandler = { [weak self] status in
+                let number = sequence.next()
+                Task { await self?.browserState(status, id: id, sequence: number) }
+            }
+            browser.browseResultsChangedHandler = { [weak self] results, _ in
+                let number = sequence.next()
+                Task { await self?.discovered(results, id: id, sequence: number) }
+            }
+            self.browser = browser
+            browser.start(queue: DispatchQueue(label: "Holodeck.mac-discovery"))
         }
-        browser.browseResultsChangedHandler = { [weak self] results, _ in Task { await self?.discovered(results) } }
-        self.browser = browser
-        browser.start(queue: DispatchQueue(label: "Holodeck.mac-discovery"))
-        publish(.searching)
+        if connection == nil, connecting == nil { publish(.searching) }
+        if !dependencies.usesSystemBrowser, !dependencies.initialMacs.isEmpty {
+            discovered(dependencies.initialMacs, id: id, sequence: 1)
+        }
     }
 
     public func stop() {
         diagnose("Stopping local discovery")
-        browser?.cancel(); browser = nil
-        cancelConnection()
+        browserID = nil; browserReady = false; browser?.cancel(); browser = nil
+        cancelConnection(); resetRecovery(); manualChoice = false
         state.macs = []; publish(.disconnected)
     }
 
     public func choose(_ id: String) {
-        cancelConnection()
-        rememberedID = id
-        if pairing?.id != id || repairID == id { pairing = nil }
-        repairID = nil
+        cancelConnection(); resetRecovery(); manualChoice = false
+        do {
+            if pairing?.id != id || repairID == id {
+                try dependencies.removeSecret(secretNamespace + "-pairing"); pairing = nil
+            }
+        } catch { publish(.failed(error.localizedDescription)); return }
+        rememberedID = id; repairID = nil
         attemptConnection(explicit: true)
     }
 
     public func changeMac() {
-        cancelConnection()
-        rememberedID = nil
-        publish(.chooseMac)
+        cancelReconnect()
+        choicePreviousStatus = state.status
+        resetRecovery(); manualChoice = true
+        state.macChoiceID = UUID(); publish(.chooseMac)
+    }
+
+    public func cancelMacChoice() {
+        guard manualChoice else { return }
+        manualChoice = false
+        if connection != nil {
+            resetRecovery(); publish(.connected(pairing?.name ?? "Mac"))
+        } else if connecting != nil {
+            resetRecovery()
+            if state.status == .chooseMac { publish(choicePreviousStatus ?? .connecting) }
+        } else if let rememberedID, state.macs.contains(where: { $0.id == rememberedID }) {
+            resetRecovery(); attemptConnection(explicit: true)
+        } else {
+            // Preserve this canceled episode until the remembered host returns.
+            recoveryID = state.macChoiceID
+            if rememberedID != nil { publish(.disconnected) }
+        }
+        choicePreviousStatus = nil
     }
 
     public func retry() {
-        if browser == nil { start(deviceName: deviceName) }
+        cancelReconnect()
+        manualChoice = false; resetRecovery()
+        if browserID == nil { start(deviceName: deviceName) }
         if connection == nil { attemptConnection(explicit: true) }
     }
 
     private func cancelConnection() {
+        cancelReconnect()
         attemptID = nil; connecting?.cancel(); connecting = nil
-        connectionTag = nil; connection?.cancel(); connection = nil; connectionID = nil
+        connectionTag = nil; connection?.cancel(); connection = nil
     }
 
-    private func browserError(_ error: NWError) {
-        diagnose("Bonjour error: \(error)")
-        if LocalProtocol.isPermissionDenied(error) { publish(.permissionDenied) }
-        else { publish(.disconnected) }
+    func browserState(_ value: NWBrowser.State, id: UUID, sequence: UInt64) {
+        guard browserID == id, sequence > browserStateSequence else { return }
+        browserStateSequence = sequence
+        switch value {
+        case .ready:
+            browserReady = true
+            if state.status == .permissionDenied, connection == nil, connecting == nil { publish(.searching) }
+            if connection == nil, connecting == nil, state.status != .chooseMac { attemptConnection() }
+        case .waiting(let error), .failed(let error):
+            browserReady = false
+            cancelReconnect()
+            recoveryTask?.cancel(); recoveryTask = nil
+            if case .failed = value { browserID = nil; browser?.cancel(); browser = nil }
+            diagnose("Bonjour error: \(error)")
+            if connection == nil, connecting == nil {
+                publish(LocalProtocol.isPermissionDenied(error) ? .permissionDenied : .disconnected)
+            }
+        default: break
+        }
     }
 
-    private func discovered(_ results: Set<NWBrowser.Result>) {
-        diagnose("Bonjour results: \(results.count)")
+    private func discovered(_ results: Set<NWBrowser.Result>, id: UUID, sequence: UInt64) {
         var macs: [String: LocalMac] = [:]
         for result in results {
             guard case .bonjour(let txt) = result.metadata, let id = txt["id"], UUID(uuidString: id) != nil,
@@ -156,81 +245,153 @@ public actor LocalCatalogClient {
             macs[id] = LocalMac(id: id, name: txt["name"] ?? "Mac", endpoint: result.endpoint,
                                interface: interface, version: Int(txt["version"] ?? "0") ?? 0)
         }
-        state.macs = macs.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        if let connectionID, !state.macs.contains(where: { $0.id == connectionID }) {
-            cancelConnection(); publish(.disconnected)
+        discovered(Array(macs.values), id: id, sequence: sequence)
+    }
+
+    func discovered(_ macs: [LocalMac], id: UUID, sequence: UInt64) {
+        guard browserID == id, sequence > discoverySequence else { return }
+        discoverySequence = sequence
+        state.macs = macs.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        if let rememberedID, !state.macs.contains(where: { $0.id == rememberedID }), connection == nil {
+            cancelReconnect()
+        }
+        // Discovery is advisory; only the channel determines whether it is alive.
+        if let rememberedID, state.macs.contains(where: { $0.id == rememberedID }), !manualChoice {
+            let recovering = recoveryID != nil
+            resetRecovery()
+            if recovering, state.status == .chooseMac { publish(.searching) }
         }
         if connection == nil, connecting == nil, state.status != .chooseMac { attemptConnection() }
-        publish()
+        updateRecovery(); publish()
+    }
+
+    private func resetRecovery() {
+        recoveryTask?.cancel(); recoveryTask = nil; recoveryID = nil; state.macChoiceID = nil
+    }
+    private func updateRecovery() {
+        guard browserReady, let browserID, connection == nil, connecting == nil, !manualChoice,
+              let rememberedID, !state.macs.contains(where: { $0.id == rememberedID }), !state.macs.isEmpty else {
+            recoveryTask?.cancel(); recoveryTask = nil
+            return
+        }
+        guard state.macChoiceID == nil, recoveryTask == nil else { return }
+        let episode = recoveryID ?? UUID(); recoveryID = episode
+        let deadline = clock.now.advanced(by: .seconds(5))
+        recoveryTask = Task { [weak self, clock] in
+            do { try await clock.sleep(until: deadline) } catch { return }
+            await self?.offerRecovery(episode, browserID: browserID)
+        }
+    }
+    private func offerRecovery(_ episode: UUID, browserID: UUID) {
+        guard self.browserID == browserID, browserReady, recoveryID == episode,
+              connection == nil, connecting == nil, let rememberedID,
+              !state.macs.contains(where: { $0.id == rememberedID }), !state.macs.isEmpty else { return }
+        recoveryTask = nil; state.macChoiceID = episode; publish(.chooseMac)
     }
 
     private func attemptConnection(explicit: Bool = false) {
-        guard connection == nil, connecting == nil else { return }
-        if !explicit, [.rejected, .identityChanged, .incompatible].contains(state.status) { return }
-        let id = LocalProtocol.chooseMacID(available: state.macs.map(\.id), remembered: rememberedID)
-        let mac = state.macs.first { $0.id == id }
-        guard let mac else {
-            publish(rememberedID == nil ? (state.macs.isEmpty ? .searching : .chooseMac) : .disconnected)
-            return
+        guard browserReady, connection == nil, connecting == nil else { return }
+        if !explicit, reconnectTask != nil { return }
+        if !explicit {
+            switch state.status {
+            case .rejected, .identityChanged, .incompatible, .permissionDenied, .failed: return
+            default: break
+            }
         }
-        rememberedID = mac.id
+        let id = LocalProtocol.chooseMacID(available: state.macs.map(\.id), remembered: rememberedID)
+        guard let mac = state.macs.first(where: { $0.id == id }) else {
+            publish(rememberedID == nil ? (state.macs.isEmpty ? .searching : .chooseMac) : .disconnected)
+            if state.status == .chooseMac, state.macChoiceID == nil { state.macChoiceID = UUID(); publish() }
+            updateRecovery(); return
+        }
+        resetRecovery(); rememberedID = mac.id
         guard mac.version == LocalProtocol.version else { publish(.incompatible); return }
         publish(.connecting)
         let attempt = UUID(); attemptID = attempt
         connecting = Task { [self] in
-            do { try await connect(mac) }
+            do { try await connect(mac, attempt: attempt) }
             catch {
                 diagnose("Connection failed: \(error)")
-                if !Task.isCancelled, attemptID == attempt { handle(error) }
+                if !Task.isCancelled, attemptID == attempt { handle(connectionError(error)) }
             }
-            if attemptID == attempt { connecting = nil; attemptID = nil }
+            if attemptID == attempt {
+                connecting = nil; attemptID = nil
+                updateRecovery(); scheduleReconnect(); publish()
+            }
         }
     }
 
     private func closed(_ tag: UUID) {
         guard connectionTag == tag else { return }
-        connection = nil; connectionID = nil; connectionTag = nil
+        connection = nil; connectionTag = nil
         publish(.disconnected)
-        if browser != nil { attemptConnection() }
+        updateRecovery(); scheduleReconnect()
     }
 
-    private func connect(_ mac: LocalMac) async throws {
-        diagnose("Resolving discovered Mac")
-        let resolved = try await LocalResolver().resolve(mac)
-        diagnose("Resolved a local destination")
+    private func cancelReconnect() {
+        reconnectTask?.cancel(); reconnectTask = nil; reconnectAttempts = 0
+    }
+    private func scheduleReconnect() {
+        guard browserReady, let browserID, connection == nil, connecting == nil, !manualChoice,
+              state.status == .disconnected, let rememberedID,
+              state.macs.contains(where: { $0.id == rememberedID }), reconnectTask == nil else { return }
+        let delay = min(1 << min(reconnectAttempts, 5), 30)
+        reconnectAttempts = min(reconnectAttempts + 1, 5)
+        let deadline = clock.now.advanced(by: .seconds(delay))
+        reconnectTask = Task { [weak self, clock] in
+            do { try await clock.sleep(until: deadline) } catch { return }
+            await self?.reconnect(browserID: browserID)
+        }
+    }
+    private func reconnect(browserID: UUID) {
+        guard !Task.isCancelled, self.browserID == browserID else { return }
+        reconnectTask = nil
+        attemptConnection()
+    }
+    private func connectionError(_ error: Error) -> Error {
+        guard let error = error as? NWError else { return error }
+        return LocalProtocol.isPermissionDenied(error) ? LocalCatalogError.permissionDenied : .disconnected
+    }
+
+    private func checkAttempt(_ id: UUID) throws {
         try Task.checkCancellation()
+        guard attemptID == id else { throw CancellationError() }
+    }
+    private func connect(_ mac: LocalMac, attempt: UUID) async throws {
+        let resolved = try await dependencies.resolve(mac)
+        try checkAttempt(attempt)
         let saved = pairing?.id == mac.id ? pairing : nil
-        let trust = LocalTrust()
-        let parameters = NWParameters(tls: trust.options(expected: saved?.pin), tcp: .init())
-        parameters.requiredInterface = mac.interface
         let tag = UUID()
-        let channel = LocalConnection(NWConnection(to: .hostPort(host: .init(resolved.address), port: .init(rawValue: resolved.port)!), using: parameters),
-            onClosed: { [weak self] in Task { await self?.closed(tag) } })
+        let transport = dependencies.transport(mac, resolved, saved?.pin, { [weak self] in Task { await self?.closed(tag) } })
+        let channel = transport.channel
         do {
-            try await channel.start()
-            diagnose("TLS connection ready")
-            try Task.checkCancellation()
+            try await channel.start(); try checkAttempt(attempt)
             let hello = try await channel.exchange(LocalPacket(message: .init(operation: "hello")))
+            try checkAttempt(attempt)
             guard hello.message.serverID == mac.id else { throw LocalCatalogError.identityChanged }
-            var request = LocalMessage(operation: saved == nil ? "pair" : "authenticate")
+            var request = LocalMessage(operation: saved?.token == nil ? "pair" : "authenticate")
             request.deviceID = deviceID; request.name = deviceName; request.token = saved?.token
-            if saved == nil { publish(.awaitingApproval(try await channel.pairingCode())) }
-            // Approval is asynchronous on the server; poll this same TLS connection.
+            if saved?.token == nil {
+                let code = try await channel.pairingCode(); try checkAttempt(attempt)
+                publish(.awaitingApproval(code))
+            }
             var response = try await channel.exchange(LocalPacket(message: request))
             while response.message.operation == "pending" {
-                try await Task.sleep(for: .seconds(1))
+                try await clock.sleep(for: .seconds(1)); try checkAttempt(attempt)
                 response = try await channel.exchange(LocalPacket(message: .init(operation: "pairStatus")))
             }
-            try check(response)
-            guard let pin = trust.fingerprint, let token = response.message.token ?? saved?.token else { throw LocalCatalogError.protocolViolation }
+            try checkAttempt(attempt); try check(response)
+            guard let pin = transport.fingerprint(), let token = response.message.token ?? saved?.token else {
+                throw LocalCatalogError.protocolViolation
+            }
             let approved = Pairing(id: mac.id, name: mac.name, pin: pin, token: token)
-            try Task.checkCancellation()
-            try LocalSecrets.write(JSONEncoder().encode(approved), account: secretNamespace + "-pairing")
-            pairing = approved; connection = channel; connectionID = mac.id; connectionTag = tag
+            try dependencies.writeSecret(JSONEncoder().encode(approved), secretNamespace + "-pairing")
+            pairing = approved; connection = channel; connectionTag = tag
+            cancelReconnect()
             state.generation &+= 1; publish(.connected(mac.name))
         } catch {
             channel.cancel()
-            if trust.identityChanged { throw LocalCatalogError.identityChanged }
+            if transport.identityChanged() { throw LocalCatalogError.identityChanged }
             throw error
         }
     }
@@ -241,23 +402,56 @@ public actor LocalCatalogClient {
         #endif
     }
 
-    private func fetch(_ request: CatalogRequest, limit: Int) async throws -> Data {
-        guard let connection else {
-            if browser != nil { attemptConnection() }
-            throw LocalCatalogError.disconnected
+    private func waitForSetup() async throws -> any LocalRequestConnection {
+        let id = UUID(); let stream = makeUpdates(id: id)
+        defer { removeObserver(id) }
+        for await update in stream {
+            try Task.checkCancellation()
+            if let connection { return connection }
+            switch update.status {
+            case .connecting: continue
+            case .awaitingApproval: throw LocalCatalogError.approvalRequired
+            case .permissionDenied: throw LocalCatalogError.permissionDenied
+            case .rejected: throw LocalCatalogError.rejected
+            case .incompatible: throw LocalCatalogError.incompatible
+            case .identityChanged: throw LocalCatalogError.identityChanged
+            default: throw LocalCatalogError.disconnected
+            }
         }
+        throw CancellationError()
+    }
+    private func waitForAvailability() async throws {
+        let id = UUID(); let stream = makeUpdates(id: id)
+        defer { removeObserver(id) }
+        for await _ in stream {
+            try Task.checkCancellation()
+            if connection != nil { return }
+        }
+        throw CancellationError()
+    }
+
+    private func fetch(_ request: CatalogRequest, limit: Int) async throws -> Data {
+        try Task.checkCancellation()
+        if connection == nil, browserID != nil, state.status != .chooseMac { attemptConnection() }
+        let channel: any LocalRequestConnection
+        if let connection { channel = connection }
+        else { channel = try await withLocalTimeout(clock: clock) { [self] in try await waitForSetup() } }
+        let response: LocalPacket
         do {
             var message = LocalMessage(operation: "asset"); message.request = request; message.limit = limit
-            let response = try await connection.exchange(LocalPacket(message: message))
-            try check(response)
+            response = try await channel.exchange(LocalPacket(message: message))
+            if response.message.error != "invalidAsset" { try check(response) }
             guard response.payload.count <= limit else { throw CatalogError.oversizedResponse }
-            return response.payload
         } catch {
-            if self.connection === connection {
-                connectionTag = nil; connection.cancel(); self.connection = nil; connectionID = nil; handle(error)
+            let failure = connectionError(error)
+            if connection === channel {
+                connectionTag = nil; channel.cancel(); connection = nil; handle(failure)
+                updateRecovery(); scheduleReconnect()
             }
-            throw error
+            throw failure
         }
+        if response.message.error == "invalidAsset" { throw CatalogError.invalidResponse }
+        return response.payload
     }
 
     private func check(_ packet: LocalPacket) throws {
@@ -265,15 +459,23 @@ public actor LocalCatalogClient {
         case nil: break
         case "revoked", "rejected": throw LocalCatalogError.rejected
         case "incompatible": throw LocalCatalogError.incompatible
-        default: throw CatalogError.invalidResponse
+        default: throw LocalCatalogError.protocolViolation
         }
     }
     private func handle(_ error: Error) {
         switch error {
-        case LocalCatalogError.rejected: pairing = nil; publish(.rejected)
+        case LocalCatalogError.rejected:
+            do {
+                if var saved = pairing {
+                    saved.token = nil; pairing = saved
+                    try dependencies.writeSecret(JSONEncoder().encode(saved), secretNamespace + "-pairing")
+                }
+                publish(.rejected)
+            } catch { publish(.failed(error.localizedDescription)) }
         case LocalCatalogError.identityChanged: repairID = rememberedID; publish(.identityChanged)
         case LocalCatalogError.incompatible: publish(.incompatible)
         case LocalCatalogError.permissionDenied: publish(.permissionDenied)
+        case LocalCatalogError.invalidFile: publish(.failed(error.localizedDescription))
         default: publish(.disconnected)
         }
     }

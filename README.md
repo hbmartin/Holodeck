@@ -12,7 +12,7 @@ A Metal scene viewer for tvOS 26.0 and later and Apple silicon Macs running macO
 - Press **Select** to open the shader picker, use directional input to browse, and press **Select** to load a shader.
 - **Back** dismisses the picker while playback or startup loading is available. After startup compilation fails, Back returns to the Home screen from idle recovery. During a pending recovery selection, the first Back cancels it; the next Back returns Home. While a shader is loading, the current one keeps running. Dismissing a pending selection retains the current shader.
 - During startup, Back leaves the startup shader loading and restores its loading hint. If you dismiss a different pending selection before any shader is active, that selection is canceled and the latest resolved startup shader loads again, provided startup has not failed. Reopening the picker focuses the active shader; compilation results and interruptions preserve your place while browsing.
-- Animation and drawing pause when the scene becomes inactive.
+- Animation and drawing pause when the scene becomes inactive. Temporary interruptions preserve the Mac connection and pairing; entering the background stops discovery and networking.
 
 ## Mac viewer
 
@@ -40,17 +40,17 @@ Choose a local [HolodeckShaders](https://github.com/hbmartin/HolodeckShaders) au
 
 The Mac loads this folder at startup and when you press **Reload Shaders**. Directory edits remain unpublished until reload. A complete candidate is validated before replacing the current immutable, app-owned publication. Revisions are canonical SHA-256 content digests; update dates use authoring-file modification times. Collections, discovery labels, and source comments are preserved. Sharing continues with the viewer window closed, stops during sleep or quit, and resumes after wake.
 
-The TV browses `_holodeck._tcp` in Bonjour's `local.` domain. One Mac connects automatically; several Macs show a chooser. A remembered Mac is retained when unavailable, and **Change Mac** allows an explicit switch. On first connection, compare the six-digit code on TV with **Settings → Shader Library** on Mac and click **Approve**. The code comes from that TLS connection. A persistent Mac public-key pin and random per-TV Keychain credential authenticate later connections. **Revoke** stops further downloads; cached playback remains usable.
+The TV browses `_holodeck._tcp` in Bonjour's `local.` domain. One Mac connects automatically; several Macs show a chooser. A remembered Mac is retained when unavailable. If alternatives remain available for five seconds while no connection or pairing is viable, the TV opens the chooser once for that absence. **Change Mac** also allows an explicit switch; discovery churn does not close a working connection. On first connection, compare the six-digit code on TV with **Settings → Shader Library** on Mac and click **Approve**. The code comes from that TLS connection. A persistent Mac public-key pin and random per-TV Keychain credential authenticate later connections. **Revoke** stops further downloads; cached playback remains usable. The TV removes the revoked token from its saved pairing while retaining the Mac selection and public-key pin.
 
 All TV catalog, source, and preview requests travel through the selected Mac over TLS 1.3. Service and address resolution use multicast-only DNS-SD, connections require a private or link-local numeric address on the discovered interface, and certificate network fetching is disabled. There are no runtime GitHub downloads or public-network fallback paths. The certificate-generation library is linked only on Mac.
 
-TV refreshes run at launch, foreground return, reconnection, and **Check for Scene Updates**. Ordinary attempts retain the existing 15-minute monotonic throttle; reconnection and explicit checks bypass it. Catalog requests coalesce, transfers are bounded and time out after 30 seconds, hashes are checked, and the complete TV cache is written atomically. Revision-specific allowlisted assets stay available during active downloads across reloads.
+TV refreshes run at launch, foreground return, reconnection, and **Check for Scene Updates**. Ordinary attempts retain the existing 15-minute monotonic throttle; reconnection and explicit checks bypass it. Catalog requests coalesce, transfers are bounded and time out after 30 seconds, idle connections use TCP keepalive, unauthenticated connections expire five minutes after acceptance, hashes are checked, and the complete TV cache is written atomically. Revision-specific allowlisted assets stay available during active downloads across reloads.
 
 The app ships with no shader assets. Existing downloaded caches, including 40-character publication revisions, remain playable after upgrade. TV starts cached playback before checking the Mac. With no cache, configure and open the Mac app, allow local-network access, and approve the TV. TV keeps its active pipeline across updates; changed source takes effect on selection or subsequent launch. Missing previews use gradients. The Mac retains its source-replacement behavior. tvOS can evict cache files, requiring another local download.
 
 Preview downloads coalesce by hash. Actor-owned LRU caches hold up to 16 MiB of verified encoded data and 32 MiB of decoded images; memory hits skip disk reads, hashing and decoding. ImageIO runs on a separate worker queue with at most two concurrent decodes, leaving the catalog actor responsive. TV aspect-fill thumbnails use laid-out card bounds, display scale and the 1.045 focus enlargement, rounding upward in 64-pixel buckets with a 2048-pixel cap; Mac previews use 176 pixels. Resizing or a larger scale retains the displayed image until its replacement succeeds. Metadata and publication changes retain images whose hashes have not changed.
 
-Failed preview downloads retry on demand after 30 seconds, doubling to a five-minute ceiling. Hash/signature and decode failures are suppressed for that publication, path and hash until a new publication or service instance. At most 500 failure records are retained. Memory warnings on TV and warning/critical memory pressure on Mac clear both memory caches while retaining catalog state, disk files and retry records. In-flight requests still complete, but work started before trimming cannot refill the caches.
+Connectivity-related preview failures wait for connection recovery and retry immediately when it succeeds. Other failed preview downloads retry on demand after 30 seconds, doubling to a five-minute ceiling. An unavailable asset fails only its request and keeps the connection alive. Hash/signature and decode failures are suppressed for that publication, path and hash until a new publication or service instance. At most 500 failure records are retained. Memory warnings on TV and warning/critical memory pressure on Mac clear both memory caches while retaining catalog state, disk files and retry records. In-flight requests still complete, but work started before trimming cannot refill the caches.
 
 `ShaderCompiler` compiles complete source libraries on its actor executor, with the existing `vertexShader`, `fragmentShader` and 16-byte buffer-0 uniform contract. Pipelines are cached by shader ID and source hash; selecting a revised shader recompiles it. Only the latest selection can activate a pipeline. Compilation diagnostics go to the console; the picker reports failures and allows another selection.
 
@@ -73,7 +73,8 @@ swift test --package-path HolodeckCore
 HOLODECK_LAN_TEST=1 HOLODECK_AUTHORING_FIXTURE=/absolute/path/to/HolodeckShaders swift test --package-path HolodeckCore
 
 xcodebuild -project Holodeck.xcodeproj -scheme HolodeckMac \
-  -destination 'platform=macOS,arch=arm64' -parallel-testing-enabled NO test
+  -destination 'platform=macOS,arch=arm64' -parallel-testing-enabled NO \
+  HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests test
 
 # From HolodeckCore/:
 xcodebuild -scheme HolodeckCore \
@@ -85,7 +86,9 @@ xcodebuild -scheme HolodeckCore \
 xcodebuild -project Holodeck.xcodeproj -scheme Holodeck \
   -sdk appletvsimulator \
   -destination 'platform=tvOS Simulator,name=Apple TV 4K (3rd generation)' \
-  -parallel-testing-enabled NO test
+  -parallel-testing-enabled NO HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests test
 ```
+
+The test bundle suffix isolates app installations and containers from the normal development apps. It changes only app and test target identifiers; dependencies retain their own identifiers. Production builds omit it.
 
 Deployment targets are tvOS 26.0 and macOS 15.0; the Mac app builds only for arm64. This is a local-development target, without a notarization or App Store distribution workflow. Verify on the minimum OS versions and physical devices before release; a deployment target alone does not confirm runtime compatibility.

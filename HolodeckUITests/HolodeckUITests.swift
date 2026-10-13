@@ -4,6 +4,13 @@ import XCTest
 final class HolodeckUITests: XCTestCase {
     private let remote = XCUIRemote.shared
 
+    private func controlCenterButton(in system: XCUIApplication) -> XCUIElement {
+        system.buttons.matching(NSPredicate(format: "identifier IN %@", [
+            "com.apple.TVSystemUIService.status.controlCenter", // tvOS 27
+            "com.apple.status.controlCenterItem" // tvOS 26
+        ])).firstMatch
+    }
+
     override func setUpWithError() throws { continueAfterFailure = false }
 
     /// Opt in with TEST_RUNNER_HOLODECK_PHYSICAL_LAN_TEST=1 and a Mac advertising
@@ -68,7 +75,7 @@ final class HolodeckUITests: XCTestCase {
         let app = isolatedApp()
         app.launchArguments += ["--ui-test-download-catalog", "--ui-test-fail-catalog-once"]
         app.launch()
-        let message = "Couldn’t load shaders. Check your Mac connection and press Select to retry."
+        let message = "Couldn’t load scenes. Check your connection to the Mac and try again."
         XCTAssertTrue(app.staticTexts[message].firstMatch.waitForExistence(timeout: 10))
         remote.press(.select)
         let plasma = card("plasma", in: app)
@@ -84,7 +91,7 @@ final class HolodeckUITests: XCTestCase {
         let app = isolatedApp()
         app.launchArguments.append("--ui-test-empty-cache")
         app.launch()
-        let message = "Couldn’t load shaders. Check your Mac connection and press Select to retry."
+        let message = "Couldn’t load scenes. Check your connection to the Mac and try again."
         XCTAssertTrue(app.staticTexts[message].firstMatch.waitForExistence(timeout: 10))
         remote.press(.select)
         XCTAssertTrue(app.otherElements["shader-picker"].waitForExistence(timeout: 5))
@@ -302,21 +309,43 @@ final class HolodeckUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["shader-status"].label.hasPrefix("Now showing Plasma"))
     }
 
+    func testControlCenterPreservesPendingPairingConnection() {
+        let app = isolatedApp()
+        app.launchArguments.append("--ui-test-pending-pairing")
+        app.launch()
+        openPicker(in: app)
+        let status = app.staticTexts["mac-connection-status"]
+        let pending = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH %@", "Pairing code:"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [pending], timeout: 10), .completed)
+        let code = status.label
+        remote.press(.home, forDuration: 1.5)
+        let system = XCUIApplication(bundleIdentifier: "com.apple.TVSystemUIService")
+        let controlCenter = controlCenterButton(in: system)
+        XCTAssertTrue(controlCenter.waitForExistence(timeout: 5))
+        waitForFocus(controlCenter)
+        remote.press(.menu)
+        XCTAssertTrue(controlCenter.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+        let resumed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH %@", "Pairing code:"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [resumed], timeout: 10), .completed)
+        XCTAssertEqual(status.label, code, "Control Center replaced the pending TLS connection")
+    }
+
     func testControlCenterResumeKeepsBrowsingFocus() {
         let app = launchShowcase()
         openPicker(in: app)
         browseToChrome(in: app)
         remote.press(.home, forDuration: 1.5)
         let system = XCUIApplication(bundleIdentifier: "com.apple.TVSystemUIService")
-        let controlCenterButton = system.buttons["com.apple.TVSystemUIService.status.controlCenter"]
-        XCTAssertTrue(controlCenterButton.waitForExistence(timeout: 5))
-        waitForFocus(controlCenterButton)
+        let button = controlCenterButton(in: system)
+        XCTAssertTrue(button.waitForExistence(timeout: 5))
+        waitForFocus(button)
         let controlCenter = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         controlCenter.name = "Control Center over picker"
         controlCenter.lifetime = .keepAlways
         add(controlCenter)
         remote.press(.menu)
-        XCTAssertTrue(controlCenterButton.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(button.waitForNonExistence(timeout: 5))
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 5))
         waitForFocus(card("chrome", in: app))
         XCTAssertTrue(app.otherElements["shader-picker"].exists)
