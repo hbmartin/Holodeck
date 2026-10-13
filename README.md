@@ -2,6 +2,10 @@
 
 A Metal scene viewer for tvOS 26.0 and later and Apple silicon Macs running macOS 15 or later. Shaders are downloaded as Metal source and compiled at runtime; no precompiled Metal library is required.
 
+- **[User quickstart](docs/quickstart.md):** configure your Mac, approve your TV, and start playing scenes.
+- **[Technical reference](docs/local-shader-serving.md):** architecture, publication, discovery, TLS pairing, protocol, caching, and developer setup.
+- **[Authoring workflow](docs/shader-catalog-workflow.md):** folder format and publication overview.
+
 ## Controls
 
 - Launch restores the last successfully activated shader full screen. A first launch discovers your Mac and waits for approval before downloading its local catalog and starting the default shader. A saved ID no longer in the catalog also resolves to its default. If a remembered shader fails to compile, the picker reports the error and keeps that saved ID until another shader succeeds.
@@ -30,7 +34,7 @@ Both viewers support ordered curated collections and mood/motion filters. TV ret
 
 ## Shader catalog
 
-See [Local shader library workflow](docs/shader-catalog-workflow.md) for setup, pairing, authoring format, transport, and offline behavior.
+Start with the [user quickstart](docs/quickstart.md). The [workflow guide](docs/shader-catalog-workflow.md) covers authoring; the [technical reference](docs/local-shader-serving.md) details transport, storage, and playback behavior.
 
 Choose a local [HolodeckShaders](https://github.com/hbmartin/HolodeckShaders) authoring folder in **HolodeckMac → Settings → Shader Library**. It must contain `index.json`, `shared/`, and `shaders/`, including each indexed shader's metadata, body, and supplied `preview.png`. Folder access is saved with a read-only security-scoped bookmark. The Mac assembles sources natively and hashes the supplied previews; serving requires no Git commits, Python, repository scripts, or Xcode installation.
 

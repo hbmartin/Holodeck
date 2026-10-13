@@ -2,6 +2,8 @@
 
 The Mac app owns publication. Apple TV discovers the Mac on the local network, pairs once with Mac approval, and downloads catalog sources and previews over TLS. Compatible shader changes require no app release.
 
+For setup and everyday controls, follow the [user quickstart](quickstart.md). For component ownership, protocol messages, credentials, storage, and developer setup, see the [technical reference](local-shader-serving.md). This guide keeps the authoring and publication overview.
+
 ## Configure and pair
 
 1. Open **HolodeckMac → Settings → Shader Library → Choose Folder** and select an authoring folder.
