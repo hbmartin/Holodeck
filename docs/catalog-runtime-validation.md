@@ -37,8 +37,8 @@ Reproduce from the app repository:
 swift test --package-path HolodeckCore
 HOLODECK_PROFILE=1 swift test --package-path HolodeckCore -c release --filter CatalogPerformanceTests
 HOLODECK_LIVE_CATALOG=1 swift test --package-path HolodeckCore --filter testLivePublishedCatalog
-xcodebuild -project Holodeck.xcodeproj -scheme Holodeck -destination 'platform=tvOS Simulator,name=Apple TV 4K (3rd generation)' -parallel-testing-enabled NO test
-xcodebuild -project Holodeck.xcodeproj -scheme HolodeckMac -destination 'platform=macOS,arch=arm64' -parallel-testing-enabled NO test
+xcodebuild -project Holodeck.xcodeproj -scheme Holodeck -destination 'platform=tvOS Simulator,name=Apple TV 4K (3rd generation)' -parallel-testing-enabled NO HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests test
+xcodebuild -project Holodeck.xcodeproj -scheme HolodeckMac -destination 'platform=macOS,arch=arm64' -parallel-testing-enabled NO HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests test
 ```
 
 Run the shared-core scheme from `HolodeckCore/` for tvOS. Deployment targets remain macOS 15 and tvOS 26. Those minimum versions and a physical Apple TV were unavailable for this check.

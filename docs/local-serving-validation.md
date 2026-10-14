@@ -41,6 +41,27 @@ xcodebuild -project Holodeck.xcodeproj -scheme Holodeck \
 
 Physical Mac Keychain identity-reset/chooser recovery and silent power-loss/keepalive cleanup were not performed in this pass. Controlled identity/pin recovery, the keepalive settings (30 seconds idle, 10 seconds between probes, three probes), deadline cleanup, and lease release have automated coverage; hardware power-loss detection remains a manual check. No deployment or publishing was performed.
 
+## PR #14 publication, focus, and test reliability fixes
+
+Reload now verifies existing publication manifests and every copied source/preview before reuse. A damaged copy is replaced by a same-volume atomic swap under the catalog actor. Swap failures preserve the existing directory; marker failures preserve the previous current revision and allowlist. Regression cases cover corrupt, missing, oversized, and mismatched-manifest assets, intact reuse, failed swaps and marker writes, staging cleanup, and leases retained across further reloads.
+
+The empty local TV picker recognizes its controls as valid restored focus and remembers the last focused local control when UIKit clears focus during Control Center. The new UI regression uses controlled pairing with an empty catalog, focuses **Check for Scene Updates**, and verifies both that focus and the pairing code after returning. It performs no real discovery or credential access.
+
+Mac preference tests use a DEBUG-only inspection launch to expose saved viewer-frame keys from the app's own persistent defaults domain. Inspection constructs no viewer/library/renderer model, disables frame autosaving, and reports only versioned frame data through accessibility. The runner rejects malformed snapshots and mismatched bundle IDs instead of opening the app's sandbox plist. The two previously blocked persistence tests now pass, including geometry restoration, implicit non-persistence, cleanup, and preservation of the live frame. The canceled-refresh waiter test now waits for removal before admitting its replacement waiter.
+
+- Mac shared core: 139 tests executed, five opt-in checks skipped, zero failures.
+- Shared core on tvOS 27 simulator: 119 tests executed, three opt-in checks skipped, zero failures.
+- TV app on tvOS 27 simulator: all 42 unit tests passed; the complete 22-case UI suite passed with its physical-LAN opt-in skipped. All three Control Center checks passed in that full run.
+- Complete Mac UI suite: 24 tests executed, two skipped, zero failures. Native full-screen and renderer-alert Escape checks require permission to post physical input and were skipped under their existing gates; all other 22 tests passed, including both previously blocked persistence tests.
+- Focused Mac preferences/inspection checks: four tests passed, zero failures.
+- Real Bonjour/TLS pairing and saved-credential reconnect, plus native loading/compilation of the local authoring library: both focused checks passed.
+- Shutdown/refresh-waiter synchronization: 500 consecutive repetitions passed using a temporary test wrapper, removed afterward.
+- Both app targets built in Debug through their complete test runs and separately in Release. The inspection launch flag and accessibility identifier are present in the Debug Mac executable and absent from Release. Xcode checks ran sequentially against shared DerivedData.
+
+The first new focus-test attempt incorrectly pressed Select after the empty picker had opened automatically, activating **Change Mac**. After correcting that setup, the test exposed UIKit clearing focus during Control Center; retaining the last local control fixed that behavior. The final focused regression and complete TV run both passed. No physical-device installation, minimum-OS runtime check, merge, or deployment was performed in this pass.
+
+Server admission was explicitly excluded from this fix pass. The shared 16-session pool and timeout policy are unchanged. Unapproved peers that continue sending accepted requests can occupy all slots until the absolute five-minute deadline, preventing an approved TV from reconnecting; completely idle initial reads time out after 30 seconds. This availability finding remains unresolved. No protocol, credential, revision-format, or storage migration changes are included.
+
 ## Original physical LAN check
 
 An Apple TV 4K running tvOS 26.6 discovered the Mac's advertised service, resolved it locally, completed TLS pairing, showed the same six-digit code as the Mac settings view, and downloaded the real 23-scene authoring library after clicking **Approve**. The default scene played successfully. Relaunch restored cached playback and reauthenticated to the remembered Mac without another approval.

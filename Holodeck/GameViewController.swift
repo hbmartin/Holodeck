@@ -27,6 +27,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     private let localControls = UIStackView()
     private let changeMacButton = UIButton(type: .system)
     private let checkUpdatesButton = UIButton(type: .system)
+    private weak var emptyPickerFocusButton: UIButton?
     private var localUpdatesTask: Task<Void, Never>?
     private var localActivityTask: Task<Void, Never>?
     private var localState = LocalClientState()
@@ -86,7 +87,11 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     override var preferredFocusEnvironments: [any UIFocusEnvironment] {
         guard pickerIsVisible, unavailableMessage == nil else { return [view] }
         if let returnFocusButton, !returnFocusButton.isHidden { return [returnFocusButton] }
-        if shaders.isEmpty { return catalogService.usesLocalNetwork ? [changeMacButton] : [view] }
+        if shaders.isEmpty {
+            guard catalogService.usesLocalNetwork else { return [view] }
+            if let button = emptyPickerFocusButton, !button.isHidden, button.isEnabled { return [button] }
+            return [changeMacButton]
+        }
         if visibleShaders.isEmpty { return [resetButton] }
         if let cell = collectionView.cellForItem(at: browsingIndexPath ?? preferredShaderIndexPath) { return [cell] }
         return [collectionView]
@@ -94,6 +99,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
         super.didUpdateFocus(in: context, with: coordinator)
+        rememberPickerFocus(context.nextFocusedView)
         // Route Down from controls into the preferred card without intercepting Up from cards.
         updateCardsFocusGuide(focused: context.nextFocusedView)
     }
@@ -143,13 +149,25 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             // UIKit may clear the first responder when the app leaves the foreground.
             becomeFirstResponder()
             let focused = UIFocusSystem.focusSystem(for: view)?.focusedItem as? UIView
-            let focusIsRestored = pickerIsVisible && unavailableMessage == nil
-                ? (shaders.isEmpty ? focused === view : focused?.isDescendant(of: picker) == true) : focused === view
-            if !focusIsRestored {
+            if !hasRestoredFocus(focused) {
                 setNeedsFocusUpdate()
                 updateFocusIfNeeded()
             }
         }
+    }
+
+    func hasRestoredFocus(_ focused: UIView?) -> Bool {
+        if pickerIsVisible, unavailableMessage == nil, !shaders.isEmpty || catalogService.usesLocalNetwork {
+            return focused?.isDescendant(of: picker) == true
+        }
+        return focused === view
+    }
+
+    func rememberPickerFocus(_ focused: UIView?) {
+        guard pickerIsVisible, shaders.isEmpty, catalogService.usesLocalNetwork,
+              let button = focused as? UIButton, button.isDescendant(of: localControls) else { return }
+        // A nil update while Control Center is open must preserve the previous local control.
+        emptyPickerFocusButton = button
     }
 
     func setSceneForeground(_ foreground: Bool) {
@@ -465,6 +483,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             collectionView.layoutIfNeeded()
         }
         // Layout can deliver focus callbacks for the previously visible item.
+        emptyPickerFocusButton = nil
         browsingIndexPath = openingIndexPath
         browsingShaderID = visibleShaders.indices.contains(openingIndexPath.item) ? visibleShaders[openingIndexPath.item].id : nil
         collectionView.setNeedsFocusUpdate()
@@ -490,6 +509,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         chooser = nil
         chooserSourceButton = nil
         returnFocusButton = nil
+        emptyPickerFocusButton = nil
         selectGesture.isEnabled = true
         menuGesture.isEnabled = false
         (view as? ShowcaseMetalView)?.acceptsFocus = true

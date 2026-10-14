@@ -331,6 +331,32 @@ final class HolodeckUITests: XCTestCase {
         XCTAssertEqual(status.label, code, "Control Center replaced the pending TLS connection")
     }
 
+    func testControlCenterPreservesEmptyLocalPickerControlFocusAndPairing() {
+        let app = isolatedApp()
+        app.launchArguments += ["--ui-test-pending-pairing", "--ui-test-empty-cache"]
+        app.launch()
+        // An empty local catalog opens the picker automatically. Select would activate Change Mac.
+        XCTAssertTrue(app.otherElements["shader-picker"].waitForExistence(timeout: 10))
+        let status = app.staticTexts["mac-connection-status"]
+        let pending = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH %@", "Pairing code:"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [pending], timeout: 10), .completed)
+        let code = status.label
+        XCTAssertEqual(app.collectionViews["shader-cards"].cells.count, 0)
+        waitForFocus(app.buttons["change-mac"])
+        remote.press(.right)
+        let check = app.buttons["check-scene-updates"]
+        waitForFocus(check)
+        remote.press(.home, forDuration: 1.5)
+        let system = XCUIApplication(bundleIdentifier: "com.apple.TVSystemUIService")
+        let controlCenter = controlCenterButton(in: system)
+        XCTAssertTrue(controlCenter.waitForExistence(timeout: 5)); waitForFocus(controlCenter)
+        remote.press(.menu)
+        XCTAssertTrue(controlCenter.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+        waitForFocus(check)
+        XCTAssertEqual(status.label, code)
+    }
+
     func testControlCenterResumeKeepsBrowsingFocus() {
         let app = launchShowcase()
         openPicker(in: app)

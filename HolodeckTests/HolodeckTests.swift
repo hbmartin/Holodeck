@@ -1016,6 +1016,50 @@ extension HolodeckTests {
         state.status = .permissionDenied; controller.applyLocalState(state)
         XCTAssertEqual(status.text, "catalog.json: Broken catalog")
     }
+
+    func testFocusRestorationRecognizesEmptyLocalPickerControlsAndExistingRootRules() async throws {
+        let (device, _) = try await Self.controllerPipeline.value
+        for local in [false, true] {
+            let client = recoveryClient()
+            let service = CatalogService(source: .unavailable, storage: .disabled, usesLocalNetwork: local)
+            let controller = try await hostController(dependencies: {
+                $0.catalogService = service; $0.localCatalogClient = client; $0.metalDevice = device
+                $0.shaderCompilerFactory = ShaderCompilerFactoryKey.liveValue
+            })
+            controller.openPickerFromRemote()
+            let change: UIButton = try findView("change-mac", in: controller)
+            let check: UIButton = try findView("check-scene-updates", in: controller)
+            XCTAssertEqual(controller.hasRestoredFocus(change), local)
+            XCTAssertEqual(controller.hasRestoredFocus(check), local)
+            XCTAssertEqual(controller.hasRestoredFocus(controller.view), !local)
+            XCTAssertFalse(controller.hasRestoredFocus(UIView()))
+            XCTAssertFalse(controller.hasRestoredFocus(nil))
+            controller.rememberPickerFocus(check)
+            controller.rememberPickerFocus(nil)
+            if local { XCTAssertTrue(controller.preferredFocusEnvironments.first === check) }
+            else { XCTAssertTrue(controller.preferredFocusEnvironments.first === controller.view) }
+            controller.closePickerFromRemote()
+            XCTAssertTrue(controller.hasRestoredFocus(controller.view))
+            XCTAssertFalse(controller.hasRestoredFocus(check))
+            controller.openPickerFromRemote()
+            XCTAssertTrue(controller.preferredFocusEnvironments.first === (local ? change : controller.view))
+        }
+        let controller = try await hostController(dependencies: {
+            $0.metalDevice = device; $0.shaderCompilerFactory = ShaderCompilerFactoryKey.liveValue
+        })
+        await controller.shaderSelectionTask?.value
+        controller.openPickerFromRemote()
+        let cards: UICollectionView = try findView("shader-cards", in: controller)
+        XCTAssertTrue(controller.hasRestoredFocus(cards))
+        XCTAssertFalse(controller.hasRestoredFocus(controller.view))
+        let unavailable = try await hostController(dependencies: {
+            $0.catalogService = CatalogService(storage: .disabled, usesLocalNetwork: true)
+            $0.localCatalogClient = recoveryClient()
+        }, factory: { _ in throw RendererStartupError.metalUnavailable })
+        let control: UIButton = try findView("change-mac", in: unavailable)
+        XCTAssertTrue(unavailable.hasRestoredFocus(unavailable.view))
+        XCTAssertFalse(unavailable.hasRestoredFocus(control))
+    }
     func testTemporaryInactivityPreservesPairingWhileBackgroundStopsIt() async throws {
         let (device, _) = try await Self.controllerPipeline.value
         let channel = TVRecoveryChannel(); let client = recoveryClient(channel: channel)

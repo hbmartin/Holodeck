@@ -87,7 +87,7 @@ Previews are required supplied PNGs. The loader checks their signature and Image
 
 Publication validates file contents and catalog structure. It does not precompile every shader; Metal syntax and pipeline creation are checked at runtime when a viewer selects a source. A compilation failure retains working playback according to `ViewerSession` policy.
 
-For a valid candidate, the actor moves the staged publication into its revision directory, atomically writes `current.json`, then updates its in-memory revision and allowlist. Requests read copied assets, so later authoring edits cannot alter already published bytes. There is no folder watcher: the authoring directory is loaded at startup and on **Reload Shaders**.
+For a valid candidate, the actor installs the staged publication into its revision directory, atomically writes `current.json`, then updates its in-memory revision and allowlist. An existing revision is reused only when its manifest matches the candidate and all copied sources and previews satisfy their size limits and hashes. Missing or corrupt copied assets are repaired by an atomic, same-volume directory swap; an unsupported or failed swap leaves the existing directory and current marker intact. Requests read copied assets, so later authoring edits cannot alter already published bytes. There is no folder watcher: the authoring directory is loaded at startup and on **Reload Shaders**.
 
 Startup first attempts to restore the copied publication after resolving the saved bookmark, then reloads the authoring folder. The restored manifest, sources, and preview hashes are checked. A valid restored library can continue serving if the subsequent authoring reload fails.
 
@@ -365,11 +365,12 @@ xcodebuild -project Holodeck.xcodeproj -scheme Holodeck \
   -destination 'platform=tvOS Simulator,name=Apple TV 4K (3rd generation)' build
 
 xcodebuild -project Holodeck.xcodeproj -scheme HolodeckMac \
-  -destination 'platform=macOS,arch=arm64' -parallel-testing-enabled NO test
+  -destination 'platform=macOS,arch=arm64' -parallel-testing-enabled NO \
+  HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests test
 
 xcodebuild -project Holodeck.xcodeproj -scheme Holodeck \
   -destination 'platform=tvOS Simulator,name=Apple TV 4K (3rd generation)' \
-  -parallel-testing-enabled NO test
+  -parallel-testing-enabled NO HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests test
 ```
 
 Use `xcodebuild -showdestinations` with the relevant project/scheme to select an installed simulator or device when its name differs. Swift Certificates is included only for the Mac target; TV uses Security/Network for TLS verification and credentials.
@@ -379,6 +380,8 @@ Use `xcodebuild -showdestinations` with the relevant project/scheme to select an
 Core tests inject catalog sources, storage, and clocks. Loopback TLS tests explicitly enable loopback with isolated server identities. `HOLODECK_LAN_TEST=1` enables actual Bonjour browsing, multicast resolution on a private interface, approval, and remembered-client reconnect. `HOLODECK_AUTHORING_FIXTURE` enables native loading/compilation and rendering of a local authoring repository.
 
 UI tests normally inject offline catalog snapshots through `HOLODECK_UI_TEST_CATALOG`. Explicit `--ui-test-storage-suite <suite>` sessions isolate preferences and disk caches. Cleanup launches use `--ui-test-cleanup-storage-suite` to remove that suite and its test credentials, with offline services so cleanup cannot recreate live state. DEBUG-only local-library/LAN flags select real loaders/transports with isolated Keychain namespaces; they retain production address and approval checks when advertising on the LAN.
+
+Mac window-persistence tests terminate the viewer and launch `--ui-test-inspect-preferences` to read saved frame keys through the app's own UserDefaults domain. The inspection view exposes a versioned accessibility snapshot and constructs no viewer, library, or renderer model; it does not autosave a viewer frame. The UI runner never reads the app's container plist directly. Inspection is excluded from Release builds. TV focus tests combine `--ui-test-pending-pairing` with `--ui-test-empty-cache` for a controlled empty local picker without discovery or credentials.
 
 For the opt-in physical TV test, keep a debug Mac validation app running with these launch arguments (set in Xcode's Run arguments or when launching the built app):
 
@@ -392,7 +395,8 @@ Use the standard `HolodeckShaders` authoring library with `plasma` as its defaul
 TEST_RUNNER_HOLODECK_PHYSICAL_LAN_TEST=1 \
 xcodebuild -project Holodeck.xcodeproj -scheme Holodeck \
   -destination 'platform=tvOS,id=<your-device-id>' -parallel-testing-enabled NO \
-  -only-testing:HolodeckUITests/HolodeckUITests/testPhysicalLocalNetworkPairingAndRememberedPlayback test
+  -only-testing:HolodeckUITests/HolodeckUITests/testPhysicalLocalNetworkPairingAndRememberedPlayback \
+  HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests test
 ```
 
 Compare the code printed by the test with the Mac's code and click **Approve**. The test checks downloads, playback, and authentication after relaunch, then cleans its TV credentials/cache. Add `TEST_RUNNER_HOLODECK_PHYSICAL_OFFLINE_TEST=1` to check cached playback after stopping the Mac server when the test prints its offline prompt. Afterward, terminate the Mac validation app and launch it with the same suite and `--ui-test-cleanup-storage-suite` to remove its test state. If several servers are advertising, select the validation host before expecting its pairing request; the test is simplest with only that host available.

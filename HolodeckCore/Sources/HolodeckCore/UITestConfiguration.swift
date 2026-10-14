@@ -43,7 +43,8 @@ nonisolated public struct UITestConfiguration: Sendable {
         if contains("--ui-test-cleanup-storage-suite") { return .offline() }
         #if DEBUG
         if contains("--ui-test-pending-pairing") {
-            return CatalogService(initialCatalog: catalog, storage: .disabled, enabled: false, usesLocalNetwork: true)
+            return CatalogService(initialCatalog: contains("--ui-test-empty-cache") ? nil : catalog,
+                                  storage: .disabled, enabled: false, usesLocalNetwork: true)
         }
         #endif
         if contains("--ui-test-local-network"), let directory = fixtureCacheDirectory {
