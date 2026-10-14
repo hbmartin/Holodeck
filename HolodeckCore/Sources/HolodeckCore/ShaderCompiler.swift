@@ -2,9 +2,11 @@ import Metal
 
 nonisolated public enum ShaderCompilationError: LocalizedError {
     case missingFunction(String)
+    case invalidUniformLayout
 
     public var errorDescription: String? {
         switch self {
+        case .invalidUniformLayout: return "Uniforms must match the 16-byte buffer-0 contract"
         case .missingFunction(let name): return "The shader is missing its \(name) entry point."
         }
     }
@@ -29,20 +31,25 @@ public actor ShaderCompiler: ShaderCompiling {
         let cacheKey = shader.id + ":" + shader.sourceHash
         if let cached = pipelines[cacheKey] { return cached }
         let library = try device.makeLibrary(source: shader.source, options: nil)
-        guard let vertex = library.makeFunction(name: "vertexShader") else {
-            throw ShaderCompilationError.missingFunction("vertexShader")
-        }
-        guard let fragment = library.makeFunction(name: "fragmentShader") else {
-            throw ShaderCompilationError.missingFunction("fragmentShader")
-        }
-        let descriptor = MTLRenderPipelineDescriptor()
-        descriptor.label = shader.title
-        descriptor.vertexFunction = vertex
-        descriptor.fragmentFunction = fragment
-        descriptor.colorAttachments[0].pixelFormat = pixelFormat
-        descriptor.rasterSampleCount = 1
-        let pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
+        let pipeline = try makeShaderPipeline(device: device, library: library, pixelFormat: pixelFormat, label: shader.title)
         pipelines[cacheKey] = pipeline
         return pipeline
     }
+}
+
+nonisolated func makeShaderPipeline(device: any MTLDevice, library: any MTLLibrary,
+                               pixelFormat: MTLPixelFormat, label: String? = nil) throws -> any MTLRenderPipelineState {
+    guard let vertex = library.makeFunction(name: "vertexShader") else {
+        throw ShaderCompilationError.missingFunction("vertexShader")
+    }
+    guard let fragment = library.makeFunction(name: "fragmentShader") else {
+        throw ShaderCompilationError.missingFunction("fragmentShader")
+    }
+    let descriptor = MTLRenderPipelineDescriptor()
+    if let label { descriptor.label = label }
+    descriptor.vertexFunction = vertex
+    descriptor.fragmentFunction = fragment
+    descriptor.colorAttachments[0].pixelFormat = pixelFormat
+    descriptor.rasterSampleCount = 1
+    return try device.makeRenderPipelineState(descriptor: descriptor)
 }

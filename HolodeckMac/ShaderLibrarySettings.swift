@@ -8,6 +8,7 @@ final class MacLibraryModel {
     var folder: URL?
     var isReloading = false
     var error: String?
+    var previewWarnings: [ShaderPreviewWarning] = []
     var serverState = LocalServerState()
     @ObservationIgnored private let catalog: DirectoryCatalog
     @ObservationIgnored private let server: LocalCatalogServer
@@ -95,7 +96,8 @@ final class MacLibraryModel {
                 // Prepare the bookmark before replacing the current publication.
                 let bookmark = saveBookmark ? try url.bookmarkData(options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess],
                     includingResourceValuesForKeys: nil, relativeTo: nil) : nil
-                _ = try await catalog.reload(from: url)
+                let result = try await catalog.reload(from: url)
+                previewWarnings = result.previewWarnings
                 if let bookmark { defaults?.set(bookmark, forKey: "holodeck.shaderFolderBookmark") }
                 if folder != url {
                     scopedURL?.stopAccessingSecurityScopedResource(); scopedURL = nil
@@ -152,7 +154,12 @@ struct ShaderLibrarySettings: View {
                     HStack { Text(error).foregroundStyle(.red).textSelection(.enabled); Spacer() }
                         .accessibilityElement(children: .combine).accessibilityLabel(error).accessibilityIdentifier("shader-library-error")
                 }
-                Text("Changes are shared after Reload Shaders. Preview images come from the shader folder.")
+                ForEach(library.previewWarnings, id: \.shaderID) { warning in
+                    Text("\(warning.shaderID): using a gradient preview. \(warning.message)")
+                        .foregroundStyle(.secondary).textSelection(.enabled)
+                        .accessibilityIdentifier("shader-preview-warning-" + warning.shaderID)
+                }
+                Text("Changes are shared after Reload Shaders. Previews are generated and cached on this Mac.")
                     .font(.caption).foregroundStyle(.secondary)
                 #if DEBUG
                 if library.isTestingReloadHeld {

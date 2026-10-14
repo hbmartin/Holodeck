@@ -19,21 +19,37 @@ nonisolated struct DirectoryCatalogFileOperations: Sendable {
     }
 }
 
+public struct ShaderPreviewWarning: Sendable, Equatable {
+    public let shaderID: String
+    public let message: String
+}
+
+public struct CatalogReloadResult: Sendable {
+    public let catalog: ValidatedCatalog
+    public let previewWarnings: [ShaderPreviewWarning]
+}
+
 /// App-owned immutable publications. Requests never read the authoring directory.
 public actor DirectoryCatalog {
     private let directory: URL
     private let files: DirectoryCatalogFileOperations
+    private let previews: ShaderPreviewGenerator
+    private var reloading = false
+    private var reloadWaiters: [CheckedContinuation<Void, Never>] = []
     private var currentRevision: String?
     private var allowed: [String: Set<String>] = [:]
     private var leases: [UUID: String] = [:]
 
     public init(directory: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("Holodeck/LocalCatalog", isDirectory: true)) {
+        .appendingPathComponent("Holodeck/LocalCatalog", isDirectory: true),
+                previewGenerator: ShaderPreviewGenerator? = nil) {
         self.directory = directory; files = DirectoryCatalogFileOperations()
+        previews = previewGenerator ?? ShaderPreviewGenerator(directory: directory.appendingPathComponent("preview-cache"))
     }
 
-    init(directory: URL, files: DirectoryCatalogFileOperations) {
+    init(directory: URL, files: DirectoryCatalogFileOperations, previewGenerator: ShaderPreviewGenerator? = nil) {
         self.directory = directory; self.files = files
+        previews = previewGenerator ?? ShaderPreviewGenerator(directory: directory.appendingPathComponent("preview-cache"))
     }
 
     public nonisolated var source: CatalogSource {
@@ -67,7 +83,18 @@ public actor DirectoryCatalog {
     }
 
     @discardableResult
-    public func reload(from root: URL) throws -> ValidatedCatalog {
+    public func reload(from root: URL) async throws -> CatalogReloadResult {
+        if reloading { await withCheckedContinuation { reloadWaiters.append($0) } }
+        else { reloading = true }
+        defer {
+            if reloadWaiters.isEmpty { reloading = false }
+            else { reloadWaiters.removeFirst().resume() }
+        }
+        try Task.checkCancellation()
+        return try await reloadCandidate(from: root)
+    }
+
+    private func reloadCandidate(from root: URL) async throws -> CatalogReloadResult {
         let fm = FileManager.default
         try fm.createDirectory(at: directory, withIntermediateDirectories: true)
         let stage = directory.appendingPathComponent("stage-" + UUID().uuidString, isDirectory: true)
@@ -121,12 +148,6 @@ public actor DirectoryCatalog {
                   let text = String(validating: bytes, as: UTF8.self) else {
                 throw LocalCatalogError.invalidFile(folder + "body.metal", "Assembled source must be UTF-8 and within the source size limits.")
             }
-            let previewPath = folder + "preview.png", png = try read(previewPath, limit: 8_388_608)
-            guard png.starts(with: [137, 80, 78, 71, 13, 10, 26, 10]),
-                  let image = CGImageSourceCreateWithData(png as CFData, nil),
-                  CGImageSourceCreateImageAtIndex(image, 0, nil) != nil else {
-                throw LocalCatalogError.invalidFile(previewPath, "Expected a valid PNG preview.")
-            }
             let dependencies = sourcePaths + [metadataPath]
             let date = try dependencies.map { path in
                 try root.appendingPathComponent(path).resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate ?? .distantPast
@@ -134,14 +155,14 @@ public actor DirectoryCatalog {
             var entry = metadata.filter { ["id", "name", "category", "description", "colors", "discovery"].contains($0.key) }
             entry["updatedAt"] = date.ISO8601Format(.init(includingFractionalSeconds: true))
             entry["sourcePath"] = "sources/\(id).metal"; entry["sourceSHA256"] = CatalogHash.sha256(bytes)
-            entry["previewPath"] = "previews/\(id).png"; entry["previewSHA256"] = CatalogHash.sha256(png)
+            entry["previewPath"] = "previews/\(id).png"; entry["previewSHA256"] = String(repeating: "0", count: 64)
             do {
                 let decoded = try JSONDecoder().decode(CatalogManifest.Entry.self, from: JSONSerialization.data(withJSONObject: entry))
                 let single = CatalogManifest(schemaVersion: 1, defaultShaderID: id, sourceRevision: String(repeating: "0", count: 64), shaders: [decoded])
                 try single.validate()
             } catch { throw LocalCatalogError.invalidFile(metadataPath, error.localizedDescription) }
             entries.append(entry); sources[id] = text
-            for (path, data) in [("sources/\(id).metal", bytes), ("previews/\(id).png", png)] {
+            for (path, data) in [("sources/\(id).metal", bytes)] {
                 paths.insert(path); try data.write(to: stage.appendingPathComponent(path), options: .atomic)
             }
         }
@@ -153,6 +174,20 @@ public actor DirectoryCatalog {
         var manifest: CatalogManifest
         do { manifest = try CatalogBuilder(manifest: JSONDecoder().decode(CatalogManifest.self, from: manifestData)).manifest }
         catch { throw LocalCatalogError.invalidFile("index.json", error.localizedDescription) }
+        var warnings: [ShaderPreviewWarning] = [], cacheKeys: Set<String> = []
+        for index in manifest.shaders.indices {
+            try Task.checkCancellation()
+            let entry = manifest.shaders[index]
+            let generated = try await previews.preview(source: sources[entry.id]!, colors: entry.colors)
+            cacheKeys.insert(generated.cacheKey)
+            if let diagnostic = generated.diagnostic {
+                warnings.append(ShaderPreviewWarning(shaderID: entry.id, message: diagnostic))
+            }
+            manifest.shaders[index].previewSHA256 = CatalogHash.sha256(generated.png)
+            paths.insert(entry.previewPath)
+            try generated.png.write(to: stage.appendingPathComponent(entry.previewPath), options: .atomic)
+        }
+        try Task.checkCancellation()
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         var canonical = try JSONSerialization.jsonObject(with: encoder.encode(manifest)) as! [String: Any]
         canonical["sourceRevision"] = nil
@@ -174,7 +209,8 @@ public actor DirectoryCatalog {
         allowed[revision] = paths; currentRevision = revision
         // Retain the previous publication as well as all connection-pinned publications.
         trim(previous: previous)
-        return catalog
+        await previews.prune(keeping: cacheKeys)
+        return CatalogReloadResult(catalog: catalog, previewWarnings: warnings)
     }
 
     private func readPublicationFile(_ url: URL, limit: Int) throws -> Data {
