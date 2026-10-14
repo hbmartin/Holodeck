@@ -83,9 +83,14 @@ public actor CatalogService {
     public init(initialCatalog: ValidatedCatalog? = nil, source: CatalogSource = .unavailable, storage: CatalogStorage = .live,
          clock: any Clock<Duration> = ContinuousClock(), enabled: Bool = true, usesLocalNetwork: Bool = false) {
         self.usesLocalNetwork = usesLocalNetwork
-        self.initialCatalog = initialCatalog
-        snapshot = initialCatalog
-        loadedCache = initialCatalog != nil
+        var initial = initialCatalog
+        if let initialCatalog, source.isLocalPublication, initialCatalog.publicationRevision.count == 64,
+           (try? CatalogPublication.validate(initialCatalog.snapshot.manifest, revision: initialCatalog.publicationRevision)) == nil {
+            initial = nil
+        }
+        self.initialCatalog = initial
+        snapshot = initial
+        loadedCache = initial != nil
         self.source = source
         self.storage = storage
         self.clock = AnyClock(clock)
@@ -101,7 +106,13 @@ public actor CatalogService {
             loadedCache = true
             if let data = try? storage.read("snapshot.json"),
                let value = try? JSONDecoder().decode(CatalogSnapshot.self, from: data) {
-                snapshot = try? value.validated()
+                do {
+                    let candidate = try value.validated()
+                    try validatePublication(candidate.snapshot.manifest, revision: candidate.publicationRevision)
+                    snapshot = candidate
+                } catch {
+                    Diagnostics.catalog.error("Discarding invalid cached publication: \(error.localizedDescription, privacy: .public)")
+                }
             }
         }
         return snapshot
@@ -140,17 +151,15 @@ public actor CatalogService {
         let id = UUID()
         let waiter = CatalogRefreshWaiter()
         refreshWaiters[id] = waiter
+        defer { refreshWaiters[id] = nil }
         let value = try await withTaskCancellationHandler {
             try await waiter.value()
         } onCancel: {
             waiter.resolve(.failure(CancellationError()))
-            Task { await self.removeRefreshWaiter(id) }
         }
         try Task.checkCancellation()
         return value
     }
-
-    private func removeRefreshWaiter(_ id: UUID) { refreshWaiters[id] = nil }
 
     private func finishRefresh(_ result: Result<CatalogRefreshOutcome, Error>) {
         refreshTask = nil
@@ -160,21 +169,29 @@ public actor CatalogService {
     }
 
     private func downloadPublication() async throws -> ValidatedCatalog? {
-        let head = try JSONDecoder().decode(CatalogHead.self, from: await source.get(.head, 65_536))
+        let head = try JSONDecoder().decode(CatalogHead.self, from: await source.get(.head, CatalogLimits.headBytes))
         let revision = head.revision
         guard CatalogHash.isRevision(revision) else { throw CatalogError.invalidManifest }
         if revision == snapshot?.publicationRevision { return nil }
-        let manifest = try JSONDecoder().decode(CatalogManifest.self, from: await source.get(.asset(revision: revision, path: "catalog.json"), 2_097_152))
+        let manifest = try JSONDecoder().decode(CatalogManifest.self, from: await source.get(.asset(revision: revision, path: "catalog.json"), CatalogLimits.manifestBytes))
         var builder = try CatalogBuilder(manifest: manifest)
+        try validatePublication(builder.manifest, revision: revision)
         // Bounded sequential downloads keep memory and transfer concurrency predictable.
         for entry in manifest.shaders {
-            let data = try await source.get(.asset(revision: revision, path: entry.sourcePath), 1_048_576)
+            let data = try await source.get(.asset(revision: revision, path: entry.sourcePath), CatalogLimits.sourceBytes)
             try builder.addSource(data, for: entry)
         }
         let candidate = try builder.finish(revision: revision)
         try storage.write("snapshot.json", JSONEncoder().encode(candidate.snapshot))
         snapshot = candidate
         return candidate
+    }
+
+    private func validatePublication(_ manifest: CatalogManifest, revision: String) throws {
+        // Legacy revisions identify a repository commit rather than manifest content.
+        if source.isLocalPublication, revision.count == 64 {
+            try CatalogPublication.validate(manifest, revision: revision)
+        }
     }
 
     public func preview(_ preview: ShaderPreview) async throws -> Data {
@@ -244,7 +261,9 @@ public actor CatalogService {
         let key = PreviewFailureKey(preview)
         let attempts = min((previewFailures.value(for: key)?.attempts ?? 0) + 1, 5)
         let permanent: Bool
-        if case CatalogError.invalidPreview = error { permanent = true } else { permanent = false }
+        if case CatalogError.invalidPreview = error {
+            permanent = !enabled || !source.isLocalPublication
+        } else { permanent = false }
         let waitsForAvailability = source.waitForAvailability != nil && (error as? LocalCatalogError)?.isConnectivityFailure == true
         let retryAt = permanent || waitsForAvailability ? nil : clock.now.advanced(by: .seconds(min(30 * (1 << (attempts - 1)), 300)))
         previewFailures.insert(PreviewFailure(error: error, attempts: attempts, retryAt: retryAt,
@@ -261,7 +280,7 @@ public actor CatalogService {
         let filename = "preview-\(preview.hash).png"
         if let cached = try? storage.read(filename), validPreview(cached, hash: preview.hash) { return cached }
         guard enabled else { throw CatalogError.invalidPreview }
-        let data = try await source.get(.asset(revision: preview.publicationRevision, path: preview.path), 8_388_608)
+        let data = try await source.get(.asset(revision: preview.publicationRevision, path: preview.path), CatalogLimits.previewBytes)
         guard validPreview(data, hash: preview.hash) else { throw CatalogError.invalidPreview }
         // An image-cache write failure should not prevent the fetched image from displaying.
         try? storage.write(filename, data)
@@ -312,7 +331,7 @@ public actor CatalogService {
     }
 
     private func validPreview(_ data: Data, hash: String) -> Bool {
-        data.count <= 8_388_608 && data.starts(with: [137, 80, 78, 71, 13, 10, 26, 10]) && CatalogHash.sha256(data) == hash
+        data.count <= CatalogLimits.previewBytes && data.starts(with: [137, 80, 78, 71, 13, 10, 26, 10]) && CatalogHash.sha256(data) == hash
     }
 
 

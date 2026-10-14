@@ -93,9 +93,11 @@ public actor LocalCatalogClient {
     var currentBrowserID: UUID? { browserID }
     var observerCount: Int { observers.count }
     public nonisolated var source: CatalogSource {
-        CatalogSource(waitForAvailability: { [self] in try await waitForAvailability() }) {
+        var source = CatalogSource(waitForAvailability: { [self] in try await waitForAvailability() }) {
             [self] request, limit in try await fetch(request, limit: limit)
         }
+        source.isLocalPublication = true
+        return source
     }
 
     public func updates() -> AsyncStream<LocalClientState> { makeUpdates(id: UUID()) }

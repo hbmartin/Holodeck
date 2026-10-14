@@ -34,7 +34,7 @@ public actor ShaderPreviewGenerator {
         let key = CatalogHash.sha256(Data("\(rendererVersion):1280:720:3:bgra8Unorm_srgb:\(CatalogHash.sha256(Data(source.utf8)))".utf8))
         let pngURL = directory.appendingPathComponent(key + ".png")
         let hashURL = directory.appendingPathComponent(key + ".sha256")
-        if let size = try? pngURL.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 8_388_608,
+        if let size = try? pngURL.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= CatalogLimits.previewBytes,
            let png = try? Data(contentsOf: pngURL),
            let hash = try? String(contentsOf: hashURL, encoding: .utf8),
            CatalogHash.sha256(png) == hash, ShaderPNG.isValid(png) {

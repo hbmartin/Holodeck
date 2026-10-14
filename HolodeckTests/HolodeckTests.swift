@@ -1030,13 +1030,22 @@ extension HolodeckTests {
             let change: UIButton = try findView("change-mac", in: controller)
             let check: UIButton = try findView("check-scene-updates", in: controller)
             XCTAssertEqual(controller.hasRestoredFocus(change), local)
-            XCTAssertEqual(controller.hasRestoredFocus(check), local)
+            XCTAssertFalse(controller.hasRestoredFocus(check))
             XCTAssertEqual(controller.hasRestoredFocus(controller.view), !local)
             XCTAssertFalse(controller.hasRestoredFocus(UIView()))
             XCTAssertFalse(controller.hasRestoredFocus(nil))
             controller.rememberPickerFocus(check)
             controller.rememberPickerFocus(nil)
-            if local { XCTAssertTrue(controller.preferredFocusEnvironments.first === check) }
+            if local {
+                XCTAssertTrue(controller.preferredFocusEnvironments.first === check)
+                controller.setSceneActive(false)
+                controller.rememberPickerFocus(change)
+                XCTAssertTrue(controller.preferredFocusEnvironments.first === check)
+                XCTAssertFalse(controller.hasRestoredFocus(change))
+                XCTAssertTrue(controller.hasRestoredFocus(check))
+                controller.setSceneActive(true)
+                XCTAssertTrue(controller.preferredFocusEnvironments.first === check)
+            }
             else { XCTAssertTrue(controller.preferredFocusEnvironments.first === controller.view) }
             controller.closePickerFromRemote()
             XCTAssertTrue(controller.hasRestoredFocus(controller.view))

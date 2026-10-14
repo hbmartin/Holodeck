@@ -4,6 +4,56 @@ import CoreGraphics
 @testable import HolodeckCore
 
 final class PreviewRecoveryTests: XCTestCase {
+    func testLocalCorruptionRetriesWithBoundedBackoffAndRecoversWithoutChangingIdentity() async throws {
+        let box = CatalogTestBox()
+        var source = box.source; source.isLocalPublication = true
+        let service = CatalogService(source: source, storage: box.storage, clock: box.clock)
+        let preview = TestCatalog.shaders[0].preview!
+        box.setResponses(["/" + preview.path: Data("corrupt".utf8)])
+        for (attempt, delay) in [30, 60, 120, 240, 300, 300].enumerated() {
+            do { _ = try await service.preview(preview); XCTFail("Corrupt preview accepted") }
+            catch CatalogError.invalidPreview {}
+            XCTAssertEqual(box.urls.count, attempt + 1)
+            let waiting = Task { try await service.waitForPreviewRetry(preview) }
+            try await waitForRetrySleeper(in: service)
+            await box.clock.advance(by: .seconds(delay - 1))
+            let count = await service.previewRetryWaiterCount
+            XCTAssertEqual(count, 1)
+            do { _ = try await service.preview(preview); XCTFail("Cooldown bypassed") } catch CatalogError.invalidPreview {}
+            XCTAssertEqual(box.urls.count, attempt + 1)
+            await box.clock.advance(by: .seconds(1))
+            let retry = try await waiting.value
+            XCTAssertTrue(retry)
+        }
+        box.setResponses(["/" + preview.path: try TestCatalog.preview(named: "preview-\(preview.hash).png")])
+        let recovered = try await service.previewImage(preview, maxPixelSize: 640)
+        XCTAssertGreaterThan(recovered.width, 0)
+        let failures = await service.previewFailureCount
+        XCTAssertEqual(failures, 0)
+        XCTAssertEqual(box.urls.count, 7)
+    }
+
+    func testLocalCorruptionRetryCancellationAndInvalidDescriptorsStayTerminal() async throws {
+        let box = CatalogTestBox()
+        var source = box.source; source.isLocalPublication = true
+        let service = CatalogService(source: source, storage: .disabled, clock: box.clock)
+        let preview = TestCatalog.shaders[0].preview!
+        box.setResponses(["/" + preview.path: Data("corrupt".utf8)])
+        do { _ = try await service.preview(preview) } catch {}
+        let waiting = Task { try await service.waitForPreviewRetry(preview) }
+        try await waitForRetrySleeper(in: service)
+        waiting.cancel()
+        do { _ = try await waiting.value; XCTFail("Cancelled cooldown completed") } catch is CancellationError {}
+        let invalid = ShaderPreview(path: "../preview.png", hash: preview.hash, publicationRevision: preview.publicationRevision)
+        do { _ = try await service.waitForPreviewRetry(invalid); XCTFail("Invalid descriptor retried") }
+        catch CatalogError.invalidPreview {}
+        XCTAssertEqual(box.urls.count, 1)
+        let offline = CatalogService(source: source, storage: .disabled, enabled: false)
+        do { _ = try await offline.preview(preview) } catch {}
+        let retry = try await offline.waitForPreviewRetry(preview)
+        XCTAssertFalse(retry)
+    }
+
     func testRetryWaitUsesCooldownAndCancellationAndRejectsPermanentFailures() async throws {
         let box = CatalogTestBox()
         let service = CatalogService(source: box.source, storage: .disabled, clock: box.clock)

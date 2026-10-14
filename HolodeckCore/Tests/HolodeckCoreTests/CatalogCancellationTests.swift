@@ -78,7 +78,8 @@ final class CatalogCancellationTests: XCTestCase {
         await fulfillment(of: [started], timeout: 3)
         first.cancel()
         assertCancelled(try await result(of: first))
-        try await waitForWaiters(0, in: service)
+        let remaining = await service.refreshWaiterCount
+        XCTAssertEqual(remaining, 0)
         let later = Task { try await service.refresh(force: true) }
         try await waitForWaiters(1, in: service)
         await gate.release()
@@ -89,14 +90,15 @@ final class CatalogCancellationTests: XCTestCase {
     }
 
     func testNoWaitersStillPublishesAndCancellationCompletionRaceResolvesOnce() async throws {
-        for iteration in 0..<20 {
+        for iteration in 0..<100 {
             let (service, box, gate, started) = try flight()
             let task = Task { try await service.refresh() }
             await fulfillment(of: [started], timeout: 3)
             if iteration.isMultiple(of: 2) {
                 task.cancel()
                 assertCancelled(try await result(of: task))
-                try await waitForWaiters(0, in: service)
+                let remaining = await service.refreshWaiterCount
+                XCTAssertEqual(remaining, 0)
                 await gate.release()
             } else {
                 async let release: Void = gate.release()

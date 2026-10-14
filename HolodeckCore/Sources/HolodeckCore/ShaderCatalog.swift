@@ -163,7 +163,7 @@ nonisolated public struct CatalogManifest: Codable, Sendable {
 
     fileprivate func validatedDates() throws -> [String: Date] {
         var dates: [String: Date] = [:]
-        guard schemaVersion == 1, !shaders.isEmpty, shaders.count <= 500,
+        guard schemaVersion == 1, !shaders.isEmpty, shaders.count <= CatalogLimits.shaderCount,
               CatalogHash.isRevision(sourceRevision),
               Set(shaders.map(\.id)).count == shaders.count,
               shaders.contains(where: { $0.id == defaultShaderID }) else { throw CatalogError.invalidManifest }
@@ -190,7 +190,7 @@ nonisolated public struct CatalogManifest: Codable, Sendable {
                       collection.id.range(of: "^[a-z0-9]+(-[a-z0-9]+)*$", options: .regularExpression) != nil,
                       !collection.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, collection.name.count <= 200,
                       !collection.description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, collection.description.count <= 2000,
-                      !collection.shaderIDs.isEmpty, collection.shaderIDs.count <= 500,
+                      !collection.shaderIDs.isEmpty, collection.shaderIDs.count <= CatalogLimits.shaderCount,
                       Set(collection.shaderIDs).count == collection.shaderIDs.count,
                       Set(collection.shaderIDs).isSubset(of: ids) else { throw CatalogError.invalidManifest }
             }
@@ -273,11 +273,11 @@ nonisolated struct CatalogBuilder {
     }
 
     mutating func addSource(_ data: Data, for entry: CatalogManifest.Entry) throws {
-        guard !data.isEmpty, data.count <= 1_048_576,
+        guard !data.isEmpty, data.count <= CatalogLimits.sourceBytes,
               CatalogHash.sha256(data) == entry.sourceSHA256,
               let source = String(validating: data, as: UTF8.self) else { throw CatalogError.invalidSource }
         sourceBytes += data.count
-        guard sourceBytes <= 16_777_216 else { throw CatalogError.oversizedResponse }
+        guard sourceBytes <= CatalogLimits.totalSourceBytes else { throw CatalogError.oversizedResponse }
         sources[entry.id] = source
     }
 

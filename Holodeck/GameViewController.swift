@@ -28,6 +28,8 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     private let changeMacButton = UIButton(type: .system)
     private let checkUpdatesButton = UIButton(type: .system)
     private weak var emptyPickerFocusButton: UIButton?
+    private var emptyPickerRestorationPending = false
+    private var sceneIsActive = false
     private var localUpdatesTask: Task<Void, Never>?
     private var localActivityTask: Task<Void, Never>?
     private var localState = LocalClientState()
@@ -89,8 +91,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         if let returnFocusButton, !returnFocusButton.isHidden { return [returnFocusButton] }
         if shaders.isEmpty {
             guard catalogService.usesLocalNetwork else { return [view] }
-            if let button = emptyPickerFocusButton, !button.isHidden, button.isEnabled { return [button] }
-            return [changeMacButton]
+            return [preferredEmptyPickerControl]
         }
         if visibleShaders.isEmpty { return [resetButton] }
         if let cell = collectionView.cellForItem(at: browsingIndexPath ?? preferredShaderIndexPath) { return [cell] }
@@ -143,6 +144,10 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     func setSceneActive(_ active: Bool) {
+        if !active, pickerIsVisible, shaders.isEmpty, catalogService.usesLocalNetwork {
+            emptyPickerRestorationPending = true
+        }
+        sceneIsActive = active
         session.setActive(active)
         if unavailableMessage != nil { (view as? MTKView)?.isPaused = true }
         if active {
@@ -152,13 +157,19 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             if !hasRestoredFocus(focused) {
                 setNeedsFocusUpdate()
                 updateFocusIfNeeded()
-            }
+            } else { emptyPickerRestorationPending = false }
         }
     }
 
+    private var preferredEmptyPickerControl: UIButton {
+        if let button = emptyPickerFocusButton, !button.isHidden, button.isEnabled { return button }
+        return changeMacButton
+    }
+
     func hasRestoredFocus(_ focused: UIView?) -> Bool {
-        if pickerIsVisible, unavailableMessage == nil, !shaders.isEmpty || catalogService.usesLocalNetwork {
-            return focused?.isDescendant(of: picker) == true
+        if pickerIsVisible, unavailableMessage == nil {
+            if shaders.isEmpty, catalogService.usesLocalNetwork { return focused === preferredEmptyPickerControl }
+            if !shaders.isEmpty { return focused?.isDescendant(of: picker) == true }
         }
         return focused === view
     }
@@ -166,7 +177,11 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     func rememberPickerFocus(_ focused: UIView?) {
         guard pickerIsVisible, shaders.isEmpty, catalogService.usesLocalNetwork,
               let button = focused as? UIButton, button.isDescendant(of: localControls) else { return }
-        // A nil update while Control Center is open must preserve the previous local control.
+        if emptyPickerRestorationPending {
+            guard sceneIsActive, button === preferredEmptyPickerControl else { return }
+            emptyPickerRestorationPending = false
+        }
+        // Ignore incidental restoration callbacks until UIKit reaches the saved control.
         emptyPickerFocusButton = button
     }
 
@@ -306,6 +321,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             updateStatus()
             showLoadingHintIfNeeded()
         case .catalogChanged:
+            if !shaders.isEmpty { emptyPickerFocusButton = nil; emptyPickerRestorationPending = false }
             catalogErrorMessage = nil
             (view as? ShowcaseMetalView)?.acceptsFocus = !pickerIsVisible || unavailableMessage != nil
             refreshBrowsing()
@@ -484,6 +500,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         }
         // Layout can deliver focus callbacks for the previously visible item.
         emptyPickerFocusButton = nil
+        emptyPickerRestorationPending = false
         browsingIndexPath = openingIndexPath
         browsingShaderID = visibleShaders.indices.contains(openingIndexPath.item) ? visibleShaders[openingIndexPath.item].id : nil
         collectionView.setNeedsFocusUpdate()
@@ -510,6 +527,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         chooserSourceButton = nil
         returnFocusButton = nil
         emptyPickerFocusButton = nil
+        emptyPickerRestorationPending = false
         selectGesture.isEnabled = true
         menuGesture.isEnabled = false
         (view as? ShowcaseMetalView)?.acceptsFocus = true

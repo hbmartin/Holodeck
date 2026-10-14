@@ -38,6 +38,9 @@ final class MacModel {
     @ObservationIgnored private var memoryPressure: (any DispatchSourceMemoryPressure)?
 
     init() {
+        #if DEBUG
+        MacInspectionLifecycle.snapshot.modelCreations += 1
+        #endif
         var autosaveName: String? = "HolodeckViewer-live"
         var defaults: UserDefaults? = UserDefaults.standard
         var directoryCatalog = DirectoryCatalog()

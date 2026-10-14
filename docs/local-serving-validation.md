@@ -97,3 +97,66 @@ The opt-in physical test uses real production transport and runtime Metal compil
 The router-level WAN-blocked test was skipped at the user's request. Physical permission denial/recovery, Mac sleep/wake, and minimum macOS 15 runtime checks remain manual release checks. Automated privacy/error mapping, revocation, TLS pinning, and offline-cache tests do not substitute for testing those OS and router behaviors.
 
 Run instructions and test opt-ins are in [the local shader library workflow](shader-catalog-workflow.md).
+
+## Publication integrity, responsiveness, and viewer recovery — 2026-10-13
+
+This follow-up starts from `f41d8b0`, after generated-preview work merged. Local 64-character publication revisions now bind normalized manifest metadata as well as asset hashes. Directory restoration rejects altered metadata and mismatched manifest revisions. Directory and local-client sources also identify local publications internally, so poisoned viewer snapshots are not activated and the repaired snapshot can be downloaded again under the same revision. Healthy offline snapshots and legacy 40-character commit revisions remain supported. Invalid local snapshots require a reachable Mac to recover; their existing files are replaced on successful refresh, without a storage-format migration.
+
+Reload preparation, staging writes, hashing, and existing-publication verification run on one serial I/O queue. Candidate revisions are retained while verification suspends the catalog actor; current head and asset requests continue during that work. Installation, marker writes, allowlists, and leases advance on the actor without suspension. Startup and subsequent maintenance reclaim only abandoned `stage-<UUID>` directories, exclude active stages, and retry logged deletion failures. Resolved filesystem paths identify stages so `/var` and `/private/var` aliases cannot cause active work to be removed. Transfer bounds are shared, and the final encoded manifest is checked against the 2 MiB limit before installation. The regression includes normalization expanding a valid 500-scene input beyond that bound, plus an exact encoded-size boundary.
+
+Enabled local previews retry integrity failures at 30, 60, 120, 240, and then 300-second intervals. Visible TV cards and Mac previews retain their retry loops through same-revision/same-hash repairs. Descriptor validation, hashing, cancellation, and permanent suppression for other sources remain covered. Empty local TV pickers freeze the remembered control across inactivity and ignore incidental restoration callbacks until that control regains focus. Refresh waiters leave the actor registry before their caller completes; cancellation/completion races run 100 iterations while shared downloads continue.
+
+The DEBUG preferences interface supports refresh without relaunching. Its schema-2 snapshot includes actual model/library construction and server-start-attempt counters. The runner validates those fields, asserts zero lifecycle activity during inspection and refresh, and polls expected persisted frame transitions for up to 10 seconds at 250-millisecond intervals. Malformed snapshots fail immediately. The inspection flag, refresh identifier, and lifecycle type name are absent from the Release Mac executable.
+
+Checks executed:
+
+- Focused directory, local publication integrity, cancellation, preview recovery, client recovery, protocol, viewer-session, and generated-preview tests: 104 executed, two opt-in skips, zero failures.
+- Complete Mac core suite: 163 executed, six opt-in skips, zero failures. Skips cover release profiling, real Bonjour/LAN access, and supplied authoring/rendering checks.
+- Complete tvOS 27 simulator core suite: 130 executed, three opt-in skips, zero failures. With the added executable product, the package test scheme is `HolodeckCore-Package`; the library-only `HolodeckCore` scheme has no test bundles.
+- TV app unit suite: 43 tests, zero failures, including visible-card repair and forced wrong-control restoration.
+- Complete TV UI suite: 22 executed, one physical-LAN opt-in skipped, zero failures. All Control Center regressions passed, including Select after returning to the empty picker.
+- Focused Mac preferences/inspection suite: five tests, zero failures, covering persistence, cleanup, lifecycle counters, schema validation, and deterministic delayed-visibility/timeout polling.
+- Complete Mac UI run: 26 executed, two physical-input opt-in skips, five failures. Logs included native window interruptions and an event-synthesis timeout. The five failing folder-selection, alert, reopening, and held-reload cases all passed in a subsequent isolated six-test run, which also reran the preferences polling test. All 24 non-skipped Mac UI cases passed across these runs; the original complete run is not reported as passing.
+- Both app targets built in Debug through their test runs and in Release. App checks used `HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests`; built Debug app identifiers were verified as `me.haroldmartin.Holodeck.RecoveryTests` and `me.haroldmartin.HolodeckMac.RecoveryTests`.
+- `git diff --check` passed. Server admission/deadline, transport framing, and package/public product API changes were excluded.
+
+The optimized profile uses the same 256-scene fixture with 1 MiB generated preview bytes and three warm unchanged reloads. The baseline ran before production edits, with the profile fixture added to `f41d8b0`. Baseline reload durations were 803/836/972 ms; head-request p50/p95/max during reload were 0.052/196.039/222.825 ms. The final profile recorded 938/998/1005 ms and 0.044/0.094/0.816 ms respectively. This demonstrates serving responsiveness, not an overall reload-speed improvement: median reload duration increased from 836 to 998 ms in these samples. The final run included Mac UI activity, so these single-machine timings are not a throughput acceptance threshold.
+
+Reproduction commands used for the final checks:
+
+```sh
+swift test --package-path HolodeckCore \
+  --filter 'DirectoryCatalogTests|LocalPublicationIntegrityTests|CatalogCancellationTests|PreviewRecoveryTests|LocalClientRecoveryTests|CatalogNetworkTests|ViewerSessionTests|ShaderPreviewTests'
+swift test --package-path HolodeckCore
+HOLODECK_PROFILE=1 swift test --package-path HolodeckCore -c release \
+  --filter DirectoryReloadPerformanceTests
+# Run from HolodeckCore:
+xcodebuild -scheme HolodeckCore-Package \
+  -destination 'platform=tvOS Simulator,id=73CAAA2D-7B80-420F-B33F-EF4B8F036AAE' \
+  -derivedDataPath ../DerivedData/TVCoreRecovery -disableAutomaticPackageResolution \
+  -parallel-testing-enabled NO test
+# Run app commands from the repository root:
+xcodebuild -project Holodeck.xcodeproj -scheme HolodeckMac \
+  -destination 'platform=macOS,arch=arm64' -derivedDataPath DerivedData/MacLocalServing \
+  -disableAutomaticPackageResolution -parallel-testing-enabled NO \
+  HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests test
+xcodebuild -project Holodeck.xcodeproj -scheme Holodeck \
+  -destination 'platform=tvOS Simulator,id=73CAAA2D-7B80-420F-B33F-EF4B8F036AAE' \
+  -derivedDataPath DerivedData/TVLocalServing -disableAutomaticPackageResolution \
+  -parallel-testing-enabled NO HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests \
+  -only-testing:HolodeckTests test
+xcodebuild -project Holodeck.xcodeproj -scheme Holodeck \
+  -destination 'platform=tvOS Simulator,id=73CAAA2D-7B80-420F-B33F-EF4B8F036AAE' \
+  -derivedDataPath DerivedData/TVLocalServing -disableAutomaticPackageResolution \
+  -parallel-testing-enabled NO HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests \
+  -only-testing:HolodeckUITests test
+xcodebuild -project Holodeck.xcodeproj -scheme HolodeckMac -configuration Release \
+  -destination 'platform=macOS,arch=arm64' -derivedDataPath DerivedData/MacReleaseRecovery \
+  -disableAutomaticPackageResolution HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests build
+xcodebuild -project Holodeck.xcodeproj -scheme Holodeck -configuration Release \
+  -destination 'platform=tvOS Simulator,id=73CAAA2D-7B80-420F-B33F-EF4B8F036AAE' \
+  -derivedDataPath DerivedData/TVReleaseRecovery -disableAutomaticPackageResolution \
+  HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests build
+```
+
+Unsupported-volume repair behavior remains unchanged: there is no rename fallback or recovery journal. The 16-session pool and five-minute unauthenticated deadline remain unchanged, with the previously documented availability limitation deferred. No standalone focus cleanup for comment 11, credential migration, physical-device installation, live LAN/authoring validation, merge, or deployment was performed in this pass.

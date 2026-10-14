@@ -29,6 +29,7 @@ final class MacLibraryModel {
     init(catalog: DirectoryCatalog, session: ViewerSession, defaults: UserDefaults?, testingNamespace: String? = nil, testingAdvertises: Bool = false) {
         self.catalog = catalog; self.session = session; self.defaults = defaults
         #if DEBUG
+        MacInspectionLifecycle.snapshot.libraryCreations += 1
         server = testingNamespace.map { LocalCatalogServer.testing(catalog: catalog, namespace: $0, advertise: testingAdvertises) } ?? LocalCatalogServer(catalog: catalog)
         holdsNextReloadForTesting = testingNamespace != nil && UITestConfiguration(applicationID: "me.haroldmartin.HolodeckMac").contains("--ui-test-hold-library-reload")
         #else
@@ -56,7 +57,7 @@ final class MacLibraryModel {
                         if try await catalog.cached() != nil {
                             ready = true
                             await session.refresh(force: true).value
-                            if !sleeping { try await server.start() }
+                            if !sleeping { try await startServer() }
                         }
                     } catch { self.error = "Couldn’t restore the previous shader library: \(error.localizedDescription)" }
                     isReloading = false
@@ -113,15 +114,21 @@ final class MacLibraryModel {
                     }
                 }
                 #endif
-                if !sleeping { try await server.start() }
+                if !sleeping { try await startServer() }
             } catch { self.error = error.localizedDescription }
         }
+    }
+    private func startServer() async throws {
+        #if DEBUG
+        MacInspectionLifecycle.snapshot.serverStartAttempts += 1
+        #endif
+        try await server.start()
     }
     func setSleeping(_ value: Bool) {
         sleeping = value
         Task {
             if value { await server.stop() }
-            else if ready { do { try await server.start() } catch { self.error = error.localizedDescription } }
+            else if ready { do { try await startServer() } catch { self.error = error.localizedDescription } }
         }
     }
     #if DEBUG
