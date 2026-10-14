@@ -59,7 +59,6 @@ shared/material.metal             # used by material shaders
 shared/fragment.metal
 shaders/<id>/metadata.json
 shaders/<id>/body.metal
-shaders/<id>/preview.png
 ```
 
 `index.json` supplies an ordered `shaders` array, an indexed `defaultShaderID`, and optional collections. It must contain 1–500 unique IDs matching `^[a-z0-9]+(-[a-z0-9]+)*$`, each at most 100 characters. Unindexed shaders are ignored.
@@ -77,15 +76,17 @@ Bodies implement `float3 shade(float2 p, float time, float2 pixel)`; the shared 
 
 Names and descriptions must be nonempty, with limits of 200 and 2,000 characters. Categories are `PROCEDURAL` or `3D MATERIAL`. Colors must be exactly two RGB triplets with finite channel values in 0…1.
 
-Previews are required supplied PNGs. The loader checks their signature and ImageIO decodability, hashes the bytes directly, and copies them unchanged. It does not generate previews or read `preview.json`. Publication runs no repository scripts, Git commands, Python, or Xcode tools.
+The Mac generates previews at 1280×720 and three seconds using the shared offscreen renderer and sRGB target. Successful PNGs are cached in app-owned storage by assembled-source hash, render settings, and renderer version; cache hashes and decoded images are checked before reuse. Legacy `preview.png` and `preview.json` files in the authoring folder are ignored. See [the library workflow](shader-catalog-workflow.md#authoring-format) for cache invalidation and reload behavior.
+
+A shader compilation, GPU render, or PNG encoding failure uses a gradient from its metadata colors and reports a per-shader diagnostic in Settings. Failed renders are retried on reload; successful renders clear the warning. Publication runs no repository scripts, Git commands, Python, or Xcode tools.
 
 ### Validation and atomic replacement
 
 `MacLibraryModel` stores `holodeck.shaderFolderBookmark` in its UserDefaults domain. The bookmark uses `.withSecurityScope` and `.securityScopeAllowOnlyReadAccess`; the app holds scoped access while using the selected folder. A stale bookmark is refreshed after a successful reload. A bookmark that cannot be resolved requires folder selection again.
 
-`DirectoryCatalog.reload(from:)` stages the candidate in app-owned storage, verifies that resolved authoring paths remain within the selected root, assembles bounded UTF-8 sources, and validates all indexed metadata and previews. Errors for authoring files include the relative path. Candidate failures leave the current served revision available.
+`DirectoryCatalog.reload(from:)` stages the candidate in app-owned storage, verifies that resolved authoring paths remain within the selected root, assembles bounded UTF-8 sources, validates all indexed metadata, and generates previews. Errors for authoring files include the relative path. Candidate failures leave the current served revision available.
 
-Publication validates file contents and catalog structure. It does not precompile every shader; Metal syntax and pipeline creation are checked at runtime when a viewer selects a source. A compilation failure retains working playback according to `ViewerSession` policy.
+Preview generation checks Metal syntax and pipeline creation for uncached sources. Render failures produce preview warnings without rejecting an otherwise valid catalog. Viewer activation compiles the selected source independently; an activation failure retains working playback according to `ViewerSession` policy.
 
 For a valid candidate, the actor installs the staged publication into its revision directory, atomically writes `current.json`, then updates its in-memory revision and allowlist. An existing revision is reused only when its manifest matches the candidate and all copied sources and previews satisfy their size limits and hashes. Missing or corrupt copied assets are repaired by an atomic, same-volume directory swap; an unsupported or failed swap leaves the existing directory and current marker intact. Requests read copied assets, so later authoring edits cannot alter already published bytes. There is no folder watcher: the authoring directory is loaded at startup and on **Reload Shaders**.
 
