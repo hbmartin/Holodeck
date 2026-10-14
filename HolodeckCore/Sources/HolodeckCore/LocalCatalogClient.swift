@@ -26,6 +26,7 @@ nonisolated public struct LocalClientState: Sendable {
     public var macs: [LocalMac] = []
     public var macChoiceID: UUID?
     public var generation: UInt64 = 0
+    public var requestsSupported = false
     public init() {}
 }
 
@@ -59,6 +60,9 @@ public actor LocalCatalogClient {
     private var state = LocalClientState()
     private var observers: [UUID: AsyncStream<LocalClientState>.Continuation] = [:]
     private var connection: (any LocalRequestConnection)?
+    private var requestGeneration: UInt64 = 0
+    private var requestConnection: (any LocalRequestConnection)?
+    private var requestConnecting: Task<any LocalRequestConnection, Error>?
     private var connecting: Task<Void, Never>?
     private var attemptID: UUID?
     private var pairing: Pairing?
@@ -160,7 +164,60 @@ public actor LocalCatalogClient {
         }
     }
 
+    private func stopRequestChannel() {
+        requestGeneration &+= 1
+        requestConnecting?.cancel(); requestConnecting = nil
+        requestConnection?.cancel(); requestConnection = nil
+    }
+
+    public func requestMacID() -> String? { pairing?.id }
+
+    /// Control traffic uses a second approved TLS connection; catalog transfers keep their existing channel.
+    public func requestControl(operation: String, payload: ShaderRequestControl = .init()) async throws -> ShaderRequestControlReply {
+        guard state.requestsSupported, let saved = pairing, let token = saved.token, connection != nil else {
+            throw ShaderRequestError.unavailable("Connect to a configured Holodeck Mac to submit requests.")
+        }
+        let generation = requestGeneration
+        let channel: any LocalRequestConnection
+        if let existing = requestConnection { channel = existing }
+        else {
+            if requestConnecting == nil {
+                guard let mac = state.macs.first(where: { $0.id == saved.id }) else { throw LocalCatalogError.disconnected }
+                let dependencies = self.dependencies, deviceID = self.deviceID
+                requestConnecting = Task {
+                    let resolved = try await dependencies.resolve(mac)
+                    let transport = dependencies.transport(mac, resolved, saved.pin, {})
+                    let channel = transport.channel
+                    do {
+                        try await channel.start()
+                        let hello = try await channel.exchange(LocalPacket(message: LocalMessage(operation: "hello")))
+                        guard hello.message.serverID == saved.id, transport.fingerprint() == saved.pin else { throw LocalCatalogError.identityChanged }
+                        var authenticate = LocalMessage(operation: "authenticate")
+                        authenticate.deviceID = deviceID; authenticate.token = token
+                        let result = try await channel.exchange(LocalPacket(message: authenticate))
+                        guard result.message.error == nil else { throw LocalCatalogError.rejected }
+                        return channel
+                    } catch { channel.cancel(); throw error }
+                }
+            }
+            do {
+                guard let pending = requestConnecting else { throw LocalCatalogError.disconnected }
+                channel = try await pending.value
+                guard requestGeneration == generation, pairing?.id == saved.id, pairing?.token == token, connection != nil else { channel.cancel(); throw LocalCatalogError.disconnected }
+                requestConnection = channel; requestConnecting = nil
+            } catch { if requestGeneration == generation { stopRequestChannel() }; throw error }
+        }
+        do {
+            let response = try await channel.exchange(LocalPacket(message: LocalMessage(operation: operation), payload: try JSONEncoder().encode(payload)))
+            if response.message.error == "requestError" { throw ShaderRequestError.unavailable(response.message.requestMessage ?? "Request failed") }
+            try check(response)
+            return try JSONDecoder().decode(ShaderRequestControlReply.self, from: response.payload)
+        } catch let error as ShaderRequestError { throw error }
+        catch { if requestGeneration == generation { stopRequestChannel() }; throw error }
+    }
+
     public func stop() {
+        stopRequestChannel()
         diagnose("Stopping local discovery")
         browserID = nil; browserReady = false; browser?.cancel(); browser = nil
         cancelConnection(); resetRecovery(); manualChoice = false
@@ -213,6 +270,7 @@ public actor LocalCatalogClient {
     private func cancelConnection() {
         cancelReconnect()
         attemptID = nil; connecting?.cancel(); connecting = nil
+        stopRequestChannel()
         connectionTag = nil; connection?.cancel(); connection = nil
     }
 
@@ -326,6 +384,7 @@ public actor LocalCatalogClient {
     private func closed(_ tag: UUID) {
         guard connectionTag == tag else { return }
         connection = nil; connectionTag = nil
+        stopRequestChannel()
         publish(.disconnected)
         updateRecovery(); scheduleReconnect()
     }
@@ -388,6 +447,8 @@ public actor LocalCatalogClient {
             }
             let approved = Pairing(id: mac.id, name: mac.name, pin: pin, token: token)
             try dependencies.writeSecret(JSONEncoder().encode(approved), secretNamespace + "-pairing")
+            stopRequestChannel()
+            state.requestsSupported = hello.message.capabilities?.contains("shaderRequests1") == true
             pairing = approved; connection = channel; connectionTag = tag
             cancelReconnect()
             state.generation &+= 1; publish(.connected(mac.name))

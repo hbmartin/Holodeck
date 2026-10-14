@@ -51,7 +51,7 @@ nonisolated public struct AdaptiveQuality {
 nonisolated public struct RenderingPolicy: Sendable {
     public let framesPerSecond: Int
     public let adaptiveResolution: Bool
-    public static let tv = Self(framesPerSecond: 60, adaptiveResolution: false)
+    public static let tv = Self(framesPerSecond: 30, adaptiveResolution: false)
     public static let mac = Self(framesPerSecond: 30, adaptiveResolution: true)
     public init(framesPerSecond: Int, adaptiveResolution: Bool) {
         self.framesPerSecond = framesPerSecond

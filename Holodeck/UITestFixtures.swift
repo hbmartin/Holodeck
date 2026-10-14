@@ -31,7 +31,7 @@ final class UITestFixtures: NSObject {
             }
             dependencies.shaderPreferences = configuration.makeUserDefaults().map(ShaderPreferences.userDefaults) ?? .inMemory()
             dependencies.catalogService = configuration.makeCatalogService()
-            if let client = configuration.makePendingPairingClient() { dependencies.localCatalogClient = client }
+            if let client = configuration.makeShaderRequestsClient() ?? configuration.makePendingPairingClient() { dependencies.localCatalogClient = client }
         }
         if arguments.contains("--ui-test-metal-unavailable") {
             dependencies.metalDevice = nil

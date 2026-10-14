@@ -32,7 +32,15 @@ public struct CatalogReloadResult: Sendable {
 }
 
 /// App-owned immutable publications. Requests never read the authoring directory.
+public struct PreparedCatalogPublication: Sendable {
+    public let id: UUID
+    public let catalog: ValidatedCatalog
+    public let previewWarnings: [ShaderPreviewWarning]
+}
+
 public actor DirectoryCatalog {
+    private struct Prepared { let candidate: DirectoryCandidate; let warnings: [ShaderPreviewWarning]; let cacheKeys: Set<String> }
+    private var prepared: [UUID: Prepared] = [:]
     private let directory: URL
     private let files: DirectoryCatalogFileOperations
     private let previews: ShaderPreviewGenerator
@@ -63,6 +71,8 @@ public actor DirectoryCatalog {
         source.isLocalPublication = true
         return source
     }
+
+    public func publicationRevisionValue() -> String? { currentRevision }
 
     public func pin(_ revision: String, for connection: UUID) { leases[connection] = revision }
     public func release(_ connection: UUID) { leases[connection] = nil; trim() }
@@ -101,12 +111,13 @@ public actor DirectoryCatalog {
             else { reloadWaiters.removeFirst().resume() }
         }
         try Task.checkCancellation()
-        return try await reloadCandidate(from: root)
+        let candidate = try await prepare(from: root)
+        return try await install(candidate.id)
     }
 
     func maintainStages() async { await io.maintenance() }
 
-    private func reloadCandidate(from root: URL) async throws -> CatalogReloadResult {
+    public func prepare(from root: URL) async throws -> PreparedCatalogPublication {
         var preparation = try await io.prepare(from: root)
         var retainedRevision: String?
         do {
@@ -126,9 +137,36 @@ public actor DirectoryCatalog {
             let candidate = try await io.finish(preparation)
             let revision = candidate.catalog.publicationRevision
             verificationRevisions.insert(revision); retainedRevision = revision
+            let id = UUID()
+            prepared[id] = Prepared(candidate: candidate, warnings: warnings, cacheKeys: cacheKeys)
+            return PreparedCatalogPublication(id: id, catalog: candidate.catalog, previewWarnings: warnings)
+        } catch {
+            if let retainedRevision { verificationRevisions.remove(retainedRevision) }
+            await io.cleanup(preparation.stage)
+            throw error
+        }
+    }
+
+    public func discard(_ id: UUID) async {
+        guard let value = prepared.removeValue(forKey: id) else { return }
+        releaseVerificationPin(value.candidate.catalog.publicationRevision)
+        await io.cleanup(value.candidate.preparation.stage)
+    }
+
+    private func releaseVerificationPin(_ revision: String) {
+        if !prepared.values.contains(where: { $0.candidate.catalog.publicationRevision == revision }) {
+            verificationRevisions.remove(revision)
+        }
+    }
+
+    public func install(_ id: UUID) async throws -> CatalogReloadResult {
+        guard let value = prepared[id] else { throw CatalogError.invalidResponse }
+        let candidate = value.candidate
+        let preparation = candidate.preparation
+        let revision = candidate.catalog.publicationRevision
+        do {
             let matches = try await io.matches(candidate)
             try Task.checkCancellation()
-            // Installation and actor state advance together, without a suspension point.
             let destination = directory.appendingPathComponent(revision)
             if FileManager.default.fileExists(atPath: destination.path) {
                 if !matches { try files.swap(preparation.stage, destination) }
@@ -136,14 +174,13 @@ public actor DirectoryCatalog {
             try files.writeMarker(JSONEncoder().encode(CatalogHead(revision: revision)), directory.appendingPathComponent("current.json"))
             let previous = currentRevision
             allowed[revision] = preparation.paths; currentRevision = revision
-            verificationRevisions.remove(revision); retainedRevision = nil
+            prepared[id] = nil; releaseVerificationPin(revision)
             trim(previous: previous)
             await io.cleanup(preparation.stage)
-            await previews.prune(keeping: cacheKeys)
-            return CatalogReloadResult(catalog: candidate.catalog, previewWarnings: warnings)
+            await previews.prune(keeping: value.cacheKeys)
+            return CatalogReloadResult(catalog: candidate.catalog, previewWarnings: value.warnings)
         } catch {
-            if let retainedRevision { verificationRevisions.remove(retainedRevision) }
-            await io.cleanup(preparation.stage)
+            await discard(id)
             throw error
         }
     }

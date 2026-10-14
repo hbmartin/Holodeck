@@ -160,3 +160,25 @@ xcodebuild -project Holodeck.xcodeproj -scheme Holodeck -configuration Release \
 ```
 
 Unsupported-volume repair behavior remains unchanged: there is no rename fallback or recovery journal. The 16-session pool and five-minute unauthenticated deadline remain unchanged, with the previously documented availability limitation deferred. No standalone focus cleanup for comment 11, credential migration, physical-device installation, live LAN/authoring validation, merge, or deployment was performed in this pass.
+
+## Shader requests validation
+
+Validated on 2026-10-14 with Xcode 27, macOS 27.0.1, the tvOS 27 simulator and the connected physical Apple TV “Arrowhead.” The implementation adds unsandboxed personal Mac execution, durable request journals, authenticated independent control traffic, staged publication, TV input/clarification/status/activation, and native-resolution 30 fps performance observation.
+
+| Check | Result | Coverage |
+| --- | --- | --- |
+| Mac and tvOS builds | Passed | Bundled rendering tool, request UI, transport, renderer capture and telemetry compile. |
+| Core suite with GPU and authoring opt-ins | Passed, 179 cases (5 opt-in skips) | Existing catalog/network/session behavior, new request validation/ownership/idempotency/scheduling/recovery and source-bound capture contracts; all 23 current authoring scenes compile/render natively. |
+| Disposable Git worker tests | Passed, 18 cases | Edits, creation, named/unlisted targets, approximations, no-op, clarification/resume, technical/visual repair, helper coverage, data-only attribution, scope rejection, dirty-checkout preservation, push races, post-push recovery, deleted context, stale performance evidence, exact CRLF source hashes, and creation identity across activation repairs. |
+| Real Codex/image/schema smoke | Passed | Official CLI 0.162.1, authenticated ChatGPT account, explicit `gpt-6.1-sol`, High reasoning, native image input and structured output. |
+| Real request execution against a local bare remote | Passed | Request `1E99DC4D-83AF-4DFA-AB63-A90D445557B5` changed Plasma to a warm palette, passed independent technical/GPU and timed image review, committed/pushed `bbdbf8647fc6c0f6334f6c3ef7b2a4fc80a0e7d1`, installed the immutable publication and completed after activation acknowledgement. Evidence was retained under `/tmp/holodeck-live-request-v2`. No production push occurred. |
+| Authenticated TLS control integration | Passed | Unapproved requests are rejected; approved submissions retain device ownership and asset framing; revocation cancels queued work. |
+| Mac Requests window | Passed | Explicit setup UI, queue detail, queued cancellation, retained record/log access and manual deletion. |
+| TV request UI | Passed | Native text entry, captured frame, lock over playback, suggested clarification, no-op completion, and gallery return. |
+| Physical Apple TV request smoke | Passed | Native text entry, Metal screenshot capture, lock, frame confirmation and continued playback using an isolated test catalog and deterministic control peer in a separate `.ShaderRequests` test app. The device needed waking; a first Select event was retried after focus settled. |
+
+The physical UI test, real TLS integration and real Codex/Git publication test exercise separate boundaries. A complete paired physical-TV → real-Codex → hosted-push round trip has not been claimed. Shader FPS on physical hardware is evidence for future optimization, not a publication gate. OS sleep/crash paths have checkpoint and recovery tests; forced physical power-loss testing and older supported OS versions remain unverified.
+
+The previously installed Codex launcher lacked its platform binary. Reinstalling its original version exposed a revoked signing certificate; the current official 0.162.1 installation launches and authenticates successfully. The authoring checkout was preserved. Its native tool/preview migration is committed on its feature branch, while its existing main branch retains the previous workflow. Setup deliberately rejects enabling automation until that work is on `origin/main`, the checkout is clean, and an explicit model has been verified.
+
+On tvOS the public Metal drawable interface lacks presentation callbacks/timestamps. The implemented performance counter estimates delivered updates by consuming GPU-completed frames on display ticks, counting at most one update per tick. GPU duration is reported separately. It does not measure the compositor's exact presentation time; this platform limitation is documented in the implementation reference and README.

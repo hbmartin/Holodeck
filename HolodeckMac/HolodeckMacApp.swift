@@ -4,6 +4,7 @@ import SwiftUI
 @main
 struct HolodeckMacApp: App {
     @NSApplicationDelegateAdaptor(MacAppDelegate.self) private var delegate
+    @Environment(\.openWindow) private var openWindow
     @State private var model: MacModel?
 
     init() {
@@ -13,7 +14,9 @@ struct HolodeckMacApp: App {
             return
         }
         #endif
-        _model = State(initialValue: MacModel())
+        let model = MacModel()
+        _model = State(initialValue: model)
+        MacAppDelegate.prepareTermination = { await model.library?.requests.service.suspend() }
     }
     var body: some Scene {
         Window("Holodeck", id: "viewer") {
@@ -38,6 +41,7 @@ struct HolodeckMacApp: App {
                 }
             }
             CommandGroup(after: .appInfo) {
+                if model?.library != nil { Button("Shader Requests") { openWindow(id: "requests") } }
                 if let model {
                     Button(model.library == nil ? "Check for Scene Updates" : "Reload Shaders") {
                         if let library = model.library { library.reload() } else { model.session.refresh(force: true) }
@@ -45,6 +49,9 @@ struct HolodeckMacApp: App {
                         .disabled(model.session.isRefreshing)
                 }
             }
+        }
+        Window("Shader Requests", id: "requests") {
+            if let requests = model?.library?.requests { RequestsView(model: requests) }
         }
         Settings {
             if let library = model?.library { ShaderLibrarySettings(library: library) }
@@ -55,6 +62,12 @@ struct HolodeckMacApp: App {
 @MainActor
 final class MacAppDelegate: NSObject, NSApplicationDelegate {
     static var viewerWindow: NSWindow?
+    static var prepareTermination: (@MainActor () async -> Void)?
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let prepare = Self.prepareTermination else { return .terminateNow }
+        Task { await prepare(); sender.reply(toApplicationShouldTerminate: true) }
+        return .terminateLater
+    }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag, let window = Self.viewerWindow {

@@ -76,6 +76,43 @@ final class DirectoryCatalogTests: XCTestCase {
         catch {}
     }
 
+    func testShaderRequestControlRequiresAuthenticatedTVAndKeepsAssetFraming() async throws {
+        let (root, store) = try fixture()
+        let catalog = try await store.reload(from: root).catalog
+        let requests = ShaderRequestService(catalog: store, directory: root.deletingLastPathComponent().appendingPathComponent("requests"))
+        await requests.suspend()
+        try await requests.start(configuration: .init(model: "fixture", enabled: true))
+        let server = LocalCatalogServer(catalog: store, testingNamespace: "test-" + UUID().uuidString)
+        await server.setRequestService(requests)
+        addTeardownBlock { try await server.clearTestSecrets() }
+        try await server.start()
+        let (channel, _) = try await tlsClient(server)
+        let hello = try await channel.exchange(LocalPacket(message: .init(operation: "hello")))
+        XCTAssertTrue(hello.message.capabilities?.contains("shaderRequests1") == true)
+        let denied = try await channel.exchange(LocalPacket(message: .init(operation: "requestStatus"), payload: JSONEncoder().encode(ShaderRequestControl())))
+        XCTAssertEqual(denied.message.error, "revoked")
+        let device = UUID().uuidString
+        var pair = LocalMessage(operation: "pair"); pair.deviceID = device; pair.name = "Request TV"
+        _ = try await channel.exchange(LocalPacket(message: pair))
+        var iterator = await server.updates().makeAsyncIterator()
+        while let state = await iterator.next() {
+            if let approval = state.pending.first { try await server.approve(approval.id); break }
+        }
+        _ = try await channel.exchange(LocalPacket(message: .init(operation: "pairStatus")))
+        let png = try RequestScreenshot.encode(pixels: Data([0, 0, 0, 255]), width: 1, height: 1, bytesPerRow: 4)
+        let request = ShaderRequest(prompt: "Make it blue", context: .init(shader: catalog.shaders[0], screenshot: png, animationTime: 3, width: 1920, height: 1080))
+        let submitted = try await channel.exchange(LocalPacket(message: .init(operation: "requestSubmit"), payload: JSONEncoder().encode(ShaderRequestControl(request: request))))
+        let accepted = try JSONDecoder().decode(ShaderRequestControlReply.self, from: submitted.payload)
+        XCTAssertEqual(accepted.jobs.first?.id, request.id)
+        XCTAssertEqual(accepted.jobs.first?.deviceID, device)
+        var asset = LocalMessage(operation: "asset"); asset.request = .head; asset.limit = 65_536
+        let head = try await channel.exchange(LocalPacket(message: asset))
+        XCTAssertEqual(try JSONDecoder().decode(CatalogHead.self, from: head.payload).revision, catalog.publicationRevision)
+        try await server.revoke(device)
+        let jobs = await requests.allJobs()
+        XCTAssertEqual(jobs.first?.stage, .cancelled)
+    }
+
     func testDeclinedTVReceivesNoCredentialOrAssets() async throws {
         let (root, store) = try fixture()
         _ = try await store.reload(from: root)
@@ -166,6 +203,31 @@ final class DirectoryCatalogTests: XCTestCase {
             try ShaderPNG.gradient(colors: entry.colors)
         }
         return (root, DirectoryCatalog(directory: base.appendingPathComponent("head"), previewGenerator: previews))
+    }
+
+    func testPreparedPublicationCannotLeakBeforeInstallationAndCanBeDiscarded() async throws {
+        let (root, store) = try fixture()
+        let initial = try await store.reload(from: root).catalog
+        let shaderID = initial.shaders[0].id
+        try Data("VERIFIED CANDIDATE\n".utf8).write(to: root.appendingPathComponent("shaders/\(shaderID)/body.metal"))
+        let candidate = try await store.prepare(from: root)
+        XCTAssertNotEqual(candidate.catalog.publicationRevision, initial.publicationRevision)
+        let head = try JSONDecoder().decode(CatalogHead.self, from: await store.source.get(.head, 65_536))
+        XCTAssertEqual(head.revision, initial.publicationRevision)
+        let restored = try await store.cached()
+        XCTAssertEqual(restored?.publicationRevision, initial.publicationRevision)
+        do {
+            _ = try await store.source.get(.asset(revision: candidate.catalog.publicationRevision, path: candidate.catalog.shaders[0].preview!.path), 8_388_608)
+            XCTFail("Candidate assets escaped before push")
+        } catch CatalogError.invalidResponse {}
+        await store.discard(candidate.id)
+        do { _ = try await store.install(candidate.id); XCTFail("Discarded candidate was installed") }
+        catch CatalogError.invalidResponse {}
+        let ready = try await store.prepare(from: root)
+        let installed = try await store.install(ready.id).catalog
+        XCTAssertEqual(installed.publicationRevision, candidate.catalog.publicationRevision)
+        let published = try JSONDecoder().decode(CatalogHead.self, from: await store.source.get(.head, 65_536))
+        XCTAssertEqual(published.revision, installed.publicationRevision)
     }
 
     func testUnpublishedHeadIsAnInvalidResponse() async throws {

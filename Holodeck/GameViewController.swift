@@ -58,6 +58,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     @Dependency(\.continuousClock) private var hintClock
     private var catalogErrorMessage: String?
     private var renderer: Renderer?
+    private var requestsController: TVRequestsController?
     private var unavailableMessage: String?
     private let picker = UIVisualEffectView(effect: UIBlurEffect(style: .dark))
     private let statusLabel = UILabel()
@@ -68,7 +69,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     private var browsingShaderID: String?
     private var pickerIsVisible = false
     private var browsingIndexPath: IndexPath?
-    private lazy var selectGesture = UITapGestureRecognizer(target: self, action: #selector(openPickerFromRemote))
+    private lazy var selectGesture = UITapGestureRecognizer(target: self, action: #selector(openPlaybackActionsFromRemote))
     private lazy var menuGesture = UITapGestureRecognizer(target: self, action: #selector(closePickerFromRemote))
     private let collectionView: UICollectionView = {
         let layout = UICollectionViewFlowLayout()
@@ -128,6 +129,21 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             self.renderer = renderer
             metalView.delegate = renderer
             session.attach(renderer)
+            if catalogService.usesLocalNetwork {
+                let configuration = UITestConfiguration(applicationID: "me.haroldmartin.Holodeck")
+                let preferences = configuration.storageSuite == nil ? UserDefaults.standard : configuration.makeUserDefaults()
+                let requests = TVRequestsController(presenter: self, renderer: renderer, client: localClient, session: session,
+                    defaults: preferences, covered: { [weak self] in
+                        guard let self else { return true }
+                        return self.pickerIsVisible || self.presentedViewController != nil || !self.sceneIsActive || !self.sceneIsForeground
+                    })
+                requests.onLockChanged = { [weak self] in
+                    guard let self else { return }
+                    if self.requestsController?.blocksBrowsing == true, self.pickerIsVisible { self.hidePicker() }
+                    self.changeMacButton.isEnabled = self.requestsController?.blocksBrowsing != true
+                }
+                requestsController = requests
+            }
         } catch {
             showUnavailable(error.localizedDescription)
         }
@@ -188,6 +204,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     func setSceneForeground(_ foreground: Bool) {
         guard sceneIsForeground != foreground else { return }
         sceneIsForeground = foreground
+        requestsController?.setForeground(foreground)
         guard catalogService.usesLocalNetwork else { return }
         localActivityTask?.cancel()
         let name = UIDevice.current.name
@@ -215,6 +232,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     func applyLocalState(_ state: LocalClientState) {
         localState = state
+        requestsController?.applyConnection(state)
         localStatusLabel.text = state.status.message
         if shaders.isEmpty {
             catalogErrorMessage = session.catalogFailure?.message
@@ -340,7 +358,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
                 hidePicker(cancelSelection: false)
             }
         case .selectionFailed:
-            showPicker()
+            if requestsController?.blocksBrowsing != true { showPicker() }
             updateStatus()
         }
     }
@@ -477,6 +495,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     }
 
     private func showPicker() {
+        guard requestsController?.blocksBrowsing != true else { return }
         let wasVisible = pickerIsVisible
         selectGesture.isEnabled = false
         hintTask?.cancel()
@@ -540,6 +559,19 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     private func chooseShader(_ shader: ShaderDefinition, origin: SelectionOrigin = .user) {
         guard renderer != nil, unavailableMessage == nil else { return }
         session.select(shader, origin: origin)
+    }
+
+    @objc func openPlaybackActionsFromRemote() {
+        guard requestsController?.blocksBrowsing != true else { return }
+        guard session.activeShader != nil, !pickerIsVisible, presentedViewController == nil else { openPickerFromRemote(); return }
+        let actions = UIAlertController(title: "Holodeck", message: requestsController?.canInput == true ? nil : requestsController?.availabilityMessage,
+                                        preferredStyle: .alert)
+        let gallery = UIAlertAction(title: "Gallery", style: .default) { [weak self] _ in self?.openPickerFromRemote() }
+        actions.addAction(gallery); actions.preferredAction = gallery
+        let input = UIAlertAction(title: "Input", style: .default) { [weak self] _ in self?.requestsController?.compose() }
+        input.isEnabled = requestsController?.canInput == true; actions.addAction(input)
+        actions.addAction(UIAlertAction(title: "Back", style: .cancel))
+        present(actions, animated: true)
     }
 
     @objc func openPickerFromRemote() {

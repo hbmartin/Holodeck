@@ -42,7 +42,7 @@ nonisolated public struct UITestConfiguration: Sendable {
     public func makeCatalogService() -> CatalogService {
         if contains("--ui-test-cleanup-storage-suite") { return .offline() }
         #if DEBUG
-        if contains("--ui-test-pending-pairing") {
+        if contains("--ui-test-shader-requests") || contains("--ui-test-pending-pairing") {
             return CatalogService(initialCatalog: contains("--ui-test-empty-cache") ? nil : catalog,
                                   storage: .disabled, enabled: false, usesLocalNetwork: true)
         }
@@ -67,6 +67,20 @@ nonisolated public struct UITestConfiguration: Sendable {
         return .offline(initialCatalog: catalog)
     }
     #if DEBUG
+    public func makeShaderRequestsClient() -> LocalCatalogClient? {
+        guard contains("--ui-test-shader-requests"), let storageSuite else { return nil }
+        let mac = LocalMac(id: UUID().uuidString, name: "Request Test Mac", endpoint: .service(name: "Request Test", type: LocalProtocol.serviceType, domain: "local.", interface: nil), interface: nil, version: LocalProtocol.version)
+        let backend = ShaderRequestUITestBackend(macID: mac.id, requiresClarification: contains("--ui-test-request-clarification"))
+        var dependencies = LocalClientDependencies()
+        dependencies.usesSystemBrowser = false; dependencies.initialMacs = [mac]
+        dependencies.readSecret = { _ in nil }; dependencies.writeSecret = { _, _ in }; dependencies.removeSecret = { _ in }
+        dependencies.resolve = { _ in ResolvedMac(address: "192.168.1.2", port: 1234) }
+        dependencies.transport = { _, _, _, _ in
+            LocalClientTransport(channel: ShaderRequestUITestChannel(backend: backend), fingerprint: { "request-test-pin" }, identityChanged: { false })
+        }
+        return LocalCatalogClient(testingNamespace: "requests-ui-" + storageSuite, dependencies: dependencies)
+    }
+
     public func makePendingPairingClient() -> LocalCatalogClient? {
         guard contains("--ui-test-pending-pairing"), let storageSuite else { return nil }
         let mac = LocalMac(id: UUID().uuidString, name: "Test Mac", endpoint: .service(name: "Test",
@@ -122,5 +136,58 @@ private actor PendingPairingTestChannel: LocalRequestConnection {
         if packet.message.operation == "hello" { response.operation = "ok"; response.serverID = id }
         return LocalPacket(message: response)
     }
+}
+#endif
+
+#if DEBUG
+/// A deterministic control peer for TV UI tests; actual TLS and Git use separate integration tests.
+private actor ShaderRequestUITestBackend {
+    let macID: String
+    let requiresClarification: Bool
+    var jobs: [UUID: ShaderRequestStatus] = [:]
+    init(macID: String, requiresClarification: Bool) { self.macID = macID; self.requiresClarification = requiresClarification }
+    func exchange(_ packet: LocalPacket) throws -> LocalPacket {
+        var message = LocalMessage(operation: "ok")
+        switch packet.message.operation {
+        case "hello": message.serverID = macID; message.capabilities = ["shaderRequests1"]
+        case "pair", "pairStatus": message.token = "fixture-approved-token"
+        case "authenticate": break
+        default:
+            let control = try JSONDecoder().decode(ShaderRequestControl.self, from: packet.payload)
+            if packet.message.operation == "requestSubmit", let request = control.request {
+                try request.validate()
+                var job = ShaderRequestStatus(request: request, deviceID: "fixture-TV")
+                job.stage = requiresClarification ? .awaitingClarification : .implementing
+                job.message = requiresClarification ? "Waiting for an answer" : "Implementing your request"
+                if requiresClarification { job.clarification = .init(question: "Edit this shader or create a new shader?", options: ["Edit this shader", "Create a new shader"]) }
+                jobs[job.id] = job
+            }
+            if packet.message.operation == "requestAnswer", let id = control.requestID {
+                jobs[id]?.stage = .awaitingActivation; jobs[id]?.clarification = nil; jobs[id]?.sequence += 1
+            }
+            for id in jobs.keys {
+                if jobs[id]?.stage == .implementing, Date().timeIntervalSince(jobs[id]!.createdAt) > 10 { jobs[id]?.stage = .awaitingActivation; jobs[id]?.sequence += 1 }
+                if jobs[id]?.stage == .awaitingActivation, jobs[id]?.result == nil {
+                    let context = jobs[id]!.request.context
+                    jobs[id]?.result = .init(outputKind: .edited, shaderID: context.shaderID, changed: false, summary: "No change was necessary", commitSHA: String(repeating: "a", count: 40), deliveredSourceHash: context.sourceHash)
+                }
+            }
+            if packet.message.operation == "requestActivated", let id = control.requestID {
+                if control.diagnostic == nil { jobs[id]?.stage = .completed; jobs[id]?.sequence += 1 }
+                else { jobs[id]?.stage = .failed; jobs[id]?.message = control.diagnostic ?? "Activation error" }
+            }
+            let selected = control.requestID.map { id in jobs.values.filter { $0.id == id } } ?? jobs.values.filter { !$0.stage.terminal }
+            return LocalPacket(message: message, payload: try JSONEncoder().encode(ShaderRequestControlReply(enabled: true, message: "Ready for shader requests", jobs: Array(selected))))
+        }
+        return LocalPacket(message: message)
+    }
+}
+private actor ShaderRequestUITestChannel: LocalRequestConnection {
+    let backend: ShaderRequestUITestBackend
+    init(backend: ShaderRequestUITestBackend) { self.backend = backend }
+    func start() {}
+    nonisolated func cancel() {}
+    func pairingCode() -> String { "123456" }
+    func exchange(_ packet: LocalPacket) async throws -> LocalPacket { try await backend.exchange(packet) }
 }
 #endif

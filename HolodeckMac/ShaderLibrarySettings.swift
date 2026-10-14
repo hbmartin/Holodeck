@@ -5,6 +5,7 @@ import HolodeckCore
 
 @MainActor @Observable
 final class MacLibraryModel {
+    let requests: MacRequestsModel
     var folder: URL?
     var isReloading = false
     var error: String?
@@ -27,6 +28,7 @@ final class MacLibraryModel {
     #endif
 
     init(catalog: DirectoryCatalog, session: ViewerSession, defaults: UserDefaults?, testingNamespace: String? = nil, testingAdvertises: Bool = false) {
+        requests = MacRequestsModel(catalog: catalog, defaults: defaults, namespace: testingNamespace)
         self.catalog = catalog; self.session = session; self.defaults = defaults
         #if DEBUG
         MacInspectionLifecycle.snapshot.libraryCreations += 1
@@ -36,6 +38,16 @@ final class MacLibraryModel {
         server = LocalCatalogServer(catalog: catalog)
         #endif
         let server = server
+        let requestService = requests.service
+        Task { await server.setRequestService(requestService) }
+        requests.onPublication = { [weak self] in
+            guard let self else { return }
+            self.ready = true
+            Task {
+                await self.session.refresh(force: true).value
+                if !self.sleeping { try? await self.server.start() }
+            }
+        }
         updates = Task { [weak self] in
             for await state in await server.updates() { self?.serverState = state }
         }
@@ -51,6 +63,7 @@ final class MacLibraryModel {
                 let url = try URL(resolvingBookmarkData: bookmark, options: [.withSecurityScope], relativeTo: nil, bookmarkDataIsStale: &stale)
                 if url.startAccessingSecurityScopedResource() { scopedURL = url }
                 folder = url
+                requests.setRepository(url)
                 isReloading = true
                 Task {
                     do {
@@ -61,7 +74,7 @@ final class MacLibraryModel {
                         }
                     } catch { self.error = "Couldn’t restore the previous shader library: \(error.localizedDescription)" }
                     isReloading = false
-                    reload(refreshBookmark: stale)
+                    if !requests.configuration.enabled { reload(refreshBookmark: stale) }
                 }
             } catch { self.error = "Choose your shader folder again: \(error.localizedDescription)" }
         }
@@ -73,7 +86,7 @@ final class MacLibraryModel {
     }
 
     func chooseFolder() {
-        guard !isReloading else { return }
+        guard !isReloading, !requests.configuration.enabled, !requests.hasUnfinishedJobs else { return }
         let panel = NSOpenPanel()
         panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
         panel.message = "Choose the HolodeckShaders folder containing index.json, shared, and shaders."
@@ -84,18 +97,19 @@ final class MacLibraryModel {
         }
     }
     func reload(refreshBookmark: Bool = false) {
+        guard !requests.configuration.enabled, !requests.hasUnfinishedJobs else { return }
         guard let folder else { chooseFolder(); return }
         load(folder, saveBookmark: refreshBookmark)
     }
     private func load(_ url: URL, saveBookmark: Bool) {
-        guard !isReloading else { return }
+        guard !isReloading, !requests.configuration.enabled, !requests.hasUnfinishedJobs else { return }
         isReloading = true; error = nil
         let accessed = url.startAccessingSecurityScopedResource()
         Task {
             defer { isReloading = false; if accessed { url.stopAccessingSecurityScopedResource() } }
             do {
                 // Prepare the bookmark before replacing the current publication.
-                let bookmark = saveBookmark ? try url.bookmarkData(options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess],
+                let bookmark = saveBookmark ? try url.bookmarkData(options: [],
                     includingResourceValuesForKeys: nil, relativeTo: nil) : nil
                 let result = try await catalog.reload(from: url)
                 previewWarnings = result.previewWarnings
@@ -104,7 +118,7 @@ final class MacLibraryModel {
                     scopedURL?.stopAccessingSecurityScopedResource(); scopedURL = nil
                     if url.startAccessingSecurityScopedResource() { scopedURL = url }
                 }
-                folder = url; ready = true
+                folder = url; requests.setRepository(url); ready = true
                 await session.refresh(force: true).value
                 #if DEBUG
                 if holdsNextReloadForTesting {
@@ -127,8 +141,11 @@ final class MacLibraryModel {
     func setSleeping(_ value: Bool) {
         sleeping = value
         Task {
-            if value { await server.stop() }
-            else if ready { do { try await startServer() } catch { self.error = error.localizedDescription } }
+            if value { await requests.service.suspend(); await server.stop() }
+            else {
+                await requests.service.resume()
+                if ready { do { try await startServer() } catch { self.error = error.localizedDescription } }
+            }
         }
     }
     #if DEBUG
@@ -154,7 +171,7 @@ struct ShaderLibrarySettings: View {
                     Button("Reload Shaders") { library.reload() }.disabled(library.folder == nil)
                         .accessibilityIdentifier("reload-shaders")
                     if library.isReloading { ProgressView().controlSize(.small) }
-                }.disabled(library.isReloading)
+                }.disabled(library.isReloading || library.requests.configuration.enabled || library.requests.hasUnfinishedJobs)
                 HStack { Text(library.serverState.message); Spacer() }
                     .accessibilityElement(children: .combine).accessibilityIdentifier("shader-serving-status")
                 if let error = library.error {
@@ -178,7 +195,8 @@ struct ShaderLibrarySettings: View {
                 }
                 #endif
             }
-            Section("Requests from Apple TV") {
+            RequestSettingsView(model: library.requests)
+            Section("Pairing Approvals from Apple TV") {
                 if library.serverState.pending.isEmpty { Text("No pending requests.").foregroundStyle(.secondary) }
                 ForEach(library.serverState.pending) { request in
                     VStack(alignment: .leading, spacing: 8) {

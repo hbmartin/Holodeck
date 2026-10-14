@@ -60,6 +60,7 @@ public final class ViewerSession {
     public private(set) var requiresExplicitSelection = false
     public private(set) var hasCheckedCache: Bool
     public private(set) var catalogFailure: Failure?
+    public private(set) var selectionDiagnostic: String?
     public private(set) var selectionFailure: Failure?
     public var failure: Failure? {
         get {
@@ -215,6 +216,7 @@ public final class ViewerSession {
     public func select(_ shader: ShaderDefinition, origin: SelectionOrigin = .user) -> Task<Void, Never> {
         guard let renderer else { return Task {} }
         generation &+= 1
+        selectionDiagnostic = nil
         let request = generation
         pendingSelection = PendingSelection(shader: shader, origin: origin, generation: request)
         // Invalidate in-flight renderer requests before this task gets executor time.
@@ -246,6 +248,7 @@ public final class ViewerSession {
                 }
                 guard self.generation == request else { return }
                 self.pendingSelection = nil
+                self.selectionDiagnostic = error.localizedDescription
                 if self.activeShader == nil { self.requiresExplicitSelection = true }
                 if origin != .update || !self.hasUserSelectionFailure {
                     self.selectionFailure = Failure(message: "Couldn’t load \(shader.title). Try again or choose another scene.", operation: .selection(shader, origin))

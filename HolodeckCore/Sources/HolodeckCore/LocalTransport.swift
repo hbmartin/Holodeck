@@ -58,6 +58,8 @@ nonisolated struct LocalMessage: Codable, Sendable {
     var request: CatalogRequest?
     var limit: Int?
     var error: String?
+    var capabilities: [String]?
+    var requestMessage: String?
 }
 
 nonisolated struct LocalPacket: Sendable {
