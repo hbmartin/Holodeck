@@ -26,6 +26,8 @@ nonisolated public struct LocalServerState: Sendable {
 
 public actor LocalCatalogServer {
     private static let productionNamespace = "mac-library"
+    private var requests: ShaderRequestService?
+    public func setRequestService(_ service: ShaderRequestService) { requests = service }
     private let catalog: DirectoryCatalog
     private let allowLoopback: Bool
     private let secretNamespace: String
@@ -159,12 +161,13 @@ public actor LocalCatalogServer {
         publish()
     }
     public func decline(_ id: UUID) { pending[id] = nil; declined.insert(id); publish() }
-    public func revoke(_ id: String) throws {
+    public func revoke(_ id: String) async throws {
         var candidate = approved; candidate[id] = nil
         try persist(candidate); approved = candidate
         for (session, record) in authenticated where record.id == id {
             cancelSession(session)
         }
+        try await requests?.revoke(id)
         publish()
     }
     private func persist(_ records: [String: ApprovedTV]) throws {
@@ -225,11 +228,30 @@ public actor LocalCatalogServer {
         if let deadline = deadlines[id], clock.now >= deadline {
             cancelSession(id); throw LocalCatalogError.timeout
         }
+        let requestOperations = ["requestSubmit", "requestStatus", "requestAnswer", "requestActivated", "requestDelivery"]
+        if requestOperations.contains(packet.message.operation) {
+            guard authorized(id), let deviceID = authenticated[id]?.id else {
+                return LocalPacket(message: LocalMessage(operation: "ok", error: "revoked"))
+            }
+            var reply = LocalMessage(operation: "ok")
+            do {
+                guard let requests else { throw ShaderRequestError.unavailable("Update the Mac app to enable requests.") }
+                let control = try JSONDecoder().decode(ShaderRequestControl.self, from: packet.payload)
+                let value = try await requests.control(operation: packet.message.operation, payload: control, deviceID: deviceID)
+                guard authorized(id) else { return LocalPacket(message: LocalMessage(operation: "ok", error: "revoked")) }
+                return LocalPacket(message: reply, payload: try JSONEncoder().encode(value))
+            } catch {
+                reply.error = "requestError"; reply.requestMessage = error.localizedDescription
+                return LocalPacket(message: reply)
+            }
+        }
         guard packet.payload.isEmpty else { throw LocalCatalogError.protocolViolation }
         let message = packet.message
         var response = LocalMessage(operation: "ok")
         switch message.operation {
-        case "hello": response.serverID = identity?.id
+        case "hello":
+            response.serverID = identity?.id
+            if requests != nil { response.capabilities = ["shaderRequests1"] }
         case "authenticate":
             guard let deviceID = message.deviceID, let token = message.token, token.count <= 100,
                   let record = approved[deviceID], record.tokenHash == CatalogHash.sha256(Data(token.utf8)) else {

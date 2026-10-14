@@ -71,6 +71,70 @@ final class HolodeckUITests: XCTestCase {
         }
     }
 
+    func testShaderRequestInputCapturesFrameLocksGalleryAndCompletes() {
+        let app = isolatedApp()
+        app.launchArguments.append("--ui-test-shader-requests")
+        remote.press(.home)
+        app.launch()
+        beginShaderRequest(in: app)
+        submitShaderRequest(in: app)
+        let progress = app.descendants(matching: .any).matching(identifier: "request-progress").firstMatch
+        XCTAssertTrue(progress.waitForExistence(timeout: 5))
+        remote.press(.select)
+        XCTAssertFalse(app.alerts["Holodeck"].exists)
+        XCTAssertFalse(app.otherElements["shader-picker"].exists)
+        let completion = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Already matches:")).firstMatch
+        XCTAssertTrue(completion.waitForExistence(timeout: 30), app.debugDescription)
+        openPicker(in: app)
+        XCTAssertEqual(card("plasma", in: app).value as? String, "Now showing")
+    }
+
+    func testShaderRequestClarificationUsesSuggestedAnswerAndKeepsPlayback() {
+        let app = isolatedApp()
+        app.launchArguments += ["--ui-test-shader-requests", "--ui-test-request-clarification"]
+        app.launch()
+        beginShaderRequest(in: app)
+        submitShaderRequest(in: app)
+        let clarification = app.alerts["One detail needed"]
+        XCTAssertTrue(clarification.waitForExistence(timeout: 15), app.debugDescription)
+        let suggested = app.buttons["Edit this shader"].firstMatch
+        if !suggested.hasFocus { remote.press(.down) }
+        waitForFocus(suggested); remote.press(.select)
+        let completion = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Already matches:")).firstMatch
+        XCTAssertTrue(completion.waitForExistence(timeout: 30), app.debugDescription)
+        openPicker(in: app)
+        XCTAssertEqual(card("plasma", in: app).value as? String, "Now showing")
+    }
+
+    private func beginShaderRequest(in app: XCUIApplication) {
+        XCTAssertTrue(app.staticTexts["Press Select to choose a shader"].waitForExistence(timeout: 15))
+        // Wait for authenticated capability negotiation and the first status response.
+        for _ in 0..<8 {
+            remote.press(.select)
+            let input = app.buttons["Input"].firstMatch
+            guard input.waitForExistence(timeout: 5) else {
+                if app.otherElements["shader-picker"].exists { remote.press(.menu) }
+                continue
+            }
+            if input.isEnabled { remote.press(.down); waitForFocus(input); remote.press(.select); break }
+            remote.press(.menu)
+        }
+        let field = app.textFields["shader-request-input"].firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 10), app.debugDescription)
+        waitForFocus(field); remote.press(.select)
+        app.typeText("Make it warmer\n") // Done commits system text entry.
+        XCTAssertTrue(app.alerts["Shader Request"].waitForExistence(timeout: 5))
+    }
+    private func submitShaderRequest(in app: XCUIApplication) {
+        let submit = app.buttons["Submit"].firstMatch
+        XCTAssertTrue(submit.waitForExistence(timeout: 5))
+        XCTAssertTrue(submit.isEnabled)
+        if !submit.hasFocus { remote.press(.down) }
+        if !submit.hasFocus { remote.press(.right) }
+        waitForFocus(submit); remote.press(.select)
+        XCTAssertTrue(app.alerts["Shader Request"].waitForNonExistence(timeout: 5))
+    }
+
     func testFirstLaunchDownloadsCatalogAfterConnectionRetry() {
         let app = isolatedApp()
         app.launchArguments += ["--ui-test-download-catalog", "--ui-test-fail-catalog-once"]
@@ -441,6 +505,10 @@ final class HolodeckUITests: XCTestCase {
 
     private func openPicker(in app: XCUIApplication) {
         remote.press(.select)
+        if app.alerts["Holodeck"].waitForExistence(timeout: 1) {
+            waitForFocus(app.buttons["Gallery"].firstMatch)
+            remote.press(.select)
+        }
         XCTAssertTrue(app.otherElements["shader-picker"].waitForExistence(timeout: 5))
     }
 

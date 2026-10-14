@@ -59,7 +59,6 @@ shared/material.metal             # used by material shaders
 shared/fragment.metal
 shaders/<id>/metadata.json
 shaders/<id>/body.metal
-shaders/<id>/preview.png
 ```
 
 `index.json` supplies an ordered `shaders` array, an indexed `defaultShaderID`, and optional collections. It must contain 1–500 unique IDs matching `^[a-z0-9]+(-[a-z0-9]+)*$`, each at most 100 characters. Unindexed shaders are ignored.
@@ -77,15 +76,17 @@ Bodies implement `float3 shade(float2 p, float time, float2 pixel)`; the shared 
 
 Names and descriptions must be nonempty, with limits of 200 and 2,000 characters. Categories are `PROCEDURAL` or `3D MATERIAL`. Colors must be exactly two RGB triplets with finite channel values in 0…1.
 
-Previews are required supplied PNGs. The loader checks their signature and ImageIO decodability, hashes the bytes directly, and copies them unchanged. It does not generate previews or read `preview.json`. Publication runs no repository scripts, Git commands, Python, or Xcode tools.
+The Mac generates previews at 1280×720 and three seconds using the shared offscreen renderer and sRGB target. Successful PNGs are cached in app-owned storage by assembled-source hash, render settings, and renderer version; cache hashes and decoded images are checked before reuse. Legacy `preview.png` and `preview.json` files in the authoring folder are ignored. See [the library workflow](shader-catalog-workflow.md#authoring-format) for cache invalidation and reload behavior.
+
+A shader compilation, GPU render, or PNG encoding failure uses a gradient from its metadata colors and reports a per-shader diagnostic in Settings. Failed renders are retried on reload; successful renders clear the warning. Publication runs no repository scripts, Git commands, Python, or Xcode tools.
 
 ### Validation and atomic replacement
 
-`MacLibraryModel` stores `holodeck.shaderFolderBookmark` in its UserDefaults domain. The bookmark uses `.withSecurityScope` and `.securityScopeAllowOnlyReadAccess`; the app holds scoped access while using the selected folder. A stale bookmark is refreshed after a successful reload. A bookmark that cannot be resolved requires folder selection again.
+`MacLibraryModel` stores `holodeck.shaderFolderBookmark` in its UserDefaults domain. The personal Mac app is unsandboxed. New bookmarks are ordinary folder bookmarks; legacy scoped bookmarks are still resolved. The app retains any available scoped access while using the folder. A stale bookmark is refreshed after a successful reload. A bookmark that cannot be resolved requires folder selection again.
 
-`DirectoryCatalog.reload(from:)` stages the candidate in app-owned storage, verifies that resolved authoring paths remain within the selected root, assembles bounded UTF-8 sources, and validates all indexed metadata and previews. Errors for authoring files include the relative path. Candidate failures leave the current served revision available.
+`DirectoryCatalog.reload(from:)` stages the candidate in app-owned storage, verifies that resolved authoring paths remain within the selected root, assembles bounded UTF-8 sources, validates all indexed metadata, and generates previews. Errors for authoring files include the relative path. Candidate failures leave the current served revision available.
 
-Publication validates file contents and catalog structure. It does not precompile every shader; Metal syntax and pipeline creation are checked at runtime when a viewer selects a source. A compilation failure retains working playback according to `ViewerSession` policy.
+Preview generation checks Metal syntax and pipeline creation for uncached sources. Render failures produce preview warnings without rejecting an otherwise valid catalog. Viewer activation compiles the selected source independently; an activation failure retains working playback according to `ViewerSession` policy.
 
 For a valid candidate, the actor installs the staged publication into its revision directory, atomically writes `current.json`, then updates its in-memory revision and allowlist. An existing revision is reused only when its manifest matches the candidate and all copied sources and previews satisfy their size limits and hashes. Missing or corrupt copied assets are repaired by an atomic, same-volume directory swap; an unsupported or failed swap leaves the existing directory and current marker intact. Requests read copied assets, so later authoring edits cannot alter already published bytes. There is no folder watcher: the authoring directory is loaded at startup and on **Reload Shaders**.
 
@@ -101,7 +102,7 @@ Reading `.head` through the server leases the current revision to that connectio
 
 ### Persistent storage
 
-Paths below are relative to the platform's sandbox-resolved directories, rather than fixed home-directory paths.
+Paths below are relative to the platform's application-support and cache directories, rather than fixed home-directory paths.
 
 | Location | Contents |
 | --- | --- |
@@ -130,7 +131,7 @@ The TV uses `NWBrowser` with `.bonjourWithTXTRecord`. Results require a valid UU
 
 Allowed production unicast destinations are IPv4 `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, and `169.254.0.0/16`, plus IPv6 unique-local `fc00::/7` and link-local `fe80::/10`. Public addresses, hostname destinations, multicast addresses, and IPv4-mapped IPv6 addresses are rejected. Loopback is allowed only by explicit integration-test configuration. The server independently checks the peer address before accepting a session.
 
-Both targets declare `NSLocalNetworkUsageDescription` and `_holodeck._tcp` in `NSBonjourServices`. The Mac sandbox enables incoming/outgoing connections and user-selected read-only file access. DNS policy denial and POSIX `EPERM`/`EACCES` produce a distinct permission state; other browser errors produce disconnection only when no channel or pairing attempt is viable.
+Both targets declare `NSLocalNetworkUsageDescription` and `_holodeck._tcp` in `NSBonjourServices`. The personal Mac target disables App Sandbox so the enabled request worker can run Codex, Python, Git and Metal tools in its managed checkout. DNS policy denial and POSIX `EPERM`/`EACCES` produce a distinct permission state; other browser errors produce disconnection only when no channel or pairing attempt is viable.
 
 The Mac server starts after a valid library is available, continues with the viewer window closed, stops on quit or sleep, and restarts on wake if the library is ready. Sleep observers belong to the library model independently of the viewer window. The TV starts discovery in the foreground and stops discovery and its connection on backgrounding or scene disconnection. Temporary inactivity pauses rendering while preserving networking and pairing. With no cache, the picker opens to show connection and approval state.
 
@@ -402,3 +403,36 @@ xcodebuild -project Holodeck.xcodeproj -scheme Holodeck \
 Compare the code printed by the test with the Mac's code and click **Approve**. The test checks downloads, playback, and authentication after relaunch, then cleans its TV credentials/cache. Add `TEST_RUNNER_HOLODECK_PHYSICAL_OFFLINE_TEST=1` to check cached playback after stopping the Mac server when the test prints its offline prompt. Afterward, terminate the Mac validation app and launch it with the same suite and `--ui-test-cleanup-storage-suite` to remove its test state. If several servers are advertising, select the validation host before expecting its pairing request; the test is simplest with only that host available.
 
 See [the validation report](local-serving-validation.md) for dated results and remaining permission-denial, sleep/wake, minimum-OS, and router-level checks. The [workflow guide](shader-catalog-workflow.md) keeps the authoring/publication overview; historical reports are explicitly marked as historical.
+
+## Shader request control and execution
+
+The optional `shaderRequests1` hello capability extends version 1 without changing existing asset framing. `LocalCatalogClient` opens a second TLS channel pinned to the same Mac and authenticated with the same device credential. Submission, status, clarification, delivery refresh and activation reports use Codable payloads in `requestSubmit`, `requestStatus`, `requestAnswer`, `requestDelivery` and `requestActivated`. The server supplies the authenticated TV identity to `ShaderRequestService`, checks authorization again before responding and cancels queued jobs on revocation. Status polling every two seconds is independent of catalog transfers and process lifetimes.
+
+`ShaderRequestContext` binds exact UTF-8 source and SHA-256 to captured metadata, publication identity, a clean 1280×720 PNG, shader animation time and native drawable dimensions. The renderer copies the current drawable through Metal after the same frame's render pass. Scene/hash changes during capture reject the snapshot. Capturing the frame excludes UIKit overlays. `ShaderRequest`, `ShaderRequestStatus`, `ShaderRequestResult`, `ShaderClarification` and `PerformanceEvidence` are the shared interfaces; status stages cover queue, implementation, clarification, technical validation, visual review, push, publication, activation, repair and terminal outcomes. Result identity describes the whole logical request, including creation followed by activation repairs.
+
+The Mac's application-support `Holodeck/Requests` directory contains the durable journal, active-worker identity and a UUID folder per request. Full input, frozen settings, JSONL logs, CLI session identity, binary parked patches, commit identities, source files, PNG samples and independent verdicts remain until a terminal record is manually deleted. TV stores only its pending manual UUID under its submitting Mac's identity; there is no TV history browser. Mac Settings and the dedicated Requests window are implemented by `MacRequestsModel` and `RequestsView`.
+
+The bundled Python bridge launches Codex with argv arrays, stdin prompts, JSONL events, output schemas and explicit `exec resume` UUIDs. Implementation uses workspace-write permission; each independent reviewer uses a fresh read-only invocation. Holodeck supplies an explicit model and reasoning setting and ignores CLI user configuration. The host owns all Git mutations. See the [official non-interactive interface](https://learn.chatgpt.com/docs/non-interactive-mode).
+
+One worker owns the existing checkout. It fetches `origin/main`, preserves captured older context separately, reapplies parked work with three-way Git patches, and rejects external dirt or local commits not on main. New IDs must be unused; a removed captured shader is recreated under a fresh ID. An existing unlisted output is appended to the published library without changing its ID. Scope enforcement uses the actual Git diff and untracked files: one primary shader, catalog membership, canonical helpers and literal notice inventories. It rejects other bodies, removed files, symlinks, changed defaults, unrelated collection/catalog edits, original-reference changes and altered validation/tooling logic.
+
+Independent host checks run `tools/library.py validate --compile` and the complete Python test suite with GPU regressions enabled. Both macOS and tvOS Metal compilers are required. Every source changed by a helper and the primary output receive timed native renders at 1280×720 and 0, 3, 10 seconds. Existing shaders include before/after frames; new shaders include after frames. Exact source bytes, image hashes, renderer identity, capture, diff and settings bind each verdict. Each verification attempt has its own evidence directory. Source changes during verification invalidate the candidate. Compilation or visual defects return to the same Codex session without an attempt or total-time budget.
+
+`DirectoryCatalog.prepare(from:)` produces an immutable staged candidate without changing served head/assets. The worker waits for that preparation before committing and pushing normally to main. A racing remote causes reapplication and repeated verification; no force push is used. `install(_:)` atomically exposes the prepared publication only after the push is confirmed. Result recovery checks the persisted commit against remote ancestry before retrying, so a lost push acknowledgement does not create another commit. Successful unchanged requests avoid an empty commit. GitHub CI is not a completion gate.
+
+The Mac parks jobs awaiting clarification or activation, allowing the next ready job to run. Ready manual jobs (including performance retries) precede automatic jobs, FIFO within each priority; an interrupted active job recovers first. Sleep/quit retain checkpoints and stop the process group. Restart verifies a recorded PID's command before terminating surviving descendants. Operational failures attempt to discard only that request's owned unpublished work and preserve pushed commits. Revocation rejects control traffic, cancels queued jobs and prevents delivery after a running job finishes its push.
+
+A returning TV requests a refresh of the output ID's latest committed source before activation. Manual delivery selects that output; automatic delivery applies only if the affected shader remains active and no manual request owns playback. Other TVs refresh their libraries without replacing their current pipeline. A successful activation includes a source-bound rendered-frame confirmation. Activation diagnostics keep the same logical request and trigger repair; background/inactive TVs defer delivery.
+
+TV performance observation uses the 30 fps target at native drawable resolution. A two-second warm-up precedes ten consecutive one-second windows below 27 fps. Scene/drawable/activity changes, covered UI and manual work reset observations. tvOS exposes no `MTLDrawable.addPresentedHandler`/`presentedTime`: the renderer consumes completed GPU frames on CADisplayLink ticks, at most one per tick, to estimate delivered updates. Zero-frame windows are included and GPU timing is separate. These are not direct compositor timestamps. Evidence includes exact source/publication identity, device/GPU, native dimensions, delivered-update estimates and GPU times. Stale evidence targets latest main immediately. Automatic jobs deduplicate by authenticated TV, shader and source version; retry creates a new manual-priority background request and dismissal lasts until the next TV launch. Performance results must pass compilation and appearance review; measured FPS never gates commits.
+
+Setup verifies a clean checkout, Git identity and dry-run push access, Codex authentication, explicit model/image/schema compatibility, Python, the bundled rendering tool, and actual compilation with both SDKs. Remote main must already contain the native shader-tool/preview migration. Existing feature-branch work is preserved and must be integrated before that checkout can be managed. Request automation remains disabled by default.
+
+Request-specific checks:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools -p test_shader_requests.py -v
+HOLODECK_GPU_TESTS=1 swift test --package-path HolodeckCore
+```
+
+The opt-in `ShaderRequestTests.testConfiguredRealCodexPublicationAndActivation` accepts `HOLODECK_REQUEST_FIXTURE_CONFIG` pointing to a JSON `ShaderRequestConfiguration`. It requires a `/tmp/` checkout and a local bare `.git` origin and retains its evidence. Never point this live Codex test at a hosted production remote. UI tests use deterministic control peers; loopback TLS tests separately enforce real pairing, authentication and revocation. Physical device testing is application validation, separate from per-request publication gates.

@@ -22,6 +22,9 @@ final class MacUITestDriver {
               configuration.hasExplicitStorageSuite, let suite = configuration.storageSuite else { return }
         NSWindow.removeFrame(usingName: Self.windowAutosaveName(for: suite))
         configuration.cleanupStorageSuite()
+        let requests = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Holodeck/Requests-tests-\(suite)")
+        try? FileManager.default.removeItem(at: requests)
         try? LocalCatalogServer.removeTestingSecrets(namespace: suite)
     }
 

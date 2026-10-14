@@ -35,6 +35,44 @@ final class HolodeckMacUITests: XCTestCase {
         app.descendants(matching: .any).matching(identifier: id).firstMatch
     }
 
+    func testShaderRequestSettingsWindowQueuedCancellationAndRetainedRecord() throws {
+        let suite = "HolodeckMacUITests-" + UUID().uuidString
+        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Holodeck/Requests-tests-\(suite)")
+        let id = UUID().uuidString
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent(id), withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let request: [String: Any] = ["id": id, "purpose": "creative", "origin": "manual", "prompt": "UI request fixture", "context": [
+            "shaderID": "plasma", "name": "Plasma", "category": "PROCEDURAL", "description": "Captured scene", "colors": [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]],
+            "source": "", "sourceHash": String(repeating: "0", count: 64), "screenshot": "", "animationTime": 3.0, "drawableWidth": 1920, "drawableHeight": 1080]]
+        let status: [String: Any] = ["id": id, "request": request, "deviceID": "fixture-TV", "createdAt": Date().timeIntervalSinceReferenceDate,
+            "updatedAt": Date().timeIntervalSinceReferenceDate, "stage": "queued", "message": "Waiting for the Mac worker", "sequence": 0]
+        let config: [String: Any] = ["repository": "", "codex": "/opt/homebrew/bin/codex", "python": "/usr/bin/python3", "git": "/usr/bin/git", "shaderTool": "", "model": "", "reasoning": "high", "enabled": false]
+        let journal = try JSONSerialization.data(withJSONObject: [["status": status, "configuration": config, "revoked": false]])
+        let app = try app(suite: suite, arguments: ["--ui-test-local-library"])
+        app.launchEnvironment["HOLODECK_UI_TEST_REQUEST_JOURNAL"] = String(decoding: journal, as: UTF8.self)
+        app.launch()
+        app.activate()
+        XCTAssertTrue(app.windows["holodeck-viewer-window"].waitForExistence(timeout: 15))
+        let settings = element("shader-library-settings", in: app)
+        XCTAssertTrue(settings.waitForExistence(timeout: 10)); settings.click()
+        XCTAssertTrue(element("request-model", in: app).waitForExistence(timeout: 10))
+        XCTAssertFalse(element("enable-shader-requests", in: app).isEnabled)
+        app.buttons["Open Requests"].firstMatch.click()
+        let requests = element("shader-requests-list", in: app)
+        XCTAssertTrue(requests.waitForExistence(timeout: 10))
+        let row = element("shader-request-" + id, in: app)
+        XCTAssertTrue(row.waitForExistence(timeout: 10)); row.click()
+        let cancel = app.buttons["Cancel Queued Request"].firstMatch
+        XCTAssertTrue(cancel.waitForExistence(timeout: 10)); cancel.click()
+        XCTAssertTrue(app.buttons["Delete Record"].firstMatch.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["Open Logs and Evidence"].firstMatch.exists)
+        let attachment = XCTAttachment(screenshot: app.screenshot()); attachment.name = "Requests window retains cancelled work"; attachment.lifetime = .keepAlways; add(attachment)
+        app.buttons["Delete Record"].firstMatch.click()
+        XCTAssertTrue(app.staticTexts["Choose a request to inspect its progress, logs and visual evidence."].waitForExistence(timeout: 10))
+        XCTAssertFalse(element("shader-request-" + id, in: app).exists)
+    }
+
     func testLocalFolderManualReloadRollbackAndBookmarkRestoration() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("HolodeckAuthoring-" + UUID().uuidString)
         let shader = root.appendingPathComponent("shaders/plasma")

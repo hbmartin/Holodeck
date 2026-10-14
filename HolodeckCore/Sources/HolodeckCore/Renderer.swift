@@ -1,5 +1,9 @@
 import MetalKit
 import Dependencies
+import Foundation
+#if os(tvOS)
+import QuartzCore
+#endif
 
 /// Matches ShaderUniforms in the runtime Metal source: 8 + 4 + 4 bytes.
 nonisolated public struct ShaderUniforms {
@@ -61,6 +65,42 @@ public final class Renderer: NSObject, MTKViewDelegate, SceneRendering {
     private var resolution = SIMD2<Float>(1, 1)
     public private(set) var activeShader: ShaderDefinition?
 
+    public var onPresentedFrame: (@MainActor @Sendable (Double, Double?) -> Void)?
+    public var onMeasurementReset: (@MainActor @Sendable () -> Void)?
+    #if os(tvOS)
+    private var displayLink: CADisplayLink?
+    private var completedFrame = false
+    private var completedGPU: Double?
+    #endif
+    private var snapshotEncodingID: UUID?
+    private var snapshotRequest: (id: UUID, shader: ShaderDefinition, continuation: CheckedContinuation<ShaderRequestContext, Error>)?
+
+    isolated deinit {
+        #if os(tvOS)
+        displayLink?.invalidate()
+        #endif
+    }
+
+    public func captureSnapshot() async throws -> ShaderRequestContext {
+        guard isActive, let shader = activeShader, snapshotRequest == nil else {
+            throw ShaderRequestError.unavailable("A playing shader is required to capture context.")
+        }
+        let id = UUID()
+        return try await withCheckedThrowingContinuation { continuation in
+            snapshotRequest = (id, shader, continuation)
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(10))
+                self?.finishSnapshot(id, .failure(ShaderRequestError.unavailable("Couldn’t capture the playing shader. Try Input again.")))
+            }
+        }
+    }
+
+    private func finishSnapshot(_ id: UUID, _ result: Result<ShaderRequestContext, Error>) {
+        guard let request = snapshotRequest, request.id == id else { return }
+        snapshotRequest = nil; snapshotEncodingID = nil
+        request.continuation.resume(with: result)
+    }
+
     public var animationTime: Float { clock.elapsed(at: now()) }
 
     public init?(metalKitView: MTKView) {
@@ -119,6 +159,65 @@ public final class Renderer: NSObject, MTKViewDelegate, SceneRendering {
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<ShaderUniforms>.stride, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
+        if let request = snapshotRequest, snapshotEncodingID != request.id {
+            snapshotEncodingID = request.id
+            if request.shader.id != activeShader?.id || request.shader.sourceHash != activeShader?.sourceHash {
+                finishSnapshot(request.id, .failure(ShaderRequestError.unavailable("The scene changed while capturing it. Try Input again.")))
+            } else {
+                let width = drawable.texture.width, height = drawable.texture.height
+                let row = (width * 4 + 255) & ~255
+                if width * height <= 16_777_216, let buffer = device.makeBuffer(length: row * height, options: .storageModeShared),
+                   let blit = commandBuffer.makeBlitCommandEncoder() {
+                    blit.copy(from: drawable.texture, sourceSlice: 0, sourceLevel: 0,
+                              sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: width, height: height, depth: 1),
+                              to: buffer, destinationOffset: 0, destinationBytesPerRow: row, destinationBytesPerImage: row * height)
+                    blit.endEncoding()
+                    let capturedBuffer = RequestMetalBuffer(buffer)
+                    let time = uniforms.time
+                    commandBuffer.addCompletedHandler { [weak self] command in
+                        guard command.status == .completed else {
+                            Task { @MainActor in self?.finishSnapshot(request.id, .failure(ShaderRequestError.unavailable("Frame capture failed."))) }
+                            return
+                        }
+                        let pixels = Data(bytes: capturedBuffer.value.contents(), count: row * height)
+                        Task.detached {
+                            do {
+                                let png = try RequestScreenshot.encode(pixels: pixels, width: width, height: height, bytesPerRow: row)
+                                let context = ShaderRequestContext(shader: request.shader, screenshot: png, animationTime: time, width: width, height: height)
+                                await self?.finishSnapshot(request.id, .success(context))
+                            } catch { await self?.finishSnapshot(request.id, .failure(error)) }
+                        }
+                    }
+                } else { finishSnapshot(request.id, .failure(ShaderRequestError.unavailable("Unable to allocate frame capture."))) }
+            }
+        }
+        let generation = timingGeneration
+        #if os(tvOS)
+        // tvOS omits MTLDrawable's presentation callback. Consume completed frames on
+        // display ticks, counting at most one visible update per tick (dropped frames
+        // do not inflate delivered FPS). GPU duration remains separate evidence.
+        commandBuffer.addCompletedHandler { [weak self] command in
+            guard command.status == .completed else { return }
+            let duration = command.gpuEndTime > command.gpuStartTime && command.gpuStartTime > 0
+                ? (command.gpuEndTime - command.gpuStartTime) * 1000 : nil
+            Task { @MainActor [weak self] in
+                guard let self, self.isActive, self.timingGeneration == generation else { return }
+                self.completedFrame = true; self.completedGPU = duration
+            }
+        }
+        #else
+        let commandTiming = RequestMetalCommand(commandBuffer)
+        drawable.addPresentedHandler { [weak self] presented in
+            let timestamp = presented.presentedTime
+            let command = commandTiming.value
+            let duration = command.gpuEndTime > command.gpuStartTime && command.gpuStartTime > 0
+                ? (command.gpuEndTime - command.gpuStartTime) * 1000 : nil
+            Task { @MainActor [weak self] in
+                guard let self, self.isActive, self.timingGeneration == generation else { return }
+                self.onPresentedFrame?(timestamp > 0 ? timestamp : self.now(), duration)
+            }
+        }
+        #endif
         if policy.adaptiveResolution {
             let generation = timingGeneration
             commandBuffer.addCompletedHandler { [weak self] buffer in
@@ -141,11 +240,18 @@ public final class Renderer: NSObject, MTKViewDelegate, SceneRendering {
         metalKitView.colorPixelFormat = .bgra8Unorm_srgb
         metalKitView.depthStencilPixelFormat = .invalid
         metalKitView.sampleCount = 1
+        metalKitView.framebufferOnly = false
         metalKitView.clearColor = MTLClearColorMake(0, 0, 0, 1)
         metalKitView.preferredFramesPerSecond = policy.framesPerSecond
         metalKitView.autoResizeDrawable = !policy.adaptiveResolution
         metalKitView.isPaused = !isActive
         metalKitView.delegate = self
+        #if os(tvOS)
+        displayLink?.invalidate()
+        let displayLink = CADisplayLink(target: RequestDisplayLinkTarget(self), selector: #selector(RequestDisplayLinkTarget.tick(_:)))
+        displayLink.add(to: .main, forMode: .common)
+        self.displayLink = displayLink
+        #endif
         nativeDrawableSize = .zero
         resetMeasurements()
         mtkView(metalKitView, drawableSizeWillChange: metalKitView.drawableSize)
@@ -166,7 +272,21 @@ public final class Renderer: NSObject, MTKViewDelegate, SceneRendering {
         updateDrawableSize()
     }
 
+    #if os(tvOS)
+    fileprivate func displayTick(_ link: CADisplayLink) {
+        guard isActive else { return }
+        if completedFrame { onPresentedFrame?(link.timestamp, completedGPU) }
+        else { onDisplayObservation?(link.timestamp) }
+        completedFrame = false; completedGPU = nil
+    }
+    public var onDisplayObservation: (@MainActor @Sendable (Double) -> Void)?
+    #endif
+
     private func resetMeasurements() {
+        #if os(tvOS)
+        completedFrame = false; completedGPU = nil
+        #endif
+        onMeasurementReset?()
         timingGeneration &+= 1
         quality.reset(at: now())
     }
@@ -179,6 +299,25 @@ public final class Renderer: NSObject, MTKViewDelegate, SceneRendering {
     }
 
     public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        resetMeasurements()
         resolution = SIMD2(Float(max(size.width, 1)), Float(max(size.height, 1)))
     }
 }
+
+// Metal owns GPU synchronization; these immutable references are read only after completion/presentation.
+nonisolated private final class RequestMetalBuffer: @unchecked Sendable {
+    let value: any MTLBuffer
+    init(_ value: any MTLBuffer) { self.value = value }
+}
+nonisolated private final class RequestMetalCommand: @unchecked Sendable {
+    let value: any MTLCommandBuffer
+    init(_ value: any MTLCommandBuffer) { self.value = value }
+}
+
+#if os(tvOS)
+@MainActor private final class RequestDisplayLinkTarget: NSObject {
+    weak var renderer: Renderer?
+    init(_ renderer: Renderer) { self.renderer = renderer }
+    @objc func tick(_ link: CADisplayLink) { renderer?.displayTick(link) }
+}
+#endif

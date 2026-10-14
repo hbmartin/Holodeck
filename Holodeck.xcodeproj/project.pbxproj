@@ -209,7 +209,7 @@
 		};
 		C00000000000000000000064 /* HolodeckMac */ = {
             isa = PBXNativeTarget; buildConfigurationList = C0000000000000000000006A;
-            buildPhases = (C00000000000000000000067, C00000000000000000000068, C00000000000000000000069);
+            buildPhases = (C00000000000000000000067, C00000000000000000000068, C00000000000000000000069, C000000000000000000000F1);
             buildRules = (); dependencies = (); fileSystemSynchronizedGroups = (C00000000000000000000065);
             name = HolodeckMac; productName = HolodeckMac; productReference = C00000000000000000000066;
             packageProductDependencies = (C0000000000000000000006D); productType = "com.apple.product-type.application";
@@ -295,6 +295,10 @@
 		C00000000000000000000069 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		C000000000000000000000CD = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (C000000000000000000000D3,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+        C000000000000000000000F1 = {isa = PBXShellScriptBuildPhase; buildActionMask = 2147483647; files = (); inputPaths = (); name = "Bundle Shader Tool"; outputPaths = ("$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Tools/holodeck-shader-tool",); runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/bash; shellScript = "set -euo pipefail\n/usr/bin/xcrun swift build --package-path \"${SRCROOT}/HolodeckCore\" -c release --product holodeck-shader-tool --scratch-path \"${DERIVED_FILE_DIR}/shader-tool-build\"\nTOOL_BIN=$(/usr/bin/xcrun swift build --package-path \"${SRCROOT}/HolodeckCore\" -c release --show-bin-path --scratch-path \"${DERIVED_FILE_DIR}/shader-tool-build\")\nmkdir -p \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/Tools\"\ninstall -m 755 \"${TOOL_BIN}/holodeck-shader-tool\" \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/Tools/holodeck-shader-tool\"\nif [ \"${CODE_SIGNING_ALLOWED:-NO}\" = YES ]; then /usr/bin/codesign --force --sign \"${EXPANDED_CODE_SIGN_IDENTITY:--}\" \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/Tools/holodeck-shader-tool\"; fi\n"; };
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		24051A443076DFD7003E9983 /* Sources */ = {
@@ -598,8 +602,8 @@
                 CODE_SIGN_STYLE = Automatic; CODE_SIGN_IDENTITY = "Apple Development"; DEVELOPMENT_TEAM = MGPHJKUJSY;
                 GENERATE_INFOPLIST_FILE = YES; SWIFT_VERSION = 6.0; SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
                 SWIFT_APPROACHABLE_CONCURRENCY = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 1.0;
-                ENABLE_APP_SANDBOX = YES; ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
-                ENABLE_INCOMING_NETWORK_CONNECTIONS = YES; ENABLE_USER_SELECTED_FILES = readonly;
+                ENABLE_APP_SANDBOX = NO; ENABLE_USER_SCRIPT_SANDBOXING = NO; ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
+                ENABLE_INCOMING_NETWORK_CONNECTIONS = YES; ENABLE_USER_SELECTED_FILES = readwrite;
                 INFOPLIST_FILE = HolodeckMac/Info.plist;
                 PRODUCT_NAME = "$(TARGET_NAME)"; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks");
                 PRODUCT_BUNDLE_IDENTIFIER = "me.haroldmartin.HolodeckMac$(HOLODECK_TEST_BUNDLE_SUFFIX)"; INFOPLIST_KEY_CFBundleDisplayName = Holodeck; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment"; COMBINE_HIDPI_IMAGES = YES;}; name = Debug; };
@@ -607,8 +611,8 @@
                 CODE_SIGN_STYLE = Automatic; CODE_SIGN_IDENTITY = "Apple Development"; DEVELOPMENT_TEAM = MGPHJKUJSY;
                 GENERATE_INFOPLIST_FILE = YES; SWIFT_VERSION = 6.0; SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
                 SWIFT_APPROACHABLE_CONCURRENCY = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 1.0;
-                ENABLE_APP_SANDBOX = YES; ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
-                ENABLE_INCOMING_NETWORK_CONNECTIONS = YES; ENABLE_USER_SELECTED_FILES = readonly;
+                ENABLE_APP_SANDBOX = NO; ENABLE_USER_SCRIPT_SANDBOXING = NO; ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
+                ENABLE_INCOMING_NETWORK_CONNECTIONS = YES; ENABLE_USER_SELECTED_FILES = readwrite;
                 INFOPLIST_FILE = HolodeckMac/Info.plist;
                 PRODUCT_NAME = "$(TARGET_NAME)"; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks");
                 PRODUCT_BUNDLE_IDENTIFIER = "me.haroldmartin.HolodeckMac$(HOLODECK_TEST_BUNDLE_SUFFIX)"; INFOPLIST_KEY_CFBundleDisplayName = Holodeck; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment"; COMBINE_HIDPI_IMAGES = YES;}; name = Release; };
