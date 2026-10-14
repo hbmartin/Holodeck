@@ -63,7 +63,9 @@ final class CatalogTests: XCTestCase {
         XCTAssertEqual(try persisted.validated().shaders.last?.id, "ninth-shader")
         let urls = box.urls
         XCTAssertEqual(urls.count, 11)
-        XCTAssertTrue(urls.dropFirst().allSatisfy { $0.host == "raw.githubusercontent.com" && $0.path.contains("/" + expected.publicationRevision + "/") })
+        XCTAssertTrue(urls.dropFirst().allSatisfy { request in
+            if case .asset(let revision, _) = request { return revision == expected.publicationRevision }; return false
+        })
     }
     func testInvalidSourceAndInterruptedWriteRetainPreviousSnapshot() async throws {
         for writeFails in [false, true] {
@@ -90,7 +92,7 @@ final class CatalogTests: XCTestCase {
         let current = await service.current()
         XCTAssertEqual(current?.shaders.count, 8)
         XCTAssertNil(box.files["snapshot.json"])
-        let offline = CatalogService(network: box.network, storage: TestCatalog.storage)
+        let offline = CatalogService(source: box.source, storage: TestCatalog.storage)
         box.setResponses([:])
         do { _ = try await offline.refresh(); XCTFail("Offline refresh must fail") } catch {}
         let fallback = await offline.current()
@@ -127,13 +129,13 @@ final class CatalogTests: XCTestCase {
     func testConcurrentRefreshDoesNotStartDuplicateDownloads() async throws {
         let gate = PreviewRequestGate()
         let service = CatalogService(
-                                     network: CatalogNetwork { url, _ in await gate.image(url.lastPathComponent) },
+                                     source: CatalogSource { url, _ in await gate.image(url.lastPathComponent) },
                                      storage: TestCatalog.storage)
         let first = Task { try await service.refresh() }
-        await gate.waitForRequest("published")
+        await gate.waitForRequest("head")
         let concurrent = Task { try await service.refresh() }
-        let reference = Data("{\"object\":{\"sha\":\"\(TestCatalog.snapshot.publicationRevision)\"}}".utf8)
-        await gate.complete("published", data: reference)
+        let reference = Data("{\"revision\":\"\(TestCatalog.snapshot.publicationRevision)\"}".utf8)
+        await gate.complete("head", data: reference)
         let result = try await first.value
         let secondResult = try await concurrent.value
         XCTAssertNil(result)
@@ -154,17 +156,17 @@ final class CatalogTests: XCTestCase {
         let gate = PreviewRequestGate()
         let box = CatalogTestBox()
         _ = try CatalogTestFixtures.makeService(expected, box: box)
-        let network = box.network
-        let service = CatalogService(network: CatalogNetwork { url, limit in
-            if url.lastPathComponent == "published" { return await gate.image("published") }
+        let network = box.source
+        let service = CatalogService(source: CatalogSource { url, limit in
+            if url.isHead { return await gate.image("head") }
             return try await network.get(url, limit)
         }, storage: TestCatalog.storage)
         let first = Task { try await service.refresh() }
-        await gate.waitForRequest("published")
+        await gate.waitForRequest("head")
         let second = Task { try await service.refresh(force: true) }
         // Let the second caller enter the actor before completing the reference request.
         await Task.yield()
-        await gate.complete("published", data: Data("{\"object\":{\"sha\":\"\(expected.publicationRevision)\"}}".utf8))
+        await gate.complete("head", data: Data("{\"revision\":\"\(expected.publicationRevision)\"}".utf8))
         let firstResult = try await first.value
         let secondResult = try await second.value
         XCTAssertEqual(firstResult?.publicationRevision, expected.publicationRevision)
@@ -192,7 +194,7 @@ final class CatalogTests: XCTestCase {
         let box = CatalogTestBox()
         let image = Data([137, 80, 78, 71, 13, 10, 26, 10] + Array("test-image".utf8))
         let preview = ShaderPreview(path: "previews/test.png", hash: CatalogHash.sha256(image), publicationRevision: CatalogTestFixtures.candidate().publicationRevision)
-        let service = CatalogService(network: box.network, storage: box.storage)
+        let service = CatalogService(source: box.source, storage: box.storage)
         box.setResponses(["/previews/test.png": Data("corrupt".utf8)])
         do { _ = try await service.preview(preview); XCTFail("Bad image hash must fail") } catch {}
         XCTAssertTrue(box.files.isEmpty)

@@ -4,17 +4,6 @@ import Dependencies
 import CoreGraphics
 import ImageIO
 
-nonisolated public struct CatalogNetwork: Sendable {
-    public var get: @Sendable (URL, Int) async throws -> Data
-    public init(get: @escaping @Sendable (URL, Int) async throws -> Data) { self.get = get }
-    public static let live = session(configuration: .default)
-
-    static func session(configuration: URLSessionConfiguration) -> Self {
-        let downloader = CatalogDownloader(configuration: configuration)
-        return Self { url, limit in try await downloader.get(url, limit: limit) }
-    }
-}
-
 nonisolated public struct CatalogStorage: Sendable {
     public var read: @Sendable (String) throws -> Data?
     public var write: @Sendable (String, Data) throws -> Void
@@ -56,10 +45,11 @@ nonisolated public enum PreviewSizing {
 
 /// Refresh downloads and persistence run off the UI executor. Failed refreshes never replace current.
 public actor CatalogService {
+    public nonisolated let usesLocalNetwork: Bool
     public nonisolated let initialCatalog: ValidatedCatalog?
     private var snapshot: ValidatedCatalog?
     private var loadedCache = false
-    private let network: CatalogNetwork
+    private let source: CatalogSource
     private let storage: CatalogStorage
     private let clock: AnyClock<Duration>
     private let enabled: Bool
@@ -67,7 +57,6 @@ public actor CatalogService {
     private var refreshTask: Task<Void, Never>?
     private var refreshWaiters: [UUID: CatalogRefreshWaiter] = [:]
     var refreshWaiterCount: Int { refreshWaiters.count }
-    private let repository: String
 
     private var previewData = CatalogLRU<String, Data>(limit: 16_777_216)
     private var previewImages = CatalogLRU<PreviewImageKey, CGImage>(limit: 33_554_432)
@@ -91,17 +80,16 @@ public actor CatalogService {
         previewImages.removeAll()
     }
 
-    public init(initialCatalog: ValidatedCatalog? = nil, network: CatalogNetwork = .live, storage: CatalogStorage = .live,
-         clock: any Clock<Duration> = ContinuousClock(), enabled: Bool = true,
-         repository: String = "hbmartin/HolodeckShaders") {
+    public init(initialCatalog: ValidatedCatalog? = nil, source: CatalogSource = .unavailable, storage: CatalogStorage = .live,
+         clock: any Clock<Duration> = ContinuousClock(), enabled: Bool = true, usesLocalNetwork: Bool = false) {
+        self.usesLocalNetwork = usesLocalNetwork
         self.initialCatalog = initialCatalog
         snapshot = initialCatalog
         loadedCache = initialCatalog != nil
-        self.network = network
+        self.source = source
         self.storage = storage
         self.clock = AnyClock(clock)
         self.enabled = enabled
-        self.repository = repository
     }
 
     public nonisolated static func offline(initialCatalog: ValidatedCatalog? = nil, storage: CatalogStorage = .disabled) -> CatalogService {
@@ -172,18 +160,15 @@ public actor CatalogService {
     }
 
     private func downloadPublication() async throws -> ValidatedCatalog? {
-        struct Commit: Decodable { let sha: String }
-        let commitURL = URL(string: "https://api.github.com/repos/\(repository)/git/ref/heads/published")!
-        struct Reference: Decodable { let object: Commit }
-        let reference = try JSONDecoder().decode(Reference.self, from: await network.get(commitURL, 65_536))
-        let revision = reference.object.sha
-        guard CatalogHash.isSHA(revision, length: 40) else { throw CatalogError.invalidManifest }
+        let head = try JSONDecoder().decode(CatalogHead.self, from: await source.get(.head, 65_536))
+        let revision = head.revision
+        guard CatalogHash.isRevision(revision) else { throw CatalogError.invalidManifest }
         if revision == snapshot?.publicationRevision { return nil }
-        let manifest = try JSONDecoder().decode(CatalogManifest.self, from: await network.get(assetURL("catalog.json", revision: revision), 2_097_152))
+        let manifest = try JSONDecoder().decode(CatalogManifest.self, from: await source.get(.asset(revision: revision, path: "catalog.json"), 2_097_152))
         var builder = try CatalogBuilder(manifest: manifest)
-        // Bounded sequential downloads keep memory and GitHub request concurrency predictable.
+        // Bounded sequential downloads keep memory and transfer concurrency predictable.
         for entry in manifest.shaders {
-            let data = try await network.get(assetURL(entry.sourcePath, revision: revision), 1_048_576)
+            let data = try await source.get(.asset(revision: revision, path: entry.sourcePath), 1_048_576)
             try builder.addSource(data, for: entry)
         }
         let candidate = try builder.finish(revision: revision)
@@ -233,6 +218,15 @@ public actor CatalogService {
         try Task.checkCancellation()
         try validatePreview(preview)
         while let failure = previewFailures.value(for: PreviewFailureKey(preview)) {
+            if failure.waitsForAvailability, let wait = source.waitForAvailability {
+                previewRetryWaiterCount += 1
+                defer { previewRetryWaiterCount -= 1 }
+                try await wait()
+                try Task.checkCancellation()
+                let key = PreviewFailureKey(preview)
+                if previewFailures.value(for: key)?.id == failure.id { previewFailures.removeValue(for: key) }
+                continue
+            }
             guard let retryAt = failure.retryAt else { return false }
             if clock.now >= retryAt { return true }
             do {
@@ -251,12 +245,14 @@ public actor CatalogService {
         let attempts = min((previewFailures.value(for: key)?.attempts ?? 0) + 1, 5)
         let permanent: Bool
         if case CatalogError.invalidPreview = error { permanent = true } else { permanent = false }
-        let retryAt = permanent ? nil : clock.now.advanced(by: .seconds(min(30 * (1 << (attempts - 1)), 300)))
-        previewFailures.insert(PreviewFailure(error: error, attempts: attempts, retryAt: retryAt), for: key, cost: 1)
+        let waitsForAvailability = source.waitForAvailability != nil && (error as? LocalCatalogError)?.isConnectivityFailure == true
+        let retryAt = permanent || waitsForAvailability ? nil : clock.now.advanced(by: .seconds(min(30 * (1 << (attempts - 1)), 300)))
+        previewFailures.insert(PreviewFailure(error: error, attempts: attempts, retryAt: retryAt,
+            waitsForAvailability: waitsForAvailability), for: key, cost: 1)
     }
 
     private func validatePreview(_ preview: ShaderPreview) throws {
-        guard CatalogHash.isSHA(preview.hash), CatalogHash.isSHA(preview.publicationRevision, length: 40),
+        guard CatalogHash.isSHA(preview.hash), CatalogHash.isRevision(preview.publicationRevision),
               preview.path.range(of: "^previews/[a-z0-9]+(-[a-z0-9]+)*\\.png$", options: .regularExpression) != nil
         else { throw CatalogError.invalidPreview }
     }
@@ -265,7 +261,7 @@ public actor CatalogService {
         let filename = "preview-\(preview.hash).png"
         if let cached = try? storage.read(filename), validPreview(cached, hash: preview.hash) { return cached }
         guard enabled else { throw CatalogError.invalidPreview }
-        let data = try await network.get(assetURL(preview.path, revision: preview.publicationRevision), 8_388_608)
+        let data = try await source.get(.asset(revision: preview.publicationRevision, path: preview.path), 8_388_608)
         guard validPreview(data, hash: preview.hash) else { throw CatalogError.invalidPreview }
         // An image-cache write failure should not prevent the fetched image from displaying.
         try? storage.write(filename, data)
@@ -319,9 +315,7 @@ public actor CatalogService {
         data.count <= 8_388_608 && data.starts(with: [137, 80, 78, 71, 13, 10, 26, 10]) && CatalogHash.sha256(data) == hash
     }
 
-    private func assetURL(_ path: String, revision: String) -> URL {
-        URL(string: "https://raw.githubusercontent.com/\(repository)/\(revision)/\(path)")!
-    }
+
 }
 
 /// Completion and cancellation may race, including before continuation registration.
@@ -360,7 +354,14 @@ extension DependencyValues {
 }
 
 nonisolated public enum CatalogServiceKey: DependencyKey {
-    public static let liveValue = CatalogService()
+    public static var liveValue: CatalogService {
+        #if os(tvOS)
+        @Dependency(\.localCatalogClient) var client
+        return CatalogService(source: client.source, usesLocalNetwork: true)
+        #else
+        return CatalogService()
+        #endif
+    }
     public static let testValue = CatalogService.offline()
     public static let previewValue = CatalogService.offline()
 }
@@ -378,9 +379,11 @@ nonisolated private struct PreviewFailureKey: Hashable {
 }
 
 nonisolated private struct PreviewFailure {
+    let id = UUID()
     let error: Error
     let attempts: Int
     let retryAt: AnyClock<Duration>.Instant?
+    let waitsForAvailability: Bool
 }
 
 nonisolated private enum PreviewSize: Hashable, Sendable {

@@ -9,7 +9,7 @@ final class CatalogTests: XCTestCase {
     func testReusedCardIgnoresLatePreviewCompletion() async throws {
         let gate = PreviewRequestGate()
         let service = CatalogService(
-                                     network: CatalogNetwork { url, _ in await gate.image(url.lastPathComponent) },
+                                     source: CatalogSource { url, _ in await gate.image(url.lastPathComponent) },
                                      storage: TestCatalog.storage)
         var old = TestCatalog.shaders[0]
         var new = TestCatalog.shaders[1]
@@ -66,7 +66,7 @@ final class CatalogTests: XCTestCase {
 
     func testResizeDuringPendingRequestIgnoresSameHashStaleCompletion() async throws {
         let gate = PreviewRequestGate()
-        let service = CatalogService(network: CatalogNetwork { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
+        let service = CatalogService(source: CatalogSource { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
         let cell = ShaderCardCell(frame: CGRect(x: 0, y: 0, width: 160, height: 116))
         let shader = TestCatalog.shaders[0]
         cell.configure(shader: shader, active: false, loading: false, catalogService: service)
@@ -125,7 +125,7 @@ final class CatalogTests: XCTestCase {
 
     func testCardRetriesValidationFailureOnlyAfterPublicationChangeAndKeepsImageOnResizeFailure() async throws {
         let gate = PreviewRequestGate()
-        let service = CatalogService(network: CatalogNetwork { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
+        let service = CatalogService(source: CatalogSource { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
         var shader = TestCatalog.shaders[0]
         let cell = ShaderCardCell(frame: CGRect(x: 0, y: 0, width: 320, height: 232))
         cell.configure(shader: shader, active: false, loading: false, catalogService: service)

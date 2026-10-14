@@ -22,6 +22,7 @@ final class MacUITestDriver {
               configuration.hasExplicitStorageSuite, let suite = configuration.storageSuite else { return }
         NSWindow.removeFrame(usingName: Self.windowAutosaveName(for: suite))
         configuration.cleanupStorageSuite()
+        try? LocalCatalogServer.removeTestingSecrets(namespace: suite)
     }
 
     func observeStartupActivation(in model: MacModel) {

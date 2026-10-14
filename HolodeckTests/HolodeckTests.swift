@@ -1,5 +1,6 @@
 import XCTest
 import MetalKit
+import Network
 import Dependencies
 import Clocks
 import ConcurrencyExtras
@@ -386,8 +387,8 @@ final class HolodeckTests: XCTestCase {
         for cached in [false, true] {
             let counter = ControllerNetworkCounter()
             let service = CatalogService(initialCatalog: cached ? TestCatalog.catalog : nil,
-                network: CatalogNetwork { url, _ in
-                    if url.host == "api.github.com" { await counter.record() }
+                source: CatalogSource { url, _ in
+                    if url.isHead { await counter.record() }
                     throw CatalogError.invalidResponse
                 }, storage: .disabled)
             let controller = try await hostController(dependencies: { $0.catalogService = service },
@@ -744,6 +745,7 @@ final class HolodeckTests: XCTestCase {
         addTeardownBlock { @MainActor in
             controller.hintTask?.cancel()
             controller.setSceneActive(false)
+            controller.setSceneForeground(false)
             guard hosted.presentingViewController != nil else { return }
             let dismissed = XCTestExpectation(description: "Controller finishes disappearing")
             hosted.dismiss(animated: false) { dismissed.fulfill() }
@@ -977,4 +979,127 @@ private final class PreferenceSpy {
 private final class ControlledTime {
     var value: TimeInterval
     init(value: TimeInterval) { self.value = value }
+}
+
+@MainActor
+extension HolodeckTests {
+    private func recoveryClient(channel: TVRecoveryChannel = TVRecoveryChannel()) -> LocalCatalogClient {
+        var dependencies = LocalClientDependencies()
+        dependencies.usesSystemBrowser = false
+        dependencies.readSecret = { _ in nil }; dependencies.writeSecret = { _, _ in }; dependencies.removeSecret = { _ in }
+        dependencies.resolve = { _ in ResolvedMac(address: "192.168.1.2", port: 1234) }
+        dependencies.transport = { mac, _, _, _ in
+            channel.setMac(mac.id)
+            return LocalClientTransport(channel: channel, fingerprint: { "test-pin" }, identityChanged: { false })
+        }
+        let client = LocalCatalogClient(testingNamespace: "tv-controller", dependencies: dependencies)
+        addTeardownBlock { await client.stop() }
+        return client
+    }
+    func testCatalogFailureRemainsPrimaryWhileConnectionStatusChanges() async throws {
+        let (device, _) = try await Self.controllerPipeline.value
+        let client = recoveryClient()
+        let service = CatalogService(source: CatalogSource { _, _ in
+            throw LocalCatalogError.invalidFile("catalog.json", "Broken catalog")
+        }, storage: .disabled, usesLocalNetwork: true)
+        let controller = try await hostController(dependencies: {
+            $0.catalogService = service; $0.localCatalogClient = client; $0.metalDevice = device; $0.shaderCompilerFactory = ShaderCompilerFactoryKey.liveValue
+        })
+        let status: UILabel = try findView("shader-status", in: controller)
+        let failed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in status.text == "catalog.json: Broken catalog" }, object: controller)
+        try await waitForExpectation(failed)
+        var state = LocalClientState(); state.status = .connected("Test Mac")
+        controller.applyLocalState(state)
+        let connection: UILabel = try findView("mac-connection-status", in: controller)
+        XCTAssertEqual(connection.text, "Connected to Test Mac")
+        XCTAssertEqual(status.text, "catalog.json: Broken catalog")
+        state.status = .permissionDenied; controller.applyLocalState(state)
+        XCTAssertEqual(status.text, "catalog.json: Broken catalog")
+    }
+    func testTemporaryInactivityPreservesPairingWhileBackgroundStopsIt() async throws {
+        let (device, _) = try await Self.controllerPipeline.value
+        let channel = TVRecoveryChannel(); let client = recoveryClient(channel: channel)
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: client.source, storage: .disabled, usesLocalNetwork: true)
+        let controller = try await hostController(dependencies: {
+            $0.catalogService = service; $0.localCatalogClient = client; $0.metalDevice = device; $0.shaderCompilerFactory = ShaderCompilerFactoryKey.liveValue
+        })
+        let deadline = ContinuousClock.now + .seconds(3)
+        while await client.currentBrowserID == nil {
+            guard ContinuousClock.now < deadline else { throw LocalCatalogError.timeout }; await Task.yield()
+        }
+        let browser = await client.currentBrowserID
+        let mac = LocalMac(id: UUID().uuidString, name: "Test Mac", endpoint: .service(name: "Test",
+            type: LocalProtocol.serviceType, domain: "local.", interface: nil), interface: nil, version: 1)
+        await client.discovered([mac], id: try XCTUnwrap(browser), sequence: 1)
+        while true {
+            if case .awaitingApproval = await client.currentState.status { break }
+            guard ContinuousClock.now < deadline else { throw LocalCatalogError.timeout }; await Task.yield()
+        }
+        let pairing = await client.currentState.status
+        controller.setSceneActive(false); controller.setSceneActive(true)
+        let resumed = await client.currentState.status
+        XCTAssertEqual(resumed, pairing); XCTAssertEqual(channel.cancellations, 0)
+        XCTAssertTrue(controller.sceneIsForeground)
+        controller.setSceneForeground(false)
+        while await client.currentBrowserID != nil || channel.cancellations == 0 {
+            guard ContinuousClock.now < deadline else { throw LocalCatalogError.timeout }; await Task.yield()
+        }
+        XCTAssertFalse(controller.sceneIsForeground)
+    }
+    func testAutomaticMacChooserDefersBehindModalAndClosesWhenRememberedMacReturns() async throws {
+        let (device, _) = try await Self.controllerPipeline.value
+        let controller = try await hostController(clock: ContinuousClock(), dependencies: { $0.metalDevice = device; $0.shaderCompilerFactory = ShaderCompilerFactoryKey.liveValue })
+        await controller.shaderSelectionTask?.value
+        let other = UIAlertController(title: "Other modal", message: nil, preferredStyle: .alert)
+        other.addAction(UIAlertAction(title: "OK", style: .default))
+        controller.present(other, animated: false)
+        var choice = LocalClientState(); choice.status = .chooseMac; choice.macChoiceID = UUID()
+        controller.applyLocalState(choice)
+        XCTAssertTrue(controller.presentedViewController === other)
+        let disappeared = XCTestExpectation(description: "Other modal dismissed")
+        other.dismiss(animated: false) { disappeared.fulfill() }
+        try await waitForExpectation(disappeared)
+        let presented = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            (controller.presentedViewController as? UIAlertController)?.title == "Choose a Mac"
+                && controller.presentedViewController?.isBeingPresented == false
+        }, object: controller)
+        try await waitForExpectation(presented)
+        var returning = LocalClientState(); returning.status = .connecting
+        controller.applyLocalState(returning)
+        let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in controller.presentedViewController == nil }, object: controller)
+        try await waitForExpectation(dismissed)
+    }
+    func testCanceledMacChooserDoesNotReopenForSameAbsenceEpisode() async throws {
+        let (device, _) = try await Self.controllerPipeline.value
+        let controller = try await hostController(clock: ContinuousClock(), dependencies: { $0.metalDevice = device; $0.shaderCompilerFactory = ShaderCompilerFactoryKey.liveValue })
+        await controller.shaderSelectionTask?.value
+        var choice = LocalClientState(); choice.status = .chooseMac; choice.macChoiceID = UUID()
+        controller.applyLocalState(choice)
+        let presented = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            controller.presentedViewController is UIAlertController && controller.presentedViewController?.isBeingPresented == false
+        }, object: controller)
+        try await waitForExpectation(presented)
+        controller.cancelMacChoice()
+        let dismissed = XCTestExpectation(description: "Canceled chooser dismissed")
+        controller.presentedViewController?.dismiss(animated: false) { dismissed.fulfill() }
+        try await waitForExpectation(dismissed)
+        controller.applyLocalState(choice)
+        await Task.yield()
+        XCTAssertNil(controller.presentedViewController)
+    }
+}
+
+private nonisolated final class TVRecoveryChannel: LocalRequestConnection, @unchecked Sendable {
+    private let lock = NSLock(); private var macID = ""; private var canceled = 0
+    var cancellations: Int { lock.withLock { canceled } }
+    func setMac(_ id: String) { lock.withLock { macID = id } }
+    func start() async throws {}
+    func pairingCode() async throws -> String { "123456" }
+    func cancel() { lock.withLock { canceled += 1 } }
+    func exchange(_ packet: LocalPacket) async throws -> LocalPacket {
+        var message = LocalMessage(operation: "ok")
+        if packet.message.operation == "hello" { message.serverID = lock.withLock { macID } }
+        else { message.operation = "pending" }
+        return LocalPacket(message: message)
+    }
 }

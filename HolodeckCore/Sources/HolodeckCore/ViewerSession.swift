@@ -11,16 +11,20 @@ public protocol SceneRendering: AnyObject {
 }
 
 nonisolated public struct ViewerPolicy: Sendable {
+    public enum CatalogErrorContext: Sendable { case generic, macLibrary, tvConnection }
     public let restoresLastScene: Bool
     public let replacesUpdatedScene: Bool
     /// Whether reactivation checks for updates before a renderer has been attached.
     public let refreshesWithoutRenderer: Bool
-    public static let tv = Self(restoresLastScene: true, replacesUpdatedScene: false, refreshesWithoutRenderer: false)
-    public static let mac = Self(restoresLastScene: false, replacesUpdatedScene: true)
-    public init(restoresLastScene: Bool, replacesUpdatedScene: Bool, refreshesWithoutRenderer: Bool = true) {
+    public let catalogErrorContext: CatalogErrorContext
+    public static let tv = Self(restoresLastScene: true, replacesUpdatedScene: false, refreshesWithoutRenderer: false, catalogErrorContext: .tvConnection)
+    public static let mac = Self(restoresLastScene: false, replacesUpdatedScene: true, catalogErrorContext: .macLibrary)
+    public init(restoresLastScene: Bool, replacesUpdatedScene: Bool, refreshesWithoutRenderer: Bool = true,
+                catalogErrorContext: CatalogErrorContext = .generic) {
         self.restoresLastScene = restoresLastScene
         self.replacesUpdatedScene = replacesUpdatedScene
         self.refreshesWithoutRenderer = refreshesWithoutRenderer
+        self.catalogErrorContext = catalogErrorContext
     }
 }
 
@@ -83,6 +87,7 @@ public final class ViewerSession {
     @ObservationIgnored private var active = false
     @ObservationIgnored private var hasBeenActive = false
     @ObservationIgnored private var savedID: String?
+    @ObservationIgnored private var forcedRefreshPending = false
 
     public init(catalogService: CatalogService, preferences: ShaderPreferences, policy: ViewerPolicy) {
         self.catalogService = catalogService
@@ -119,50 +124,70 @@ public final class ViewerSession {
 
     @discardableResult
     public func refresh(force: Bool = false) -> Task<Void, Never> {
-        if let refreshTask { return refreshTask }
+        if let refreshTask {
+            if force { forcedRefreshPending = true }
+            return refreshTask
+        }
         isRefreshing = true
-        onEvent?(.catalogLoading)
         let service = catalogService
         let task = Task { [weak self] in
             defer {
                 self?.isRefreshing = false
                 self?.refreshTask = nil
+                self?.forcedRefreshPending = false
                 self?.onEvent?(.catalogFinished)
             }
-            let cached = await service.current()
-            guard !Task.isCancelled else { return }
-            self?.hasCheckedCache = true
-            if let cached { self?.applyCatalog(cached) }
-            self?.onEvent?(.catalogCacheChecked)
-            do {
-                let outcome = try await service.refreshOutcome(force: force)
-                let current = await service.current()
-                guard !Task.isCancelled, let self else { return }
-                if let current { self.applyCatalog(current) }
-                switch outcome {
-                case .updated, .unchanged:
-                    self.catalogFailure = nil
-                case .throttled, .disabled:
-                    if self.catalog == nil {
-                        if self.catalogFailure != nil { self.onEvent?(.catalogFailed) }
-                        else { throw CatalogError.invalidManifest }
+            var forcePass = force
+            repeat {
+                let cached = await service.current()
+                guard !Task.isCancelled else { return }
+                self?.hasCheckedCache = true
+                if let cached { self?.applyCatalog(cached) }
+                self?.onEvent?(.catalogCacheChecked)
+                do {
+                    let outcome = try await service.refreshOutcome(force: forcePass)
+                    let current = await service.current()
+                    guard !Task.isCancelled, let self else { return }
+                    if let current { self.applyCatalog(current) }
+                    switch outcome {
+                    case .updated, .unchanged:
+                        self.catalogFailure = nil
+                    case .throttled, .disabled:
+                        if self.catalog == nil {
+                            if self.catalogFailure != nil { self.onEvent?(.catalogFailed) }
+                            else { throw CatalogError.invalidManifest }
+                        }
                     }
+                } catch {
+                    let current = await service.current()
+                    guard !Task.isCancelled, let self else { return }
+                    if let current { self.applyCatalog(current) }
+                    let message = self.catalogErrorMessage(error)
+                    if self.catalogFailure?.message != message {
+                        self.catalogFailure = Failure(message: message, operation: .catalog)
+                    }
+                    self.onEvent?(.catalogFailed)
                 }
-            } catch {
-                let current = await service.current()
-                guard !Task.isCancelled, let self else { return }
-                if let current { self.applyCatalog(current) }
-                let message = self.catalog != nil
-                    ? "Couldn’t check for scene updates. Cached scenes are still available."
-                    : "Couldn’t download scenes. Check your internet connection and try again."
-                if self.catalogFailure?.message != message {
-                    self.catalogFailure = Failure(message: message, operation: .catalog)
-                }
-                self.onEvent?(.catalogFailed)
-            }
+                forcePass = self?.forcedRefreshPending == true
+                self?.forcedRefreshPending = false
+            } while forcePass && !Task.isCancelled
         }
         refreshTask = task
+        onEvent?(.catalogLoading)
         return task
+    }
+
+    private func catalogErrorMessage(_ error: Error) -> String {
+        if let local = error as? LocalCatalogError {
+            if case .invalidFile = local { return local.localizedDescription }
+            if policy.catalogErrorContext == .tvConnection { return local.localizedDescription }
+        }
+        if catalog != nil { return "Couldn’t check for scene updates. Cached scenes are still available." }
+        switch policy.catalogErrorContext {
+        case .macLibrary: return "Couldn’t load scenes. Choose or reload your shader folder and try again."
+        case .tvConnection: return "Couldn’t load scenes. Check your connection to the Mac and try again."
+        case .generic: return "Couldn’t load scenes. Try again."
+        }
     }
 
     public func applyCatalog(_ snapshot: ValidatedCatalog) {
@@ -262,6 +287,7 @@ public final class ViewerSession {
     }
 
     public func shutdown() {
+        forcedRefreshPending = false
         cancelPendingSelection()
         selectionTask?.cancel()
         refreshTask?.cancel()

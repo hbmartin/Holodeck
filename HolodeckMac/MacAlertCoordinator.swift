@@ -46,7 +46,13 @@ final class MacAlertCoordinator {
               window.attachedSheet == nil else { return }
         let payload: Payload
         if let failure = model.startupError { payload = .renderer(failure) }
-        else if let failure = model.session.failure { payload = .session(failure) }
+        else if let failure = model.session.failure {
+            if let library = model.library {
+                guard !library.isReloading else { return }
+                if case .catalog = failure.operation, library.folder == nil { return }
+            }
+            payload = .session(failure)
+        }
         else { return }
 
         let alert = NSAlert()

@@ -1,310 +1,80 @@
-# Shader repositories and catalog workflow
+# Local shader library workflow
 
-[HolodeckShaders](https://github.com/hbmartin/HolodeckShaders) is the public source of truth for shader code, metadata, ordering, defaults, and previews. [Holodeck](https://github.com/hbmartin/Holodeck) owns the tvOS player and downloads validated publications directly from GitHub. A compatible catalog update needs no app release.
+The Mac app owns publication. Apple TV discovers the Mac on the local network, pairs once with Mac approval, and downloads catalog sources and previews over TLS. Compatible shader changes require no app release.
 
-The app ships **no bundled catalog, Metal sources, or preview images**. First launch requires internet. Later launches can start from a previously downloaded, validated disk snapshot. If tvOS evicts that cache, another download is required.
+For setup and everyday controls, follow the [user quickstart](quickstart.md). For component ownership, protocol messages, credentials, storage, and developer setup, see the [technical reference](local-shader-serving.md). This guide keeps the authoring and publication overview.
 
-## Repository responsibilities
+## Configure and pair
 
-| Repository / branch | Owns | How it changes |
-| --- | --- | --- |
-| `HolodeckShaders/main` | Shader bodies, shared helpers, metadata, committed previews and fingerprints, authoring tools | Authors open PRs; merging triggers validation and publication |
-| `HolodeckShaders/published` | Generated manifest, complete Metal libraries, PNG previews | GitHub Actions replaces the branch with one complete validated commit |
-| `Holodeck` | Downloading, validation, cache, picker, runtime compilation, playback, tests | App code changes follow the app's normal release process |
+1. Open **HolodeckMac → Settings → Shader Library → Choose Folder** and select an authoring folder.
+2. Wait for **Serving shaders on the local network**. Keep the Mac app running; its viewer window may be closed.
+3. Open Holodeck on Apple TV on the same network and allow local-network access. One available Mac connects automatically; several show a chooser.
+4. Compare the six-digit code on both devices, then click **Approve** in the Mac's Shader Library settings.
+5. Use **Reload Shaders** on Mac after edits. Use **Check for Scene Updates** on TV for an immediate check.
 
-```mermaid
-flowchart LR
-    Author[Shader author on a Metal-capable Mac] --> Main[HolodeckShaders main]
-    Main --> CI[GitHub Actions validation]
-    CI --> Published[HolodeckShaders published]
-    Published --> API[GitHub API resolves published commit]
-    API --> Raw[Raw content at fixed commit]
-    Raw --> Service[Holodeck catalog service]
-    Service --> Cache[Downloaded disk snapshot]
-    Service --> Picker[Picker metadata and previews]
-    Service --> Compiler[Runtime Metal compiler]
-    Compiler --> Renderer[Playing shader]
-```
+A remembered Mac is never silently replaced by another server. Use **Change Mac** to switch or repair pairing after a changed host key. **Revoke** cancels that TV's active connection and prevents further downloads. Its previously cached scenes remain playable.
 
-There is no backend or user login. One public GitHub REST API request resolves the publication; commit-pinned raw URLs deliver assets without consuming the REST API quota. Authoring and publishing use the contributor's normal GitHub permissions.
-
-## Authoring layout
-
-In a HolodeckShaders checkout:
+## Authoring format
 
 ```text
-index.json                       # Ordered IDs and defaultShaderID
-shared/common.metal              # Uniforms, vertex entry point, shared helpers
-shared/material.metal            # Optional material helpers
-shared/fragment.metal            # Fragment entry point
-shaders/<id>/metadata.json
+index.json                          # ordered shader IDs, defaultShaderID, optional collections
+shared/common.metal
+shared/material.metal               # required by shaders that declare material helpers
+shared/fragment.metal
+shaders/<id>/metadata.json           # id, name, category, description, colors, shared, discovery
 shaders/<id>/body.metal
-shaders/<id>/preview.png          # Generated and committed
-shaders/<id>/preview.json         # Fingerprint, PNG hash, rendering settings
-tools/catalog.py                 # Assembly, generation, validation
-tools/render-preview.swift       # Local Metal preview renderer
+shaders/<id>/preview.png             # supplied PNG, served byte-for-byte
 ```
 
-The eight migrated IDs are `plasma`, `aurora`, `waves`, `kaleidoscope`, `starfield`, `chrome`, `brushed-gold`, and `iridescent`, in that order. Plasma remains the default. Keep IDs stable: the app uses them for saved selections and picker focus. A display-name change does not require a new ID.
+Only indexed shaders are loaded, in index order. Shared declarations must be `["common", "fragment"]` or `["common", "material", "fragment"]`. Sources concatenate common helpers, optional material helpers, body, and fragment wrapper without rewriting source bytes or attribution comments. Collections and supported metadata use the existing catalog schema. Discovery labels retain existing normalization and optional-field recovery.
 
-## Add a shader
+The loader neither generates previews nor checks `preview.json`. Authors supply preview images themselves. Git, Python, repository scripts, commits, and Xcode tools are unnecessary for publication from the app. Update dates use the latest modification time of a shader's metadata, body, and declared helpers.
 
-HolodeckShaders also owns an authoring-only snippet and reference library. Start with its `docs/shader-library.md` and `docs/shader-authoring.md`; `tools/library.py` supports search, scaffolding, byte-preserving local imports, example compilation and sampled renders. Technical validation and editorial publication selection are separate.
+The selected directory is persisted with a read-only security-scoped bookmark. The Mac sandbox allows user-selected read access and incoming connections. The directory is read at startup and on explicit reload, with no watcher or background helper. Copying a complete candidate into app-owned storage keeps served bytes independent of subsequent edits. Validation failure names its file and leaves the previous publication available. The copied publication can also be restored when authoring access fails after restart.
 
-Schema version 1 accepts optional ordered `collections` (`id`, `name`, `description`, `shaderIDs`) and shader `discovery` (`tags`, `moods`, `motion`). Collections can overlap, but members must be published IDs. All retains manifest order. Apps trim and lowercase discovery strings and deduplicate tags and moods, allowing future vocabulary. If optional discovery fails decoding or its size/length checks, the app discards that shader's discovery, logs the shader ID and reason, and retains the shader. Sanitized metadata is persisted in the unchanged cache format. The producer validates its documented vocabulary. Authoring `reuse` links never enter publication assets.
+## Revisions, transport, and trust
 
-Both app targets filter locally without altering playback, pending selection or animation time. Missing collection selections reset to All after refresh; unavailable mood/motion selections reset to Any. Mac search also matches discovery labels and tags. TV selector dismissal returns focus to its control; empty results leave filters and Reset usable. Preserve the existing per-platform startup and source-update policies.
+A local revision is the SHA-256 digest of sorted-key canonical catalog metadata and asset hashes, before adding `sourceRevision`. The manifest's `sourceRevision` and publication revision use that 64-character digest. Legacy 40-character revisions remain valid in TV disk snapshots. Per-shader and collection array order is significant.
 
-See [the implementation validation record](shader-library-validation.md) for compatibility, platform checks and remaining release checks.
+The Mac advertises `_holodeck._tcp` in `local.` with protocol version, stable Mac UUID, and display name. TV uses `NWBrowser`, then resolves SRV and numeric addresses using `DNSServiceResolve` and `DNSServiceGetAddrInfo`, both with `kDNSServiceFlagsForceMulticast`. The SRV hostname must end in `.local`; sockets accept only private or link-local destinations on the discovered interface. Loopback is enabled only for integration tests. Public IPs, DNS names, multicast destinations, and globally routable IPv6 are rejected before connecting.
 
-Use a Mac with Xcode, the tvOS SDK, a Metal-capable GPU, and Python 3. The Python tools use only the standard library. All commands in this section run in **HolodeckShaders**, not the app repository.
+The Mac's TLS 1.3 identity is generated with Apple's Swift Certificates library and persisted in Keychain; that library is restricted to macOS. Certificate verification disables network fetching and pins the public key after approved pairing. The six-digit code derives from TLS exported key material for that connection. Approval issues a random 256-bit per-TV credential. TV persists its credential and host pin in Keychain; Mac persists only the credential hash and approval. A changed host key fails closed until the user explicitly repairs the pairing.
 
-### 1. Create an authoring branch and files
+A frame contains a four-byte big-endian JSON-header length, the JSON control message, then an optional binary payload. Control messages include a protocol version and payload length. Operations are `hello`, `pair`, `pairStatus`, `authenticate`, and `asset`; catalog requests are a current revision lookup or an asset path at a fixed revision. No catalog assets are released before approval/authentication. Every asset belongs to a validated snapshot allowlist. A connection pins its current revision, and publications used by active transfers survive reloads.
 
-```sh
-git clone git@github.com:hbmartin/HolodeckShaders.git
-cd HolodeckShaders
-git switch -c add-ripple
-mkdir -p shaders/ripple
-```
-
-Create `shaders/ripple/metadata.json`:
-
-```json
-{
-  "id": "ripple",
-  "name": "Ripple",
-  "category": "PROCEDURAL",
-  "description": "Animated rings flowing across a field of color.",
-  "colors": [[0.1, 0.3, 0.8], [0.8, 0.2, 0.6]],
-  "shared": ["common", "fragment"]
-}
-```
-
-IDs must be unique lowercase words separated by hyphens, up to 100 characters. The directory, metadata ID, and index ID must agree. Names and descriptions must be nonempty, with limits of 200 and 2,000 characters respectively. `colors` contains exactly two RGB triples with each component in `0...1`; these provide the card gradient when a preview is unavailable.
-
-The supported categories are `PROCEDURAL` and `3D MATERIAL`. Use `shared: ["common", "material", "fragment"]` when the body needs material helpers; those are the only two supported shared-file combinations.
-
-Create `shaders/ripple/body.metal`, for example:
-
-```metal
-float3 shade(float2 p, float time, float2 pixel) {
-    float rings = 0.5 + 0.5 * sin(length(p) * 35.0 - time * 2.0);
-    return mix(float3(0.1, 0.3, 0.8), float3(0.8, 0.2, 0.6), rings);
-}
-```
-
-`p` is centered, with Y pointing up and coordinates scaled by drawable height. `pixel` is the fragment's drawable position; `time` is animation time in seconds. Return linear RGB. The shared fragment clamps it to `0...1` and emits opaque alpha into the app's sRGB drawable.
-
-The assembler concatenates common helpers, optional material helpers, the body, and the fragment helper. Authors implement `shade`; the shared files supply `vertexShader`, `fragmentShader`, and this 16-byte uniform contract at buffer 0:
-
-```metal
-struct ShaderUniforms {
-    float2 resolution;
-    float time;
-    float padding;
-};
-```
-
-Preserve that contract for released apps. Check the existing shaders before changing shared helpers, since a shared edit can affect several shaders.
-
-### 2. Add the stable ID to the index
-
-Append `"ripple"` to the `shaders` array in `index.json`, or place it at the desired picker position. Preserve the existing IDs and `defaultShaderID: "plasma"` unless intentionally changing the catalog default. The default must refer to an indexed shader; the catalog must contain between 1 and 500 unique IDs.
-
-### 3. Generate previews and inspect the result
-
-```sh
-python3 tools/catalog.py generate
-```
-
-This renders **every indexed shader**, writing its `preview.png` and `preview.json`. Inspect the new PNG and any previews affected by shared edits. Previews use 1280×720, animation time 3 seconds, and `bgra8Unorm_srgb` to match the app's sRGB output behavior.
-
-The fingerprint covers the assembled source, the preview renderer's source, and rendering settings. Source, shared dependency, renderer, or settings changes require regeneration. Metadata-only name, description, or card-color edits do not change the rendered source fingerprint. The PNG's own SHA-256 is also recorded, so replacing an image without updating its record fails validation.
-
-### 4. Commit, then validate the publication
-
-```sh
-git add index.json shaders shared
-git commit -m "Add Ripple shader and preview"
-python3 tools/test_catalog.py
-python3 tools/catalog.py validate
-```
-
-Review the staged changes before committing, including any previews regenerated for existing shaders. Commit changes to `tools/` too if you intentionally changed the renderer or generation settings.
-
-Validation uses Git history to derive dates and the authoring revision, so run the final validation **after committing**. It checks metadata, IDs, defaults, referenced assets, preview fingerprints and hashes, source sizes, and tvOS Metal compilation. It writes:
-
-```text
-dist/catalog.json
-dist/sources/<id>.metal
-dist/previews/<id>.png
-```
-
-`dist/` and `.cache/` are ignored build outputs. Do not edit or commit them. `python3 tools/catalog.py build` assembles and checks artifacts without the Metal compilation step; use `validate` for the complete pre-publication check.
-
-If validation fails, fix the authoring files, regenerate affected previews, commit the fix, and validate again. Also check animation in the app: the preview records a single frame and cannot demonstrate motion over time.
-
-### 5. Open a shader-repository PR and merge
-
-Push the authoring branch and open a PR against `HolodeckShaders/main`. The PR workflow validates without publishing. After merge, the main-branch workflow validates again and publishes the complete snapshot. A manual run of the **Validate and publish catalog** workflow on `main` can also publish; rerunning validation on a PR does not publish it.
-
-Once publication succeeds, an app with connectivity receives Ripple on its next eligible refresh. Users select it from the picker; publishing does not automatically replace their playing shader.
-
-## Publication process
-
-```mermaid
-flowchart TD
-    Edit[Edit metadata, body, index, or shared helpers] --> Generate[Generate and inspect previews locally]
-    Generate --> Commit[Commit authoring files and previews]
-    Commit --> Validate[Run tests and catalog validation]
-    Validate --> LocalOK{Validation passes?}
-    LocalOK -->|No| Edit
-    LocalOK -->|Yes| PR[Open PR in HolodeckShaders]
-    PR --> PRChecks[Actions validates PR without publishing]
-    PRChecks --> Merge[Merge to main after checks pass]
-    Merge --> MainChecks[Actions tests and validates main]
-    MainChecks --> ChecksOK{Validation passes?}
-    ChecksOK -->|No| Previous[Previous publication remains available]
-    ChecksOK -->|Yes| Current{Run still matches current main?}
-    Current -->|No| Skip[Skip obsolete publication]
-    Current -->|Yes| Publish[Commit all dist assets and replace published]
-    Publish --> Refresh[Apps discover the new commit on refresh]
-```
-
-The workflow runs on macOS with full Git history. Publication jobs are serialized, and a run checks that its authoring commit is still the current `main` before publishing. The generated manifest and all assets enter `published` in a single commit, so the branch never exposes a partially uploaded snapshot.
-
-Treat `published` as generated output. To roll back a shader, restore the desired authoring content on `main`, regenerate previews as needed, and let validation publish a new snapshot. Do not manually patch individual files on `published`.
-
-## Manifest and revision contract
-
-`catalog.json` uses schema version 1. It contains `defaultShaderID`, `sourceRevision`, and an ordered `shaders` array. Each entry has:
-
-| Fields | Meaning |
+| Bound | Maximum |
 | --- | --- |
-| `id`, `name`, `category`, `description`, `colors` | Stable identity and picker metadata |
-| `updatedAt` | UTC ISO-8601 date derived from Git history |
-| `sourcePath`, `sourceSHA256` | Complete Metal library at `sources/<id>.metal` and its hash |
-| `previewPath`, `previewSHA256` | PNG at `previews/<id>.png` and its hash |
+| JSON frame header / revision response | 64 KiB |
+| Catalog manifest | 2 MiB |
+| One assembled source | 1 MiB |
+| All sources | 16 MiB |
+| One preview / binary frame payload | 8 MiB |
+| Active server connections | 16 |
+| Transfer / connection timeout | 30 seconds |
+| Pending approval | 5 minutes |
 
-`sourceRevision` identifies the **authoring commit on main**. The app separately stores the **published commit** it downloaded. These commits differ because publication builds a new commit containing generated assets.
+All TV asset paths, including previews, use an injected `CatalogSource`. `DirectoryCatalog` supplies the Mac viewer; `LocalCatalogClient` supplies TV. Production code has no URLSession downloader, GitHub URL, public DNS resolver, or public-network fallback.
 
-`updatedAt` is the committer date of the latest commit affecting a shader's metadata, body, or declared shared helpers. Shared edits therefore update all dependent shaders' dates. Preview-only regeneration does not change the date. Initial migration dates come from the migration commit. Authors do not manually enter `updatedAt` or manifest hashes.
+## Playback and offline behavior
 
-Keep schema version 1 and the rendering contract compatible with released apps. New shaders and compatible metadata/source updates require no app release; an incompatible schema or rendering contract requires corresponding app support. An older client rejects an unsupported schema and retains its prior downloaded snapshot.
+TV applies a verified disk cache before requesting updates. A full candidate manifest and every source are verified before an atomic `snapshot.json` write. A failed update preserves the prior cache. Preview hashes, disk caching, bounded memory caches, independent fetching, decoding, retry policy, and gradient fallback remain unchanged.
 
-## App startup and refresh control flow
+Ordinary launch and foreground checks retain a 15-minute monotonic throttle once a usable cache exists. Explicit checks and reconnection bypass it. Concurrent refreshes share one operation. Mac authoring changes do not become visible until startup or **Reload Shaders**.
 
-The catalog service injects networking, storage, and a monotonic clock. Construction performs no disk reads. Actor-isolated `current()` lazily reads and validates the existing `CatalogSnapshot` JSON once, preparing immutable `ValidatedCatalog` values with dates, verified source hashes, shader definitions and collections. Its current catalog is optional until a valid disk snapshot or download is available. Sessions apply cached state before the network check and reconcile current state after both successful and failed refreshes, so reconnected scenes receive the latest catalog.
+TV playback retains its existing pipeline during catalog updates. Revised source compiles when selected or on subsequent launch. A removed active shader continues playing; a missing saved ID resolves to the new default next launch. Mac replaces changed active source after successful compilation. Selection failures retain working playback.
 
-```mermaid
-flowchart TD
-    Launch[Launch app] --> Cache{Valid downloaded disk snapshot?}
-    Cache -->|Yes| Start[Resolve saved ID or catalog default and start playback]
-    Cache -->|No| Loading[Show downloading state]
-    Start --> Refresh[Request asynchronous refresh]
-    Loading --> Refresh
-    Foreground[Return from inactive to active] --> Refresh
-    Retry[Select after an empty-cache download failure] --> Refresh
-    Refresh --> Eligible{No refresh in progress and eligible?}
-    Eligible -->|No| Keep[Keep current state]
-    Eligible -->|Yes| Resolve[Resolve published branch to a commit]
-    Resolve --> Changed{Commit differs from current snapshot?}
-    Changed -->|No| Keep
-    Changed -->|Yes| Manifest[Fetch and validate manifest at fixed commit]
-    Manifest --> Sources[Fetch and verify every Metal source at same commit]
-    Sources --> Save[Atomically write complete disk snapshot]
-    Save --> Activate[Activate snapshot and update picker by stable ID]
-    Activate --> Playing{Already playing a shader?}
-    Playing -->|Yes| Continue[Keep active shader playing]
-    Playing -->|No| First[Resolve saved ID or default and compile startup shader]
-    Resolve -. Failure .-> Failure[Retain previous snapshot; if empty, show retry state]
-    Manifest -. Failure .-> Failure
-    Sources -. Failure .-> Failure
-    Save -. Failure .-> Failure
-```
+No usable TV cache means the user must configure and open the Mac app and approve the TV. Searching, local-network permission denial, awaiting approval, disconnection, incompatible version, and changed-key states have distinct messages. Revocation does not erase cached scenes.
 
-With a usable snapshot, refresh attempts are throttled by `ContinuousClock` to once per 15 minutes, including failed attempts. Wall-clock changes do not affect eligibility. This is triggered by launch and actual foreground returns; there is no polling timer. Forced checks bypass the throttle. Without a usable snapshot, Select can retry immediately. Concurrent refresh requests share the same operation and result.
+## Validation
 
-The app first requests:
+Run `swift test --package-path HolodeckCore`. Set `HOLODECK_AUTHORING_FIXTURE=/absolute/path/to/HolodeckShaders` to additionally load, compile, render, animate, and verify previews from a local authoring repository. Run both app schemes' tests with injected fixtures. The Mac UI includes a real folder-picker, manual-reload, invalid-file rollback, and bookmark-relaunch test.
 
-```text
-GET https://api.github.com/repos/hbmartin/HolodeckShaders/git/ref/heads/published
-```
+Set `HOLODECK_LAN_TEST=1` for the shared-core test that advertises a real Bonjour service, resolves it using multicast-only DNS-SD on a private interface, compares the TLS pairing codes, approves the client, downloads a revision, and reconnects using its saved Keychain credential. Test identities and approvals use isolated namespaces and are removed afterward.
 
-It then fetches the manifest and assets using raw URLs pinned to the resolved commit:
+The opt-in TV UI test `testPhysicalLocalNetworkPairingAndRememberedPlayback` uses the real network client and disk cache. Enable it with `TEST_RUNNER_HOLODECK_PHYSICAL_LAN_TEST=1` when running `xcodebuild test` against a physical Apple TV. Run an isolated debug Mac app with `--ui-test-storage-suite Holodeck.physical-mac-validation --ui-test-local-library --ui-test-local-network`, choose the authoring folder, and leave Shader Library settings open. Compare the code printed by the TV test with the Mac request and click **Approve**. The test checks rendered playback and a credential-based reconnect after relaunch, then removes its TV test credentials and cache. Remove the Mac test namespace afterward using its existing test cleanup launch argument.
 
-```text
-GET https://raw.githubusercontent.com/hbmartin/HolodeckShaders/<published-commit>/catalog.json
-GET https://raw.githubusercontent.com/hbmartin/HolodeckShaders/<published-commit>/sources/<id>.metal
-GET https://raw.githubusercontent.com/hbmartin/HolodeckShaders/<published-commit>/previews/<id>.png
-```
+Also set `TEST_RUNNER_HOLODECK_PHYSICAL_OFFLINE_TEST=1` to pause that test after reconnecting. When it prints the offline-check prompt, quit the Mac validation app. It verifies disconnection and cached playback after another TV relaunch.
 
-Every asset belongs to that fixed commit even if `published` changes during download. An unchanged publication skips downloading the catalog again.
+Before release, verify physical Mac-to-Apple-TV discovery and matching pairing codes, local-network permission denial/recovery, revocation, host-key repair, sleep/wake, offline playback, and updates while playing. Block WAN access while retaining LAN/mDNS access to confirm the complete physical flow works without internet. Automated loopback TLS tests do not establish router or device privacy behavior.
 
-The URLSession delegate accumulates `Data` chunks, rejects non-200 responses and oversized declared lengths, and cancels on streamed overflow or task cancellation. Requests retain a 30-second timeout. Limits are 64 KiB for the reference, 2 MiB for the manifest, 1 MiB per source, 16 MiB for all sources and 8 MiB per preview. Sources download sequentially. Previews load independently and never block catalog activation.
-
-The app rejects unsupported schemas, invalid core metadata or paths, duplicate IDs, missing defaults or sources, and source hash mismatches. It downloads and verifies **all sources** before writing and activating a snapshot. Network, core validation, or disk-write failures retain the previous snapshot. The catalog service owns a shared download through completion, even when every refresh caller cancels. Each cancelled caller stops waiting immediately; a later caller joins the same in-progress download. A snapshot is a single atomically written `snapshot.json` containing the manifest, sources, and publication revision in the app's `ShaderCatalog` cache directory.
-
-Timezone-bearing ISO-8601 dates accept whole or fractional seconds and numeric offsets; malformed and timezone-free values are rejected. Strict UTF-8 decoding retains BOM bytes, so the persisted string reproduces the exact source bytes that were hashed. The disk format and schema version remain unchanged, including compatibility with legacy and discovery-enabled catalogs. Runtime consumers use the prepared catalog without revalidating it on the main actor.
-
-## Selection, pipeline reuse, and previews
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant Picker
-    participant Renderer
-    participant Compiler
-    participant Preferences
-    User->>Picker: Select shader from current snapshot
-    Picker->>Renderer: Request selection with source and source hash
-    Renderer->>Compiler: Get pipeline for ID and source hash
-    alt Matching pipeline is cached
-        Compiler-->>Renderer: Reuse pipeline
-    else New ID or changed source hash
-        Compiler->>Compiler: Compile library and pipeline
-        Compiler-->>Renderer: Return pipeline or failure
-    end
-    alt Success and selection is still current
-        Renderer->>Renderer: Activate pipeline
-        Renderer->>Preferences: Save successful shader ID
-    else Failed, canceled, or superseded
-        Renderer->>Renderer: Retain current playing shader
-    end
-```
-
-Catalog refresh updates the picker and preserves focus by stable ID. Playback keeps its existing pipeline, including when that ID disappears from the catalog. On the next launch, a saved ID missing from the current snapshot resolves to the manifest default. Pending selections retain their selected source; a catalog refresh does not replace a selection already in progress.
-
-TV filters survive refreshes. Focus remains on the current filter control or stable shader ID. If the focused ID disappears, focus prefers a visible active shader, then the latest resolved startup/default shader, then the first visible result. Startup resolution is updated with every catalog. After compilation fails before any activation, the picker stays open with the error; Back and canceled selections do not retry that failed startup automatically. The saved ID survives until an explicit selection succeeds. Before startup fails, canceling a different pending selection may resume the latest startup definition; Back can hide a pending startup and restore its loading hint. User activation dismisses an open chooser and the picker; startup completion preserves browsing. Mac retains its existing policy of replacing changed active sources after successful compilation.
-
-Cached update failures appear inline with Retry in the Mac viewer and inside the TV picker. Automatic checks never open the TV picker. Refreshes and automatic source replacements preserve unrelated user selection errors; alert dismissal and retry apply only to the displayed failure ID. Unified logs include selection failures with the shader ID, selection origin and compiler error. Catalog preparation stores discovery options, and both viewers share a filter cache keyed by publication revision and all browsing criteria.
-
-Pipelines are cached by shader ID plus source hash. Identical source reuses its compiled pipeline; revised source under the same ID compiles again when selected. Only the latest successful selection activates and updates the saved preference.
-
-Previews download on demand, independently of source activation, and cache as `preview-<SHA-256>.png`. An actor-owned 16 MiB LRU cache stores verified encoded data, and a separate 32 MiB LRU cache stores decoded thumbnails by hash and requested size. Concurrent requests coalesce by hash (and size for decoding). ImageIO decodes thumbnails on a two-operation worker queue, outside both the UI and catalog actors. TV requests aspect-fill pixels from card bounds × display scale × 1.045, bucketed upward by 64 with a 2048-pixel cap; Mac requests 176 pixels. Memory hits skip disk reads, hashing and decoding; identical hashes retain displayed images across metadata and revision changes. Reused cells cancel their prior image task and guard both the request identity and represented hash before displaying a result. Larger layouts retain their old image until a replacement succeeds. Transient preview failures retry on demand after 30 seconds with exponential backoff capped at five minutes. Validation/decode failures remain suppressed for the publication, path and hash; failure records are bounded at 500. Platform memory-pressure callbacks clear both memory caches, retaining disk/catalog/retry state. Flights started before trimming still serve callers but cannot repopulate caches. Missing images use an opaque gradient base; successful previews retain the translucent overlay. Cards format `updatedAt` as a localized, abbreviated date.
-
-## Failure behavior and verification
-
-| Situation | Result |
-| --- | --- |
-| Shader-repository validation fails | Previous `published` snapshot remains available |
-| GitHub is unavailable or rate-limited, with a valid app cache | Browsing and playback continue from the downloaded snapshot |
-| First launch has no valid cache and download fails | Download error and Select-to-retry state; no built-in shader fallback |
-| Source download is incomplete or a hash is wrong | Candidate rejected; previous app snapshot retained |
-| Preview fails to load | Card gradient remains; catalog and source selection remain usable |
-| Startup source fails runtime compilation | TV picker remains open with the error; Back does not expose an empty viewer, and the saved ID remains until a successful selection |
-| Refreshed source fails runtime compilation | Selection fails; current playing shader and saved successful ID remain |
-| Active shader is removed from the catalog | Current playback continues; next launch resolves a missing saved ID to the default |
-
-Holodeck's `HolodeckCore/Tests/HolodeckCoreTests/TestSupport/` catalog and images are recorded fixtures linked only to test targets. They support deterministic tests and are excluded from the shipping app. Ordinary app builds and tests do not fetch live catalog content. See the [app validation instructions](../README.md#validation) for simulator tests; verify actual preview generation on a Metal-capable Mac and animation in the app when changing shaders.
-
-Implementation references:
-
-- [Catalog model and validation](../HolodeckCore/Sources/HolodeckCore/ShaderCatalog.swift)
-- [Networking, refresh, disk snapshots, and preview cache](../HolodeckCore/Sources/HolodeckCore/CatalogService.swift)
-- [Startup, lifecycle, picker updates, and selection](../Holodeck/GameViewController.swift)
-- [Pipeline compilation and reuse](../HolodeckCore/Sources/HolodeckCore/ShaderCompiler.swift)
-- [Playback and selection cancellation](../HolodeckCore/Sources/HolodeckCore/Renderer.swift)
-- [Shader authoring and publication tool](https://github.com/hbmartin/HolodeckShaders/blob/main/tools/catalog.py)
-- [Publication workflow](https://github.com/hbmartin/HolodeckShaders/blob/main/.github/workflows/publish.yml)
+Implementation: [directory loader](../HolodeckCore/Sources/HolodeckCore/DirectoryCatalog.swift), [LAN server](../HolodeckCore/Sources/HolodeckCore/LocalCatalogServer.swift), [TV client](../HolodeckCore/Sources/HolodeckCore/LocalCatalogClient.swift), [resolver](../HolodeckCore/Sources/HolodeckCore/LocalDiscovery.swift), [framing and trust](../HolodeckCore/Sources/HolodeckCore/LocalTransport.swift), and [cache service](../HolodeckCore/Sources/HolodeckCore/CatalogService.swift).

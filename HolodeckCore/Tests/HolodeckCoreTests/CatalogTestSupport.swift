@@ -22,7 +22,7 @@ enum CatalogTestFixtures {
 
     static func makeService(_ candidate: CatalogSnapshot, box: CatalogTestBox = CatalogTestBox(), cached: Bool = true) throws -> CatalogService {
         var responses: [String: Data] = [
-            "/git/ref/heads/published": Data("{\"object\":{\"sha\":\"\(candidate.publicationRevision)\"}}".utf8),
+            "/head": Data("{\"revision\":\"\(candidate.publicationRevision)\"}".utf8),
             "/catalog.json": try JSONEncoder().encode(candidate.manifest)
         ]
         for entry in candidate.manifest.shaders {
@@ -33,7 +33,7 @@ enum CatalogTestFixtures {
             if let value = try box.storage.read(name) { return value }
             return cached && name == "snapshot.json" ? TestCatalog.data : nil
         }, write: box.storage.write)
-        return CatalogService(network: box.network, storage: storage, clock: box.clock)
+        return CatalogService(source: box.source, storage: storage, clock: box.clock)
     }
 }
 
@@ -41,7 +41,7 @@ nonisolated final class CatalogTestBox: @unchecked Sendable {
     private let lock = NSLock()
     private var stored: [String: Data] = [:]
     private var responses: [String: Data] = [:]
-    private var requests: [URL] = []
+    private var requests: [CatalogRequest] = []
     private var reads: [String] = []
     private var writes: [String] = []
     private var readOnMain = false
@@ -49,7 +49,7 @@ nonisolated final class CatalogTestBox: @unchecked Sendable {
     private var failing = false
     var files: [String: Data] { lock.withLock { stored } }
     var responseFiles: [String: Data] { lock.withLock { responses } }
-    var urls: [URL] { lock.withLock { requests } }
+    var urls: [CatalogRequest] { lock.withLock { requests } }
     var storageReads: [String] { lock.withLock { reads } }
     var storageWrites: [String] { lock.withLock { writes } }
     var storageReadOnMain: Bool { lock.withLock { readOnMain } }
@@ -58,13 +58,12 @@ nonisolated final class CatalogTestBox: @unchecked Sendable {
         set { lock.withLock { failing = newValue } }
     }
     func setResponses(_ values: [String: Data]) { lock.withLock { responses = values } }
-    var network: CatalogNetwork {
-        CatalogNetwork { [self] url, _ in
+    var source: CatalogSource {
+        CatalogSource { [self] url, _ in
             try lock.withLock {
                 requests.append(url)
-                let path = url.host == "raw.githubusercontent.com"
-                    ? "/" + url.path.split(separator: "/").dropFirst(3).joined(separator: "/")
-                    : url.path.replacingOccurrences(of: "/repos/hbmartin/HolodeckShaders", with: "")
+                let path: String
+                switch url { case .head: path = "/head"; case .asset(_, let value): path = "/" + value }
                 guard let response = responses[path] else { throw CatalogError.invalidResponse }
                 return response
             }

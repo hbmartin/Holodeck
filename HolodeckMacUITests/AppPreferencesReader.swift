@@ -8,12 +8,12 @@ nonisolated enum AppPreferencesReader {
         case invalidDictionary(URL)
     }
 
-    static func appURL() throws -> URL {
+    static func appURL(bundleIdentifier: String = "me.haroldmartin.HolodeckMac") throws -> URL {
         // The app and UI runner use separate preferences domains. Xcode also redirects
         // the runner's home, so resolve the sandboxed app's path from the real user home.
         guard let directory = getpwuid(getuid())?.pointee.pw_dir else { throw ReadError.homeDirectoryUnavailable }
         return URL(fileURLWithPath: String(cString: directory), isDirectory: true)
-            .appendingPathComponent("Library/Containers/me.haroldmartin.HolodeckMac/Data/Library/Preferences/me.haroldmartin.HolodeckMac.plist")
+            .appendingPathComponent("Library/Containers/\(bundleIdentifier)/Data/Library/Preferences/\(bundleIdentifier).plist")
     }
 
     static func read(at url: URL, allowMissing: Bool = false) throws -> [String: Any] {

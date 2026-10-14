@@ -65,7 +65,7 @@ final class ViewerSessionTests: XCTestCase {
 
     func testLazyCacheRefreshWithoutRendererJoinsOnAttachmentAndNeverSignalsEmptyCache() async throws {
         let gate = PreviewRequestGate()
-        let service = CatalogService(network: CatalogNetwork { _, _ in await gate.image("published") }, storage: TestCatalog.storage)
+        let service = CatalogService(source: CatalogSource { _, _ in await gate.image("head") }, storage: TestCatalog.storage)
         let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
         var checkedWithCache = false
         session.onEvent = { event in
@@ -73,7 +73,7 @@ final class ViewerSessionTests: XCTestCase {
         }
         XCTAssertFalse(session.hasCheckedCache)
         let refresh = session.refresh()
-        await gate.waitForRequest("published")
+        await gate.waitForRequest("head")
         XCTAssertEqual(session.shaders.count, 8)
         XCTAssertTrue(checkedWithCache)
         XCTAssertNil(session.activeShader)
@@ -82,14 +82,14 @@ final class ViewerSessionTests: XCTestCase {
         XCTAssertEqual(session.activeShader?.id, "plasma")
         let requests = await gate.requestCount
         XCTAssertEqual(requests, 1)
-        await gate.complete("published", data: Data())
+        await gate.complete("head", data: Data())
         await refresh.value
         session.onEvent = nil
     }
 
     func testRecoveryCatalogFailureKeepsBothOperationsAndRetriesDownload() async throws {
         let counter = NetworkCounter()
-        let service = CatalogService(initialCatalog: TestCatalog.catalog, network: CatalogNetwork { _, _ in
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource { _, _ in
             await counter.record(); throw CatalogError.invalidResponse
         }, storage: .disabled)
         let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
@@ -316,11 +316,11 @@ final class ViewerSessionTests: XCTestCase {
         let latest = changed()
         let box = CatalogTestBox()
         try box.storage.write("snapshot.json", TestCatalog.data)
-        var responses = ["/git/ref/heads/published": Data("{\"object\":{\"sha\":\"\(latest.publicationRevision)\"}}".utf8),
+        var responses = ["/head": Data("{\"revision\":\"\(latest.publicationRevision)\"}".utf8),
                          "/catalog.json": try JSONEncoder().encode(latest.manifest)]
         for entry in latest.manifest.shaders { responses["/\(entry.sourcePath)"] = Data(latest.sources[entry.id]!.utf8) }
         box.setResponses(responses)
-        let service = CatalogService(network: box.network, storage: box.storage, clock: box.clock)
+        let service = CatalogService(source: box.source, storage: box.storage, clock: box.clock)
         _ = try await service.refresh()
         for scenario in 0..<3 {
             if scenario > 0 { await box.clock.advance(by: .seconds(900)) }
@@ -336,7 +336,7 @@ final class ViewerSessionTests: XCTestCase {
 
     func testFirstActivationDoesNotRetryFailedInitialDownload() async {
         let counter = NetworkCounter()
-        let service = CatalogService(network: CatalogNetwork { _, _ in
+        let service = CatalogService(source: CatalogSource { _, _ in
             await counter.record()
             throw CatalogError.invalidResponse
         }, storage: .disabled)
@@ -358,14 +358,14 @@ final class ViewerSessionTests: XCTestCase {
 
     func testCachedStartupActivatesBeforeTheNetworkRefreshCompletes() async {
         let gate = PreviewRequestGate()
-        let service = CatalogService(network: CatalogNetwork { _, _ in await gate.image("published") }, storage: TestCatalog.storage)
+        let service = CatalogService(source: CatalogSource { _, _ in await gate.image("head") }, storage: TestCatalog.storage)
         let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .tv)
         session.attach(FakeRenderer())
-        await gate.waitForRequest("published")
+        await gate.waitForRequest("head")
         await session.selectionTask?.value
         XCTAssertEqual(session.activeShader?.id, "plasma")
         XCTAssertTrue(session.isRefreshing)
-        await gate.complete("published", data: Data("{\"object\":{\"sha\":\"\(TestCatalog.catalog.publicationRevision)\"}}".utf8))
+        await gate.complete("head", data: Data("{\"revision\":\"\(TestCatalog.catalog.publicationRevision)\"}".utf8))
         await settled(session)
         XCTAssertFalse(session.isRefreshing)
     }
@@ -377,7 +377,7 @@ final class ViewerSessionTests: XCTestCase {
         XCTAssertTrue(renderer.isActive)
         session.setActive(false)
         XCTAssertFalse(renderer.isActive)
-        let failing = ViewerSession(catalogService: CatalogService(network: CatalogNetwork { _, _ in throw CatalogError.invalidResponse }, storage: TestCatalog.storage),
+        let failing = ViewerSession(catalogService: CatalogService(source: CatalogSource { _, _ in throw CatalogError.invalidResponse }, storage: TestCatalog.storage),
                                     preferences: .inMemory(), policy: .mac)
         let working = FakeRenderer()
         failing.attach(working)
@@ -459,7 +459,7 @@ final class ViewerSessionTests: XCTestCase {
 
     func testCachedUpdateRetryPreservesSelectionFailureAndClearsNotice() async throws {
         let box = CatalogTestBox()
-        let service = CatalogService(initialCatalog: TestCatalog.catalog, network: box.network, storage: .disabled)
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: box.source, storage: .disabled)
         let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
         let renderer = FakeRenderer()
         session.attach(renderer)
@@ -469,7 +469,7 @@ final class ViewerSessionTests: XCTestCase {
         renderer.failNext = true
         await session.select(TestCatalog.shaders[1]).value
         let failure = try XCTUnwrap(session.failure)
-        box.setResponses(["/git/ref/heads/published": Data("{\"object\":{\"sha\":\"\(TestCatalog.catalog.publicationRevision)\"}}".utf8)])
+        box.setResponses(["/head": Data("{\"revision\":\"\(TestCatalog.catalog.publicationRevision)\"}".utf8)])
         session.retry(notice)
         await settled(session)
         XCTAssertNil(session.catalogUpdateFailure)
@@ -529,4 +529,112 @@ private final class FakeRenderer: SceneRendering {
 private actor NetworkCounter {
     private(set) var count = 0
     func record() { count += 1 }
+}
+
+@MainActor
+extension ViewerSessionTests {
+    func testForcedRefreshDrainsOneFollowupAfterAnOlderPassIncludingFailure() async throws {
+        for initialForce in [false, true] {
+            for firstFails in [false, true] {
+                let updated = changed()
+                let gate = RecoveryGate()
+                let source = HeldRefreshSource(old: TestCatalog.snapshot, updated: updated, gate: gate, firstFails: firstFails)
+                let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource { request, limit in
+                    try await source.get(request, limit: limit)
+                }, storage: .disabled)
+                let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
+                var finishes = 0
+                session.onEvent = { if case .catalogFinished = $0 { finishes += 1 } }
+                let first = session.refresh(force: initialForce)
+                let deadline = ContinuousClock.now + .seconds(3)
+                while !(await gate.hasEntered) {
+                    guard ContinuousClock.now < deadline else { throw LocalCatalogError.timeout }
+                    await Task.yield()
+                }
+                let forced = session.refresh(force: true)
+                for _ in 0..<10 { session.refresh(force: true) }
+                XCTAssertTrue(session.isRefreshing)
+                await gate.release()
+                await forced.value; await first.value
+                let heads = await source.headRequests
+                XCTAssertEqual(heads, 2, "Overlapping force requests should share one followup")
+                XCTAssertEqual(session.catalog?.publicationRevision, updated.publicationRevision)
+                XCTAssertNil(session.catalogFailure); XCTAssertFalse(session.isRefreshing)
+                XCTAssertEqual(finishes, 1)
+            }
+        }
+    }
+    func testShutdownDiscardsQueuedForcedPassWithoutCancelingServiceWork() async throws {
+        let gate = RecoveryGate()
+        let source = HeldRefreshSource(old: TestCatalog.snapshot, updated: changed(), gate: gate, firstFails: false)
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource { request, limit in
+            try await source.get(request, limit: limit)
+        }, storage: .disabled)
+        let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
+        let first = session.refresh()
+        let deadline = ContinuousClock.now + .seconds(3)
+        while !(await gate.hasEntered) {
+            guard ContinuousClock.now < deadline else { throw LocalCatalogError.timeout }
+            await Task.yield()
+        }
+        session.refresh(force: true); session.shutdown(); await first.value
+        XCTAssertFalse(session.isRefreshing)
+        let joining = Task { try await service.refreshOutcome(force: true) }
+        while await service.refreshWaiterCount != 1 {
+            guard ContinuousClock.now < deadline else { throw LocalCatalogError.timeout }
+            await Task.yield()
+        }
+        await gate.release()
+        _ = try await joining.value
+        let heads = await source.headRequests
+        XCTAssertEqual(heads, 1, "Shutdown should discard the queued viewer pass")
+    }
+    func testCatalogErrorContextIsPlatformSpecificAndPreservesFileDiagnostics() async throws {
+        for policy in [ViewerPolicy.mac, .tv, .init(restoresLastScene: false, replacesUpdatedScene: false)] {
+            let service = CatalogService(source: .unavailable, storage: .disabled)
+            let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: policy)
+            await session.refresh().value
+            let message = try XCTUnwrap(session.catalogFailure?.message)
+            switch policy.catalogErrorContext {
+            case .macLibrary: XCTAssertEqual(message, "Couldn’t load scenes. Choose or reload your shader folder and try again.")
+            case .tvConnection: XCTAssertEqual(message, LocalCatalogError.disconnected.localizedDescription)
+            case .generic: XCTAssertEqual(message, "Couldn’t load scenes. Try again.")
+            }
+            let fileService = CatalogService(source: CatalogSource { _, _ in
+                throw LocalCatalogError.invalidFile("index.json", "Broken file")
+            }, storage: .disabled)
+            let fileSession = ViewerSession(catalogService: fileService, preferences: .inMemory(), policy: policy)
+            await fileSession.refresh().value
+            XCTAssertEqual(fileSession.catalogFailure?.message, "index.json: Broken file")
+        }
+    }
+}
+
+private actor HeldRefreshSource {
+    let old: CatalogSnapshot
+    let updated: CatalogSnapshot
+    let gate: RecoveryGate
+    let firstFails: Bool
+    private(set) var headRequests = 0
+    init(old: CatalogSnapshot, updated: CatalogSnapshot, gate: RecoveryGate, firstFails: Bool) {
+        self.old = old; self.updated = updated; self.gate = gate; self.firstFails = firstFails
+    }
+    func get(_ request: CatalogRequest, limit: Int) async throws -> Data {
+        switch request {
+        case .head:
+            headRequests += 1
+            let first = headRequests == 1
+            let revision = first ? old.publicationRevision : updated.publicationRevision
+            if first {
+                try await gate.wait()
+                if firstFails { throw CatalogError.invalidResponse }
+            }
+            return try JSONEncoder().encode(CatalogHead(revision: revision))
+        case .asset(let revision, let path):
+            let snapshot = revision == old.publicationRevision ? old : updated
+            if path == "catalog.json" { return try JSONEncoder().encode(snapshot.manifest) }
+            let id = String(path.split(separator: "/").last!.split(separator: ".")[0])
+            return Data(snapshot.sources[id]!.utf8)
+        }
+    }
 }

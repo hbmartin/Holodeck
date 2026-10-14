@@ -3,7 +3,7 @@ import ImageIO
 import XCTest
 @testable import HolodeckCore
 
-/// Opt-in optimized comparisons, using deterministic chunk delivery and a real preview file.
+/// Opt-in optimized comparisons using local catalog and preview fixtures.
 @MainActor
 final class CatalogPerformanceTests: XCTestCase {
     private func requireOptIn() throws {
@@ -44,37 +44,6 @@ final class CatalogPerformanceTests: XCTestCase {
         let cached = CatalogBenchmark.milliseconds(start.duration(to: clock.now))
         XCTAssertEqual(cache.computationCount, 1)
         print("Scene filter profile: 500 scenes, 1000 repeated redraws; filter \(uncached) ms, prepared results \(cached) ms, 1 computation")
-    }
-
-    func testChunkedDownloadComparedWithPreviousByteLoop() async throws {
-        try requireOptIn()
-        let preview = TestCatalog.shaders[3].preview!
-        let data = try TestCatalog.preview(named: "preview-\(preview.hash).png")
-        let url = URL(string: "https://catalog.test/" + UUID().uuidString)!
-        let chunks = stride(from: 0, to: data.count, by: 16_384).map { offset in
-            data.subdata(in: offset..<min(offset + 16_384, data.count))
-        }
-        CatalogProtocol.registry.set(url, response: .init(status: 200, length: data.count, chunks: chunks, started: nil, stopped: nil))
-        defer { CatalogProtocol.registry.remove(url) }
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [CatalogProtocol.self]
-        let network = CatalogNetwork.session(configuration: configuration)
-        let previous = URLSession(configuration: configuration)
-        defer { previous.invalidateAndCancel() }
-        var oldTimes: [Double] = [], chunkTimes: [Double] = []
-        for iteration in 0..<7 {
-            let clock = ContinuousClock()
-            var start = clock.now
-            let old = try await Task.detached { try await CatalogBenchmark.byteLoop(previous, url: url, limit: 8_388_608) }.value
-            let oldTime = CatalogBenchmark.milliseconds(start.duration(to: clock.now))
-            start = clock.now
-            let current = try await network.get(url, 8_388_608)
-            let chunkTime = CatalogBenchmark.milliseconds(start.duration(to: clock.now))
-            XCTAssertEqual(old, data)
-            XCTAssertEqual(current, data)
-            if iteration >= 2 { oldTimes.append(oldTime); chunkTimes.append(chunkTime) }
-        }
-        print("Catalog download profile: \(data.count) bytes, median of 5 after 2 warmups, URLProtocol chunks; byte loop \(oldTimes.sorted()[2]) ms, delegate \(chunkTimes.sorted()[2]) ms")
     }
 
     func testRepeatedPreviewBrowsingComparedWithPreviousReadHashDecode() async throws {
@@ -122,18 +91,5 @@ final class CatalogPerformanceTests: XCTestCase {
 nonisolated private enum CatalogBenchmark {
     static func milliseconds(_ duration: Duration) -> Double {
         Double(duration.components.seconds) * 1000 + Double(duration.components.attoseconds) / 1e15
-    }
-    static func byteLoop(_ session: URLSession, url: URL, limit: Int) async throws -> Data {
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 30
-        let (bytes, response) = try await session.bytes(for: request)
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw CatalogError.invalidResponse }
-        guard response.expectedContentLength <= Int64(limit) else { throw CatalogError.oversizedResponse }
-        var data = Data()
-        for try await byte in bytes {
-            guard data.count < limit else { throw CatalogError.oversizedResponse }
-            data.append(byte)
-        }
-        return data
     }
 }

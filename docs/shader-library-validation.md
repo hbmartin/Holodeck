@@ -1,5 +1,8 @@
 # Shader library and discovery validation
 
+> Historical validation for the earlier public catalog transport. Current local serving and test commands are documented in [Local shader library workflow](shader-catalog-workflow.md).
+
+
 Validation on October 9, 2026 used an Apple M2 Pro, macOS 27.0.1, Xcode 27.0 (27A266a), and a tvOS 27 simulator. The app implementation starts from the existing shared-core/Mac baseline `733f2fe`.
 
 | Check | Result |

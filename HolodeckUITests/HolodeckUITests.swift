@@ -4,13 +4,78 @@ import XCTest
 final class HolodeckUITests: XCTestCase {
     private let remote = XCUIRemote.shared
 
+    private func controlCenterButton(in system: XCUIApplication) -> XCUIElement {
+        system.buttons.matching(NSPredicate(format: "identifier IN %@", [
+            "com.apple.TVSystemUIService.status.controlCenter", // tvOS 27
+            "com.apple.status.controlCenterItem" // tvOS 26
+        ])).firstMatch
+    }
+
     override func setUpWithError() throws { continueAfterFailure = false }
+
+    /// Opt in with TEST_RUNNER_HOLODECK_PHYSICAL_LAN_TEST=1 and a Mac advertising
+    /// its configured library. Approval remains a real action in the Mac's UI.
+    func testPhysicalLocalNetworkPairingAndRememberedPlayback() throws {
+        guard ProcessInfo.processInfo.environment["HOLODECK_PHYSICAL_LAN_TEST"] == "1" else {
+            throw XCTSkip("Requires an awake Apple TV and the Mac's Shader Library approval UI")
+        }
+        let app = XCUIApplication()
+        let suite = "Holodeck.physical-lan-validation"
+        app.launchArguments = ["--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite"]
+        app.launch()
+        app.terminate()
+        defer {
+            app.terminate()
+            app.launchArguments = ["--ui-test-storage-suite", suite, "--ui-test-cleanup-storage-suite"]
+            app.launch()
+            app.terminate()
+        }
+        app.launchArguments = ["--ui-test-storage-suite", suite, "--ui-test-local-network"]
+        app.launch()
+        if !app.otherElements["shader-picker"].waitForExistence(timeout: 5) { openPicker(in: app) }
+        let systemUI = XCUIApplication(bundleIdentifier: "com.apple.TVSystemUIService")
+        let home = XCUIApplication(bundleIdentifier: "com.apple.PineBoard")
+        let focusedProfile = systemUI.buttons.matching(NSPredicate(format: "hasFocus == YES AND label != %@", "Add Profile")).firstMatch
+        if home.windows["PBProfilePickerWindow"].exists, focusedProfile.exists { remote.press(.select) }
+        let status = app.staticTexts["mac-connection-status"]
+        let pairing = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH %@", "Pairing code:"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [pairing], timeout: 45), .completed, app.debugDescription)
+        print("Physical TV approval request: \(status.label)")
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Physical TV TLS pairing code"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        let plasma = card("plasma", in: app)
+        XCTAssertTrue(plasma.waitForExistence(timeout: 120), app.debugDescription)
+        let playing = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", "Now showing"), object: plasma)
+        XCTAssertEqual(XCTWaiter.wait(for: [playing], timeout: 30), .completed)
+        XCTAssertTrue(status.label.hasPrefix("Connected to"))
+        remote.press(.menu)
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(app.staticTexts["Press Select to choose a shader"].waitForExistence(timeout: 30))
+        openPicker(in: app)
+        let connected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH %@", "Connected to"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [connected], timeout: 30), .completed)
+        XCTAssertEqual(card("plasma", in: app).value as? String, "Now showing")
+        if ProcessInfo.processInfo.environment["HOLODECK_PHYSICAL_OFFLINE_TEST"] == "1" {
+            print("Physical TV offline check: stop the Mac validation server now")
+            let disconnected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH %@", "Open Holodeck on your Mac"), object: status)
+            XCTAssertEqual(XCTWaiter.wait(for: [disconnected], timeout: 90), .completed)
+            app.terminate()
+            app.launch()
+            XCTAssertTrue(app.staticTexts["Press Select to choose a shader"].waitForExistence(timeout: 30))
+            openPicker(in: app)
+            XCTAssertEqual(card("plasma", in: app).value as? String, "Now showing")
+            XCTAssertFalse(status.label.hasPrefix("Connected to"))
+        }
+    }
 
     func testFirstLaunchDownloadsCatalogAfterConnectionRetry() {
         let app = isolatedApp()
         app.launchArguments += ["--ui-test-download-catalog", "--ui-test-fail-catalog-once"]
         app.launch()
-        let message = "Couldn’t download shaders. Connect to the internet and press Select to retry."
+        let message = "Couldn’t load scenes. Check your connection to the Mac and try again."
         XCTAssertTrue(app.staticTexts[message].firstMatch.waitForExistence(timeout: 10))
         remote.press(.select)
         let plasma = card("plasma", in: app)
@@ -26,7 +91,7 @@ final class HolodeckUITests: XCTestCase {
         let app = isolatedApp()
         app.launchArguments.append("--ui-test-empty-cache")
         app.launch()
-        let message = "Couldn’t download shaders. Connect to the internet and press Select to retry."
+        let message = "Couldn’t load scenes. Check your connection to the Mac and try again."
         XCTAssertTrue(app.staticTexts[message].firstMatch.waitForExistence(timeout: 10))
         remote.press(.select)
         XCTAssertTrue(app.otherElements["shader-picker"].waitForExistence(timeout: 5))
@@ -244,21 +309,43 @@ final class HolodeckUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["shader-status"].label.hasPrefix("Now showing Plasma"))
     }
 
+    func testControlCenterPreservesPendingPairingConnection() {
+        let app = isolatedApp()
+        app.launchArguments.append("--ui-test-pending-pairing")
+        app.launch()
+        openPicker(in: app)
+        let status = app.staticTexts["mac-connection-status"]
+        let pending = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH %@", "Pairing code:"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [pending], timeout: 10), .completed)
+        let code = status.label
+        remote.press(.home, forDuration: 1.5)
+        let system = XCUIApplication(bundleIdentifier: "com.apple.TVSystemUIService")
+        let controlCenter = controlCenterButton(in: system)
+        XCTAssertTrue(controlCenter.waitForExistence(timeout: 5))
+        waitForFocus(controlCenter)
+        remote.press(.menu)
+        XCTAssertTrue(controlCenter.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+        let resumed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH %@", "Pairing code:"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [resumed], timeout: 10), .completed)
+        XCTAssertEqual(status.label, code, "Control Center replaced the pending TLS connection")
+    }
+
     func testControlCenterResumeKeepsBrowsingFocus() {
         let app = launchShowcase()
         openPicker(in: app)
         browseToChrome(in: app)
         remote.press(.home, forDuration: 1.5)
         let system = XCUIApplication(bundleIdentifier: "com.apple.TVSystemUIService")
-        let controlCenterButton = system.buttons["com.apple.TVSystemUIService.status.controlCenter"]
-        XCTAssertTrue(controlCenterButton.waitForExistence(timeout: 5))
-        waitForFocus(controlCenterButton)
+        let button = controlCenterButton(in: system)
+        XCTAssertTrue(button.waitForExistence(timeout: 5))
+        waitForFocus(button)
         let controlCenter = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         controlCenter.name = "Control Center over picker"
         controlCenter.lifetime = .keepAlways
         add(controlCenter)
         remote.press(.menu)
-        XCTAssertTrue(controlCenterButton.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(button.waitForNonExistence(timeout: 5))
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 5))
         waitForFocus(card("chrome", in: app))
         XCTAssertTrue(app.otherElements["shader-picker"].exists)

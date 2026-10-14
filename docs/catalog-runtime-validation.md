@@ -1,5 +1,8 @@
 # Catalog runtime validation
 
+> Historical validation for the earlier public catalog transport. Current local serving and test commands are documented in [Local shader library workflow](shader-catalog-workflow.md).
+
+
 Checked on October 9, 2026 using an Apple M2 Pro, macOS 27.0.1, Xcode 27.0 and a tvOS 27.0 simulator. The implementation preserves the merged discovery work: collections, tags, mood/motion filters, legacy manifests and cached JSON. Both apps continue shipping without bundled catalog assets.
 
 The changes are grouped into three reviewable stages:
