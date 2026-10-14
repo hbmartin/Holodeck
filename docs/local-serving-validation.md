@@ -242,3 +242,21 @@ xcodebuild -project Holodeck.xcodeproj -scheme Holodeck -configuration Release \
 ```
 
 Targeted UI reruns selected the two TV request cases and the seven Mac folder/preferences/frame cases; Mac reruns enabled test timeouts with 120/180-second default/maximum allowances. Logs are retained at `/tmp/holodeck-v2-*`, including baseline/final profiles, full suites, reruns and final builds. Cross-instance coordination remains deferred. No live LAN, physical-device, authoring/GPU opt-in, real Codex/Git execution, credential migration, push, merge or deployment was performed in this pass.
+
+## Shader request publication and recovery fixes
+
+Validated on 2026-10-14 after the PR #18 comment triage. Host Git commands bypass hooks without changing repository configuration, and the complete committed file hashes/modes must match the verified candidate. Repair attempts retain their own commit identity separately from prior publications. Pristine baseline checks distinguish infrastructure failures from unlimited candidate repair. Revocation/operational cleanup is serialized and durable; failed cleanup unlocks TV browsing while blocking Mac readiness. Automatic performance submissions retain their capture guard through acknowledgement. The Gallery instruction grammar is corrected.
+
+| Check | Result |
+| --- | --- |
+| Immutable PR snapshot Core suite with native GPU and authoring opt-ins | 190 tests, 5 opt-in skips, zero failures; all 23 current scenes compiled/rendered. Pending catalog-size edits/cases were excluded. Log: `/tmp/holodeck-request-fixes-pr-core.log`. |
+| Shared-workspace Core suite with native GPU and authoring opt-ins | 197 tests, 5 opt-in skips, zero failures; all 23 current scenes compiled/rendered. Includes the pending catalog-size cases. |
+| Disposable Git worker regressions | 29 passed: hook/config preservation, exact new/staged/CRLF bytes, filter mismatch rejection, legacy repair cleanup, lost repair push acknowledgement, newer-main recovery, baseline/host/GPU outages, repeated genuine defects and push races. |
+| Deterministic recovery scheduling | Three gated process/cleanup tests repeated ten times: 30 passes. Covers revocation during teardown, pending-cleanup restart and operational cleanup failure. |
+| Mac Requests UI | Passed queued cancellation, retained evidence access and record deletion; final Mac app/tool build passed. |
+| TV simulator | Both Input/clarification flows passed, and the controlled capture/acknowledgement test passed after more than a full slowdown observation interval. Final TV build passed. |
+| Real authenticated Codex and local publication | Passed: request `82D366CC-4D76-41A7-89B3-5AAEC29CD9F5`, implementation and fresh independent timed-image review, technical/GPU/macOS/tvOS validation, exact commit verification, local push, immutable installation and activation acknowledgement. Commit `228f1adc0c826e029d849636afa5e3a46e3cccf8`. |
+
+Actual before/after Plasma images were inspected and the independent source/image-bound verdict passed at 0, 3 and 10 seconds. This live run used a freshly seeded `/tmp/holodeck-request-fixes-live` checkout and local bare origin; no production shader push occurred. Evidence and logs remain there and under `/tmp/holodeck-request-fixes-*`. Physical TV validation remains the earlier isolated smoke test; it was not repeated for these fixes.
+
+The local cache-identity fixture correction is included in this follow-up. The byte-count expectation and renamed `CatalogRequest` fixture remain with the separate pending catalog-size work; that work and the authoring migration were preserved. The paired transport/wire types remain unchanged; the Mac model reads pending cleanup separately from terminal TV status.

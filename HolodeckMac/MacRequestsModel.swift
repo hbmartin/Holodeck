@@ -6,6 +6,7 @@ import Observation
 final class MacRequestsModel {
     var configuration: ShaderRequestConfiguration
     var jobs: [ShaderRequestStatus] = []
+    private var pendingCleanup = false
     var checking = false
     var message = "Configure Codex and enable requests."
     var error: String?
@@ -44,13 +45,14 @@ final class MacRequestsModel {
             for await jobs in await service.updates() {
                 guard let self else { break }
                 self.jobs = jobs
+                self.pendingCleanup = await service.hasPendingCleanup()
                 let current = await catalog.publicationRevisionValue()
                 if let current, current != self.revision { self.revision = current; self.onPublication?() }
             }
         }
     }
     isolated deinit { observation?.cancel() }
-    var hasUnfinishedJobs: Bool { jobs.contains { !$0.stage.terminal } }
+    var hasUnfinishedJobs: Bool { pendingCleanup || jobs.contains { !$0.stage.terminal } }
     func setRepository(_ url: URL) {
         guard !configuration.enabled, !hasUnfinishedJobs else { return }
         configuration.repository = url.path; save()

@@ -44,7 +44,7 @@ Keep the Mac awake and the app running while the TV downloads. Closing its viewe
 4. When the codes match, click **Approve** on the Mac. If they do not match, click **Decline**.
 5. Wait for the library to download and the default scene to play. The approval is saved for future connections.
 
-Press **Select**, choose **Gallery**, to open the scene picker, browse with directional controls, and press **Select** to play. **Back** closes the picker while a scene is playing.
+Press **Select**, then choose **Gallery** to open the scene picker, browse with directional controls, and press **Select** to play. **Back** closes the picker while a scene is playing.
 
 ## Publish changes and manage access
 

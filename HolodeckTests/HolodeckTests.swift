@@ -9,6 +9,51 @@ import ConcurrencyExtras
 
 @MainActor
 final class HolodeckTests: XCTestCase {
+    func testPerformanceSubmissionGuardSpansCaptureAndDelayedAcknowledgement() async throws {
+        let gate = PerformanceSubmissionGate()
+        let capture = AsyncStream<Void>.makeStream()
+        let acknowledgement = AsyncStream<Void>.makeStream()
+        var captures = 0, submissions = 0
+        func waitUntil(_ condition: () -> Bool) async throws {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            while !condition() {
+                guard ContinuousClock.now < deadline else { XCTFail("Submission fixture timed out"); throw ShaderRequestError.unavailable("Test backstop") }
+                try await Task.sleep(for: .milliseconds(5))
+            }
+        }
+        let submit: @MainActor () async -> Void = {
+            captures += 1
+            for await _ in capture.stream { break }
+            submissions += 1
+            for await _ in acknowledgement.stream { break }
+        }
+        gate.start(submit)
+        try await waitUntil { captures == 1 }
+        capture.continuation.yield()
+        try await waitUntil { submissions == 1 }
+        var monitor = ShaderPerformanceMonitor()
+        monitor.reset(at: 0)
+        for frame in 0..<300 {
+            if monitor.presented(at: Double(frame) / 20) != nil { gate.start(submit) }
+        }
+        XCTAssertEqual(captures, 1)
+        XCTAssertEqual(submissions, 1)
+        XCTAssertTrue(gate.isSubmitting)
+        acknowledgement.continuation.yield()
+        try await waitUntil { !gate.isSubmitting }
+        XCTAssertFalse(gate.isSubmitting)
+        gate.start(submit)
+        try await waitUntil { captures == 2 }
+        capture.continuation.yield()
+        try await waitUntil { submissions == 2 }
+        acknowledgement.continuation.yield()
+        try await waitUntil { !gate.isSubmitting }
+        capture.continuation.finish(); acknowledgement.continuation.finish()
+        XCTAssertEqual(captures, 2)
+        XCTAssertEqual(submissions, 2)
+        XCTAssertFalse(gate.isSubmitting)
+    }
+
     func testUserActivationDismissesOpenChooserButStartupLeavesItOpen() async throws {
         for userSelection in [false, true] {
             let (controller, compiler, pipeline) = try await controlledController()

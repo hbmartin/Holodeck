@@ -27,7 +27,7 @@ final class TVRequestsController {
     private var optimizationRequests: [String: UUID] = [:]
     private var measuringHash: String?
     private var monitor = ShaderPerformanceMonitor()
-    private var submittingPerformance = false
+    private let performanceSubmission = PerformanceSubmissionGate()
     private var lastRevision: String?
     private var deliveryNonce = UUID().uuidString
     private var requestedDeliveries: Set<UUID> = []
@@ -168,12 +168,13 @@ final class TVRequestsController {
             } catch { showBanner(error.localizedDescription) }
         }
     }
-    private func submit(_ request: ShaderRequest) {
+    @discardableResult
+    private func submit(_ request: ShaderRequest) -> Task<Void, Never> {
         if request.purpose == .creative {
             renderer.cancelPendingSelection()
             savePending(request.id)
         }
-        Task {
+        return Task {
             do {
                 let reply = try await client.requestControl(operation: "requestSubmit", payload: .init(request: request))
                 jobs += reply.jobs.filter { incoming in !jobs.contains { $0.id == incoming.id } }
@@ -265,12 +266,10 @@ final class TVRequestsController {
             monitor.reset(at: time); return
         }
         if measuringHash != shader.sourceHash { measuringHash = shader.sourceHash; monitor.reset(at: time) }
-        guard !dismissedShaders.contains(shader.id), !submittingPerformance,
+        guard !dismissedShaders.contains(shader.id), !performanceSubmission.isSubmitting,
               !jobs.contains(where: { !$0.stage.terminal && $0.request.purpose == .performance && $0.request.context.shaderID == shader.id }),
               let evidence = monitor.observe(at: time, deliveredFrames: deliveredFrames, gpuMilliseconds: gpu) else { return }
-        submittingPerformance = true
-        Task {
-            defer { submittingPerformance = false }
+        performanceSubmission.start { [self] in
             do {
                 let context = try await renderer.captureSnapshot()
                 guard context.sourceHash == shader.sourceHash else { return }
@@ -279,7 +278,7 @@ final class TVRequestsController {
                 if attemptedVersions.contains(shader.id + ":" + shader.sourceHash) {
                     offerPerformanceRetry(context: context, evidence: evidence)
                 } else {
-                    submit(performanceRequest(context: context, evidence: evidence, origin: .automatic))
+                    await submit(performanceRequest(context: context, evidence: evidence, origin: .automatic)).value
                 }
             } catch { showBanner(error.localizedDescription) }
         }
@@ -309,5 +308,18 @@ final class TVRequestsController {
         } else if bannerUntil > Date() { label.text = banner }
         else { label.text = nil }
         overlay.isHidden = label.text == nil
+    }
+}
+
+/// Keeps capture and submission in one lifetime, including a delayed acknowledgement.
+@MainActor final class PerformanceSubmissionGate {
+    private(set) var isSubmitting = false
+    func start(_ operation: @escaping @MainActor () async -> Void) {
+        guard !isSubmitting else { return }
+        isSubmitting = true
+        Task {
+            defer { isSubmitting = false }
+            await operation()
+        }
     }
 }
