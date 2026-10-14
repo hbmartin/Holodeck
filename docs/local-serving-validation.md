@@ -182,3 +182,63 @@ The physical UI test, real TLS integration and real Codex/Git publication test e
 The previously installed Codex launcher lacked its platform binary. Reinstalling its original version exposed a revoked signing certificate; the current official 0.162.1 installation launches and authenticates successfully. The authoring checkout was preserved. Its native tool/preview migration is committed on its feature branch, while its existing main branch retains the previous workflow. Setup deliberately rejects enabling automation until that work is on `origin/main`, the checkout is clean, and an explicit model has been verified.
 
 On tvOS the public Metal drawable interface lacks presentation callbacks/timestamps. The implemented performance counter estimates delivered updates by consuming GPU-completed frames on display ticks, counting at most one update per tick. GPU duration is reported separately. It does not measure the compositor's exact presentation time; this platform limitation is documented in the implementation reference and README.
+
+## Raw-byte publication integrity and recovery — 2026-10-14
+
+Implemented on `codex/apple-tv-shader-requests`, starting from clean `d3b704d`, preserving its request prepare/install/discard APIs and generated previews. Local transport is version 2 without negotiation. Local manifest schema 2 omits `sourceRevision`; the revision is SHA-256 of the exact final encoded bytes, checked against the 2 MiB bound. Consumers verify those bytes before decoding or sanitizing and derive the internal source revision. Local snapshot format 2 stores the original manifest bytes and sources, without a duplicate decoded manifest. Older or invalid local snapshots are deleted; removal failures are logged and never activate rejected data. Both apps must update, and older local caches require an updated reachable Mac to repopulate. Pairing credentials and generated-preview caches remain intact.
+
+Source kind is immutable and required at construction; request wrappers preserve kind and availability. Storage providers now supply removal. Cold restoration is a shared service-owned operation on a serial worker, and directory restoration shares reload verification while retaining inspected revisions and serializing installation. Stage ownership uses UUID names, including after moves through symlink paths. Maintenance scans run once at startup and before each preparation; final cleanup removes only the operation's own stage. Enabled local transfer-integrity failures retain capped backoff, while hash-valid undecodable PNGs are terminal. Active directional navigation overrides pending empty-picker restoration. DEBUG preferences schema 3 carries an acknowledged refresh generation with one ten-second polling budget and stale-generation timeout diagnostics.
+
+Executed validation:
+
+| Check | Result |
+| --- | --- |
+| Initial focused integrity, worker, directory, preview, cancellation, protocol and client recovery regressions | 81 executed, 2 opt-in skips, zero failures. Later restoration/stage tests are included in the full suite below. |
+| Final complete macOS core suite | 187 executed, 11 opt-in skips, zero failures. Includes raw unknown fields, discarded discovery, alternate float spellings, changed bytes, exact size bounds, old-cache deletion, same-revision recovery, healthy offline caches, shared/cancelled cold loads, worker responsiveness, symlink stage keys, scan counts and cancellation cleanup. |
+| Complete tvOS simulator core suite | 140 executed, 3 opt-in skips, zero failures; finalized with `TEST SUCCEEDED`. Xcode's post-test diagnostic collector timed out after 600 seconds. Test-only semaphore gates also produced QoS warnings. |
+| Final TV app unit suite | 44 tests, zero failures, including user-navigation ownership, remembered focus across another interruption, and visible-card corruption recovery. An earlier run had one startup-check/injected-catalog race; the helper now awaits initial refresh before injection. |
+| Focused Mac preferences suite | 5 tests passed initially. The subsequent seven-case rerun passed all six preferences/frame cases with the final strict deadline reader; its folder case still failed before the bookmark fix below. |
+| Complete TV UI run | 24 total: 21 passed, 1 physical-LAN opt-in skip, 2 failed. Clarification focus timed out, and the request-input test terminated unexpectedly. Both request cases passed in an isolated two-test rerun. All 23 non-skipped cases passed across runs; the original full run did not pass. All Control Center/pairing regressions passed in the full run. |
+| Complete Mac UI run | 27 total: 24 passed, 2 physical-input opt-in skips, 1 failed. The folder case was interrupted after XCTest stalled symbolizing a failed assertion; the app itself was idle. The six preferences/frame cases passed on rerun, and the folder/reload/bookmark/preview-fallback case passed after the resolver fix. All 25 non-skipped cases passed across runs; the original full run did not pass. |
+| Debug/Release integration | Both apps built in Debug through tests and in Release. Checks used `HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests`; app identifiers were verified. Inspection flags, refresh control identifier, lifecycle type and inspection text type were absent from the final Release Mac executable. |
+| Diff checks | `git diff --check` passed. Server admission/deadlines and generated-preview implementation were unchanged. |
+
+The app matrix exposed three integration problems already present on this branch. Copying a top-level `Resources` directory made the tvOS resource bundle fail signing; a disposable copy signed after renaming that directory. The package now copies the Python worker file directly, and its bundle lookup/availability test follow that layout. Release TV code referenced DEBUG-only `UITestConfiguration`; fixture preferences selection is now DEBUG-gated. Mac library selection saved regular bookmarks but restored them with security-scope options; resolution now matches the stored format. The folder UI assertion is scoped to the viewer so a Settings button cannot satisfy it. No Python worker behavior, request APIs, credentials, publication swap fallback or recovery journal changed.
+
+Optimized profiles used the same 256-scene fixture with approximately 1 MiB previews, three unchanged reloads and three disk restorations. The baseline was captured before production edits. Baseline reloads were 902/1376/914 ms; final reloads were 870/984/932 ms. Head-request p95 during reload was 0.861 → 0.086 ms. Disk-restoration median was 174.855 → 181.597 ms, while concurrent head p95 was 139.846 → 0.090 ms. Viewer cold-load median was 18.339 → 14.155 ms; its concurrent actor-query median was 18.269 → 0.013 ms. These samples demonstrate responsiveness, with a modest directory-restoration duration increase. The final profile overlapped app UI activity and is not a throughput threshold.
+
+Commands executed (repository root unless noted):
+
+```sh
+swift test --package-path HolodeckCore --filter 'CatalogWorkerRecoveryTests|LocalPublicationIntegrityTests|DirectoryCatalogTests|PreviewRecoveryTests|LocalClientRecoveryTests|CatalogNetworkTests|CatalogCancellationTests'
+swift test --package-path HolodeckCore
+HOLODECK_PROFILE=1 swift test --package-path HolodeckCore -c release --filter DirectoryReloadPerformanceTests
+# From HolodeckCore:
+xcodebuild -scheme HolodeckCore-Package \
+  -destination 'platform=tvOS Simulator,id=73CAAA2D-7B80-420F-B33F-EF4B8F036AAE' \
+  -derivedDataPath ../DerivedData/TVCoreRecovery -disableAutomaticPackageResolution \
+  -parallel-testing-enabled NO test
+xcodebuild -project Holodeck.xcodeproj -scheme Holodeck \
+  -destination 'platform=tvOS Simulator,id=73CAAA2D-7B80-420F-B33F-EF4B8F036AAE' \
+  -derivedDataPath DerivedData/TVLocalServing -disableAutomaticPackageResolution \
+  -parallel-testing-enabled NO HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests \
+  -only-testing:HolodeckTests test
+xcodebuild -project Holodeck.xcodeproj -scheme Holodeck \
+  -destination 'platform=tvOS Simulator,id=73CAAA2D-7B80-420F-B33F-EF4B8F036AAE' \
+  -derivedDataPath DerivedData/TVLocalServing -disableAutomaticPackageResolution \
+  -parallel-testing-enabled NO HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests \
+  -only-testing:HolodeckUITests test
+xcodebuild -project Holodeck.xcodeproj -scheme HolodeckMac \
+  -destination 'platform=macOS,arch=arm64' -derivedDataPath DerivedData/MacLocalServing \
+  -disableAutomaticPackageResolution -parallel-testing-enabled NO \
+  HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests test
+xcodebuild -project Holodeck.xcodeproj -scheme HolodeckMac -configuration Release \
+  -destination 'platform=macOS,arch=arm64' -derivedDataPath DerivedData/MacReleaseRecovery \
+  -disableAutomaticPackageResolution HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests build
+xcodebuild -project Holodeck.xcodeproj -scheme Holodeck -configuration Release \
+  -destination 'platform=tvOS Simulator,id=73CAAA2D-7B80-420F-B33F-EF4B8F036AAE' \
+  -derivedDataPath DerivedData/TVReleaseRecovery -disableAutomaticPackageResolution \
+  HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests build
+```
+
+Targeted UI reruns selected the two TV request cases and the seven Mac folder/preferences/frame cases; Mac reruns enabled test timeouts with 120/180-second default/maximum allowances. Logs are retained at `/tmp/holodeck-v2-*`, including baseline/final profiles, full suites, reruns and final builds. Cross-instance coordination remains deferred. No live LAN, physical-device, authoring/GPU opt-in, real Codex/Git execution, credential migration, push, merge or deployment was performed in this pass.

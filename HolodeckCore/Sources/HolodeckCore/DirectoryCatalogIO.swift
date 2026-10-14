@@ -21,6 +21,10 @@ nonisolated final class DirectoryCatalogIO: @unchecked Sendable {
     private let files: DirectoryCatalogFileOperations
     // Accessed only on queue, including cleanup after an async preview-generation pause.
     private var activeStages: Set<String> = []
+    private var scanCount = 0
+    func maintenanceCounts() async -> (scans: Int, active: Int) {
+        (try? await run { (self.scanCount, self.activeStages.count) }) ?? (0, 0)
+    }
 
     init(directory: URL, files: DirectoryCatalogFileOperations) {
         self.directory = directory; self.files = files
@@ -41,6 +45,7 @@ nonisolated final class DirectoryCatalogIO: @unchecked Sendable {
     }
 
     private func cleanupOrphans() {
+        scanCount += 1
         guard let entries = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey]) else { return }
         for entry in entries where !activeStages.contains(stageKey(entry)) {
             let name = entry.lastPathComponent
@@ -51,7 +56,7 @@ nonisolated final class DirectoryCatalogIO: @unchecked Sendable {
     }
 
     private func stageKey(_ url: URL) -> String {
-        url.resolvingSymlinksInPath().standardizedFileURL.path
+        url.lastPathComponent
     }
 
     private func removeStage(_ stage: URL) {
@@ -62,7 +67,7 @@ nonisolated final class DirectoryCatalogIO: @unchecked Sendable {
     }
 
     func cleanup(_ stage: URL) async {
-        _ = try? await run { self.removeStage(stage); self.cleanupOrphans() }
+        _ = try? await run { self.removeStage(stage) }
     }
 
     func prepare(from root: URL) async throws -> DirectoryPreparation {
@@ -167,11 +172,11 @@ nonisolated final class DirectoryCatalogIO: @unchecked Sendable {
 
     func finish(_ preparation: DirectoryPreparation) async throws -> DirectoryCandidate {
         try await run {
-            var manifest = preparation.manifest
-            let revision = try CatalogPublication.revision(for: manifest)
-            manifest.sourceRevision = revision
-            let catalog = try CatalogSnapshot(manifest: manifest, sources: preparation.sources, publicationRevision: revision).validated()
-            let encoded = try CatalogPublication.encodedManifest(catalog.snapshot.manifest)
+            let encoded = try CatalogPublication.encodedManifest(preparation.manifest)
+            let revision = CatalogHash.sha256(encoded)
+            let builder = try CatalogPublication.builder(encoded, revision: revision, kind: .localPublication)
+            let catalog = try CatalogPublication.finish(builder,
+                sources: preparation.sources.mapValues { Data($0.utf8) }, revision: revision)
             try encoded.write(to: preparation.stage.appendingPathComponent("catalog.json"), options: .atomic)
             return DirectoryCandidate(preparation: preparation, catalog: catalog, manifest: encoded)
         }
@@ -183,17 +188,42 @@ nonisolated final class DirectoryCatalogIO: @unchecked Sendable {
             let publication = self.directory.appendingPathComponent(candidate.catalog.publicationRevision)
             guard FileManager.default.fileExists(atPath: publication.path) else { return false }
             do {
-                guard try CatalogPublicationFiles.read(publication.appendingPathComponent("catalog.json"),
-                    limit: CatalogLimits.manifestBytes) == candidate.manifest else { return false }
-                for entry in candidate.catalog.snapshot.manifest.shaders {
-                    _ = try CatalogPublicationFiles.verified(publication.appendingPathComponent(entry.sourcePath),
-                        hash: entry.sourceSHA256, limit: CatalogLimits.sourceBytes, error: .invalidSource)
-                    _ = try CatalogPublicationFiles.verified(publication.appendingPathComponent(entry.previewPath),
-                        hash: entry.previewSHA256, limit: CatalogLimits.previewBytes, error: .invalidPreview)
-                }
+                _ = try self.verify(revision: candidate.catalog.publicationRevision, expected: candidate.manifest)
                 return true
             } catch { return false }
         }
+    }
+
+    func marker() async throws -> CatalogHead? {
+        try await run {
+            let marker = self.directory.appendingPathComponent("current.json")
+            guard FileManager.default.fileExists(atPath: marker.path) else { return nil }
+            let head = try JSONDecoder().decode(CatalogHead.self,
+                from: CatalogPublicationFiles.read(marker, limit: CatalogLimits.headBytes))
+            guard CatalogHash.isSHA(head.revision) else { throw CatalogError.invalidManifest }
+            return head
+        }
+    }
+
+    func restore(_ revision: String) async throws -> ValidatedCatalog {
+        try await run {
+            self.files.beforeVerification()
+            return try self.verify(revision: revision)
+        }
+    }
+
+    private func verify(revision: String, expected: Data? = nil) throws -> ValidatedCatalog {
+        let publication = directory.appendingPathComponent(revision)
+        let bytes = try CatalogPublicationFiles.read(publication.appendingPathComponent("catalog.json"), limit: CatalogLimits.manifestBytes)
+        if let expected, expected != bytes { throw CatalogError.invalidManifest }
+        var builder = try CatalogPublication.builder(bytes, revision: revision, kind: .localPublication)
+        for entry in builder.manifest.shaders {
+            try builder.addSource(CatalogPublicationFiles.read(publication.appendingPathComponent(entry.sourcePath),
+                limit: CatalogLimits.sourceBytes), for: entry)
+            _ = try CatalogPublicationFiles.verified(publication.appendingPathComponent(entry.previewPath),
+                hash: entry.previewSHA256, limit: CatalogLimits.previewBytes, error: .invalidPreview)
+        }
+        return try builder.finish(revision: revision)
     }
 }
 #endif

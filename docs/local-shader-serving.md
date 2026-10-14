@@ -40,6 +40,7 @@ struct CatalogHead: Codable, Sendable {
 }
 
 struct CatalogSource: Sendable {
+    let kind: Kind // standard or localPublication; required at construction
     var get: @Sendable (CatalogRequest, Int) async throws -> Data
 }
 ```
@@ -96,7 +97,7 @@ Startup first attempts to restore the copied publication after resolving the sav
 
 For each shader, `updatedAt` is the latest modification time of its metadata, body, and declared helpers, formatted as a timezone-bearing ISO-8601 timestamp. A preview-only edit changes its preview hash and publication revision without advancing that shader's update date.
 
-Revision calculation uses the validated/sanitized manifest encoded with sorted JSON keys, removes `sourceRevision`, and hashes the canonical JSON with SHA-256. Asset SHA-256 hashes and update dates are part of that metadata; array order remains significant. The resulting lowercase 64-character digest becomes both manifest `sourceRevision` and publication revision. It is independent of Git history.
+Local publications use manifest schema 2. The Mac encodes the normalized metadata once, omits `sourceRevision`, checks the final 2 MiB bound, and hashes the exact served bytes with SHA-256. The lowercase 64-character digest is the publication revision. Consumers hash those original bytes before decoding or sanitizing, and derive `sourceRevision` internally. Unknown optional fields, discarded discovery metadata, and different Foundation number encodings cannot invalidate the identity after decoding. Byte-level encoding changes deliberately produce a different revision.
 
 Reading `.head` through the server leases the current revision to that connection. Retention keeps the current publication, the previous publication, and all connection-leased revisions. Reload and connection cleanup trim other revision directories. Closing a connection releases its lease. Retention is not an archive of every past publication.
 
@@ -113,6 +114,8 @@ Paths below are relative to the platform's application-support and cache directo
 | Mac UserDefaults | Scoped authoring-folder bookmark and viewer preferences. |
 | Keychain service: `me.haroldmartin.Holodeck.local-network` | Mac identity/approvals and TV identity/pairing records, described below. |
 
+Restoration and existing-publication verification share the serial I/O worker. Installation and lease transitions stay on the catalog actor. Stage ownership uses UUID names, with one orphan scan at startup and before each reload; failed deletions retry at later scans. Concurrent app-instance coordination is not provided.
+
 Implementation: [DirectoryCatalog.swift](../HolodeckCore/Sources/HolodeckCore/DirectoryCatalog.swift), [Mac folder/settings ownership](../HolodeckMac/ShaderLibrarySettings.swift), and [CatalogService.swift](../HolodeckCore/Sources/HolodeckCore/CatalogService.swift).
 
 ## Discovery, selection, and lifecycle
@@ -123,7 +126,7 @@ The Mac uses `NWListener` on a system-assigned TCP port and advertises `_holodec
 | --- | --- |
 | `id` | Persistent Mac UUID. |
 | `name` | Mac computer display name, limited to 100 characters. |
-| `version` | Protocol version as text, currently `1`. |
+| `version` | Protocol version as text, currently `2`. |
 
 The TV uses `NWBrowser` with `.bonjourWithTXTRecord`. Results require a valid UUID, the matching service type/domain, and a discovered interface; repeated results are grouped by Mac UUID. With no remembered host, one Mac connects automatically and multiple Macs require selection. A remembered host is selected only if it is present. The client retains cached playback when it disappears and does not silently switch to another Mac. A different TXT protocol version produces the incompatible-server state.
 
@@ -212,7 +215,7 @@ This is a sequential request/response protocol over the TLS TCP stream. It is an
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `version` | Integer | Required; currently `1`. |
+| `version` | Integer | Required; currently `2`. |
 | `operation` | String | Required request operation or response `ok`/`pending`. |
 | `length` | Integer | Required payload size; control-only messages use `0`. |
 | `deviceID` | String | TV UUID for pairing/authentication. |
@@ -244,33 +247,33 @@ IDs, credentials, and digests below are illustrative. Header key order is immate
 First connection's pairing request, followed by the server's pending response:
 
 ```json
-{"version":1,"operation":"pair","length":0,"deviceID":"11111111-1111-4111-8111-111111111111","name":"Living Room TV"}
+{"version":2,"operation":"pair","length":0,"deviceID":"11111111-1111-4111-8111-111111111111","name":"Living Room TV"}
 ```
 
 ```json
-{"version":1,"operation":"pending","length":0}
+{"version":2,"operation":"pending","length":0}
 ```
 
 After approval, the response to `pairStatus` includes a credential. A later connection sends it in `authenticate` with its TV UUID:
 
 ```json
-{"version":1,"operation":"ok","length":0,"token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}
+{"version":2,"operation":"ok","length":0,"token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}
 ```
 
 ```json
-{"version":1,"operation":"authenticate","length":0,"deviceID":"11111111-1111-4111-8111-111111111111","token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}
+{"version":2,"operation":"authenticate","length":0,"deviceID":"11111111-1111-4111-8111-111111111111","token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}
 ```
 
 An authenticated current-revision lookup:
 
 ```json
-{"version":1,"operation":"asset","length":0,"request":{"head":{}},"limit":65536}
+{"version":2,"operation":"asset","length":0,"request":{"head":{}},"limit":65536}
 ```
 
 Response header and its separate 79-byte payload:
 
 ```json
-{"version":1,"operation":"ok","length":79}
+{"version":2,"operation":"ok","length":79}
 ```
 
 ```json
@@ -280,17 +283,17 @@ Response header and its separate 79-byte payload:
 Requests for a source and preview at that revision:
 
 ```json
-{"version":1,"operation":"asset","length":0,"request":{"asset":{"revision":"0000000000000000000000000000000000000000000000000000000000000000","path":"sources/plasma.metal"}},"limit":1048576}
+{"version":2,"operation":"asset","length":0,"request":{"asset":{"revision":"0000000000000000000000000000000000000000000000000000000000000000","path":"sources/plasma.metal"}},"limit":1048576}
 ```
 
 ```json
-{"version":1,"operation":"asset","length":0,"request":{"asset":{"revision":"0000000000000000000000000000000000000000000000000000000000000000","path":"previews/plasma.png"}},"limit":8388608}
+{"version":2,"operation":"asset","length":0,"request":{"asset":{"revision":"0000000000000000000000000000000000000000000000000000000000000000","path":"previews/plasma.png"}},"limit":8388608}
 ```
 
 The corresponding `ok` response's `length` is the asset byte count and its binary payload is the asset itself. A denied request has an error header and no asset payload:
 
 ```json
-{"version":1,"operation":"ok","length":0,"error":"revoked"}
+{"version":2,"operation":"ok","length":0,"error":"revoked"}
 ```
 
 ### Bounds, timeouts, and errors
@@ -315,11 +318,11 @@ The client maps `revoked` and `rejected` to the access-rejected state and recogn
 
 Catalog errors are formatted for the Mac library or TV connection rather than sharing TV-only instructions. The TV displays catalog failures separately from connection status. Mac renderer alerts do not depend on a configured folder; selection alerts delayed by a reload are retried when it finishes. Cached update failures remain inline.
 
-`CatalogService.current()` validates and restores its disk snapshot before downloads. A refresh retrieves `.head`, accepts lowercase 40- or 64-character revisions, and returns unchanged when the publication revision matches. For a new revision, it retrieves `catalog.json` and then every source sequentially with explicit size limits. It validates manifest structure, source hashes, UTF-8, and total source bytes before atomically writing `snapshot.json` and replacing the in-memory catalog. Previews are fetched separately on demand and do not gate catalog activation.
+`CatalogService.current()` asynchronously restores its disk snapshot on a serial worker; concurrent callers share that load. Local snapshots use a format-2 envelope containing the revision, original manifest bytes, and sources, without a second decoded manifest. Older or invalid local snapshots are rejected and deleted, and deletion failures are logged. Nonlocal fixtures retain their existing snapshot format. A refresh retrieves `.head`, requires a lowercase 64-character SHA-256 revision for local sources, and returns unchanged when the publication revision matches. For a new revision, it retrieves `catalog.json` and then every source sequentially with explicit size limits. It validates manifest structure, source hashes, UTF-8, and total source bytes before atomically writing `snapshot.json` and replacing the in-memory catalog. Previews are fetched separately on demand and do not gate catalog activation.
 
 Concurrent refresh callers share a service-owned operation. Cancelling a waiter ends its wait immediately; the underlying operation can finish and persist even after all waiters leave. Ordinary attempts are throttled for 15 minutes, measured from the last attempt by a monotonic clock, when a usable snapshot exists. Explicit checks and successful connection-generation changes force a refresh. A viewer force request arriving during another pass queues one coalesced forced follow-up; the same returned viewer task completes after all queued passes finish. Viewer shutdown discards queued passes without canceling the service-owned operation. Launch and foreground return also trigger ordinary checks; a foreground reconnect can consequently force one.
 
-Preview requests coalesce by hash and decoded-image size. Validated encoded bytes are cached on disk by hash and in a 16 MiB LRU; decoded images use a 32 MiB LRU. ImageIO runs on a worker queue with two concurrent decodes. Requests use 64-pixel destination buckets and a 2048-pixel cap. Fetches wait up to 30 seconds for connection setup, but approval-required and other actionable states return immediately. Canceling a setup waiter does not cancel shared pairing. Connectivity failures use the optional `CatalogSource.waitForAvailability` hook and retry immediately after authentication succeeds. Other transient failures retry on demand after 30 seconds, doubling to a five-minute ceiling. Validation/decode failures are suppressed for their publication/path/hash until that key changes or the service is recreated. At most 500 failure records are retained. Memory-pressure trimming clears memory caches without deleting disk content; an epoch prevents pre-trim work from repopulating them.
+Preview requests coalesce by hash and decoded-image size. Validated encoded bytes are cached on disk by hash and in a 16 MiB LRU; decoded images use a 32 MiB LRU. ImageIO runs on a worker queue with two concurrent decodes. Requests use 64-pixel destination buckets and a 2048-pixel cap. Fetches wait up to 30 seconds for connection setup, but approval-required and other actionable states return immediately. Canceling a setup waiter does not cancel shared pairing. Connectivity failures use the optional `CatalogSource.waitForAvailability` hook and retry immediately after authentication succeeds. Other transient failures retry on demand after 30 seconds, doubling to a five-minute ceiling. For enabled local sources, transfer-integrity failures retry at 30, 60, 120, 240, and then 300-second intervals. Hash-valid PNGs that fail decoding are terminal for their publication/path/hash until that key changes or the service is recreated. Transfer success clears transfer failures; decoding success clears image failures. Other sources retain permanent integrity-failure suppression. At most 500 failure records are retained. Memory-pressure trimming clears memory caches without deleting disk content; an epoch prevents pre-trim work from repopulating them.
 
 | Policy | TV | Mac |
 | --- | --- | --- |
@@ -331,7 +334,7 @@ Preview requests coalesce by hash and decoded-image size. Validated encoded byte
 
 `ShaderCompiler` caches pipelines by ID and source hash and expects `vertexShader`, `fragmentShader`, and the existing 16-byte buffer-0 uniforms. Selection cancellation/supersession prevents stale results from becoming active. TV saves its last shader ID only after successful activation.
 
-Legacy disk snapshots retain their 40-character revisions and playable sources. The local server does not recreate old remote publications: an uncached preview from an unavailable legacy revision falls back to a gradient without disconnecting the TV. Revocation affects future downloads, not cached playback. tvOS may evict cache files, after which an approved, available Mac is needed to download again.
+Protocol version 2 and local manifest/cache format 2 require both apps to update. Version-1 peers report incompatibility; there is no negotiation or migration of older local snapshots. An updated, reachable Mac is required to repopulate those caches. Healthy format-2 snapshots remain usable offline; generated-preview caches and pairing credentials are retained. Revocation affects future downloads, not cached playback. tvOS may evict cache files, after which an approved, available Mac is needed to download again.
 
 Implementation: [CatalogService.swift](../HolodeckCore/Sources/HolodeckCore/CatalogService.swift), [ViewerSession.swift](../HolodeckCore/Sources/HolodeckCore/ViewerSession.swift), and [ShaderCompiler.swift](../HolodeckCore/Sources/HolodeckCore/ShaderCompiler.swift).
 
@@ -406,7 +409,7 @@ See [the validation report](local-serving-validation.md) for dated results and r
 
 ## Shader request control and execution
 
-The optional `shaderRequests1` hello capability extends version 1 without changing existing asset framing. `LocalCatalogClient` opens a second TLS channel pinned to the same Mac and authenticated with the same device credential. Submission, status, clarification, delivery refresh and activation reports use Codable payloads in `requestSubmit`, `requestStatus`, `requestAnswer`, `requestDelivery` and `requestActivated`. The server supplies the authenticated TV identity to `ShaderRequestService`, checks authorization again before responding and cancels queued jobs on revocation. Status polling every two seconds is independent of catalog transfers and process lifetimes.
+The optional `shaderRequests1` hello capability extends protocol version 2 without changing asset framing. `LocalCatalogClient` opens a second TLS channel pinned to the same Mac and authenticated with the same device credential. Submission, status, clarification, delivery refresh and activation reports use Codable payloads in `requestSubmit`, `requestStatus`, `requestAnswer`, `requestDelivery` and `requestActivated`. The server supplies the authenticated TV identity to `ShaderRequestService`, checks authorization again before responding and cancels queued jobs on revocation. Status polling every two seconds is independent of catalog transfers and process lifetimes.
 
 `ShaderRequestContext` binds exact UTF-8 source and SHA-256 to captured metadata, publication identity, a clean 1280×720 PNG, shader animation time and native drawable dimensions. The renderer copies the current drawable through Metal after the same frame's render pass. Scene/hash changes during capture reject the snapshot. Capturing the frame excludes UIKit overlays. `ShaderRequest`, `ShaderRequestStatus`, `ShaderRequestResult`, `ShaderClarification` and `PerformanceEvidence` are the shared interfaces; status stages cover queue, implementation, clarification, technical validation, visual review, push, publication, activation, repair and terminal outcomes. Result identity describes the whole logical request, including creation followed by activation repairs.
 

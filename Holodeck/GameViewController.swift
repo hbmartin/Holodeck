@@ -3,6 +3,17 @@ import UIKit
 import MetalKit
 import Dependencies
 
+@MainActor
+struct EmptyPickerFocusRestoration {
+    var pending = false
+    mutating func accepts(active: Bool, preferred: Bool, heading: UIFocusHeading) -> Bool {
+        guard pending else { return true }
+        guard active, preferred || !heading.isEmpty else { return false }
+        pending = false
+        return true
+    }
+}
+
 final class GameViewController: UIViewController, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout {
     @Dependency(\.rendererFactory) private var rendererFactory
     @Dependency(\.shaderPreferences) private var shaderPreferences
@@ -28,7 +39,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     private let changeMacButton = UIButton(type: .system)
     private let checkUpdatesButton = UIButton(type: .system)
     private weak var emptyPickerFocusButton: UIButton?
-    private var emptyPickerRestorationPending = false
+    private var emptyPickerRestoration = EmptyPickerFocusRestoration()
     private var sceneIsActive = false
     private var localUpdatesTask: Task<Void, Never>?
     private var localActivityTask: Task<Void, Never>?
@@ -55,6 +66,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
     private var pendingSelection: ViewerSession.PendingSelection? { session.pendingSelection }
     private typealias SelectionOrigin = ViewerSession.SelectionOrigin
     var shaderSelectionTask: Task<Void, Never>? { session.selectionTask }
+    var catalogRefreshTask: Task<Void, Never>? { session.refreshTask }
     @Dependency(\.continuousClock) private var hintClock
     private var catalogErrorMessage: String?
     private var renderer: Renderer?
@@ -101,7 +113,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
         super.didUpdateFocus(in: context, with: coordinator)
-        rememberPickerFocus(context.nextFocusedView)
+        rememberPickerFocus(context.nextFocusedView, heading: context.focusHeading)
         // Route Down from controls into the preferred card without intercepting Up from cards.
         updateCardsFocusGuide(focused: context.nextFocusedView)
     }
@@ -130,8 +142,12 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             metalView.delegate = renderer
             session.attach(renderer)
             if catalogService.usesLocalNetwork {
+                #if DEBUG
                 let configuration = UITestConfiguration(applicationID: "me.haroldmartin.Holodeck")
                 let preferences = configuration.storageSuite == nil ? UserDefaults.standard : configuration.makeUserDefaults()
+                #else
+                let preferences = UserDefaults.standard
+                #endif
                 let requests = TVRequestsController(presenter: self, renderer: renderer, client: localClient, session: session,
                     defaults: preferences, covered: { [weak self] in
                         guard let self else { return true }
@@ -161,7 +177,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
 
     func setSceneActive(_ active: Bool) {
         if !active, pickerIsVisible, shaders.isEmpty, catalogService.usesLocalNetwork {
-            emptyPickerRestorationPending = true
+            emptyPickerRestoration.pending = true
         }
         sceneIsActive = active
         session.setActive(active)
@@ -173,7 +189,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             if !hasRestoredFocus(focused) {
                 setNeedsFocusUpdate()
                 updateFocusIfNeeded()
-            } else { emptyPickerRestorationPending = false }
+            } else { emptyPickerRestoration.pending = false }
         }
     }
 
@@ -190,14 +206,12 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         return focused === view
     }
 
-    func rememberPickerFocus(_ focused: UIView?) {
+    func rememberPickerFocus(_ focused: UIView?, heading: UIFocusHeading = []) {
         guard pickerIsVisible, shaders.isEmpty, catalogService.usesLocalNetwork,
               let button = focused as? UIButton, button.isDescendant(of: localControls) else { return }
-        if emptyPickerRestorationPending {
-            guard sceneIsActive, button === preferredEmptyPickerControl else { return }
-            emptyPickerRestorationPending = false
-        }
-        // Ignore incidental restoration callbacks until UIKit reaches the saved control.
+        guard emptyPickerRestoration.accepts(active: sceneIsActive,
+            preferred: button === preferredEmptyPickerControl, heading: heading) else { return }
+        // Active directional navigation takes ownership from programmatic restoration.
         emptyPickerFocusButton = button
     }
 
@@ -339,7 +353,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
             updateStatus()
             showLoadingHintIfNeeded()
         case .catalogChanged:
-            if !shaders.isEmpty { emptyPickerFocusButton = nil; emptyPickerRestorationPending = false }
+            if !shaders.isEmpty { emptyPickerFocusButton = nil; emptyPickerRestoration.pending = false }
             catalogErrorMessage = nil
             (view as? ShowcaseMetalView)?.acceptsFocus = !pickerIsVisible || unavailableMessage != nil
             refreshBrowsing()
@@ -519,7 +533,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         }
         // Layout can deliver focus callbacks for the previously visible item.
         emptyPickerFocusButton = nil
-        emptyPickerRestorationPending = false
+        emptyPickerRestoration.pending = false
         browsingIndexPath = openingIndexPath
         browsingShaderID = visibleShaders.indices.contains(openingIndexPath.item) ? visibleShaders[openingIndexPath.item].id : nil
         collectionView.setNeedsFocusUpdate()
@@ -546,7 +560,7 @@ final class GameViewController: UIViewController, UICollectionViewDataSource, UI
         chooserSourceButton = nil
         returnFocusButton = nil
         emptyPickerFocusButton = nil
-        emptyPickerRestorationPending = false
+        emptyPickerRestoration.pending = false
         selectGesture.isEnabled = true
         menuGesture.isEnabled = false
         (view as? ShowcaseMetalView)?.acceptsFocus = true

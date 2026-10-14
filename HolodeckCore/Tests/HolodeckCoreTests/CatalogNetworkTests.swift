@@ -100,7 +100,7 @@ final class CatalogNetworkTests: XCTestCase {
 
     func testIncompatibleProtocolAndInterruptedTransferFail() async throws {
         let (client, server) = try await pair()
-        var message = LocalMessage(operation: "hello"); message.version = 99
+        var message = LocalMessage(operation: "hello"); message.version = 1
         try await raw(header(message), on: client)
         do { _ = try await server.receive(); XCTFail("Incompatible version accepted") }
         catch LocalCatalogError.incompatible {}

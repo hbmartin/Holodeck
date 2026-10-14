@@ -58,7 +58,7 @@ final class CatalogPerformanceTests: XCTestCase {
         let storage = CatalogStorage(read: { name in
             _ = try counter.storage.read(name)
             return try disk.read(name)
-        }, write: disk.write)
+        }, write: disk.write, remove: disk.remove)
         let service = CatalogService.offline(storage: storage)
         let first = try await service.previewImage(preview, maxPixelSize: 640)
         let clock = ContinuousClock()

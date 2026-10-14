@@ -13,12 +13,17 @@ nonisolated enum TestCatalog {
         return value
     }()
     static let catalog = try! snapshot.validated()
+    static let localCatalog: ValidatedCatalog = {
+        let bytes = try! CatalogPublication.encodedManifest(snapshot.manifest), revision = CatalogHash.sha256(bytes)
+        return try! CatalogPublication.finish(CatalogPublication.builder(bytes, revision: revision, kind: .localPublication),
+            sources: snapshot.sources.mapValues { Data($0.utf8) }, revision: revision)
+    }()
     static var shaders: [ShaderDefinition] { catalog.shaders }
     static var initialShader: ShaderDefinition { catalog.initialShader }
     static let storage = CatalogStorage(read: { name in
         if name == "snapshot.json" { return data }
         return try? preview(named: name)
-    }, write: { _, _ in })
+    }, write: { _, _ in }, remove: { _ in })
     static func preview(named name: String) throws -> Data {
         guard let url = Bundle(for: HolodeckTests.self).url(forResource: name, withExtension: nil, subdirectory: "TestSupport") else { throw CatalogError.invalidPreview }
         return try Data(contentsOf: url)

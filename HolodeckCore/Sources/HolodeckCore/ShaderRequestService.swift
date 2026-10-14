@@ -29,6 +29,7 @@ nonisolated struct RequestWorkerEvent: Decodable, Sendable {
 
 /// Reading subprocess pipes never occupies the UI or the catalog/server actor.
 nonisolated final class RequestWorkerProcess: @unchecked Sendable {
+    static var bundledScript: URL? { Bundle.module.url(forResource: "shader_requests", withExtension: "py") }
     let process = Process()
     private let scriptOverride: URL?
     init(script: URL? = nil) { scriptOverride = script }
@@ -55,7 +56,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         AsyncThrowingStream { continuation in
             DispatchQueue(label: "Holodeck.request-worker").async { [self] in
                 do {
-                    guard let script = scriptOverride ?? Bundle.module.url(forResource: "shader_requests", withExtension: "py", subdirectory: "Resources") else {
+                    guard let script = scriptOverride ?? Self.bundledScript else {
                         throw ShaderRequestError.unavailable("Bundled shader request worker is missing.")
                     }
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

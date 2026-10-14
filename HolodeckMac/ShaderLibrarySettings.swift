@@ -60,7 +60,7 @@ final class MacLibraryModel {
         if let bookmark = defaults?.data(forKey: "holodeck.shaderFolderBookmark") {
             do {
                 var stale = false
-                let url = try URL(resolvingBookmarkData: bookmark, options: [.withSecurityScope], relativeTo: nil, bookmarkDataIsStale: &stale)
+                let url = try URL(resolvingBookmarkData: bookmark, options: [], relativeTo: nil, bookmarkDataIsStale: &stale)
                 if url.startAccessingSecurityScopedResource() { scopedURL = url }
                 folder = url
                 requests.setRepository(url)

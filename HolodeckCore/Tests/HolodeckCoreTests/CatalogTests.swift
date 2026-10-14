@@ -129,7 +129,7 @@ final class CatalogTests: XCTestCase {
     func testConcurrentRefreshDoesNotStartDuplicateDownloads() async throws {
         let gate = PreviewRequestGate()
         let service = CatalogService(
-                                     source: CatalogSource { url, _ in await gate.image(url.lastPathComponent) },
+                                     source: CatalogSource(kind: .standard) { url, _ in await gate.image(url.lastPathComponent) },
                                      storage: TestCatalog.storage)
         let first = Task { try await service.refresh() }
         await gate.waitForRequest("head")
@@ -157,7 +157,7 @@ final class CatalogTests: XCTestCase {
         let box = CatalogTestBox()
         _ = try CatalogTestFixtures.makeService(expected, box: box)
         let network = box.source
-        let service = CatalogService(source: CatalogSource { url, limit in
+        let service = CatalogService(source: CatalogSource(kind: .standard) { url, limit in
             if url.isHead { return await gate.image("head") }
             return try await network.get(url, limit)
         }, storage: TestCatalog.storage)

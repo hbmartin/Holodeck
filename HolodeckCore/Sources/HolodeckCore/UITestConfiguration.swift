@@ -56,13 +56,13 @@ nonisolated public struct UITestConfiguration: Sendable {
             return .offline(storage: storage)
         }
         if contains("--ui-test-empty-cache") {
-            return CatalogService(source: CatalogSource { _, _ in throw CatalogError.invalidResponse }, storage: .disabled)
+            return CatalogService(source: CatalogSource(kind: .standard) { _, _ in throw CatalogError.invalidResponse }, storage: .disabled)
         }
         if let catalog, contains("--ui-test-download-catalog") || contains("--ui-test-fail-refresh") {
             let fixture = CatalogDownloadFixture(snapshot: catalog.snapshot,
                 failFirst: contains("--ui-test-fail-catalog-once") || contains("--ui-test-fail-refresh"))
             return CatalogService(initialCatalog: contains("--ui-test-fail-refresh") ? catalog : nil,
-                                  source: CatalogSource { url, _ in try await fixture.get(url) }, storage: .disabled)
+                                  source: CatalogSource(kind: .standard) { url, _ in try await fixture.get(url) }, storage: .disabled)
         }
         return .offline(initialCatalog: catalog)
     }

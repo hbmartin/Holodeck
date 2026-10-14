@@ -387,7 +387,7 @@ final class HolodeckTests: XCTestCase {
         for cached in [false, true] {
             let counter = ControllerNetworkCounter()
             let service = CatalogService(initialCatalog: cached ? TestCatalog.catalog : nil,
-                source: CatalogSource { url, _ in
+                source: CatalogSource(kind: .standard) { url, _ in
                     if url.isHead { await counter.record() }
                     throw CatalogError.invalidResponse
                 }, storage: .disabled)
@@ -717,6 +717,9 @@ final class HolodeckTests: XCTestCase {
             $0.metalDevice = device
             $0.shaderCompilerFactory = { _, _ in compiler }
         })
+        if let refresh = controller.catalogRefreshTask {
+            try await waitForAsync("Initial catalog check finishes before injecting updates") { await refresh.value }
+        }
         return (controller, compiler, pipeline)
     }
 
@@ -999,7 +1002,7 @@ extension HolodeckTests {
     func testCatalogFailureRemainsPrimaryWhileConnectionStatusChanges() async throws {
         let (device, _) = try await Self.controllerPipeline.value
         let client = recoveryClient()
-        let service = CatalogService(source: CatalogSource { _, _ in
+        let service = CatalogService(source: CatalogSource(kind: .standard) { _, _ in
             throw LocalCatalogError.invalidFile("catalog.json", "Broken catalog")
         }, storage: .disabled, usesLocalNetwork: true)
         let controller = try await hostController(dependencies: {
@@ -1015,6 +1018,20 @@ extension HolodeckTests {
         XCTAssertEqual(status.text, "catalog.json: Broken catalog")
         state.status = .permissionDenied; controller.applyLocalState(state)
         XCTAssertEqual(status.text, "catalog.json: Broken catalog")
+    }
+
+    func testDirectionalUserFocusTakesOwnershipDuringPendingRestoration() {
+        var restoration = EmptyPickerFocusRestoration(pending: true)
+        XCTAssertFalse(restoration.accepts(active: false, preferred: false, heading: .right))
+        XCTAssertFalse(restoration.accepts(active: true, preferred: false, heading: []))
+        XCTAssertTrue(restoration.pending)
+        XCTAssertTrue(restoration.accepts(active: true, preferred: false, heading: .right))
+        XCTAssertFalse(restoration.pending)
+        // Once navigation wins, later focus updates are remembered normally.
+        XCTAssertTrue(restoration.accepts(active: true, preferred: false, heading: []))
+        restoration.pending = true
+        XCTAssertTrue(restoration.accepts(active: true, preferred: true, heading: []))
+        XCTAssertFalse(restoration.pending)
     }
 
     func testFocusRestorationRecognizesEmptyLocalPickerControlsAndExistingRootRules() async throws {
@@ -1045,6 +1062,13 @@ extension HolodeckTests {
                 XCTAssertTrue(controller.hasRestoredFocus(check))
                 controller.setSceneActive(true)
                 XCTAssertTrue(controller.preferredFocusEnvironments.first === check)
+                controller.rememberPickerFocus(change, heading: .right)
+                XCTAssertTrue(controller.preferredFocusEnvironments.first === change)
+                controller.setSceneActive(false)
+                controller.rememberPickerFocus(check)
+                XCTAssertTrue(controller.preferredFocusEnvironments.first === change)
+                controller.setSceneActive(true)
+                XCTAssertTrue(controller.preferredFocusEnvironments.first === change)
             }
             else { XCTAssertTrue(controller.preferredFocusEnvironments.first === controller.view) }
             controller.closePickerFromRemote()
@@ -1072,7 +1096,7 @@ extension HolodeckTests {
     func testTemporaryInactivityPreservesPairingWhileBackgroundStopsIt() async throws {
         let (device, _) = try await Self.controllerPipeline.value
         let channel = TVRecoveryChannel(); let client = recoveryClient(channel: channel)
-        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: client.source, storage: .disabled, usesLocalNetwork: true)
+        let service = CatalogService(initialCatalog: TestCatalog.localCatalog, source: client.source, storage: .disabled, usesLocalNetwork: true)
         let controller = try await hostController(dependencies: {
             $0.catalogService = service; $0.localCatalogClient = client; $0.metalDevice = device; $0.shaderCompilerFactory = ShaderCompilerFactoryKey.liveValue
         })
@@ -1082,7 +1106,7 @@ extension HolodeckTests {
         }
         let browser = await client.currentBrowserID
         let mac = LocalMac(id: UUID().uuidString, name: "Test Mac", endpoint: .service(name: "Test",
-            type: LocalProtocol.serviceType, domain: "local.", interface: nil), interface: nil, version: 1)
+            type: LocalProtocol.serviceType, domain: "local.", interface: nil), interface: nil, version: LocalProtocol.version)
         await client.discovered([mac], id: try XCTUnwrap(browser), sequence: 1)
         while true {
             if case .awaitingApproval = await client.currentState.status { break }

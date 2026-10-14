@@ -47,6 +47,8 @@ public actor DirectoryCatalog {
     private let io: DirectoryCatalogIO
     private var verificationRevisions: Set<String> = []
     private var reloading = false
+    private var restoring = false
+    private var restorationRevision: String?
     private var reloadWaiters: [CheckedContinuation<Void, Never>] = []
     private var currentRevision: String?
     private var allowed: [String: Set<String>] = [:]
@@ -67,9 +69,7 @@ public actor DirectoryCatalog {
     }
 
     public nonisolated var source: CatalogSource {
-        var source = CatalogSource { [self] request, limit in try await get(request, limit: limit) }
-        source.isLocalPublication = true
-        return source
+        CatalogSource(kind: .localPublication) { [self] request, limit in try await get(request, limit: limit) }
     }
 
     public func publicationRevisionValue() -> String? { currentRevision }
@@ -78,44 +78,45 @@ public actor DirectoryCatalog {
     public func release(_ connection: UUID) { leases[connection] = nil; trim() }
 
     /// Restore only copied, hash-verified assets from our own last successful publication.
-    public func cached() throws -> ValidatedCatalog? {
-        let marker = directory.appendingPathComponent("current.json")
-        guard FileManager.default.fileExists(atPath: marker.path) else { return nil }
-        let head = try JSONDecoder().decode(CatalogHead.self, from: Data(contentsOf: marker))
-        guard CatalogHash.isSHA(head.revision) else { throw CatalogError.invalidManifest }
-        let publication = directory.appendingPathComponent(head.revision)
-        func read(_ path: String, limit: Int) throws -> Data {
-            try CatalogPublicationFiles.read(publication.appendingPathComponent(path), limit: limit)
+    public func cached() async throws -> ValidatedCatalog? {
+        await beginTransition()
+        restoring = true
+        defer {
+            restoring = false
+            if let revision = restorationRevision { restorationRevision = nil; releaseVerificationPin(revision) }
+            endTransition()
         }
-        let manifest = try JSONDecoder().decode(CatalogManifest.self, from: read("catalog.json", limit: CatalogLimits.manifestBytes))
-        var builder = try CatalogBuilder(manifest: manifest)
-        try CatalogPublication.validate(builder.manifest, revision: head.revision)
+        try Task.checkCancellation()
+        guard let head = try await io.marker() else { return nil }
+        restorationRevision = head.revision; verificationRevisions.insert(head.revision)
+        let catalog = try await io.restore(head.revision)
+        try Task.checkCancellation()
         var paths: Set<String> = ["catalog.json"]
-        for entry in manifest.shaders {
-            try builder.addSource(read(entry.sourcePath, limit: CatalogLimits.sourceBytes), for: entry)
-            _ = try CatalogPublicationFiles.verified(publication.appendingPathComponent(entry.previewPath),
-                hash: entry.previewSHA256, limit: CatalogLimits.previewBytes, error: .invalidPreview)
-            paths.insert(entry.sourcePath); paths.insert(entry.previewPath)
-        }
-        let catalog = try builder.finish(revision: head.revision)
+        for entry in catalog.snapshot.manifest.shaders { paths.insert(entry.sourcePath); paths.insert(entry.previewPath) }
         currentRevision = head.revision; allowed[head.revision] = paths
         return catalog
     }
 
-    @discardableResult
-    public func reload(from root: URL) async throws -> CatalogReloadResult {
+    private func beginTransition() async {
         if reloading { await withCheckedContinuation { reloadWaiters.append($0) } }
         else { reloading = true }
-        defer {
-            if reloadWaiters.isEmpty { reloading = false }
-            else { reloadWaiters.removeFirst().resume() }
-        }
+    }
+    private func endTransition() {
+        if reloadWaiters.isEmpty { reloading = false }
+        else { reloadWaiters.removeFirst().resume() }
+    }
+
+    @discardableResult
+    public func reload(from root: URL) async throws -> CatalogReloadResult {
+        await beginTransition()
+        defer { endTransition() }
         try Task.checkCancellation()
         let candidate = try await prepare(from: root)
-        return try await install(candidate.id)
+        return try await installPrepared(candidate.id)
     }
 
     func maintainStages() async { await io.maintenance() }
+    func stageMaintenanceCounts() async -> (scans: Int, active: Int) { await io.maintenanceCounts() }
 
     public func prepare(from root: URL) async throws -> PreparedCatalogPublication {
         var preparation = try await io.prepare(from: root)
@@ -135,6 +136,7 @@ public actor DirectoryCatalog {
             }
             try Task.checkCancellation()
             let candidate = try await io.finish(preparation)
+            try Task.checkCancellation()
             let revision = candidate.catalog.publicationRevision
             verificationRevisions.insert(revision); retainedRevision = revision
             let id = UUID()
@@ -154,12 +156,21 @@ public actor DirectoryCatalog {
     }
 
     private func releaseVerificationPin(_ revision: String) {
-        if !prepared.values.contains(where: { $0.candidate.catalog.publicationRevision == revision }) {
+        if restorationRevision != revision, !prepared.values.contains(where: { $0.candidate.catalog.publicationRevision == revision }) {
             verificationRevisions.remove(revision)
         }
     }
 
     public func install(_ id: UUID) async throws -> CatalogReloadResult {
+        await beginTransition()
+        defer { endTransition() }
+        do {
+            try Task.checkCancellation()
+            return try await installPrepared(id)
+        } catch { await discard(id); throw error }
+    }
+
+    private func installPrepared(_ id: UUID) async throws -> CatalogReloadResult {
         guard let value = prepared[id] else { throw CatalogError.invalidResponse }
         let candidate = value.candidate
         let preparation = candidate.preparation
@@ -205,6 +216,7 @@ public actor DirectoryCatalog {
     private var previousRevision: String?
     private func trim(previous: String? = nil) {
         if let previous, previous != currentRevision { previousRevision = previous }
+        guard !restoring || restorationRevision != nil else { return }
         let keep = Set(leases.values).union(verificationRevisions).union([currentRevision, previousRevision].compactMap { $0 })
         for revision in Array(allowed.keys) where !keep.contains(revision) {
             allowed[revision] = nil

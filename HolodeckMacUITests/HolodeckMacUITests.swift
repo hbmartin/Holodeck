@@ -120,7 +120,8 @@ final class HolodeckMacUITests: XCTestCase {
         try JSONSerialization.data(withJSONObject: metadata).write(to: metadataURL)
         app.terminate(); app.launch()
         waitForTitle("Edited Plasma", in: app)
-        XCTAssertFalse(element("choose-shader-folder", in: app).exists)
+        XCTAssertFalse(app.windows["holodeck-viewer-window"].descendants(matching: .any)
+            .matching(identifier: "choose-shader-folder").firstMatch.exists)
 
         // A failed preview for an unselected scene must not block local publication or playback.
         let broken = root.appendingPathComponent("shaders/broken")
@@ -685,7 +686,7 @@ final class HolodeckMacUITests: XCTestCase {
 
     func testPreferencesReaderRejectsMalformedOrMismatchedSnapshots() throws {
         func payload(_ overrides: [String: Any] = [:]) throws -> String {
-            var raw: [String: Any] = ["schemaVersion": 2, "bundleIdentifier": MacUITestSettings.bundleIdentifier,
+            var raw: [String: Any] = ["schemaVersion": 3, "refreshGeneration": 0, "bundleIdentifier": MacUITestSettings.bundleIdentifier,
                 "domainExists": true, "frames": ["NSWindow Frame HolodeckViewer-test": "saved frame"],
                 "lifecycle": ["modelCreations": 0, "libraryCreations": 0, "serverStartAttempts": 0]]
             for (key, value) in overrides { raw[key] = value }
@@ -696,11 +697,11 @@ final class HolodeckMacUITests: XCTestCase {
         }
         XCTAssertEqual(try read(payload())["NSWindow Frame HolodeckViewer-test"], "saved frame")
         for text in ["invalid JSON", "[]", "{}", try payload(["frames": ["NSWindow Frame HolodeckViewer-test": 2]]),
-                     try payload(["frames": ["unexpected": "value"]]), try payload(["domainExists": false]), try payload(["lifecycle": [:]]),
+                     try payload(["frames": ["unexpected": "value"]]), try payload(["domainExists": false]), try payload(["refreshGeneration": -1]), try payload(["lifecycle": [:]]),
                      try payload(["lifecycle": ["modelCreations": -1, "libraryCreations": 0, "serverStartAttempts": 0]])] {
             XCTAssertThrowsError(try read(text, allowMissing: true))
         }
-        XCTAssertThrowsError(try read(payload(["schemaVersion": 3])))
+        XCTAssertThrowsError(try read(payload(["schemaVersion": 2])))
         XCTAssertThrowsError(try read(payload(["bundleIdentifier": "another.app"])))
         let missing = try payload(["domainExists": false, "frames": [String: String]()])
         XCTAssertThrowsError(try read(missing))
@@ -721,20 +722,26 @@ final class HolodeckMacUITests: XCTestCase {
         }
         XCTAssertFalse(element("holodeck-viewer-window", in: probe).exists)
         XCTAssertFalse(element("shader-serving-status", in: probe).exists)
-        var first = true
-        let result = try AppPreferencesReader.wait(read: {
-            if !first { probe.buttons["ui-test-refresh-preferences"].click() }
-            first = false
+        let deadline = ProcessInfo.processInfo.systemUptime + 10
+        func readSnapshot() throws -> AppPreferencesReader.Snapshot {
             guard let payload = snapshot.value as? String else { throw AppPreferencesReader.ReadError.invalidSnapshot }
             let value = try AppPreferencesReader.snapshot(payload, bundleIdentifier: MacUITestSettings.bundleIdentifier, allowMissing: allowMissing)
             XCTAssertTrue(value.lifecycle.isIdle, "Inspection started application components: \(value.lifecycle)")
             return value
-        }, until: { predicate($0.frames) })
-        // A second snapshot directly verifies that the refresh path also stays side-effect free.
-        probe.buttons["ui-test-refresh-preferences"].click()
-        let refreshed = try AppPreferencesReader.snapshot(try XCTUnwrap(snapshot.value as? String),
-            bundleIdentifier: MacUITestSettings.bundleIdentifier, allowMissing: allowMissing)
-        XCTAssertTrue(refreshed.lifecycle.isIdle)
+        }
+        var last = try readSnapshot(), first = true
+        func refreshSnapshot() throws -> AppPreferencesReader.Snapshot {
+            let expected = last.refreshGeneration + 1
+            probe.buttons["ui-test-refresh-preferences"].click()
+            last = try AppPreferencesReader.acknowledged(read: readSnapshot, generation: expected, deadline: deadline)
+            return last
+        }
+        let result = try AppPreferencesReader.wait(read: {
+            if first { first = false; return last }
+            return try refreshSnapshot()
+        }, until: { predicate($0.frames) }, deadline: deadline)
+        // An acknowledged refresh proves that the action actually ran, even when values stay equal.
+        _ = try refreshSnapshot()
         return result.frames
     }
 
@@ -744,7 +751,7 @@ final class HolodeckMacUITests: XCTestCase {
         var reads = 0
         let result = try AppPreferencesReader.wait(read: {
             reads += 1
-            return AppPreferencesReader.Snapshot(schemaVersion: 2, bundleIdentifier: "test", domainExists: true,
+            return AppPreferencesReader.Snapshot(schemaVersion: 3, refreshGeneration: 0, bundleIdentifier: "test", domainExists: true,
                 frames: time >= 0.5 ? ["frame": "saved"] : [:], lifecycle: lifecycle)
         }, until: { $0.frames["frame"] != nil }, now: { time }, sleep: { time += $0 })
         XCTAssertEqual(result.frames["frame"], "saved"); XCTAssertEqual(reads, 3)
@@ -757,6 +764,31 @@ final class HolodeckMacUITests: XCTestCase {
             reads += 1; throw AppPreferencesReader.ReadError.invalidSnapshot
         }, until: { _ in false }))
         XCTAssertEqual(reads, 1, "Malformed snapshots must fail immediately")
+    }
+
+    func testPreferencesRefreshWaitsForAcknowledgementEvenWhenValuesAreUnchanged() throws {
+        let lifecycle = AppPreferencesReader.Lifecycle(modelCreations: 0, libraryCreations: 0, serverStartAttempts: 0)
+        var time: TimeInterval = 0
+        func value(_ generation: Int) -> AppPreferencesReader.Snapshot {
+            .init(schemaVersion: 3, refreshGeneration: generation, bundleIdentifier: "test", domainExists: true,
+                frames: ["frame": "saved"], lifecycle: lifecycle)
+        }
+        let fresh = try AppPreferencesReader.acknowledged(read: { value(time >= 0.5 ? 1 : 0) }, generation: 1,
+            deadline: 1, now: { time }, sleep: { time += $0 })
+        XCTAssertEqual(fresh.refreshGeneration, 1); XCTAssertEqual(fresh.frames, value(0).frames)
+        time = 0
+        XCTAssertThrowsError(try AppPreferencesReader.acknowledged(read: { value(0) }, generation: 1,
+            deadline: 0.5, now: { time }, sleep: { time += $0 })) { error in
+            XCTAssertEqual(error as? AppPreferencesReader.ReadError, .refreshTimedOut(expected: 1, observed: 0))
+            XCTAssertTrue(error.localizedDescription.contains("last observed 0"))
+        }
+        time = 0.75
+        XCTAssertThrowsError(try AppPreferencesReader.acknowledged(read: { value(1) }, generation: 1,
+            deadline: 0.5, now: { time }, sleep: { time += $0 }))
+        time = 0
+        XCTAssertThrowsError(try AppPreferencesReader.acknowledged(read: { throw AppPreferencesReader.ReadError.invalidSnapshot },
+            generation: 1, deadline: 1, now: { time }, sleep: { time += $0 }))
+        XCTAssertEqual(time, 0)
     }
 
     private func resizeWindow(in app: XCUIApplication) {

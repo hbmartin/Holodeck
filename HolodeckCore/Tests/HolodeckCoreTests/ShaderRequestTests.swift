@@ -8,6 +8,14 @@ final class ShaderRequestTests: XCTestCase {
         let png = try RequestScreenshot.encode(pixels: Data([128, 64, 32, 255]), width: 1, height: 1, bytesPerRow: 4)
         return .init(shader: TestCatalog.initialShader, screenshot: png, animationTime: 3.25, width: 1920, height: 1080)
     }
+    #if os(macOS)
+    func testBundledRequestWorkerRemainsAvailable() throws {
+        let script = try XCTUnwrap(RequestWorkerProcess.bundledScript)
+        let bytes = try Data(contentsOf: script)
+        XCTAssertTrue(String(decoding: bytes, as: UTF8.self).contains("def main("))
+    }
+    #endif
+
     func testCapturedContextPreservesExactSourceAndRejectsTampering() throws {
         let original = try context()
         var request = ShaderRequest(prompt: "Make it warmer", context: original)

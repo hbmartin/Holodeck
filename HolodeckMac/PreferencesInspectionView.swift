@@ -29,12 +29,14 @@ struct PreferencesInspectionView: View {
 private struct PreferencesInspectionField: NSViewRepresentable {
     let refreshGeneration: Int
     func makeNSView(context: Context) -> PreferencesInspectionText { PreferencesInspectionText() }
-    func updateNSView(_ view: PreferencesInspectionText, context: Context) { view.refreshSnapshot() }
+    func updateNSView(_ view: PreferencesInspectionText, context: Context) { view.refreshSnapshot(generation: refreshGeneration) }
 }
 
 final class PreferencesInspectionText: NSTextField {
+    private var refreshGeneration = 0
     private struct Snapshot: Encodable {
-        let schemaVersion = 2
+        let schemaVersion = 3
+        let refreshGeneration: Int
         let bundleIdentifier: String
         let domainExists: Bool
         let frames: [String: String]
@@ -49,7 +51,8 @@ final class PreferencesInspectionText: NSTextField {
         super.viewDidMoveToWindow()
         refreshSnapshot()
     }
-    func refreshSnapshot() {
+    func refreshSnapshot(generation: Int? = nil) {
+        if let generation { refreshGeneration = generation }
         guard let window, let identifier = Bundle.main.bundleIdentifier else { return }
         window.setFrameAutosaveName("")
         let domain = UserDefaults.standard.persistentDomain(forName: identifier)
@@ -58,7 +61,7 @@ final class PreferencesInspectionText: NSTextField {
                 values[entry.key] = frame
             }
         }
-        let snapshot = Snapshot(bundleIdentifier: identifier, domainExists: domain != nil, frames: frames,
+        let snapshot = Snapshot(refreshGeneration: refreshGeneration, bundleIdentifier: identifier, domainExists: domain != nil, frames: frames,
                                 lifecycle: MacInspectionLifecycle.snapshot)
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         do {

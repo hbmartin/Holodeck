@@ -71,6 +71,7 @@ extension DirectoryCatalogTests {
             let generator = ShaderPreviewGenerator(directory: base.appendingPathComponent("worker-previews")) { _ in png }
             let restarted = DirectoryCatalog(directory: directory, files: files, previewGenerator: generator)
             _ = try await restarted.cached()
+            gate.arm()
             let reload = Task { try await restarted.reload(from: root) }
             let deadline = ContinuousClock.now + .seconds(3)
             while !gate.entered {
@@ -137,14 +138,76 @@ extension DirectoryCatalogTests {
         await gate.release(); _ = try await reload.value
         XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: directory.path).contains { $0.hasPrefix("stage-") })
     }
+    func testRestorationWorkerServesCurrentAndReleasesProtectionOnCancellation() async throws {
+        for cancel in [false, true] {
+            let (root, _) = try fixture(), gate = DirectoryVerificationGate()
+            defer { gate.release() }
+            let base = root.deletingLastPathComponent(), directory = base.appendingPathComponent("restore-worker")
+            var files = DirectoryCatalogFileOperations(); files.beforeVerification = { gate.hold() }
+            let png = try ShaderPNG.gradient(colors: [[0, 0, 0], [1, 1, 1]])
+            let generator = ShaderPreviewGenerator(directory: base.appendingPathComponent("restore-previews")) { _ in png }
+            let store = DirectoryCatalog(directory: directory, files: files, previewGenerator: generator)
+            let original = try await store.reload(from: root).catalog
+            gate.arm()
+            let restore = Task { try await store.cached() }
+            let deadline = ContinuousClock.now + .seconds(3)
+            while !gate.entered { guard ContinuousClock.now < deadline else { throw LocalCatalogError.timeout }; await Task.yield() }
+            let responsive = expectation(description: "Head and asset complete before restoration verification resumes")
+            let query = Task {
+                let head = try JSONDecoder().decode(CatalogHead.self, from: await store.get(.head, limit: CatalogLimits.headBytes))
+                XCTAssertEqual(head.revision, original.publicationRevision)
+                let bytes = try await store.get(.asset(revision: head.revision, path: "sources/plasma.metal"), limit: CatalogLimits.sourceBytes)
+                XCTAssertEqual(String(decoding: bytes, as: UTF8.self), original.shaders[0].source)
+                await store.release(UUID()); responsive.fulfill()
+            }
+            await fulfillment(of: [responsive], timeout: 2)
+            if cancel { restore.cancel() }
+            gate.release(); try await query.value
+            if cancel { do { _ = try await restore.value; XCTFail("Cancelled restoration activated") } catch is CancellationError {} }
+            else { let result = try await restore.value; XCTAssertEqual(result?.publicationRevision, original.publicationRevision) }
+            gate.disarm()
+            // A subsequent transition must not remain queued behind a cancelled restoration.
+            try Data("NEXT".utf8).write(to: root.appendingPathComponent("shaders/plasma/body.metal"))
+            let next = try await store.reload(from: root).catalog
+            XCTAssertNotEqual(next.publicationRevision, original.publicationRevision)
+            let counts = await store.stageMaintenanceCounts(); XCTAssertEqual(counts.active, 0)
+            XCTAssertFalse(gate.timedOut)
+        }
+    }
+
+    func testStageNamesRemainStableThroughSymlinkMovesAndScansRunOncePerReload() async throws {
+        let (root, _) = try fixture(), base = root.deletingLastPathComponent()
+        let real = base.appendingPathComponent("real-publications"), alias = base.appendingPathComponent("publication-alias")
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: real)
+        let png = try ShaderPNG.gradient(colors: [[0, 0, 0], [1, 1, 1]])
+        let generator = ShaderPreviewGenerator(directory: base.appendingPathComponent("stable-previews")) { _ in png }
+        let store = DirectoryCatalog(directory: alias, previewGenerator: generator)
+        let startup = await store.stageMaintenanceCounts(); XCTAssertEqual(startup.scans, 1)
+        for iteration in 1...3 {
+            try Data("BODY \(iteration)".utf8).write(to: root.appendingPathComponent("shaders/plasma/body.metal"))
+            _ = try await store.reload(from: root)
+            let counts = await store.stageMaintenanceCounts()
+            XCTAssertEqual(counts.active, 0); XCTAssertEqual(counts.scans, iteration + 1)
+        }
+        let prepared = try await store.prepare(from: root)
+        let pending = await store.stageMaintenanceCounts(); XCTAssertEqual(pending.active, 1)
+        let cancelled = Task { try await store.install(prepared.id) }; cancelled.cancel()
+        do { _ = try await cancelled.value; XCTFail("Cancelled install activated") } catch is CancellationError {}
+        let final = await store.stageMaintenanceCounts(); XCTAssertEqual(final.active, 0)
+    }
+
 }
 
 private final class DirectoryVerificationGate: @unchecked Sendable {
     private let lock = NSLock(), semaphore = DispatchSemaphore(value: 0)
-    private var holding = false, expired = false
+    private var holding = false, expired = false, armed = false
+    func arm() { lock.withLock { armed = true } }
+    func disarm() { lock.withLock { armed = false } }
     var entered: Bool { lock.withLock { holding } }
     var timedOut: Bool { lock.withLock { expired } }
     func hold() {
+        guard lock.withLock({ armed }) else { return }
         lock.withLock { holding = true }
         if semaphore.wait(timeout: .now() + 5) == .timedOut { lock.withLock { expired = true } }
     }
