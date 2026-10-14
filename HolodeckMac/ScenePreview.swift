@@ -23,10 +23,21 @@ struct ScenePreview: View {
         .task(id: shader.preview) {
             if imageHash != shader.preview?.hash { image = nil; imageHash = nil }
             guard image == nil else { return }
-            guard let preview = shader.preview,
-                  let decoded = try? await service.previewImage(preview, maxPixelSize: 176), !Task.isCancelled else { return }
-            image = NSImage(cgImage: decoded, size: NSSize(width: decoded.width, height: decoded.height))
-            imageHash = preview.hash
+            guard let preview = shader.preview else { return }
+            do {
+                while !Task.isCancelled {
+                    do {
+                        let decoded = try await service.previewImage(preview, maxPixelSize: 176)
+                        try Task.checkCancellation()
+                        image = NSImage(cgImage: decoded, size: NSSize(width: decoded.width, height: decoded.height))
+                        imageHash = preview.hash
+                        return
+                    } catch {
+                        if CatalogError.isCancellation(error) { return }
+                        guard try await service.waitForPreviewRetry(preview) else { return }
+                    }
+                }
+            } catch { return }
         }
     }
 }

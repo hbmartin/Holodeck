@@ -17,6 +17,7 @@ nonisolated public struct CatalogHead: Codable, Sendable {
 }
 
 nonisolated public struct CatalogSource: Sendable {
+    var isLocalPublication = false
     /// Waits for source recovery without canceling its shared connection attempt.
     public var waitForAvailability: (@Sendable () async throws -> Void)?
     public var get: @Sendable (CatalogRequest, Int) async throws -> Data

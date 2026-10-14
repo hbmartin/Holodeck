@@ -14,6 +14,8 @@ nonisolated struct DirectoryCatalogFileOperations: Sendable {
         }
         guard failure == 0 else { throw POSIXError(POSIXErrorCode(rawValue: failure) ?? .EIO) }
     }
+    var beforeVerification: @Sendable () -> Void = {}
+    var removeStage: @Sendable (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }
     var writeMarker: @Sendable (Data, URL) throws -> Void = { data, url in
         try data.write(to: url, options: .atomic)
     }
@@ -34,6 +36,8 @@ public actor DirectoryCatalog {
     private let directory: URL
     private let files: DirectoryCatalogFileOperations
     private let previews: ShaderPreviewGenerator
+    private let io: DirectoryCatalogIO
+    private var verificationRevisions: Set<String> = []
     private var reloading = false
     private var reloadWaiters: [CheckedContinuation<Void, Never>] = []
     private var currentRevision: String?
@@ -44,16 +48,20 @@ public actor DirectoryCatalog {
         .appendingPathComponent("Holodeck/LocalCatalog", isDirectory: true),
                 previewGenerator: ShaderPreviewGenerator? = nil) {
         self.directory = directory; files = DirectoryCatalogFileOperations()
+        io = DirectoryCatalogIO(directory: directory, files: files)
         previews = previewGenerator ?? ShaderPreviewGenerator(directory: directory.appendingPathComponent("preview-cache"))
     }
 
     init(directory: URL, files: DirectoryCatalogFileOperations, previewGenerator: ShaderPreviewGenerator? = nil) {
         self.directory = directory; self.files = files
+        io = DirectoryCatalogIO(directory: directory, files: files)
         previews = previewGenerator ?? ShaderPreviewGenerator(directory: directory.appendingPathComponent("preview-cache"))
     }
 
     public nonisolated var source: CatalogSource {
-        CatalogSource { [self] request, limit in try await get(request, limit: limit) }
+        var source = CatalogSource { [self] request, limit in try await get(request, limit: limit) }
+        source.isLocalPublication = true
+        return source
     }
 
     public func pin(_ revision: String, for connection: UUID) { leases[connection] = revision }
@@ -67,14 +75,16 @@ public actor DirectoryCatalog {
         guard CatalogHash.isSHA(head.revision) else { throw CatalogError.invalidManifest }
         let publication = directory.appendingPathComponent(head.revision)
         func read(_ path: String, limit: Int) throws -> Data {
-            try readPublicationFile(publication.appendingPathComponent(path), limit: limit)
+            try CatalogPublicationFiles.read(publication.appendingPathComponent(path), limit: limit)
         }
-        let manifest = try JSONDecoder().decode(CatalogManifest.self, from: read("catalog.json", limit: 2_097_152))
-        var builder = try CatalogBuilder(manifest: manifest), paths: Set<String> = ["catalog.json"]
+        let manifest = try JSONDecoder().decode(CatalogManifest.self, from: read("catalog.json", limit: CatalogLimits.manifestBytes))
+        var builder = try CatalogBuilder(manifest: manifest)
+        try CatalogPublication.validate(builder.manifest, revision: head.revision)
+        var paths: Set<String> = ["catalog.json"]
         for entry in manifest.shaders {
-            try builder.addSource(read(entry.sourcePath, limit: 1_048_576), for: entry)
-            let preview = try read(entry.previewPath, limit: 8_388_608)
-            guard CatalogHash.sha256(preview) == entry.previewSHA256 else { throw CatalogError.invalidPreview }
+            try builder.addSource(read(entry.sourcePath, limit: CatalogLimits.sourceBytes), for: entry)
+            _ = try CatalogPublicationFiles.verified(publication.appendingPathComponent(entry.previewPath),
+                hash: entry.previewSHA256, limit: CatalogLimits.previewBytes, error: .invalidPreview)
             paths.insert(entry.sourcePath); paths.insert(entry.previewPath)
         }
         let catalog = try builder.finish(revision: head.revision)
@@ -94,141 +104,48 @@ public actor DirectoryCatalog {
         return try await reloadCandidate(from: root)
     }
 
+    func maintainStages() async { await io.maintenance() }
+
     private func reloadCandidate(from root: URL) async throws -> CatalogReloadResult {
-        let fm = FileManager.default
-        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
-        let stage = directory.appendingPathComponent("stage-" + UUID().uuidString, isDirectory: true)
-        try fm.createDirectory(at: stage, withIntermediateDirectories: true)
-        defer { try? fm.removeItem(at: stage) }
-        try fm.createDirectory(at: stage.appendingPathComponent("sources"), withIntermediateDirectories: true)
-        try fm.createDirectory(at: stage.appendingPathComponent("previews"), withIntermediateDirectories: true)
-
-        func read(_ path: String, limit: Int) throws -> Data {
-            let url = root.appendingPathComponent(path)
-            do {
-                let resolved = url.resolvingSymlinksInPath().standardizedFileURL.path
-                guard resolved.hasPrefix(root.resolvingSymlinksInPath().standardizedFileURL.path + "/") else {
-                    throw LocalCatalogError.invalidFile(path, "File must stay inside the selected folder.")
+        var preparation = try await io.prepare(from: root)
+        var retainedRevision: String?
+        do {
+            var warnings: [ShaderPreviewWarning] = [], cacheKeys: Set<String> = []
+            for index in preparation.manifest.shaders.indices {
+                try Task.checkCancellation()
+                let entry = preparation.manifest.shaders[index]
+                let generated = try await previews.preview(source: preparation.sources[entry.id]!, colors: entry.colors)
+                cacheKeys.insert(generated.cacheKey)
+                if let diagnostic = generated.diagnostic {
+                    warnings.append(ShaderPreviewWarning(shaderID: entry.id, message: diagnostic))
                 }
-                let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-                guard size <= limit else { throw CatalogError.oversizedResponse }
-                let bytes = try Data(contentsOf: url)
-                guard bytes.count <= limit else { throw CatalogError.oversizedResponse }
-                return bytes
-            } catch { throw LocalCatalogError.invalidFile(path, error.localizedDescription) }
-        }
-        func json(_ path: String) throws -> [String: Any] {
-            do {
-                guard let value = try JSONSerialization.jsonObject(with: read(path, limit: 2_097_152)) as? [String: Any] else {
-                    throw CatalogError.invalidManifest
-                }
-                return value
-            } catch { throw LocalCatalogError.invalidFile(path, error.localizedDescription) }
-        }
-        let index = try json("index.json")
-        guard let ids = index["shaders"] as? [String], (1...500).contains(ids.count),
-              Set(ids).count == ids.count, let defaultID = index["defaultShaderID"] as? String, ids.contains(defaultID),
-              ids.allSatisfy({ $0.count <= 100 && $0.range(of: "^[a-z0-9]+(-[a-z0-9]+)*$", options: .regularExpression) != nil }) else {
-            throw LocalCatalogError.invalidFile("index.json", "Expected unique shader IDs and an indexed defaultShaderID.")
-        }
-        var entries: [[String: Any]] = [], sources: [String: String] = [:], paths: Set<String> = ["catalog.json"]
-        var total = 0
-        for id in ids {
-            let folder = "shaders/\(id)/", metadataPath = folder + "metadata.json"
-            let metadata = try json(metadataPath)
-            guard metadata["id"] as? String == id, let shared = metadata["shared"] as? [String],
-                  shared == ["common", "fragment"] || shared == ["common", "material", "fragment"] else {
-                throw LocalCatalogError.invalidFile(metadataPath, "ID and shared helper declaration are invalid.")
+                preparation.manifest.shaders[index].previewSHA256 = try await io.writePreview(generated.png, path: entry.previewPath, stage: preparation.stage)
+                preparation.paths.insert(entry.previewPath)
             }
-            let sourcePaths = shared.dropLast().map { "shared/\($0).metal" } + [folder + "body.metal", "shared/fragment.metal"]
-            var bytes = Data()
-            for path in sourcePaths { bytes.append(try read(path, limit: 1_048_576)) }
-            total += bytes.count
-            guard !bytes.isEmpty, bytes.count <= 1_048_576, total <= 16_777_216,
-                  let text = String(validating: bytes, as: UTF8.self) else {
-                throw LocalCatalogError.invalidFile(folder + "body.metal", "Assembled source must be UTF-8 and within the source size limits.")
-            }
-            let dependencies = sourcePaths + [metadataPath]
-            let date = try dependencies.map { path in
-                try root.appendingPathComponent(path).resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate ?? .distantPast
-            }.max() ?? .distantPast
-            var entry = metadata.filter { ["id", "name", "category", "description", "colors", "discovery"].contains($0.key) }
-            entry["updatedAt"] = date.ISO8601Format(.init(includingFractionalSeconds: true))
-            entry["sourcePath"] = "sources/\(id).metal"; entry["sourceSHA256"] = CatalogHash.sha256(bytes)
-            entry["previewPath"] = "previews/\(id).png"; entry["previewSHA256"] = String(repeating: "0", count: 64)
-            do {
-                let decoded = try JSONDecoder().decode(CatalogManifest.Entry.self, from: JSONSerialization.data(withJSONObject: entry))
-                let single = CatalogManifest(schemaVersion: 1, defaultShaderID: id, sourceRevision: String(repeating: "0", count: 64), shaders: [decoded])
-                try single.validate()
-            } catch { throw LocalCatalogError.invalidFile(metadataPath, error.localizedDescription) }
-            entries.append(entry); sources[id] = text
-            for (path, data) in [("sources/\(id).metal", bytes)] {
-                paths.insert(path); try data.write(to: stage.appendingPathComponent(path), options: .atomic)
-            }
-        }
-        var wire: [String: Any] = ["schemaVersion": 1, "defaultShaderID": defaultID, "shaders": entries]
-        if let collections = index["collections"] { wire["collections"] = collections }
-        wire["sourceRevision"] = String(repeating: "0", count: 64)
-        let manifestData = try JSONSerialization.data(withJSONObject: wire, options: [.sortedKeys])
-        guard manifestData.count <= 2_097_152 else { throw LocalCatalogError.invalidFile("index.json", "Catalog exceeds 2 MiB.") }
-        var manifest: CatalogManifest
-        do { manifest = try CatalogBuilder(manifest: JSONDecoder().decode(CatalogManifest.self, from: manifestData)).manifest }
-        catch { throw LocalCatalogError.invalidFile("index.json", error.localizedDescription) }
-        var warnings: [ShaderPreviewWarning] = [], cacheKeys: Set<String> = []
-        for index in manifest.shaders.indices {
             try Task.checkCancellation()
-            let entry = manifest.shaders[index]
-            let generated = try await previews.preview(source: sources[entry.id]!, colors: entry.colors)
-            cacheKeys.insert(generated.cacheKey)
-            if let diagnostic = generated.diagnostic {
-                warnings.append(ShaderPreviewWarning(shaderID: entry.id, message: diagnostic))
-            }
-            manifest.shaders[index].previewSHA256 = CatalogHash.sha256(generated.png)
-            paths.insert(entry.previewPath)
-            try generated.png.write(to: stage.appendingPathComponent(entry.previewPath), options: .atomic)
+            let candidate = try await io.finish(preparation)
+            let revision = candidate.catalog.publicationRevision
+            verificationRevisions.insert(revision); retainedRevision = revision
+            let matches = try await io.matches(candidate)
+            try Task.checkCancellation()
+            // Installation and actor state advance together, without a suspension point.
+            let destination = directory.appendingPathComponent(revision)
+            if FileManager.default.fileExists(atPath: destination.path) {
+                if !matches { try files.swap(preparation.stage, destination) }
+            } else { try FileManager.default.moveItem(at: preparation.stage, to: destination) }
+            try files.writeMarker(JSONEncoder().encode(CatalogHead(revision: revision)), directory.appendingPathComponent("current.json"))
+            let previous = currentRevision
+            allowed[revision] = preparation.paths; currentRevision = revision
+            verificationRevisions.remove(revision); retainedRevision = nil
+            trim(previous: previous)
+            await io.cleanup(preparation.stage)
+            await previews.prune(keeping: cacheKeys)
+            return CatalogReloadResult(catalog: candidate.catalog, previewWarnings: warnings)
+        } catch {
+            if let retainedRevision { verificationRevisions.remove(retainedRevision) }
+            await io.cleanup(preparation.stage)
+            throw error
         }
-        try Task.checkCancellation()
-        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
-        var canonical = try JSONSerialization.jsonObject(with: encoder.encode(manifest)) as! [String: Any]
-        canonical["sourceRevision"] = nil
-        let revision = CatalogHash.sha256(try JSONSerialization.data(withJSONObject: canonical, options: [.sortedKeys]))
-        manifest.sourceRevision = revision
-        let catalog = try CatalogSnapshot(manifest: manifest, sources: sources, publicationRevision: revision).validated()
-        let publishedManifest = try encoder.encode(catalog.snapshot.manifest)
-        try publishedManifest.write(to: stage.appendingPathComponent("catalog.json"), options: .atomic)
-        let destination = directory.appendingPathComponent(revision)
-        if fm.fileExists(atPath: destination.path) {
-            if (try? publicationMatches(catalog, manifest: publishedManifest, at: destination)) != true {
-                // Both paths are siblings. A failed swap leaves the existing publication intact;
-                // a successful swap leaves its damaged contents at stage for deferred cleanup.
-                try files.swap(stage, destination)
-            }
-        } else { try fm.moveItem(at: stage, to: destination) }
-        try files.writeMarker(JSONEncoder().encode(CatalogHead(revision: revision)), directory.appendingPathComponent("current.json"))
-        let previous = currentRevision
-        allowed[revision] = paths; currentRevision = revision
-        // Retain the previous publication as well as all connection-pinned publications.
-        trim(previous: previous)
-        await previews.prune(keeping: cacheKeys)
-        return CatalogReloadResult(catalog: catalog, previewWarnings: warnings)
-    }
-
-    private func readPublicationFile(_ url: URL, limit: Int) throws -> Data {
-        guard (try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= limit else { throw CatalogError.oversizedResponse }
-        let data = try Data(contentsOf: url)
-        guard data.count <= limit else { throw CatalogError.oversizedResponse }
-        return data
-    }
-
-    private func publicationMatches(_ catalog: ValidatedCatalog, manifest: Data, at publication: URL) throws -> Bool {
-        guard try readPublicationFile(publication.appendingPathComponent("catalog.json"), limit: 2_097_152) == manifest else { return false }
-        for entry in catalog.snapshot.manifest.shaders {
-            let source = try readPublicationFile(publication.appendingPathComponent(entry.sourcePath), limit: 1_048_576)
-            let preview = try readPublicationFile(publication.appendingPathComponent(entry.previewPath), limit: 8_388_608)
-            guard CatalogHash.sha256(source) == entry.sourceSHA256,
-                  CatalogHash.sha256(preview) == entry.previewSHA256 else { return false }
-        }
-        return true
     }
 
     public func get(_ request: CatalogRequest, limit: Int, pinFor connection: UUID? = nil) throws -> Data {
@@ -251,7 +168,7 @@ public actor DirectoryCatalog {
     private var previousRevision: String?
     private func trim(previous: String? = nil) {
         if let previous, previous != currentRevision { previousRevision = previous }
-        let keep = Set(leases.values).union([currentRevision, previousRevision].compactMap { $0 })
+        let keep = Set(leases.values).union(verificationRevisions).union([currentRevision, previousRevision].compactMap { $0 })
         for revision in Array(allowed.keys) where !keep.contains(revision) {
             allowed[revision] = nil
             try? FileManager.default.removeItem(at: directory.appendingPathComponent(revision))

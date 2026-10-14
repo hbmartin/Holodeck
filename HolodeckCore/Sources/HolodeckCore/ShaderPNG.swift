@@ -26,7 +26,7 @@ public enum ShaderPNG {
     }
 
     static func isValid(_ png: Data) -> Bool {
-        guard png.count <= 8_388_608, png.starts(with: [137, 80, 78, 71, 13, 10, 26, 10]),
+        guard png.count <= CatalogLimits.previewBytes, png.starts(with: [137, 80, 78, 71, 13, 10, 26, 10]),
               let source = CGImageSourceCreateWithData(png as CFData, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return false }
         return image.width == 1280 && image.height == 720

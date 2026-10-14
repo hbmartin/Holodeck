@@ -7,6 +7,30 @@ import ConcurrencyExtras
 
 @MainActor
 final class ShaderCardPreviewTests: XCTestCase {
+    func testLocalIntegrityFailureKeepsVisibleCardWaitingAndSameIdentityRepairRecovers() async throws {
+        try await withMainSerialExecutor {
+            let clock = TestClock()
+            let network = CellPreviewNetwork(response: Data("corrupt".utf8))
+            var source = CatalogSource { _, _ in try await network.get() }
+            source.isLocalPublication = true
+            let service = CatalogService(source: source, storage: .disabled, clock: clock)
+            let cell = cell(service: service)
+            defer { cell.prepareForReuse() }
+            try await waitUntil { await service.previewRetryWaiterCount == 1 }
+            let id = cell.requestID
+            for _ in 0..<100 { cell.setNeedsLayout(); cell.layoutIfNeeded() }
+            XCTAssertNotNil(cell.previewTask)
+            XCTAssertEqual(cell.requestID, id)
+            await network.setResponse(try previewData())
+            await clock.advance(by: .seconds(30))
+            try await waitUntil { cell.previewTask == nil }
+            XCTAssertEqual(cell.requestID, id)
+            XCTAssertNotNil(image(in: cell))
+            let attempts = await network.attempts
+            XCTAssertEqual(attempts, 2)
+        }
+    }
+
     func testTransportCancellationDoesNotSuppressCurrentCellRecovery() async throws {
         for urlCancellation in [false, true] {
             let network = CellPreviewNetwork(cancels: true, urlCancellation: urlCancellation)

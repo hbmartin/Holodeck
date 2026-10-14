@@ -355,6 +355,8 @@ final class HolodeckUITests: XCTestCase {
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
         waitForFocus(check)
         XCTAssertEqual(status.label, code)
+        remote.press(.select)
+        XCTAssertFalse(app.alerts["Choose a Mac"].exists, "Select must activate the restored update control")
     }
 
     func testControlCenterResumeKeepsBrowsingFocus() {

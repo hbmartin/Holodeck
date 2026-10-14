@@ -579,10 +579,8 @@ extension ViewerSessionTests {
         }
         session.refresh(force: true); session.shutdown(); await first.value
         XCTAssertFalse(session.isRefreshing)
-        while await service.refreshWaiterCount != 0 {
-            guard ContinuousClock.now < deadline else { throw LocalCatalogError.timeout }
-            await Task.yield()
-        }
+        let cancelledWaiters = await service.refreshWaiterCount
+        XCTAssertEqual(cancelledWaiters, 0)
         let joining = Task { try await service.refreshOutcome(force: true) }
         while await service.refreshWaiterCount != 1 {
             guard ContinuousClock.now < deadline else { throw LocalCatalogError.timeout }

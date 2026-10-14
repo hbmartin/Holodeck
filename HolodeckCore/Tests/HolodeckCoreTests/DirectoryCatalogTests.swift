@@ -360,8 +360,8 @@ extension DirectoryCatalogTests {
         entries[0]["name"] = "Unexpected title"; wire["shaders"] = entries
         try JSONSerialization.data(withJSONObject: wire, options: [.sortedKeys]).write(to: manifestURL)
         let restarted = DirectoryCatalog(directory: directory)
-        let altered = try await restarted.cached()
-        XCTAssertEqual(altered?.shaders[0].title, "Unexpected title")
+        do { _ = try await restarted.cached(); XCTFail("Altered metadata restored under its original revision") }
+        catch CatalogError.invalidManifest {}
         let repaired = try await restarted.reload(from: root).catalog
         XCTAssertEqual(repaired.publicationRevision, first.publicationRevision)
         let served = try await restarted.get(.asset(revision: repaired.publicationRevision, path: "catalog.json"), limit: 2_097_152)
