@@ -4,9 +4,25 @@ import CoreGraphics
 @testable import HolodeckCore
 
 final class PreviewRecoveryTests: XCTestCase {
+    func testHashValidUndecodableLocalPNGStaysTerminalAcrossTrimAndReread() async throws {
+        let box = CatalogTestBox(), invalid = Data([137, 80, 78, 71, 13, 10, 26, 10])
+        let preview = ShaderPreview(path: "previews/plasma.png", hash: CatalogHash.sha256(invalid),
+            publicationRevision: String(repeating: "a", count: 64))
+        box.setResponses(["/" + preview.path: invalid])
+        let service = CatalogService(source: CatalogSource(kind: .localPublication, get: box.source.get), storage: box.storage, clock: box.clock)
+        do { _ = try await service.previewImage(preview, maxPixelSize: 640); XCTFail("Broken PNG decoded") }
+        catch CatalogError.invalidPreview {}
+        let retry = try await service.waitForPreviewRetry(preview); XCTAssertFalse(retry)
+        await service.trimPreviewCaches(); await box.clock.advance(by: .seconds(600))
+        do { _ = try await service.previewImage(preview, maxPixelSize: 640); XCTFail("Terminal decode failure retried") }
+        catch CatalogError.invalidPreview {}
+        XCTAssertEqual(box.urls.count, 1)
+        XCTAssertEqual(box.storageReads.count, 1)
+    }
+
     func testLocalCorruptionRetriesWithBoundedBackoffAndRecoversWithoutChangingIdentity() async throws {
         let box = CatalogTestBox()
-        var source = box.source; source.isLocalPublication = true
+        let source = CatalogSource(kind: .localPublication, get: box.source.get)
         let service = CatalogService(source: source, storage: box.storage, clock: box.clock)
         let preview = TestCatalog.shaders[0].preview!
         box.setResponses(["/" + preview.path: Data("corrupt".utf8)])
@@ -14,6 +30,7 @@ final class PreviewRecoveryTests: XCTestCase {
             do { _ = try await service.preview(preview); XCTFail("Corrupt preview accepted") }
             catch CatalogError.invalidPreview {}
             XCTAssertEqual(box.urls.count, attempt + 1)
+            await service.trimPreviewCaches()
             let waiting = Task { try await service.waitForPreviewRetry(preview) }
             try await waitForRetrySleeper(in: service)
             await box.clock.advance(by: .seconds(delay - 1))
@@ -35,7 +52,7 @@ final class PreviewRecoveryTests: XCTestCase {
 
     func testLocalCorruptionRetryCancellationAndInvalidDescriptorsStayTerminal() async throws {
         let box = CatalogTestBox()
-        var source = box.source; source.isLocalPublication = true
+        let source = CatalogSource(kind: .localPublication, get: box.source.get)
         let service = CatalogService(source: source, storage: .disabled, clock: box.clock)
         let preview = TestCatalog.shaders[0].preview!
         box.setResponses(["/" + preview.path: Data("corrupt".utf8)])
@@ -150,7 +167,7 @@ final class PreviewRecoveryTests: XCTestCase {
     func testCanceledNetworkFailureCreatesNoRetryRecord() async throws {
         for urlCancellation in [false, true] {
             let counter = CancellationCounter()
-            let service = CatalogService(source: CatalogSource { _, _ in
+            let service = CatalogService(source: CatalogSource(kind: .standard) { _, _ in
                 await counter.record()
                 if urlCancellation { throw URLError(.cancelled) }
                 throw CancellationError()
@@ -233,7 +250,7 @@ final class PreviewRecoveryTests: XCTestCase {
     func testTrimDuringDownloadServesCallerWithoutCaching() async throws {
         let gate = PreviewRequestGate()
         let preview = TestCatalog.shaders[0].preview!
-        let service = CatalogService(source: CatalogSource { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
+        let service = CatalogService(source: CatalogSource(kind: .standard) { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
         let task = Task { try await service.previewImage(preview, maxPixelSize: 640) }
         await gate.waitForRequest("plasma.png")
         await service.trimPreviewCaches()
@@ -278,7 +295,7 @@ extension PreviewRecoveryTests {
         let preview = TestCatalog.shaders[0].preview!
         box.setResponses(["/previews/plasma.png": try TestCatalog.preview(named: "preview-\(preview.hash).png")])
         let connection = PreviewConnectionGate(gate: gate, source: box.source)
-        let service = CatalogService(source: CatalogSource(waitForAvailability: { try await gate.wait() }) { request, limit in
+        let service = CatalogService(source: CatalogSource(kind: .standard, waitForAvailability: { try await gate.wait() }) { request, limit in
             try await connection.get(request, limit: limit)
         }, storage: .disabled, clock: box.clock)
         do { _ = try await service.preview(preview); XCTFail() } catch LocalCatalogError.disconnected {}
@@ -302,7 +319,7 @@ extension PreviewRecoveryTests {
     }
     func testAvailabilityHookDoesNotBypassOrdinaryAssetCooldown() async throws {
         let box = CatalogTestBox(); let gate = RecoveryGate()
-        let service = CatalogService(source: CatalogSource(waitForAvailability: { try await gate.wait() }, get: box.source.get),
+        let service = CatalogService(source: CatalogSource(kind: .standard, waitForAvailability: { try await gate.wait() }, get: box.source.get),
             storage: .disabled, clock: box.clock)
         let preview = TestCatalog.shaders[0].preview!
         do { _ = try await service.preview(preview); XCTFail() } catch CatalogError.invalidResponse {}

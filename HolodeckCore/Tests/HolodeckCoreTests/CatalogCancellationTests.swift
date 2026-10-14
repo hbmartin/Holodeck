@@ -12,7 +12,7 @@ final class CatalogCancellationTests: XCTestCase {
         let gate = RefreshGate(started: started)
         addTeardownBlock { await gate.release() }
         let network = box.source
-        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: .init { url, limit in
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: .init(kind: .standard) { url, limit in
             if url.isHead { await gate.hold() }
             return try await network.get(url, limit)
         }, storage: box.storage)

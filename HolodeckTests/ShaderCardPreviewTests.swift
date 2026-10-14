@@ -11,8 +11,7 @@ final class ShaderCardPreviewTests: XCTestCase {
         try await withMainSerialExecutor {
             let clock = TestClock()
             let network = CellPreviewNetwork(response: Data("corrupt".utf8))
-            var source = CatalogSource { _, _ in try await network.get() }
-            source.isLocalPublication = true
+            let source = CatalogSource(kind: .localPublication) { _, _ in try await network.get() }
             let service = CatalogService(source: source, storage: .disabled, clock: clock)
             let cell = cell(service: service)
             defer { cell.prepareForReuse() }
@@ -34,7 +33,7 @@ final class ShaderCardPreviewTests: XCTestCase {
     func testTransportCancellationDoesNotSuppressCurrentCellRecovery() async throws {
         for urlCancellation in [false, true] {
             let network = CellPreviewNetwork(cancels: true, urlCancellation: urlCancellation)
-            let service = CatalogService(source: CatalogSource { _, _ in try await network.get() }, storage: .disabled)
+            let service = CatalogService(source: CatalogSource(kind: .standard) { _, _ in try await network.get() }, storage: .disabled)
             let cell = cell(service: service)
             defer { cell.prepareForReuse() }
             try await waitUntil { cell.previewTask == nil }
@@ -54,7 +53,7 @@ final class ShaderCardPreviewTests: XCTestCase {
         try await withMainSerialExecutor {
             let clock = TestClock()
             let network = CellPreviewNetwork()
-            let service = CatalogService(source: CatalogSource { _, _ in try await network.get() }, storage: .disabled, clock: clock)
+            let service = CatalogService(source: CatalogSource(kind: .standard) { _, _ in try await network.get() }, storage: .disabled, clock: clock)
             let cell = cell(service: service)
             defer { cell.prepareForReuse() }
             try await waitUntil { await service.previewRetryWaiterCount == 1 }
@@ -77,7 +76,7 @@ final class ShaderCardPreviewTests: XCTestCase {
 
     func testPermanentFailureIgnoresLayoutsButNewPublicationRetriesSameHash() async throws {
         let network = CellPreviewNetwork(response: Data("invalid".utf8))
-        let service = CatalogService(source: CatalogSource { _, _ in try await network.get() }, storage: .disabled)
+        let service = CatalogService(source: CatalogSource(kind: .standard) { _, _ in try await network.get() }, storage: .disabled)
         let cell = cell(service: service)
         defer { cell.prepareForReuse() }
         try await waitUntil { cell.previewTask == nil }
@@ -99,7 +98,7 @@ final class ShaderCardPreviewTests: XCTestCase {
 
     func testServiceReplacementClearsTerminalFailure() async throws {
         let network = CellPreviewNetwork(response: Data("invalid".utf8))
-        let old = CatalogService(source: CatalogSource { _, _ in try await network.get() }, storage: .disabled)
+        let old = CatalogService(source: CatalogSource(kind: .standard) { _, _ in try await network.get() }, storage: .disabled)
         let cell = cell(service: old)
         defer { cell.prepareForReuse() }
         try await waitUntil { cell.previewTask == nil }
@@ -113,7 +112,7 @@ final class ShaderCardPreviewTests: XCTestCase {
         try await withMainSerialExecutor {
             let clock = TestClock()
             let network = CellPreviewNetwork()
-            let service = CatalogService(source: CatalogSource { _, _ in try await network.get() }, storage: .disabled, clock: clock)
+            let service = CatalogService(source: CatalogSource(kind: .standard) { _, _ in try await network.get() }, storage: .disabled, clock: clock)
             let cell = cell(service: service)
             try await waitUntil { await service.previewRetryWaiterCount == 1 }
             let waiting = try XCTUnwrap(cell.previewTask)

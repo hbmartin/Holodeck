@@ -32,7 +32,7 @@ enum CatalogTestFixtures {
         let storage = CatalogStorage(read: { name in
             if let value = try box.storage.read(name) { return value }
             return cached && name == "snapshot.json" ? TestCatalog.data : nil
-        }, write: box.storage.write)
+        }, write: box.storage.write, remove: box.storage.remove)
         return CatalogService(source: box.source, storage: storage, clock: box.clock)
     }
 }
@@ -44,6 +44,7 @@ nonisolated final class CatalogTestBox: @unchecked Sendable {
     private var requests: [CatalogRequest] = []
     private var reads: [String] = []
     private var writes: [String] = []
+    private var removals: [String] = []
     private var readOnMain = false
     let clock = TestClock()
     private var failing = false
@@ -51,6 +52,7 @@ nonisolated final class CatalogTestBox: @unchecked Sendable {
     var responseFiles: [String: Data] { lock.withLock { responses } }
     var urls: [CatalogRequest] { lock.withLock { requests } }
     var storageReads: [String] { lock.withLock { reads } }
+    var storageRemovals: [String] { lock.withLock { removals } }
     var storageWrites: [String] { lock.withLock { writes } }
     var storageReadOnMain: Bool { lock.withLock { readOnMain } }
     var failWrites: Bool {
@@ -59,7 +61,7 @@ nonisolated final class CatalogTestBox: @unchecked Sendable {
     }
     func setResponses(_ values: [String: Data]) { lock.withLock { responses = values } }
     var source: CatalogSource {
-        CatalogSource { [self] url, _ in
+        CatalogSource(kind: .standard) { [self] url, _ in
             try lock.withLock {
                 requests.append(url)
                 let path: String
@@ -80,7 +82,9 @@ nonisolated final class CatalogTestBox: @unchecked Sendable {
                 stored[name] = data
                 writes.append(name)
             }
-        })
+        }, remove: { [self] name in lock.withLock {
+            stored[name] = nil; removals.append(name)
+        } })
     }
 }
 

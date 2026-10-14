@@ -238,6 +238,7 @@ nonisolated public struct CatalogSnapshot: Codable, Sendable {
 
 /// Prepared once on the catalog actor; UI consumers cannot activate unvalidated wire data.
 nonisolated public struct ValidatedCatalog: Sendable {
+    let localPublicationEvidence: LocalPublicationEvidence?
     public let snapshot: CatalogSnapshot
     public let shaders: [ShaderDefinition]
     public let initialShader: ShaderDefinition
@@ -246,7 +247,8 @@ nonisolated public struct ValidatedCatalog: Sendable {
     public let motions: [String]
     public var publicationRevision: String { snapshot.publicationRevision }
 
-    fileprivate init(snapshot: CatalogSnapshot, shaders: [ShaderDefinition]) {
+    fileprivate init(snapshot: CatalogSnapshot, shaders: [ShaderDefinition], evidence: LocalPublicationEvidence?) {
+        localPublicationEvidence = evidence
         self.snapshot = snapshot
         self.shaders = shaders
         initialShader = shaders.first { $0.id == snapshot.manifest.defaultShaderID }!
@@ -261,13 +263,15 @@ nonisolated public struct ValidatedCatalog: Sendable {
 }
 
 /// The download and disk paths share validation without rehashing or reparsing at activation.
-nonisolated struct CatalogBuilder {
+nonisolated struct CatalogBuilder: Sendable {
     let manifest: CatalogManifest
     private let dates: [String: Date]
     private var sources: [String: String] = [:]
     private var sourceBytes = 0
+    private let evidence: LocalPublicationEvidence?
 
-    init(manifest: CatalogManifest) throws {
+    init(manifest: CatalogManifest, evidence: LocalPublicationEvidence? = nil) throws {
+        self.evidence = evidence
         self.manifest = manifest.sanitizingDiscovery()
         dates = try manifest.validatedDates()
     }
@@ -289,6 +293,6 @@ nonisolated struct CatalogBuilder {
             ShaderDefinition(entry: $0, source: sources[$0.id]!, date: dates[$0.id]!, revision: revision)
         }
         return ValidatedCatalog(snapshot: CatalogSnapshot(manifest: manifest, sources: sources, publicationRevision: revision),
-                                shaders: shaders)
+                                shaders: shaders, evidence: evidence)
     }
 }

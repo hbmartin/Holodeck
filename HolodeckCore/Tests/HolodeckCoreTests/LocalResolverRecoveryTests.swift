@@ -6,7 +6,7 @@ import dnssd
 final class LocalResolverRecoveryTests: XCTestCase {
     private func mac() -> LocalMac {
         LocalMac(id: UUID().uuidString, name: "Test Mac", endpoint: .service(name: "Test",
-            type: LocalProtocol.serviceType, domain: "local.", interface: nil), interface: nil, version: 1)
+            type: LocalProtocol.serviceType, domain: "local.", interface: nil), interface: nil, version: LocalProtocol.version)
     }
     private func wait(_ condition: @escaping @Sendable () -> Bool) async throws {
         let deadline = ContinuousClock.now + .seconds(3)

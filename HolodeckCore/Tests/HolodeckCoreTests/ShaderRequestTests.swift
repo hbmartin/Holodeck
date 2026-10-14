@@ -8,6 +8,14 @@ final class ShaderRequestTests: XCTestCase {
         let png = try RequestScreenshot.encode(pixels: Data([128, 64, 32, 255]), width: 1, height: 1, bytesPerRow: 4)
         return .init(shader: TestCatalog.initialShader, screenshot: png, animationTime: 3.25, width: 1920, height: 1080)
     }
+    #if os(macOS)
+    func testBundledRequestWorkerRemainsAvailable() throws {
+        let script = try XCTUnwrap(RequestWorkerProcess.bundledScript)
+        let bytes = try Data(contentsOf: script)
+        XCTAssertTrue(String(decoding: bytes, as: UTF8.self).contains("def main("))
+    }
+    #endif
+
     func testCapturedContextPreservesExactSourceAndRejectsTampering() throws {
         let original = try context()
         var request = ShaderRequest(prompt: "Make it warmer", context: original)
@@ -197,6 +205,131 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertEqual(ShaderRequestScheduling.next(in: restored, recoveringID: request.id), request.id)
         do { try await restarted.cancelQueued(request.id); XCTFail("Interrupted running job was cancellable") }
         catch ShaderRequestError.unavailable {}
+    }
+
+    private func recoveryFixture() throws -> (URL, URL) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("worker.py")
+        try """
+        import json, signal, sys, time
+        from pathlib import Path
+        mode=sys.argv[1]; job=Path(sys.argv[3])
+        def emit(event, **data): print(json.dumps(dict(event=event, **data)), flush=True)
+        if mode=='preflight': emit('preflight'); raise SystemExit(0)
+        if mode=='discard':
+            (job/'cleanup-started').touch()
+            while (job/'hold-cleanup').exists(): time.sleep(.005)
+            if (job/'fail-cleanup').exists(): emit('failure',message='Fixture cleanup unavailable'); raise SystemExit(1)
+            (job/'owned-patch').unlink(missing_ok=True)
+            emit('discarded'); raise SystemExit(0)
+        def stop(*args):
+            (job/'stopping').touch()
+            while (job/'hold-exit').exists(): time.sleep(.005)
+            raise SystemExit(1)
+        signal.signal(signal.SIGTERM, stop)
+        (job/'worker-started').touch()
+        emit('stage',stage='implementing',message='Fixture running')
+        while True: time.sleep(.005)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        return (root, script)
+    }
+    private func recoveryService(_ root: URL, script: URL, enabled: Bool = true) async throws -> ShaderRequestService {
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script)
+        await service.suspend()
+        try await service.start(configuration: .init(repository: root.path, model: "fixture", enabled: enabled))
+        return service
+    }
+    private func waitFor(_ condition: () async -> Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+        while !(await condition()) {
+            guard ContinuousClock.now < deadline else { XCTFail("Fixture transition timed out", file: file, line: line); throw ShaderRequestError.unavailable("Test backstop") }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+    func testRevokedRecoveredRepairCleansBeforeOtherJobsAndPersistsTerminalOutcome() async throws {
+        let (root, script) = try recoveryFixture()
+        let initial = try await recoveryService(root, script: script)
+        let first = ShaderRequest(prompt: "Recovered", context: try context())
+        let second = ShaderRequest(prompt: "Next", context: try context())
+        _ = try await initial.control(operation: "requestSubmit", payload: .init(request: first), deviceID: "TV-A")
+        _ = try await initial.control(operation: "requestSubmit", payload: .init(request: second), deviceID: "TV-B")
+        try JSONEncoder().encode(first.id).write(to: root.appendingPathComponent("active.json"), options: .atomic)
+        let recovered = try await recoveryService(root, script: script)
+        let job = root.appendingPathComponent(first.id.uuidString)
+        try Data().write(to: job.appendingPathComponent("hold-cleanup"))
+        try Data().write(to: job.appendingPathComponent("owned-patch"))
+        try await recovered.revoke("TV-A")
+        // Restart before cleanup to exercise the durable pending-cleanup field.
+        let restarted = try await recoveryService(root, script: script, enabled: false)
+        await restarted.resume()
+        try await waitFor { FileManager.default.fileExists(atPath: job.appendingPathComponent("cleanup-started").path) }
+        let waiting = await restarted.allJobs()
+        XCTAssertEqual(waiting.first { $0.id == second.id }?.stage, .queued)
+        XCTAssertEqual(waiting.first { $0.id == first.id }?.stage, .repairing)
+        try FileManager.default.removeItem(at: job.appendingPathComponent("hold-cleanup"))
+        try await waitFor { await restarted.allJobs().first { $0.id == first.id }?.stage == .failed }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: job.appendingPathComponent("owned-patch").path))
+        try await restarted.cancelQueued(second.id)
+        try await restarted.disable() // All persisted states now permit setup changes.
+        let again = try await recoveryService(root, script: script, enabled: false)
+        let durable = await again.allJobs()
+        XCTAssertEqual(durable.first { $0.id == first.id }?.stage, .failed)
+        XCTAssertEqual(durable.first { $0.id == second.id }?.stage, .cancelled)
+    }
+    func testRevokeDuringSuspendedProcessTeardownWaitsForExitAndCleanup() async throws {
+        let (root, script) = try recoveryFixture()
+        let service = try await recoveryService(root, script: script)
+        let first = ShaderRequest(prompt: "Running", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: first), deviceID: "TV-A")
+        let job = root.appendingPathComponent(first.id.uuidString)
+        try Data().write(to: job.appendingPathComponent("hold-exit"))
+        try Data().write(to: job.appendingPathComponent("hold-cleanup"))
+        await service.resume()
+        try await waitFor { FileManager.default.fileExists(atPath: job.appendingPathComponent("worker-started").path) }
+        try await service.revoke("TV-A")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: job.appendingPathComponent("stopping").path)) // Revocation does not preempt a running job.
+        await service.suspend()
+        try await waitFor { FileManager.default.fileExists(atPath: job.appendingPathComponent("stopping").path) }
+        let second = ShaderRequest(prompt: "Queued", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: second), deviceID: "TV-B")
+        await service.resume()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: job.appendingPathComponent("cleanup-started").path))
+        try FileManager.default.removeItem(at: job.appendingPathComponent("hold-exit"))
+        try await waitFor { FileManager.default.fileExists(atPath: job.appendingPathComponent("cleanup-started").path) }
+        let statuses = await service.allJobs()
+        XCTAssertEqual(statuses.first { $0.id == second.id }?.stage, .queued)
+        try await service.cancelQueued(second.id)
+        try FileManager.default.removeItem(at: job.appendingPathComponent("hold-cleanup"))
+        try await waitFor { await service.allJobs().first { $0.id == first.id }?.stage == .failed }
+        try await service.disable()
+    }
+    func testCleanupFailureBlocksReadinessAndRestartRetriesIt() async throws {
+        let (root, script) = try recoveryFixture()
+        let initial = try await recoveryService(root, script: script)
+        let request = ShaderRequest(prompt: "Interrupted", context: try context())
+        _ = try await initial.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV-A")
+        try JSONEncoder().encode(request.id).write(to: root.appendingPathComponent("active.json"), options: .atomic)
+        let service = try await recoveryService(root, script: script)
+        let job = root.appendingPathComponent(request.id.uuidString)
+        try Data().write(to: job.appendingPathComponent("fail-cleanup"))
+        try await service.revoke("TV-A"); await service.resume()
+        try await waitFor { await service.allJobs().first?.message.contains("Cleanup failed") == true }
+        let failed = await service.allJobs().first
+        XCTAssertEqual(failed?.stage, .failed)
+        XCTAssertFalse(failed?.blocksBrowsing ?? true)
+        let pendingCleanup = await service.hasPendingCleanup()
+        XCTAssertTrue(pendingCleanup)
+        let reply = try await service.control(operation: "requestStatus", payload: .init(), deviceID: "TV-B")
+        XCTAssertFalse(reply.enabled)
+        do { try await service.disable(); XCTFail("Enabled setup while owned cleanup was incomplete") } catch ShaderRequestError.unavailable {}
+        await service.suspend()
+        try FileManager.default.removeItem(at: job.appendingPathComponent("fail-cleanup"))
+        let restarted = try await recoveryService(root, script: script, enabled: false)
+        await restarted.resume()
+        try await waitFor { await restarted.allJobs().first?.stage == .failed }
+        try await restarted.disable()
     }
 
     func testPerformanceDedupPerDeviceShaderVersionAndRevocation() async throws {

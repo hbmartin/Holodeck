@@ -84,7 +84,7 @@ final class RenderingTests: XCTestCase {
             XCTAssertEqual(CatalogHash.sha256(image), preview.hash)
             attachImage(first, name: "Local-" + shader.title)
         }
-        let offline = CatalogService.offline(storage: .disk(at: directory.appendingPathComponent("viewer")))
+        let offline = CatalogService(source: local.source, storage: .disk(at: directory.appendingPathComponent("viewer")), enabled: false)
         let cached = await offline.current()
         XCTAssertEqual(cached?.publicationRevision, snapshot.publicationRevision)
         print("Verified \(snapshot.shaders.count) local scenes at \(snapshot.publicationRevision)")

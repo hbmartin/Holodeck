@@ -141,7 +141,7 @@ extension CatalogTests {
         let hash = CatalogHash.sha256(bytes)
         let firstPreview = ShaderPreview(path: "previews/first.png", hash: hash, publicationRevision: String(repeating: "a", count: 40))
         let secondPreview = ShaderPreview(path: "previews/second.png", hash: hash, publicationRevision: String(repeating: "b", count: 40))
-        let service = CatalogService(source: CatalogSource { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
+        let service = CatalogService(source: CatalogSource(kind: .standard) { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
         let first = Task { try await service.preview(firstPreview) }
         await gate.waitForRequest("first.png")
         let second = Task { try await service.preview(secondPreview) }
@@ -190,7 +190,7 @@ extension CatalogTests {
         let gate = PreviewRequestGate()
         let preview = TestCatalog.shaders[0].preview!
         let bytes = try TestCatalog.preview(named: "preview-\(preview.hash).png")
-        let service = CatalogService(source: CatalogSource { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
+        let service = CatalogService(source: CatalogSource(kind: .standard) { url, _ in await gate.image(url.lastPathComponent) }, storage: .disabled)
         let first = Task { try await service.previewImage(preview, maxPixelSize: 640) }
         await gate.waitForRequest("plasma.png")
         let second = Task { try await service.previewImage(preview, maxPixelSize: 640) }

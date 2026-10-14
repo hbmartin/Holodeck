@@ -29,6 +29,7 @@ nonisolated struct RequestWorkerEvent: Decodable, Sendable {
 
 /// Reading subprocess pipes never occupies the UI or the catalog/server actor.
 nonisolated final class RequestWorkerProcess: @unchecked Sendable {
+    static var bundledScript: URL? { Bundle.module.url(forResource: "shader_requests", withExtension: "py") }
     let process = Process()
     private let scriptOverride: URL?
     init(script: URL? = nil) { scriptOverride = script }
@@ -36,6 +37,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     private let output = Pipe()
     private let error = Pipe()
     private let lock = NSLock()
+    private let drained = DispatchGroup()
     private var started = false
     private var stopping = false
     func reply(_ accepted: Bool) {
@@ -53,9 +55,11 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     }
     func run(mode: String, configuration: ShaderRequestConfiguration, directory: URL) -> AsyncThrowingStream<RequestWorkerEvent, Error> {
         AsyncThrowingStream { continuation in
+            drained.enter()
             DispatchQueue(label: "Holodeck.request-worker").async { [self] in
+                defer { drained.leave() }
                 do {
-                    guard let script = scriptOverride ?? Bundle.module.url(forResource: "shader_requests", withExtension: "py", subdirectory: "Resources") else {
+                    guard let script = scriptOverride ?? Self.bundledScript else {
                         throw ShaderRequestError.unavailable("Bundled shader request worker is missing.")
                     }
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -66,7 +70,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     process.standardInput = input; process.standardOutput = output; process.standardError = error
                     process.currentDirectoryURL = URL(fileURLWithPath: configuration.repository)
                     let logURL = directory.appendingPathComponent("worker.log")
-                    FileManager.default.createFile(atPath: logURL.path, contents: nil)
+                    if !FileManager.default.fileExists(atPath: logURL.path) { FileManager.default.createFile(atPath: logURL.path, contents: nil) }
                     let log = try FileHandle(forWritingTo: logURL)
                     try log.seekToEnd()
                     defer { try? log.close() }
@@ -121,8 +125,15 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 if !process.isRunning { return }
                 try? await Task.sleep(for: .milliseconds(50))
             }
-            if process.isRunning { kill(-process.processIdentifier, SIGKILL) }
+            if process.isRunning {
+                if kill(-process.processIdentifier, SIGKILL) != 0 { process.terminate() }
+                process.waitUntilExit()
+            }
         }.value
+        // Also finish pipe draining and identity-file cleanup before reusing this journal.
+        await withCheckedContinuation { continuation in
+            drained.notify(queue: .global()) { continuation.resume() }
+        }
     }
 
     private struct WorkerIdentity: Codable { let pid: Int32; let script: String; let directory: String }
@@ -156,9 +167,13 @@ public actor ShaderRequestService {
         var configuration: ShaderRequestConfiguration
         var revoked = false
         var deliveryNonce: String?
+        var cleanupPending: Bool?
+        var cleanupFailure: String?
+        var cleanupMessage: String?
     }
     private let directory: URL
     private let catalog: DirectoryCatalog
+    private let workerScript: URL?
     private var configuration = ShaderRequestConfiguration()
     private var records: [UUID: Record] = [:]
     private var observers: [UUID: AsyncStream<[ShaderRequestStatus]>.Continuation] = [:]
@@ -172,8 +187,12 @@ public actor ShaderRequestService {
     private var setupMessage = "Enable shader requests in Mac Settings."
 
     public init(catalog: DirectoryCatalog, directory: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Holodeck/Requests")) {
-        self.catalog = catalog; self.directory = directory
+        self.catalog = catalog; self.directory = directory; self.workerScript = nil
     }
+    init(catalog: DirectoryCatalog, directory: URL, workerScript: URL) {
+        self.catalog = catalog; self.directory = directory; self.workerScript = workerScript
+    }
+    private func workerProcess() -> RequestWorkerProcess { RequestWorkerProcess(script: workerScript) }
 
     public func start(configuration: ShaderRequestConfiguration) throws {
         try load()
@@ -198,12 +217,21 @@ public actor ShaderRequestService {
                 records[id]?.status.message = "Recovering interrupted request"
             }
         }
+        for id in records.keys {
+            if records[id]?.revoked == true, records[id]?.status.stage.terminal == false {
+                records[id]?.cleanupPending = true
+                records[id]?.cleanupMessage = "TV access was revoked; any pushed commit remains"
+            }
+            // A restart makes one new recovery attempt after the operator can repair the host.
+            records[id]?.cleanupFailure = nil
+        }
         loaded = true
         try persist()
     }
     private func folder(_ id: UUID) -> URL { directory.appendingPathComponent(id.uuidString) }
     public func artifacts(for id: UUID) -> URL { folder(id) }
     public func configurationValue() -> ShaderRequestConfiguration { configuration }
+    public func hasPendingCleanup() -> Bool { records.values.contains { $0.cleanupPending == true } }
     public func allJobs() -> [ShaderRequestStatus] { records.values.map(\.status).sorted { $0.createdAt > $1.createdAt } }
     public func updates() -> AsyncStream<[ShaderRequestStatus]> {
         let id = UUID()
@@ -224,10 +252,10 @@ public actor ShaderRequestService {
     }
     public func verify(configuration candidate: ShaderRequestConfiguration) async throws {
         try load()
-        guard activeID == nil, !records.values.contains(where: { !$0.status.stage.terminal }) else {
+        guard activeID == nil, !records.values.contains(where: { !$0.status.stage.terminal || $0.cleanupPending == true }) else {
             throw ShaderRequestError.unavailable("Finish or cancel queued requests before changing setup.")
         }
-        let process = RequestWorkerProcess()
+        let process = workerProcess()
         var verified = false
         for try await event in process.run(mode: "preflight", configuration: candidate, directory: directory.appendingPathComponent("setup")) {
             if event.event == "failure" { throw ShaderRequestError.unavailable(event.message ?? "Setup failed") }
@@ -240,7 +268,7 @@ public actor ShaderRequestService {
         try persist(); kick()
     }
     public func disable() throws {
-        guard !records.values.contains(where: { !$0.status.stage.terminal }) else {
+        guard activeID == nil, !records.values.contains(where: { !$0.status.stage.terminal || $0.cleanupPending == true }) else {
             throw ShaderRequestError.unavailable("Requests are still in progress.")
         }
         configuration.enabled = false; setupMessage = "Shader requests are disabled."
@@ -255,7 +283,7 @@ public actor ShaderRequestService {
         kick()
     }
     public func deleteFinished(_ id: UUID) throws {
-        guard records[id]?.status.stage.terminal == true else { throw ShaderRequestError.invalidRequest }
+        guard records[id]?.status.stage.terminal == true, records[id]?.cleanupPending != true, activeID != id else { throw ShaderRequestError.invalidRequest }
         try FileManager.default.removeItem(at: folder(id)); records[id] = nil; try persist()
     }
     public func revoke(_ deviceID: String) throws {
@@ -263,17 +291,19 @@ public actor ShaderRequestService {
             records[id]?.revoked = true
             if records[id]?.status.stage == .queued, activeID != id {
                 try update(id, stage: .cancelled, message: "TV access was revoked")
-            } else if records[id]?.status.stage == .awaitingActivation || records[id]?.status.stage == .awaitingClarification {
-                try update(id, stage: .failed, message: "TV access was revoked; any pushed commit remains")
+            } else if activeID != id {
+                records[id]?.cleanupPending = true
+                records[id]?.cleanupMessage = "TV access was revoked; any pushed commit remains"
+                try update(id, stage: .repairing, message: "Discarding revoked unpublished work")
             }
         }
-        try persist()
+        try persist(); kick()
     }
 
     public func control(operation: String, payload: ShaderRequestControl, deviceID: String) async throws -> ShaderRequestControlReply {
         try load()
         if operation == "requestSubmit" {
-            guard configuration.enabled else { throw ShaderRequestError.unavailable(setupMessage) }
+            guard configuration.enabled, !records.values.contains(where: { $0.cleanupFailure != nil }) else { throw ShaderRequestError.unavailable(setupMessage) }
             guard let request = payload.request else { throw ShaderRequestError.invalidRequest }
             try request.validate()
             if let existing = records[request.id] {
@@ -322,7 +352,7 @@ public actor ShaderRequestService {
             } else if record.status.stage == .awaitingActivation {
                 if let diagnostic = payload.diagnostic {
                     guard diagnostic.utf8.count <= 16_384 else { throw ShaderRequestError.invalidRequest }
-                    try JSONEncoder().encode(["shaderID": record.status.result?.shaderID ?? "", "diagnostic": diagnostic])
+                    try JSONEncoder().encode(["attemptID": UUID().uuidString, "shaderID": record.status.result?.shaderID ?? "", "diagnostic": diagnostic])
                         .write(to: folder(id).appendingPathComponent("repair.json"), options: .atomic)
                     try update(id, stage: .repairing, message: "Repairing the TV activation error")
                     kick()
@@ -341,26 +371,63 @@ public actor ShaderRequestService {
     private func reply(deviceID: String, requestID: UUID?) async throws -> ShaderRequestControlReply {
         let owned = allJobs().filter { $0.deviceID == deviceID }
         let jobs = requestID.map { id in owned.filter { $0.id == id } } ?? owned.filter { !$0.stage.terminal }
-        return ShaderRequestControlReply(enabled: configuration.enabled, message: setupMessage, jobs: jobs,
+        return ShaderRequestControlReply(enabled: configuration.enabled && !records.values.contains(where: { $0.cleanupFailure != nil }), message: setupMessage, jobs: jobs,
                                         publicationRevision: await catalog.publicationRevisionValue())
     }
     private func kick() {
-        guard loaded, configuration.enabled, !suspended, activeID == nil else { return }
+        guard loaded, !suspended, activeID == nil, !records.values.contains(where: { $0.cleanupFailure != nil }) else { return }
         let eligible = records.values.filter { !$0.revoked }.map(\.status)
-        guard let id = ShaderRequestScheduling.next(in: eligible, recoveringID: recoveryID) else { return }
+        let cleanupID = records.values.filter { $0.cleanupPending == true }.sorted { $0.status.createdAt < $1.status.createdAt }.first?.status.id
+        guard let id = cleanupID ?? (configuration.enabled ? ShaderRequestScheduling.next(in: eligible, recoveringID: recoveryID) : nil) else { return }
         do {
             try JSONEncoder().encode(id).write(to: directory.appendingPathComponent("active.json"), options: .atomic)
-            try update(id, stage: .implementing, message: "Preparing the managed checkout")
+            try update(id, stage: cleanupID != nil ? .repairing : .implementing,
+                       message: cleanupID != nil ? "Discarding unpublished work" : "Preparing the managed checkout")
         } catch {
             try? update(id, stage: .failed, message: error.localizedDescription)
             return
         }
         activeID = id
-        workerTask = Task { [weak self] in await self?.execute(id) }
+        workerTask = Task { [weak self] in
+            if cleanupID != nil { await self?.cleanup(id) }
+            else { await self?.execute(id) }
+        }
+    }
+    private func cleanup(_ id: UUID) async {
+        guard let record = records[id] else { activeID = nil; return }
+        let process = workerProcess(); activeProcess = process
+        do {
+            let job = folder(id)
+            try await Task.detached { try RequestWorkerProcess.reconcileOrphan(in: job) }.value
+            var discarded = false
+            for try await event in process.run(mode: "discard", configuration: record.configuration, directory: job) {
+                if event.event == "failure" { throw ShaderRequestError.unavailable(event.message ?? "Cleanup failed") }
+                if event.event == "discarded" { discarded = true }
+            }
+            guard discarded else { throw ShaderRequestError.unavailable("Cleanup did not complete.") }
+            records[id]?.cleanupPending = false; records[id]?.cleanupFailure = nil
+            try update(id, stage: .failed, message: record.cleanupMessage ?? "TV access was revoked; any pushed commit remains")
+        } catch {
+            process.stop(); await process.waitForExit()
+            if !suspended {
+                records[id]?.cleanupFailure = error.localizedDescription
+                setupMessage = "Checkout recovery is required. Restore Git/Python access and restart the Mac app."
+                try? update(id, stage: .failed, message: "Cleanup failed: \(error.localizedDescription). \(setupMessage)")
+            }
+        }
+        finishWorker(id)
+    }
+    private func finishWorker(_ id: UUID) {
+        activeProcess = nil; activeID = nil; workerTask = nil
+        if !suspended || records[id]?.status.stage.terminal == true {
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent("active.json"))
+            if recoveryID == id { recoveryID = nil }
+            kick()
+        } else { recoveryID = id }
     }
     private func execute(_ id: UUID) async {
         guard let record = records[id] else { activeID = nil; return }
-        let process = RequestWorkerProcess(); activeProcess = process
+        let process = workerProcess(); activeProcess = process
         var outcomeSeen = false
         do {
             let job = folder(id)
@@ -385,9 +452,13 @@ public actor ShaderRequestService {
                 case "discardPublication":
                     if let preparedID { await catalog.discard(preparedID); self.preparedID = nil }
                 case "clarification":
+                    if records[id]?.revoked == true {
+                        records[id]?.cleanupPending = true
+                        records[id]?.cleanupMessage = "TV access was revoked; any pushed commit remains"
+                    }
                     records[id]?.status.clarification = ShaderClarification(question: event.question ?? "Please clarify the request", options: event.options ?? [])
-                    try update(id, stage: records[id]?.revoked == true ? .failed : .awaitingClarification,
-                               message: records[id]?.revoked == true ? "TV access was revoked" : "Waiting for a TV answer")
+                    try update(id, stage: records[id]?.revoked == true ? .repairing : .awaitingClarification,
+                               message: records[id]?.revoked == true ? "Discarding revoked unpublished work" : "Waiting for a TV answer")
                     outcomeSeen = true
                 case "result":
                     guard let result = event.result, ShaderRequest.validID(result.shaderID), let preparedID else {
@@ -403,7 +474,7 @@ public actor ShaderRequestService {
                         continue
                     }
                     guard let output = publication.catalog.shaders.first(where: { $0.id == result.shaderID }) else {
-                        try JSONEncoder().encode(["shaderID": result.shaderID, "diagnostic": "The committed output was removed before TV delivery. Recreate it under a fresh unused ID."])
+                        try JSONEncoder().encode(["attemptID": UUID().uuidString, "shaderID": result.shaderID, "diagnostic": "The committed output was removed before TV delivery. Recreate it under a fresh unused ID."])
                             .write(to: job.appendingPathComponent("repair.json"), options: .atomic)
                         try update(id, stage: .repairing, message: "Recreating the output removed before delivery")
                         outcomeSeen = true
@@ -421,25 +492,27 @@ public actor ShaderRequestService {
         } catch {
             process.stop()
             if !suspended {
-                try? update(id, stage: .failed, message: error.localizedDescription)
-                await process.waitForExit()
-                // Operational failures discard only this request's owned, unpublished work.
-                let cleanup = RequestWorkerProcess()
-                do { for try await _ in cleanup.run(mode: "discard", configuration: record.configuration, directory: folder(id)) {} }
-                catch { cleanup.stop() }
+                records[id]?.cleanupPending = true
+                records[id]?.cleanupMessage = error.localizedDescription
+                try? update(id, stage: .repairing, message: "Discarding failed unpublished work: \(error.localizedDescription)")
             }
         }
+        // A suspended/revoked process must release its lease before recovery or cleanup starts.
+        if suspended { process.stop() }
+        await process.waitForExit()
+        if records[id]?.revoked == true, records[id]?.status.stage.terminal == false {
+            records[id]?.cleanupPending = true
+            records[id]?.cleanupMessage = "TV access was revoked; any pushed commit remains"
+            try? persist()
+        }
         if let preparedID { await catalog.discard(preparedID); self.preparedID = nil }
-        activeProcess = nil; activeID = nil; workerTask = nil
-        if !suspended {
-            try? FileManager.default.removeItem(at: directory.appendingPathComponent("active.json"))
-            if recoveryID == id { recoveryID = nil }
-            kick()
-        } else { recoveryID = id }
+        finishWorker(id)
     }
     public func suspend() {
         suspended = true; activeProcess?.stop()
-        if let id = activeID { try? update(id, stage: .repairing, message: "Waiting for the Mac to resume") }
+        if let id = activeID, records[id]?.status.stage.terminal == false {
+            try? update(id, stage: .repairing, message: "Waiting for the Mac to resume")
+        }
     }
     public func resume() { suspended = false; kick() }
 }

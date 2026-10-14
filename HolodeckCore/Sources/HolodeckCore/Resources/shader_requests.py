@@ -24,6 +24,14 @@ class CandidateError(RuntimeError):
     pass
 
 
+class VerificationError(CandidateError):
+    def __init__(self, message, command=None, shader_id=None, time=None):
+        super().__init__(message)
+        self.command = command
+        self.shader_id = shader_id
+        self.time = time
+
+
 def write(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -61,6 +69,11 @@ class Worker:
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.git_executable = config["git"]
+        self.hooks = self.directory / "empty-hooks"
+        self.hooks.mkdir(exist_ok=True)
+        if any(self.hooks.iterdir()):
+            raise OperationalError("App-owned hooks directory must be empty")
+        self.git_arguments = [self.git_executable, "-c", "core.hooksPath=" + str(self.hooks)]
         self.env = dict(os.environ, GIT_TERMINAL_PROMPT="0", HOLODECK_SHADER_TOOL=config["shaderTool"], PYTHONDONTWRITEBYTECODE="1")
         self.env["PATH"] = os.pathsep.join([str(Path(config["codex"]).parent), str(Path(config["python"]).parent),
                                              "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"])
@@ -71,7 +84,7 @@ class Worker:
         self.owner = self.gitdir / "holodeck-request-owner.json"
 
     def git(self, *args, check=True, raw=False):
-        result = subprocess.run([self.git_executable, *args], cwd=self.root, env=self.env,
+        result = subprocess.run([*self.git_arguments, *args], cwd=self.root, env=self.env,
                                 capture_output=True, text=not raw, timeout=60)
         if check and result.returncode:
             detail = result.stderr.decode("utf-8", errors="replace") if raw else result.stderr
@@ -86,11 +99,11 @@ class Worker:
         self.save(stage=name)
         emit("stage", stage=name, message=message)
 
-    def clean(self):
+    def clean(self, revision=None):
         # Only files produced while this request holds the exclusive checkout lease.
         if self.owner.exists() and json.loads(self.owner.read_text()).get("id") == self.request.get("id"):
             others = self.git("ls-files", "--others", "--exclude-standard", "-z").split("\0")
-            self.git("reset", "--hard", self.checkpoint.get("base", "HEAD"))
+            self.git("reset", "--hard", revision or self.checkpoint.get("base", "HEAD"))
             for name in filter(None, others):
                 path = self.root / name
                 if path.is_symlink() or path.is_file():
@@ -103,8 +116,7 @@ class Worker:
 
     def save_patch(self):
         base = self.checkpoint["base"]
-        patch = subprocess.run([self.git_executable, "diff", "--binary", base], cwd=self.root,
-                               capture_output=True, check=True).stdout
+        patch = self.git("diff", "--binary", base, raw=True)
         (self.directory / "changes.patch").write_bytes(patch)
         others = self.git("ls-files", "--others", "--exclude-standard", "-z").split("\0")
         files = {}
@@ -118,7 +130,7 @@ class Worker:
     def restore_patch(self):
         patch = self.directory / "changes.patch"
         if patch.exists() and patch.stat().st_size:
-            result = run([self.git_executable, "apply", "--3way", patch], self.root, self.env, check=False)
+            result = self.git("apply", "--3way", str(patch), check=False)
             # A conflict is given to Codex; never push or verify unresolved files.
             if result.returncode:
                 emit("log", text="Reapplying checkpoint requires conflict resolution by Codex.")
@@ -147,8 +159,9 @@ class Worker:
         if head != remote and self.git("merge-base", "--is-ancestor", head, remote, check=False).returncode:
             raise OperationalError("Local commits are not on origin/main; commit/push them before enabling management")
         self.git("checkout", "-B", "main", "origin/main")
-        self.save(base=remote)
+        self.save(base=remote, commitSHA=None)
         write(self.owner, {"id": self.request["id"], "directory": str(self.directory)})
+        self.validate_baseline()
         self.restore_patch()
 
     def discard(self):
@@ -158,16 +171,76 @@ class Worker:
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
             sha = self.checkpoint.get("commitSHA")
             published = False
-            if sha:
+            if sha and self.owner.exists():
                 self.git("fetch", "origin", "main")
                 published = self.git("merge-base", "--is-ancestor", sha, "origin/main", check=False).returncode == 0
             if published:
-                self.owner.unlink(missing_ok=True)
+                self.clean(revision=sha)
             else:
                 self.clean()
             for name in ("changes.patch", "untracked.json"):
                 (self.directory / name).unlink(missing_ok=True)
         emit("discarded")
+
+    def candidate_manifest(self):
+        names = set(filter(None, self.git("ls-files", "-z").split("\0")))
+        names.update(filter(None, self.git("ls-files", "--others", "--exclude-standard", "-z").split("\0")))
+        manifest = {}
+        for name in sorted(names):
+            path = self.root / name
+            if path.is_symlink():
+                data, mode = os.fsencode(os.readlink(path)), "120000"
+            elif path.is_file():
+                data = path.read_bytes()
+                mode = "100755" if path.stat().st_mode & 0o111 else "100644"
+            else:
+                raise OperationalError("Cannot freeze candidate path: " + name)
+            manifest[name] = {"mode": mode, "hash": digest(data)}
+        return manifest
+
+    def verify_commit(self, sha, manifest, check_workspace=True):
+        committed = {}
+        for entry in filter(None, self.git("ls-tree", "-r", "-z", sha).split("\0")):
+            descriptor, name = entry.split("\t", 1)
+            mode, kind, oid = descriptor.split()
+            if kind != "blob":
+                raise OperationalError("Managed source tree contains unsupported Git entries")
+            committed[name] = {"mode": mode, "hash": digest(self.git("cat-file", "blob", oid, raw=True))}
+        if committed != manifest or (check_workspace and self.candidate_manifest() != manifest):
+            raise OperationalError("Committed tree differs from verified source; Git filters or external changes must be corrected")
+
+    def begin_attempt(self):
+        repair = self.directory / "repair.json"
+        if repair.exists():
+            payload = json.loads(repair.read_text())
+            attempt = payload.get("attemptID") or "legacy-repair-" + digest(repair.read_bytes())
+        else:
+            attempt = "initial"
+        if self.checkpoint.get("attemptID") != attempt:
+            previous = self.previous_publication()
+            sha = self.checkpoint.get("commitSHA")
+            # Upgrade a pending old-format commit without adopting the prior publication as this repair.
+            legacy_pending = self.checkpoint.get("attemptID") is None and sha and (not previous or sha != previous["commitSHA"])
+            self.save(attemptID=attempt, commitSHA=sha if legacy_pending else None)
+
+    def publication_result(self, outcome, sha):
+        response = {k: outcome[k] for k in ("outputKind", "shaderID", "changed", "summary", "approximations")}
+        previous = self.previous_publication()
+        if previous:
+            response["changed"] = outcome["changed"] or previous["changed"]
+            if not outcome["changed"] and previous["shaderID"] == outcome["shaderID"]:
+                sha = previous["commitSHA"]
+                response["summary"] = previous["summary"] + " Verified again after activation repair; no further source changes were necessary."
+                response["approximations"] = list(dict.fromkeys(previous["approximations"] + outcome["approximations"]))
+        response.update(commitSHA=sha, deliveredSourceHash=None)
+        return response
+
+    def finish_publication(self, response):
+        write(self.directory / "worker-result.json", response)
+        self.owner.unlink(missing_ok=True)
+        for name in ("changes.patch", "untracked.json", "repair.json"):
+            (self.directory / name).unlink(missing_ok=True)
+        emit("result", result=response)
 
     def fingerprint(self):
         value = self.git("diff", "--binary", self.checkpoint["base"], raw=True)
@@ -377,15 +450,56 @@ An unchanged existing shader may be successful if it already satisfies the promp
                           "capturedContext": context, "answer": answer, "activationRepair": repair,
                           "previousOutput": self.checkpoint.get("outcome"), "previousPublication": self.previous_publication(), "verificationFeedback": feedback}, indent=2)
 
-    def technical(self):
+    def technical(self, baseline=False, commands=None):
         self.stage("validating", "Compiling macOS and tvOS shaders and running authoring/GPU tests")
         env = dict(self.env, HOLODECK_GPU_TESTS="1")
-        commands = [[self.config["python"], "tools/library.py", "validate", "--compile"],
+        commands = commands or [[self.config["python"], "tools/library.py", "validate", "--compile"],
                     [self.config["python"], "-m", "unittest", "discover", "-s", "tools", "-p", "test_*.py"]]
         for command in commands:
             result = run(command, self.root, env, check=False)
             if result.returncode:
-                raise CandidateError((result.stdout + result.stderr)[-12000:])
+                message = (result.stdout + result.stderr)[-12000:] or f"Validation exited {result.returncode}"
+                if baseline or result.returncode < 0:
+                    raise OperationalError("Baseline or host validation failed: " + message)
+                raise VerificationError(message, command=command)
+
+    def baseline_render(self, shader_id=None, time=None):
+        sid = shader_id if shader_id in self.baseline_ids() else json.loads((self.root / "index.json").read_text())["defaultShaderID"]
+        directory = self.directory / "baseline" / self.checkpoint["base"] / sid
+        directory.mkdir(parents=True, exist_ok=True)
+        source = directory / "source.metal"
+        source.write_bytes(self.source(sid).encode("utf-8"))
+        for sample in (0, 3, 10) if time is None else (time,):
+            png = directory / f"{sample}.png"
+            png.unlink(missing_ok=True)
+            result = run([self.config["shaderTool"], "render", source, png, "--width", "1280", "--height", "720", "--time", str(sample)], self.root, self.env, timeout=60, check=False)
+            if result.returncode or not self.valid_image(png):
+                raise OperationalError("Baseline rendering or host GPU failed: " + sid)
+
+    @staticmethod
+    def valid_image(path):
+        if not path.is_file():
+            return False
+        header = path.read_bytes()[:24]
+        return header[:8] == b"\x89PNG\r\n\x1a\n" and len(header) == 24 and struct.unpack(">II", header[16:24]) == (1280, 720)
+
+    def validate_baseline(self):
+        emit("log", text="Checking pristine main before restoring the candidate or invoking Codex")
+        self.technical(baseline=True)
+        self.baseline_render()
+
+    def classify_verification_failure(self, error):
+        # Keep one checkout: park the candidate while the same failing operation probes pristine base.
+        self.save_patch()
+        self.clean()
+        write(self.owner, {"id": self.request["id"], "directory": str(self.directory)})
+        try:
+            if error.command:
+                self.technical(baseline=True, commands=[error.command])
+            else:
+                self.baseline_render(error.shader_id, error.time)
+        finally:
+            self.restore_patch()
 
     def visual(self, outcome):
         self.stage("reviewing", "Rendering samples and running independent visual review")
@@ -417,11 +531,10 @@ An unchanged existing shader may be successful if it already satisfies the promp
                     png = path / f"{time}.png"
                     png.unlink(missing_ok=True)
                     result = run([self.config["shaderTool"], "render", metal, png, "--width", "1280", "--height", "720", "--time", str(time)], self.root, self.env, timeout=60, check=False)
-                    if result.returncode or not png.exists() or png.stat().st_size == 0:
-                        raise CandidateError("Sample rendering failed: " + sid)
-                    header = png.read_bytes()[:24]
-                    if header[:8] != b"\x89PNG\r\n\x1a\n" or len(header) != 24 or struct.unpack(">II", header[16:24]) != (1280, 720):
-                        raise CandidateError("Missing or incorrectly sized render evidence: " + sid)
+                    if result.returncode or not self.valid_image(png):
+                        if label == "before" or result.returncode < 0:
+                            raise OperationalError("Baseline sample or host rendering failed: " + sid)
+                        raise VerificationError("Missing, failed or incorrectly sized render evidence: " + sid, shader_id=sid, time=time)
                     images.append(png)
                     evidence.append({"shaderID": sid, "variant": label, "time": time, "sourceHash": hashes[label],
                                      "imageHash": digest(png.read_bytes()), "path": str(png)})
@@ -470,26 +583,28 @@ An unchanged existing shader may be successful if it already satisfies the promp
                 if self.git("merge-base", "--is-ancestor", result["commitSHA"], "origin/main", check=False).returncode:
                     raise OperationalError("The previously pushed commit is no longer on main")
                 self.git("checkout", "-B", "main", "origin/main")
+                self.verify_commit("origin/main", self.candidate_manifest())
                 self.prepare_publication()
                 emit("result", result=result)
                 return
             # Crash/lost-ack recovery: adopt an already-pushed request commit before reapplying any patch.
-            if self.checkpoint.get("commitSHA") and not (self.directory / "repair.json").exists():
+            self.begin_attempt()
+            if self.checkpoint.get("commitSHA"):
                 self.git("fetch", "origin", "main")
                 sha = self.checkpoint["commitSHA"]
                 if self.git("merge-base", "--is-ancestor", sha, "origin/main", check=False).returncode == 0:
                     outcome = self.checkpoint["outcome"]
-                    response = {k: outcome[k] for k in ("outputKind", "shaderID", "changed", "summary", "approximations")}
-                    response.update(commitSHA=sha, deliveredSourceHash=None)
-                    write(ready, response)
-                    self.owner.unlink(missing_ok=True)
-                    for name in ("changes.patch", "untracked.json"):
-                        (self.directory / name).unlink(missing_ok=True)
+                    manifest = self.checkpoint.get("commitManifest")
+                    if manifest:
+                        self.verify_commit(sha, manifest, check_workspace=False)
+                    response = self.publication_result(outcome, sha)
+                    self.clean(revision=sha)
                     if self.git("status", "--porcelain").strip():
                         raise OperationalError("Uncommitted files prevent recovery of the pushed result")
                     self.git("checkout", "-B", "main", "origin/main")
+                    self.verify_commit("origin/main", self.candidate_manifest())
                     self.prepare_publication()
-                    emit("result", result=response)
+                    self.finish_publication(response)
                     return
             self.synchronize()
             schema = {"type": "object", "properties": {"status": {"type": "string", "enum": ["completed", "needsClarification"]},
@@ -511,6 +626,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
                         return
                     self.scope(outcome)
                     frozen = self.fingerprint()
+                    manifest = self.candidate_manifest()
                     self.technical()
                     self.visual(outcome)
                     if self.fingerprint() != frozen:
@@ -522,17 +638,20 @@ An unchanged existing shader may be successful if it already satisfies the promp
                         feedback = "Remote main changed; reapply the intent, resolve conflicts, and repeat verification."
                         continue
                     self.prepare_publication()
-                    if self.fingerprint() != frozen:
+                    if self.fingerprint() != frozen or self.candidate_manifest() != manifest:
                         emit("discardPublication")
                         raise CandidateError("Candidate changed while preparing publication")
                     self.stage("pushing", "Committing verified changes and pushing to main")
+                    write(self.directory / "candidate-manifest.json", manifest)
+                    write(self.directory / "evidence" / f"attempt-{self.checkpoint['verificationAttempt']}" / "candidate-manifest.json", manifest)
                     if outcome["changed"]:
                         self.save_patch()
                         self.git("add", "--all")
                         message = f"{outcome['summary'][:180]}\n\nHolodeck-Request-ID: {self.request['id']}"
                         self.git("commit", "-m", message)
                         sha = self.git("rev-parse", "HEAD").strip()
-                        self.save(commitSHA=sha)
+                        self.verify_commit(sha, manifest)
+                        self.save(commitSHA=sha, commitManifest=manifest)
                         result = self.git("push", "origin", "HEAD:main", check=False)
                         self.git("fetch", "origin", "main")
                         published = self.git("merge-base", "--is-ancestor", sha, "origin/main", check=False).returncode == 0
@@ -546,23 +665,12 @@ An unchanged existing shader may be successful if it already satisfies the promp
                             raise OperationalError("Git push failed: " + result.stderr[-4000:])
                     else:
                         sha = self.checkpoint["base"]
-                    response = {k: outcome[k] for k in ("outputKind", "shaderID", "changed", "summary", "approximations")}
-                    previous = self.previous_publication()
-                    if previous:
-                        response["changed"] = outcome["changed"] or previous["changed"]
-                        if not outcome["changed"] and previous["shaderID"] == outcome["shaderID"]:
-                            sha = previous["commitSHA"]
-                            response["summary"] = previous["summary"] + " Verified again after activation repair; no further source changes were necessary."
-                            response["approximations"] = list(dict.fromkeys(previous["approximations"] + outcome["approximations"]))
-                    response["commitSHA"] = sha
-                    response["deliveredSourceHash"] = None
-                    write(ready, response)
-                    self.owner.unlink(missing_ok=True)
-                    for name in ("changes.patch", "untracked.json", "repair.json"):
-                        (self.directory / name).unlink(missing_ok=True)
-                    emit("result", result=response)
+                        self.verify_commit(sha, manifest)
+                    self.finish_publication(self.publication_result(outcome, sha))
                     return
                 except (CandidateError, ValueError, SyntaxError, KeyError, TypeError, IndexError) as error:
+                    if isinstance(error, VerificationError):
+                        self.classify_verification_failure(error)
                     feedback = str(error)
                     emit("log", text="Repairing shader defect: " + feedback)
                     self.stage("repairing", "Repairing verification findings")
@@ -637,7 +745,8 @@ def main():
                 for name in ("changes.patch", "untracked.json"):
                     (worker.directory / name).unlink(missing_ok=True)
             else:
-                worker.owner.unlink(missing_ok=True)
+                with contextlib.suppress(Exception):
+                    worker.clean(revision=sha)
         emit("failure", message=str(error))
         sys.exit(1)
 

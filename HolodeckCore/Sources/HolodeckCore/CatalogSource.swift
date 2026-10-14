@@ -17,15 +17,19 @@ nonisolated public struct CatalogHead: Codable, Sendable {
 }
 
 nonisolated public struct CatalogSource: Sendable {
-    var isLocalPublication = false
+    public enum Kind: Sendable, Equatable { case standard, localPublication }
+    public let kind: Kind
     /// Waits for source recovery without canceling its shared connection attempt.
     public var waitForAvailability: (@Sendable () async throws -> Void)?
     public var get: @Sendable (CatalogRequest, Int) async throws -> Data
-    public init(waitForAvailability: (@Sendable () async throws -> Void)? = nil,
+    public init(kind: Kind, waitForAvailability: (@Sendable () async throws -> Void)? = nil,
                 get: @escaping @Sendable (CatalogRequest, Int) async throws -> Data) {
-        self.waitForAvailability = waitForAvailability; self.get = get
+        self.kind = kind; self.waitForAvailability = waitForAvailability; self.get = get
     }
-    public static let unavailable = Self { _, _ in throw LocalCatalogError.disconnected }
+    public func replacingGet(_ get: @escaping @Sendable (CatalogRequest, Int) async throws -> Data) -> Self {
+        Self(kind: kind, waitForAvailability: waitForAvailability, get: get)
+    }
+    public static let unavailable = Self(kind: .standard) { _, _ in throw LocalCatalogError.disconnected }
 }
 
 nonisolated public enum LocalCatalogError: Error, LocalizedError, Sendable {

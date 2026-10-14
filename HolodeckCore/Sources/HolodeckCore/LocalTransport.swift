@@ -4,7 +4,7 @@ import Security
 import CryptoKit
 
 nonisolated public enum LocalProtocol {
-    public static let version = 1
+    public static let version = 2
     public static let serviceType = "_holodeck._tcp"
     public static let maximumHeader = 65_536
     public static let maximumPayload = 8_388_608

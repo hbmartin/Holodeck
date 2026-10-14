@@ -43,9 +43,9 @@ final class MacModel {
         #endif
         var autosaveName: String? = "HolodeckViewer-live"
         var defaults: UserDefaults? = UserDefaults.standard
-        var directoryCatalog = DirectoryCatalog()
+        var directoryCatalog: DirectoryCatalog?
         let localCache = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Holodeck/LocalViewerCache")
-        var service = CatalogService(source: directoryCatalog.source, storage: .disk(at: localCache))
+        var configuredService: CatalogService?
         var usesDirectory = true
         var libraryTestNamespace: String?
         var testingAdvertises = false
@@ -59,11 +59,12 @@ final class MacModel {
             let cleanup = configuration.contains("--ui-test-cleanup-storage-suite")
             autosaveName = configuration.hasExplicitStorageSuite && !cleanup ? name : nil
             defaults = configuration.makeUserDefaults()
-            service = configuration.makeCatalogService()
+            configuredService = configuration.makeCatalogService()
             usesDirectory = false
             if configuration.contains("--ui-test-local-library"), !cleanup, let cache = configuration.fixtureCacheDirectory {
-                directoryCatalog = DirectoryCatalog(directory: cache.appendingPathComponent("publications"))
-                service = CatalogService(source: directoryCatalog.source, storage: .disk(at: cache.appendingPathComponent("viewer")))
+                let selected = DirectoryCatalog(directory: cache.appendingPathComponent("publications"))
+                directoryCatalog = selected
+                configuredService = CatalogService(source: selected.source, storage: .disk(at: cache.appendingPathComponent("viewer")))
                 usesDirectory = true
                 libraryTestNamespace = suite
                 testingAdvertises = configuration.contains("--ui-test-local-network")
@@ -71,6 +72,8 @@ final class MacModel {
             if configuration.contains("--ui-test-metal-unavailable") { metalDevice = nil }
         }
         #endif
+        if usesDirectory, directoryCatalog == nil { directoryCatalog = DirectoryCatalog() }
+        let service = configuredService ?? CatalogService(source: directoryCatalog!.source, storage: .disk(at: localCache))
         self.defaults = defaults
         windowAutosaveName = autosaveName
         self.device = metalDevice
@@ -78,7 +81,7 @@ final class MacModel {
         favorites = defaults.map { SceneFavorites(defaults: $0) } ?? .inMemory()
         sidebarVisible = defaults?.object(forKey: "holodeck.sidebarVisible") as? Bool ?? true
         session = ViewerSession(catalogService: service, preferences: defaults.map(ShaderPreferences.userDefaults) ?? .inMemory(), policy: .mac)
-        library = usesDirectory ? MacLibraryModel(catalog: directoryCatalog, session: session, defaults: defaults, testingNamespace: libraryTestNamespace, testingAdvertises: testingAdvertises) : nil
+        library = usesDirectory ? MacLibraryModel(catalog: directoryCatalog!, session: session, defaults: defaults, testingNamespace: libraryTestNamespace, testingAdvertises: testingAdvertises) : nil
         #if DEBUG
         alerts = MacAlertCoordinator(didPresent: driver.didPresentFailure)
         driver.observeStartupActivation(in: self)

@@ -17,7 +17,7 @@ nonisolated enum TestCatalog {
     static let storage = CatalogStorage(read: { name in
         if name == "snapshot.json" { return data }
         return try? preview(named: name)
-    }, write: { _, _ in })
+    }, write: { _, _ in }, remove: { _ in })
     static func preview(named name: String) throws -> Data {
         guard let url = Bundle.module.url(forResource: name, withExtension: nil, subdirectory: "TestSupport") else { throw CatalogError.invalidPreview }
         return try Data(contentsOf: url)

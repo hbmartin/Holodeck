@@ -7,10 +7,12 @@ import ImageIO
 nonisolated public struct CatalogStorage: Sendable {
     public var read: @Sendable (String) throws -> Data?
     public var write: @Sendable (String, Data) throws -> Void
+    public var remove: @Sendable (String) throws -> Void
 
     public init(read: @escaping @Sendable (String) throws -> Data?,
-                write: @escaping @Sendable (String, Data) throws -> Void) {
-        self.read = read; self.write = write
+                write: @escaping @Sendable (String, Data) throws -> Void,
+                remove: @escaping @Sendable (String) throws -> Void) {
+        self.read = read; self.write = write; self.remove = remove
     }
     public static func disk(at directory: URL) -> Self {
         Self(read: { name in
@@ -20,11 +22,14 @@ nonisolated public struct CatalogStorage: Sendable {
         }, write: { name, data in
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             try data.write(to: directory.appendingPathComponent(name), options: .atomic)
+        }, remove: { name in
+            let url = directory.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
         })
     }
 
     public static let live = disk(at: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("ShaderCatalog", isDirectory: true))
-    public static let disabled = Self(read: { _ in nil }, write: { _, _ in })
+    public static let disabled = Self(read: { _ in nil }, write: { _, _ in }, remove: { _ in })
 }
 
 nonisolated public enum CatalogRefreshOutcome: Sendable {
@@ -49,6 +54,10 @@ public actor CatalogService {
     public nonisolated let initialCatalog: ValidatedCatalog?
     private var snapshot: ValidatedCatalog?
     private var loadedCache = false
+    private var cacheTask: Task<ValidatedCatalog?, Never>?
+    private let worker = CatalogIOWorker(label: "Holodeck.catalog-validation")
+    private var beforeCatalogValidation: (@Sendable () -> Void)?
+    func setBeforeCatalogValidation(_ hook: (@Sendable () -> Void)?) { beforeCatalogValidation = hook }
     private let source: CatalogSource
     private let storage: CatalogStorage
     private let clock: AnyClock<Duration>
@@ -83,11 +92,7 @@ public actor CatalogService {
     public init(initialCatalog: ValidatedCatalog? = nil, source: CatalogSource = .unavailable, storage: CatalogStorage = .live,
          clock: any Clock<Duration> = ContinuousClock(), enabled: Bool = true, usesLocalNetwork: Bool = false) {
         self.usesLocalNetwork = usesLocalNetwork
-        var initial = initialCatalog
-        if let initialCatalog, source.isLocalPublication, initialCatalog.publicationRevision.count == 64,
-           (try? CatalogPublication.validate(initialCatalog.snapshot.manifest, revision: initialCatalog.publicationRevision)) == nil {
-            initial = nil
-        }
+        let initial = initialCatalog.flatMap { CatalogPublication.accepts($0, kind: source.kind) ? $0 : nil }
         self.initialCatalog = initial
         snapshot = initial
         loadedCache = initial != nil
@@ -101,19 +106,35 @@ public actor CatalogService {
         CatalogService(initialCatalog: initialCatalog, storage: storage, enabled: false)
     }
 
-    public func current() -> ValidatedCatalog? {
-        if !loadedCache {
-            loadedCache = true
-            if let data = try? storage.read("snapshot.json"),
-               let value = try? JSONDecoder().decode(CatalogSnapshot.self, from: data) {
+    public func current() async -> ValidatedCatalog? {
+        guard !loadedCache else { return snapshot }
+        if cacheTask == nil {
+            let storage = storage, kind = source.kind, worker = worker, hook = beforeCatalogValidation
+            // Cache restoration belongs to the service, independently of a caller's cancellation.
+            cacheTask = Task {
                 do {
-                    let candidate = try value.validated()
-                    try validatePublication(candidate.snapshot.manifest, revision: candidate.publicationRevision)
-                    snapshot = candidate
+                    return try await worker.run {
+                        hook?()
+                        guard let data = try storage.read("snapshot.json") else { return nil }
+                        do { return try CatalogPublication.restored(data, kind: kind) }
+                        catch {
+                            Diagnostics.catalog.error("Discarding invalid cached publication: \(error.localizedDescription, privacy: .public)")
+                            if kind == .localPublication {
+                                do { try storage.remove("snapshot.json") }
+                                catch { Diagnostics.catalog.error("Couldn’t delete invalid snapshot: \(error.localizedDescription, privacy: .public)") }
+                            }
+                            return nil
+                        }
+                    }
                 } catch {
-                    Diagnostics.catalog.error("Discarding invalid cached publication: \(error.localizedDescription, privacy: .public)")
+                    Diagnostics.catalog.error("Couldn’t read cached publication: \(error.localizedDescription, privacy: .public)")
+                    return nil
                 }
             }
+        }
+        let candidate = await cacheTask!.value
+        if !loadedCache {
+            loadedCache = true; snapshot = candidate; cacheTask = nil
         }
         return snapshot
     }
@@ -128,7 +149,8 @@ public actor CatalogService {
     @discardableResult
     public func refreshOutcome(force: Bool = false) async throws -> CatalogRefreshOutcome {
         try Task.checkCancellation()
-        _ = current()
+        _ = await current()
+        try Task.checkCancellation()
         guard enabled else { return .disabled }
         if refreshTask == nil {
             let instant = clock.now
@@ -171,27 +193,31 @@ public actor CatalogService {
     private func downloadPublication() async throws -> ValidatedCatalog? {
         let head = try JSONDecoder().decode(CatalogHead.self, from: await source.get(.head, CatalogLimits.headBytes))
         let revision = head.revision
-        guard CatalogHash.isRevision(revision) else { throw CatalogError.invalidManifest }
-        if revision == snapshot?.publicationRevision { return nil }
-        let manifest = try JSONDecoder().decode(CatalogManifest.self, from: await source.get(.asset(revision: revision, path: "catalog.json"), CatalogLimits.manifestBytes))
-        var builder = try CatalogBuilder(manifest: manifest)
-        try validatePublication(builder.manifest, revision: revision)
-        // Bounded sequential downloads keep memory and transfer concurrency predictable.
-        for entry in manifest.shaders {
-            let data = try await source.get(.asset(revision: revision, path: entry.sourcePath), CatalogLimits.sourceBytes)
-            try builder.addSource(data, for: entry)
+        guard CatalogHash.isRevision(revision), source.kind != .localPublication || CatalogHash.isSHA(revision) else {
+            throw CatalogError.invalidManifest
         }
-        let candidate = try builder.finish(revision: revision)
-        try storage.write("snapshot.json", JSONEncoder().encode(candidate.snapshot))
+        if revision == snapshot?.publicationRevision { return nil }
+        let data = try await source.get(.asset(revision: revision, path: "catalog.json"), CatalogLimits.manifestBytes)
+        let kind = source.kind, hook = beforeCatalogValidation
+        let builder = try await worker.run {
+            hook?()
+            return try CatalogPublication.builder(data, revision: revision, kind: kind)
+        }
+        var sources: [String: Data] = [:], total = 0
+        for entry in builder.manifest.shaders {
+            let bytes = try await source.get(.asset(revision: revision, path: entry.sourcePath), CatalogLimits.sourceBytes)
+            total += bytes.count
+            guard bytes.count <= CatalogLimits.sourceBytes, total <= CatalogLimits.totalSourceBytes else { throw CatalogError.oversizedResponse }
+            sources[entry.id] = bytes
+        }
+        let downloaded = sources, storage = storage
+        let candidate = try await worker.run {
+            let candidate = try CatalogPublication.finish(builder, sources: downloaded, revision: revision)
+            try storage.write("snapshot.json", CatalogPublication.persisted(candidate, kind: kind))
+            return candidate
+        }
         snapshot = candidate
         return candidate
-    }
-
-    private func validatePublication(_ manifest: CatalogManifest, revision: String) throws {
-        // Legacy revisions identify a repository commit rather than manifest content.
-        if source.isLocalPublication, revision.count == 64 {
-            try CatalogPublication.validate(manifest, revision: revision)
-        }
     }
 
     public func preview(_ preview: ShaderPreview) async throws -> Data {
@@ -210,7 +236,8 @@ public actor CatalogService {
                 defer { previewTasks[preview.hash] = nil }
                 do {
                     let data = try await downloadPreview(preview)
-                    previewFailures.removeValue(for: PreviewFailureKey(preview))
+                    let failureKey = PreviewFailureKey(preview)
+                    if previewFailures.value(for: failureKey)?.stage == .transfer { previewFailures.removeValue(for: failureKey) }
                     if epoch == cacheEpoch { previewData.insert(data, for: preview.hash, cost: data.count) }
                     return data
                 } catch {
@@ -256,17 +283,17 @@ public actor CatalogService {
         return true
     }
 
-    private func recordPreviewFailure(_ error: Error, preview: ShaderPreview) {
+    private func recordPreviewFailure(_ error: Error, preview: ShaderPreview, stage: PreviewFailureStage = .transfer) {
         guard !CatalogError.isCancellation(error) else { return }
         let key = PreviewFailureKey(preview)
         let attempts = min((previewFailures.value(for: key)?.attempts ?? 0) + 1, 5)
         let permanent: Bool
         if case CatalogError.invalidPreview = error {
-            permanent = !enabled || !source.isLocalPublication
+            permanent = stage == .decode || !enabled || source.kind != .localPublication
         } else { permanent = false }
         let waitsForAvailability = source.waitForAvailability != nil && (error as? LocalCatalogError)?.isConnectivityFailure == true
         let retryAt = permanent || waitsForAvailability ? nil : clock.now.advanced(by: .seconds(min(30 * (1 << (attempts - 1)), 300)))
-        previewFailures.insert(PreviewFailure(error: error, attempts: attempts, retryAt: retryAt,
+        previewFailures.insert(PreviewFailure(error: error, stage: stage, attempts: attempts, retryAt: retryAt,
             waitsForAvailability: waitsForAvailability), for: key, cost: 1)
     }
 
@@ -319,7 +346,7 @@ public actor CatalogService {
                     if epoch == cacheEpoch { previewImages.insert(image, for: key, cost: image.bytesPerRow * image.height) }
                     return image
                 } catch {
-                    recordPreviewFailure(error, preview: preview)
+                    recordPreviewFailure(error, preview: preview, stage: .decode)
                     throw error
                 }
             }
@@ -397,9 +424,12 @@ nonisolated private struct PreviewFailureKey: Hashable {
     init(_ preview: ShaderPreview) { revision = preview.publicationRevision; path = preview.path; hash = preview.hash }
 }
 
+nonisolated private enum PreviewFailureStage { case transfer, decode }
+
 nonisolated private struct PreviewFailure {
     let id = UUID()
     let error: Error
+    let stage: PreviewFailureStage
     let attempts: Int
     let retryAt: AnyClock<Duration>.Instant?
     let waitsForAvailability: Bool

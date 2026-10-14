@@ -83,7 +83,7 @@ final class LocalClientRecoveryTests: XCTestCase {
 
     func testMissingRememberedMacOffersChooserAfterGraceAndOnlyOncePerEpisode() async throws {
         let clock = TestClock()
-        let old = LocalMac(id: UUID().uuidString, name: "Old", endpoint: mac.endpoint, interface: nil, version: 1)
+        let old = LocalMac(id: UUID().uuidString, name: "Old", endpoint: mac.endpoint, interface: nil, version: LocalProtocol.version)
         let (client, _, _) = try fixture(remembered: old, clock: clock)
         await client.start(); try await discover([mac], client: client)
         await clock.advance(by: .seconds(4))
@@ -106,7 +106,7 @@ final class LocalClientRecoveryTests: XCTestCase {
     func testRememberedMacReturningDuringGraceCancelsChooser() async throws {
         let clock = TestClock()
         let (client, _, _) = try fixture(remembered: mac, clock: clock)
-        let other = LocalMac(id: UUID().uuidString, name: "Other", endpoint: mac.endpoint, interface: nil, version: 1)
+        let other = LocalMac(id: UUID().uuidString, name: "Other", endpoint: mac.endpoint, interface: nil, version: LocalProtocol.version)
         await client.start(); try await discover([other], client: client)
         await clock.advance(by: .seconds(4))
         try await discover([mac, other], client: client, sequence: 2); try await connected(client)

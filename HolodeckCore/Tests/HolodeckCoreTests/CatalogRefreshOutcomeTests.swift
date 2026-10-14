@@ -121,7 +121,7 @@ final class CatalogRefreshOutcomeTests: XCTestCase {
         let started = expectation(description: "One shared check begins")
         let gate = RefreshGate(started: started)
         addTeardownBlock { await gate.release() }
-        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource { _, _ in
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource(kind: .standard) { _, _ in
             await gate.hold()
             return Data("{\"revision\":\"\(TestCatalog.catalog.publicationRevision)\"}".utf8)
         }, storage: .disabled)

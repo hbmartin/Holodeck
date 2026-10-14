@@ -57,11 +57,34 @@ final class DirectoryReloadPerformanceTests: XCTestCase {
             _ = try await store.reload(from: root)
             reloads.append(Self.milliseconds(start.duration(to: clock.now)))
         }
+        let reloadLatencies = await samples.drain()
+        var restorations: [Double] = []
+        for _ in 0..<3 {
+            let start = clock.now
+            _ = try await store.cached()
+            restorations.append(Self.milliseconds(start.duration(to: clock.now)))
+        }
         await samples.stop()
         try await sampler.value
         let latencies = await samples.values
         XCTAssertFalse(latencies.isEmpty)
-        print("Directory reload profile: 256 scenes, 1 MiB previews, 3 warm reloads; reload ms \(reloads); idle head p50/p95/max ms \(Self.percentiles(idle)); reload head p50/p95/max ms \(Self.percentiles(latencies)); samples \(latencies.count)")
+        print("Directory reload profile: 256 scenes, 1 MiB previews, 3 warm reloads; reload ms \(reloads); idle head p50/p95/max ms \(Self.percentiles(idle)); reload head p50/p95/max ms \(Self.percentiles(reloadLatencies)); disk restoration ms \(restorations); restoration head p50/p95/max ms \(Self.percentiles(latencies)); samples \(reloadLatencies.count)/\(latencies.count)")
+        let storage = CatalogStorage.disk(at: base.appendingPathComponent("viewer"))
+        _ = try await CatalogService(source: store.source, storage: storage).refresh()
+        var coldLoads: [Double] = [], coldQueries: [Double] = []
+        for _ in 0..<3 {
+            let service = CatalogService(source: store.source, storage: storage, enabled: false)
+            let start = clock.now
+            let load = Task { await service.current() }
+            await Task.yield()
+            let queryStart = clock.now
+            _ = await service.previewFailureCount
+            coldQueries.append(Self.milliseconds(queryStart.duration(to: clock.now)))
+            let restored = await load.value
+            XCTAssertEqual(restored?.shaders.count, 256)
+            coldLoads.append(Self.milliseconds(start.duration(to: clock.now)))
+        }
+        print("Viewer cold-load profile: load ms \(coldLoads); concurrent actor query ms \(coldQueries)")
     }
 
     private static func milliseconds(_ duration: Duration) -> Double {
@@ -78,5 +101,6 @@ private actor ReloadProfileSamples {
     var values: [Double] = []
     func record(_ value: Double) { values.append(value) }
     func stop() { running = false }
+    func drain() -> [Double] { defer { values.removeAll() }; return values }
 }
 #endif

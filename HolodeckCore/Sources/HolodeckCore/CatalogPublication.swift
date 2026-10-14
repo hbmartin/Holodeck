@@ -9,29 +9,85 @@ nonisolated enum CatalogLimits {
     static let shaderCount = 500
 }
 
-/// Local revisions fingerprint the normalized manifest, without its self-reference.
-nonisolated enum CatalogPublication {
-    static func revision(for manifest: CatalogManifest) throws -> String {
-        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
-        guard var canonical = try JSONSerialization.jsonObject(with: encoder.encode(manifest)) as? [String: Any] else {
-            throw CatalogError.invalidManifest
-        }
-        canonical["sourceRevision"] = nil
-        return CatalogHash.sha256(try JSONSerialization.data(withJSONObject: canonical, options: [.sortedKeys]))
+/// Proof is created only after hashing the exact schema-2 wire bytes.
+nonisolated struct LocalPublicationEvidence: Sendable {
+    let manifestBytes: Data
+    let revision: String
+    fileprivate init(manifestBytes: Data, revision: String) {
+        self.manifestBytes = manifestBytes; self.revision = revision
     }
+}
 
-    static func validate(_ manifest: CatalogManifest, revision: String) throws {
-        guard CatalogHash.isSHA(revision), manifest.sourceRevision == revision,
-              try self.revision(for: manifest) == revision else { throw CatalogError.invalidManifest }
+nonisolated enum CatalogPublication {
+    private struct Manifest: Codable {
+        let schemaVersion: Int
+        let defaultShaderID: String
+        let shaders: [CatalogManifest.Entry]
+        let collections: [CatalogCollection]?
+    }
+    private struct Cache: Codable {
+        let formatVersion: Int
+        let revision: String
+        let manifestBytes: Data
+        let sources: [String: String]
     }
 
     static func encodedManifest(_ manifest: CatalogManifest) throws -> Data {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
-        let data = try encoder.encode(manifest)
+        let data = try encoder.encode(Manifest(schemaVersion: 2, defaultShaderID: manifest.defaultShaderID,
+            shaders: manifest.shaders, collections: manifest.collections))
         guard data.count <= CatalogLimits.manifestBytes else {
             throw LocalCatalogError.invalidFile("index.json", "Catalog exceeds 2 MiB.")
         }
         return data
+    }
+
+    static func builder(_ data: Data, revision: String, kind: CatalogSource.Kind) throws -> CatalogBuilder {
+        guard data.count <= CatalogLimits.manifestBytes else { throw CatalogError.oversizedResponse }
+        if kind == .standard {
+            return try CatalogBuilder(manifest: JSONDecoder().decode(CatalogManifest.self, from: data))
+        }
+        guard CatalogHash.isSHA(revision), CatalogHash.sha256(data) == revision else { throw CatalogError.invalidManifest }
+        let wire = try JSONDecoder().decode(Manifest.self, from: data)
+        guard wire.schemaVersion == 2 else { throw CatalogError.invalidManifest }
+        let manifest = CatalogManifest(schemaVersion: 1, defaultShaderID: wire.defaultShaderID,
+            sourceRevision: revision, shaders: wire.shaders, collections: wire.collections)
+        return try CatalogBuilder(manifest: manifest,
+            evidence: LocalPublicationEvidence(manifestBytes: data, revision: revision))
+    }
+
+    static func accepts(_ catalog: ValidatedCatalog, kind: CatalogSource.Kind) -> Bool {
+        kind == .standard || catalog.localPublicationEvidence?.revision == catalog.publicationRevision
+    }
+
+    static func persisted(_ catalog: ValidatedCatalog, kind: CatalogSource.Kind) throws -> Data {
+        guard accepts(catalog, kind: kind) else { throw CatalogError.invalidManifest }
+        if kind == .standard { return try JSONEncoder().encode(catalog.snapshot) }
+        guard let proof = catalog.localPublicationEvidence else { throw CatalogError.invalidManifest }
+        return try JSONEncoder().encode(Cache(formatVersion: 2, revision: proof.revision,
+            manifestBytes: proof.manifestBytes, sources: catalog.snapshot.sources))
+    }
+
+    static func restored(_ data: Data, kind: CatalogSource.Kind) throws -> ValidatedCatalog {
+        if kind == .standard { return try JSONDecoder().decode(CatalogSnapshot.self, from: data).validated() }
+        let cache = try JSONDecoder().decode(Cache.self, from: data)
+        guard cache.formatVersion == 2 else { throw CatalogError.invalidManifest }
+        let builder = try builder(cache.manifestBytes, revision: cache.revision, kind: kind)
+        guard cache.sources.count == builder.manifest.shaders.count else { throw CatalogError.invalidManifest }
+        let sources = try Dictionary(uniqueKeysWithValues: builder.manifest.shaders.map { entry in
+            guard let text = cache.sources[entry.id] else { throw CatalogError.invalidSource }
+            return (entry.id, Data(text.utf8))
+        })
+        return try finish(builder, sources: sources, revision: cache.revision)
+    }
+
+    static func finish(_ builder: CatalogBuilder, sources: [String: Data], revision: String) throws -> ValidatedCatalog {
+        var builder = builder
+        for entry in builder.manifest.shaders {
+            guard let bytes = sources[entry.id] else { throw CatalogError.invalidSource }
+            try builder.addSource(bytes, for: entry)
+        }
+        return try builder.finish(revision: revision)
     }
 }
 

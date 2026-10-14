@@ -307,5 +307,135 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         code,events=self.run_worker();self.assertNotEqual(code,0)
         self.assertEqual((self.root/'shaders/alpha/body.metal').read_text(),'USER WORK\n')
 
+    def test_host_skips_all_local_hooks_without_changing_configuration(self):
+        hooks=self.base/'configured-hooks';hooks.mkdir()
+        for name in ('post-checkout','pre-commit','prepare-commit-msg','commit-msg','post-commit','pre-push'):
+            hook=hooks/name
+            hook.write_text('#!/bin/sh\ntouch "'+str(self.base/'hook-ran')+'"\nexit 1\n');hook.chmod(0o755)
+        self.git(self.root,'config','core.hooksPath',str(hooks))
+        code,events=self.run_worker();self.assertEqual(code,0,events)
+        self.assertFalse((self.base/'hook-ran').exists())
+        self.assertEqual(self.git(self.root,'config','core.hooksPath').strip(),str(hooks))
+        result=self.result(events)
+        self.assertEqual(self.git(self.root,'show',result['commitSHA']+':shaders/alpha/body.metal'),'EDIT\n')
+        self.assertTrue((self.job/'candidate-manifest.json').exists())
+
+    def test_git_clean_filter_cannot_publish_different_bytes(self):
+        (self.root/'.gitattributes').write_text('shaders/*/body.metal filter=request-fixture\n')
+        self.git(self.root,'add','.gitattributes');self.git(self.root,'commit','-m','Filter declaration');self.git(self.root,'push','origin','main')
+        baseline=self.git(self.root,'rev-parse','HEAD').strip()
+        executable=self.base/'clean-filter'
+        executable.write_text('#!'+sys.executable+'\nimport sys\nsys.stdout.write(sys.stdin.read().replace("EDIT", "FILTERED"))\n');executable.chmod(0o755)
+        self.git(self.root,'config','filter.request-fixture.clean',str(executable))
+        code,events=self.run_worker();self.assertNotEqual(code,0)
+        self.assertTrue(any('Committed tree differs' in e.get('message','') for e in events))
+        self.assertEqual(self.git(self.root,'rev-parse','origin/main').strip(),baseline)
+        self.assertEqual(self.git(self.root,'status','--porcelain').strip(),'')
+
+    def test_staged_forbidden_file_and_new_source_manifest(self):
+        worker=worker_module.Worker(self.config,self.job);worker.request=self.request;worker.save(base=self.base_sha)
+        before=worker.fingerprint()
+        (self.root/'tools/library.py').write_text('pass\n');self.git(self.root,'add','tools/library.py')
+        with self.assertRaisesRegex(worker_module.CandidateError,'Forbidden'):worker.scope()
+        self.assertNotEqual(worker.fingerprint(),before)
+        self.git(self.root,'reset','--hard',self.base_sha)
+        self.request['prompt']='new';self.save_request()
+        code,events=self.run_worker();self.assertEqual(code,0,events)
+        manifest=json.loads((self.job/'candidate-manifest.json').read_text())
+        self.assertEqual(manifest['shaders/gamma/body.metal']['hash'],worker_module.digest(b'NEW\n'))
+
+    def test_failed_activation_repair_cleans_owned_changes_and_preserves_publication(self):
+        code,events=self.run_worker();self.assertEqual(code,0,events)
+        previous=self.result(events)
+        checkpoint=json.loads((self.job/'checkpoint.json').read_text());checkpoint.pop('attemptID')
+        (self.job/'checkpoint.json').write_text(json.dumps(checkpoint))
+        (self.job/'repair.json').write_text(json.dumps({'shaderID':'alpha','diagnostic':'Activation failure'}))
+        self.codex.write_text('#!'+sys.executable+'\nfrom pathlib import Path\nPath("shaders/alpha/body.metal").write_text("UNPUBLISHED\\n")\nraise SystemExit(1)\n')
+        code,failed=self.run_worker();self.assertNotEqual(code,0)
+        self.assertEqual(self.git(self.root,'status','--porcelain').strip(),'')
+        self.assertEqual(self.git(self.root,'rev-parse','origin/main').strip(),previous['commitSHA'])
+        self.assertFalse((self.root/'.git/holodeck-request-owner.json').exists())
+        self.assertEqual(json.loads((self.job/'worker-result.json').read_text()),previous)
+        self.codex.write_text(CODEX)
+        self.job=self.base/'next-request';self.job.mkdir()
+        self.request['id']=str(uuid.uuid4());self.request['prompt']='named';self.save_request()
+        code,next_events=self.run_worker();self.assertEqual(code,0,next_events)
+
+    def test_activation_repair_lost_push_ack_recovers_without_duplicate_commit(self):
+        self.request['prompt']='new';self.save_request();code,events=self.run_worker();self.assertEqual(code,0,events)
+        previous=self.result(events)
+        (self.job/'repair.json').write_text(json.dumps({'attemptID':str(uuid.uuid4()),'shaderID':'gamma','diagnostic':'Activation failure'}))
+        original_git=self.config['git'];wrapper=self.base/'git-lost-ack'
+        wrapper.write_text('#!'+sys.executable+'\nimport os,signal,subprocess,sys\nresult=subprocess.run(['+repr(original_git)+',*sys.argv[1:]])\nif "push" in sys.argv and result.returncode==0: os.kill(os.getppid(),signal.SIGKILL)\nraise SystemExit(result.returncode)\n');wrapper.chmod(0o755)
+        self.config['git']=str(wrapper);self.config_path.write_text(json.dumps(self.config))
+        code,interrupted=self.run_worker();self.assertNotEqual(code,0)
+        current=self.git(self.root,'rev-parse','origin/main').strip();self.assertNotEqual(current,previous['commitSHA'])
+        count=len(self.invocations())
+        self.config['git']=original_git;self.config_path.write_text(json.dumps(self.config))
+        code,recovered=self.run_worker();self.assertEqual(code,0,recovered)
+        self.assertEqual(self.result(recovered)['commitSHA'],current)
+        self.assertEqual(self.result(recovered)['outputKind'],'new')
+        self.assertEqual(len(self.invocations()),count)
+        self.assertEqual(self.git(self.root,'rev-list','--count','origin/main').strip(),'3')
+        self.assertFalse((self.job/'repair.json').exists())
+
+    def test_failed_pristine_baseline_does_not_invoke_codex_or_restore_patch(self):
+        (self.root/'tools/library.py').write_text('raise SystemExit(1)\n')
+        self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Broken baseline');self.git(self.root,'push','origin','main')
+        (self.job/'untracked.json').write_text(json.dumps({'shaders/gamma/body.metal':base64.b64encode(b'PARKED').decode()}))
+        code,events=self.run_worker();self.assertNotEqual(code,0)
+        self.assertFalse((self.job/'invocations.jsonl').exists())
+        self.assertFalse((self.root/'shaders/gamma/body.metal').exists())
+        self.assertEqual(self.git(self.root,'status','--porcelain').strip(),'')
+
+    def test_host_outage_after_baseline_is_operational_without_another_codex_call(self):
+        outage=self.base/'host-outage'
+        (self.root/'tools/library.py').write_text('from pathlib import Path\nif Path('+repr(str(outage))+').exists(): raise SystemExit(1)\n')
+        self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Outage-aware fixture');self.git(self.root,'push','origin','main')
+        self.codex.write_text(CODEX.replace("if status=='completed':", "Path("+repr(str(outage))+ ").touch()\n    if status=='completed':"))
+        code,events=self.run_worker();self.assertNotEqual(code,0)
+        self.assertEqual((self.job/'implementation-count').read_text(),'1')
+        self.assertEqual(self.git(self.root,'status','--porcelain').strip(),'')
+        self.assertTrue(any('Baseline or host validation failed' in e.get('message','') for e in events))
+
+    def test_candidate_defects_continue_without_attempt_limit(self):
+        self.codex.write_text(CODEX.replace("mode=='repair' and count==1", "mode=='repair' and count<5"))
+        self.request['prompt']='repair';self.save_request()
+        code,events=self.run_worker();self.assertEqual(code,0,events)
+        self.assertEqual((self.job/'implementation-count').read_text(),'5')
+        self.assertEqual(len([e for e in events if e.get('stage')=='repairing']),4)
+
+    def test_new_bad_remote_baseline_fails_raced_request_without_reimplementation(self):
+        upstream=self.base/'upstream';self.git(self.base,'clone','-b','main',self.remote,upstream)
+        self.git(upstream,'config','user.name','Upstream');self.git(upstream,'config','user.email','upstream@example.invalid')
+        advanced=[]
+        def race(event):
+            if event['event']=='preparePublication' and not advanced:
+                (upstream/'tools/library.py').write_text('raise SystemExit(1)\n')
+                self.git(upstream,'add','--all');self.git(upstream,'commit','-m','Broken new baseline');self.git(upstream,'push','origin','main');advanced.append(True)
+        code,events=self.run_worker(race);self.assertNotEqual(code,0)
+        self.assertEqual((self.job/'implementation-count').read_text(),'1')
+        self.assertEqual(self.git(self.root,'status','--porcelain').strip(),'')
+
+    def test_render_host_outage_does_not_repair_shader_indefinitely(self):
+        outage=self.base/'gpu-outage'
+        self.tool.write_text(TOOL.replace("Path(sys.argv[3]).write_bytes", "if Path("+repr(str(outage))+").exists(): raise SystemExit(1)\nPath(sys.argv[3]).write_bytes"))
+        self.codex.write_text(CODEX.replace("if status=='completed':", "Path("+repr(str(outage))+ ").touch()\n    if status=='completed':"))
+        self.request['prompt']='new';self.save_request()
+        code,events=self.run_worker();self.assertNotEqual(code,0)
+        self.assertEqual((self.job/'implementation-count').read_text(),'1')
+        self.assertEqual(self.git(self.root,'status','--porcelain').strip(),'')
+        self.assertTrue(any('Baseline rendering or host GPU failed' in e.get('message','') for e in events))
+
+    def test_lost_ack_adopts_verified_commit_when_workspace_is_newer_main(self):
+        code,events=self.run_worker();self.assertEqual(code,0,events);published=self.result(events)
+        count=len(self.invocations());(self.job/'worker-result.json').unlink()
+        (self.root/'shaders/beta/body.metal').write_text('NEWER MAIN\n')
+        self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Later unrelated shader');self.git(self.root,'push','origin','main')
+        code,recovered=self.run_worker();self.assertEqual(code,0,recovered)
+        self.assertEqual(self.result(recovered)['commitSHA'],published['commitSHA'])
+        self.assertEqual((self.root/'shaders/beta/body.metal').read_text(),'NEWER MAIN\n')
+        self.assertEqual(len(self.invocations()),count)
+
 
 if __name__=='__main__': unittest.main()

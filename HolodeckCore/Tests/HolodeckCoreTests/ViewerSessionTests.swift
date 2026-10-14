@@ -65,7 +65,7 @@ final class ViewerSessionTests: XCTestCase {
 
     func testLazyCacheRefreshWithoutRendererJoinsOnAttachmentAndNeverSignalsEmptyCache() async throws {
         let gate = PreviewRequestGate()
-        let service = CatalogService(source: CatalogSource { _, _ in await gate.image("head") }, storage: TestCatalog.storage)
+        let service = CatalogService(source: CatalogSource(kind: .standard) { _, _ in await gate.image("head") }, storage: TestCatalog.storage)
         let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
         var checkedWithCache = false
         session.onEvent = { event in
@@ -89,7 +89,7 @@ final class ViewerSessionTests: XCTestCase {
 
     func testRecoveryCatalogFailureKeepsBothOperationsAndRetriesDownload() async throws {
         let counter = NetworkCounter()
-        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource { _, _ in
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource(kind: .standard) { _, _ in
             await counter.record(); throw CatalogError.invalidResponse
         }, storage: .disabled)
         let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
@@ -336,7 +336,7 @@ final class ViewerSessionTests: XCTestCase {
 
     func testFirstActivationDoesNotRetryFailedInitialDownload() async {
         let counter = NetworkCounter()
-        let service = CatalogService(source: CatalogSource { _, _ in
+        let service = CatalogService(source: CatalogSource(kind: .standard) { _, _ in
             await counter.record()
             throw CatalogError.invalidResponse
         }, storage: .disabled)
@@ -358,7 +358,7 @@ final class ViewerSessionTests: XCTestCase {
 
     func testCachedStartupActivatesBeforeTheNetworkRefreshCompletes() async {
         let gate = PreviewRequestGate()
-        let service = CatalogService(source: CatalogSource { _, _ in await gate.image("head") }, storage: TestCatalog.storage)
+        let service = CatalogService(source: CatalogSource(kind: .standard) { _, _ in await gate.image("head") }, storage: TestCatalog.storage)
         let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .tv)
         session.attach(FakeRenderer())
         await gate.waitForRequest("head")
@@ -377,7 +377,7 @@ final class ViewerSessionTests: XCTestCase {
         XCTAssertTrue(renderer.isActive)
         session.setActive(false)
         XCTAssertFalse(renderer.isActive)
-        let failing = ViewerSession(catalogService: CatalogService(source: CatalogSource { _, _ in throw CatalogError.invalidResponse }, storage: TestCatalog.storage),
+        let failing = ViewerSession(catalogService: CatalogService(source: CatalogSource(kind: .standard) { _, _ in throw CatalogError.invalidResponse }, storage: TestCatalog.storage),
                                     preferences: .inMemory(), policy: .mac)
         let working = FakeRenderer()
         failing.attach(working)
@@ -539,7 +539,7 @@ extension ViewerSessionTests {
                 let updated = changed()
                 let gate = RecoveryGate()
                 let source = HeldRefreshSource(old: TestCatalog.snapshot, updated: updated, gate: gate, firstFails: firstFails)
-                let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource { request, limit in
+                let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource(kind: .standard) { request, limit in
                     try await source.get(request, limit: limit)
                 }, storage: .disabled)
                 let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
@@ -567,7 +567,7 @@ extension ViewerSessionTests {
     func testShutdownDiscardsQueuedForcedPassWithoutCancelingServiceWork() async throws {
         let gate = RecoveryGate()
         let source = HeldRefreshSource(old: TestCatalog.snapshot, updated: changed(), gate: gate, firstFails: false)
-        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource { request, limit in
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource(kind: .standard) { request, limit in
             try await source.get(request, limit: limit)
         }, storage: .disabled)
         let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
@@ -602,7 +602,7 @@ extension ViewerSessionTests {
             case .tvConnection: XCTAssertEqual(message, LocalCatalogError.disconnected.localizedDescription)
             case .generic: XCTAssertEqual(message, "Couldn’t load scenes. Try again.")
             }
-            let fileService = CatalogService(source: CatalogSource { _, _ in
+            let fileService = CatalogService(source: CatalogSource(kind: .standard) { _, _ in
                 throw LocalCatalogError.invalidFile("index.json", "Broken file")
             }, storage: .disabled)
             let fileSession = ViewerSession(catalogService: fileService, preferences: .inMemory(), policy: policy)
