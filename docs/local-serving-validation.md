@@ -62,6 +62,28 @@ The first new focus-test attempt incorrectly pressed Select after the empty pick
 
 Server admission was explicitly excluded from this fix pass. The shared 16-session pool and timeout policy are unchanged. Unapproved peers that continue sending accepted requests can occupy all slots until the absolute five-minute deadline, preventing an approved TV from reconnecting; completely idle initial reads time out after 30 seconds. This availability finding remains unresolved. No protocol, credential, revision-format, or storage migration changes are included.
 
+## Catalog error classification and request bounds — 2026-10-13
+
+An unpublished directory catalog now reports `CatalogError.invalidResponse` for a head request. Viewer error wording remains platform-specific. Client payload-size validation runs after a complete exchange, so exceeding an individual request's limit fails that request without canceling its connection or changing the connected state or generation. Exchange, framing, protocol, and authorization failures retain the existing teardown and connection identity check; an oversized frame rejected before its payload is consumed still disconnects.
+
+Three new regressions cover the unpublished head, a complete head response exceeding its request limit followed by a successful request on the same connection, and an injected oversized exchange failure that cancels the connection and publishes disconnection. Before the implementation changes, the first two tests failed as expected and the exchange teardown test passed.
+
+- Focused directory, client recovery, protocol, and viewer-session suites: 71 tests executed, two opt-in checks skipped, zero failures.
+- Complete Mac shared core: 142 tests executed, five opt-in checks skipped, zero failures. The skipped checks require real LAN access, a supplied authoring library, or release profiling.
+- Debug tvOS 27 simulator app build: succeeded with `HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests`; the built app identifier is `me.haroldmartin.Holodeck.RecoveryTests`.
+
+```sh
+swift test --package-path HolodeckCore \
+  --filter 'DirectoryCatalogTests|LocalClientRecoveryTests|CatalogNetworkTests|ViewerSessionTests'
+swift test --package-path HolodeckCore
+xcodebuild -project Holodeck.xcodeproj -scheme Holodeck \
+  -destination 'platform=tvOS Simulator,id=73CAAA2D-7B80-420F-B33F-EF4B8F036AAE' \
+  -derivedDataPath DerivedData/TVLocalServing -disableAutomaticPackageResolution \
+  HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests build
+```
+
+Server admission and deadlines remain unchanged; the availability limitation above remains deferred. This pass ran no app UI tests, physical-device installations, or opt-in LAN/authoring/profiling checks. No protocol, credential, or storage migration changes are included.
+
 ## Original physical LAN check
 
 An Apple TV 4K running tvOS 26.6 discovered the Mac's advertised service, resolved it locally, completed TLS pairing, showed the same six-digit code as the Mac settings view, and downloaded the real 23-scene authoring library after clicking **Approve**. The default scene played successfully. Relaunch restored cached playback and reauthenticated to the remembered Mac without another approval.

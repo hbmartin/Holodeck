@@ -441,7 +441,6 @@ public actor LocalCatalogClient {
             var message = LocalMessage(operation: "asset"); message.request = request; message.limit = limit
             response = try await channel.exchange(LocalPacket(message: message))
             if response.message.error != "invalidAsset" { try check(response) }
-            guard response.payload.count <= limit else { throw CatalogError.oversizedResponse }
         } catch {
             let failure = connectionError(error)
             if connection === channel {
@@ -450,6 +449,8 @@ public actor LocalCatalogClient {
             }
             throw failure
         }
+        // The complete frame has been consumed; request validation does not invalidate the channel.
+        guard response.payload.count <= limit else { throw CatalogError.oversizedResponse }
         if response.message.error == "invalidAsset" { throw CatalogError.invalidResponse }
         return response.payload
     }

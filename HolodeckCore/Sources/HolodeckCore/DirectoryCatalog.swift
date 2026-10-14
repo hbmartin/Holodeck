@@ -199,7 +199,7 @@ public actor DirectoryCatalog {
         let data: Data
         switch request {
         case .head:
-            guard let currentRevision else { throw LocalCatalogError.disconnected }
+            guard let currentRevision else { throw CatalogError.invalidResponse }
             if let connection { leases[connection] = currentRevision }
             data = try JSONEncoder().encode(CatalogHead(revision: currentRevision))
         case .asset(let revision, let path):

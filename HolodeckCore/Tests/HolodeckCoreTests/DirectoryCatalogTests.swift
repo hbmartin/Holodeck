@@ -165,6 +165,14 @@ final class DirectoryCatalogTests: XCTestCase {
         return (root, DirectoryCatalog(directory: base.appendingPathComponent("head")))
     }
 
+    func testUnpublishedHeadIsAnInvalidResponse() async throws {
+        let (_, store) = try fixture()
+        do {
+            _ = try await store.source.get(.head, 65_536)
+            XCTFail("An unpublished catalog returned a head")
+        } catch CatalogError.invalidResponse {}
+    }
+
     func testAssemblyRevisionAndProvidedPreviewAreStableWithoutGit() async throws {
         let (root, store) = try fixture()
         let first = try await store.reload(from: root)
