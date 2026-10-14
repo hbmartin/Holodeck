@@ -579,83 +579,92 @@ final class HolodeckMacUITests: XCTestCase {
 
     func testNamedWindowFramePersistsAndCleanupCannotRecreateIt() throws {
         let suite = "HolodeckMacUITests-" + UUID().uuidString
-        let name = "HolodeckViewer-" + suite
-        let live = savedFrame("HolodeckViewer-live", allowMissing: true)
+        let key = "NSWindow Frame HolodeckViewer-" + suite
+        let liveKey = "NSWindow Frame HolodeckViewer-live"
+        let live = try inspectPreferences(allowMissing: true)[liveKey]
         let app = try app(suite: suite)
         try launch(app)
         waitForTitle("Plasma", in: app)
         resizeWindow(in: app)
         let resized = app.windows["holodeck-viewer-window"].frame.size
-        // Termination flushes AppKit's autosaved preferences before reading their disk copy.
         app.terminate()
-        let saved = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in savedFrame(name, allowMissing: true) != nil }, object: nil)
-        XCTAssertEqual(XCTWaiter.wait(for: [saved], timeout: 10), .completed)
-        let frame = try XCTUnwrap(savedFrame(name))
+        let frame = try XCTUnwrap(inspectPreferences()[key])
         try launch(app)
         XCTAssertEqual(app.windows["holodeck-viewer-window"].frame.width, resized.width, accuracy: 1)
         XCTAssertEqual(app.windows["holodeck-viewer-window"].frame.height, resized.height, accuracy: 1)
-        XCTAssertEqual(savedFrame(name), frame)
         app.terminate()
+        XCTAssertEqual(try inspectPreferences()[key], frame)
         let cleanup = try XCTUnwrap(cleanups[ObjectIdentifier(app)])
         try cleanup.run()
-        let removed = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in savedFrame(name, allowMissing: true) == nil }, object: nil)
-        XCTAssertEqual(XCTWaiter.wait(for: [removed], timeout: 10), .completed)
-        XCTAssertNil(savedFrame(name, allowMissing: true), "Cleanup must not save another frame while terminating")
-        XCTAssertEqual(savedFrame("HolodeckViewer-live", allowMissing: true), live)
+        let after = try inspectPreferences(allowMissing: true)
+        XCTAssertNil(after[key], "Cleanup and inspection must not save another viewer frame")
+        XCTAssertEqual(after[liveKey], live)
     }
 
     func testImplicitFixtureDoesNotSaveWindowFrame() throws {
         let controlSuite = "HolodeckMacUITests-" + UUID().uuidString
-        let controlName = "HolodeckViewer-" + controlSuite
+        let controlKey = "NSWindow Frame HolodeckViewer-" + controlSuite
+        let liveKey = "NSWindow Frame HolodeckViewer-live"
         let control = try app(suite: controlSuite)
         try launch(control)
         waitForTitle("Plasma", in: control)
         resizeWindow(in: control)
         control.terminate()
-        let saved = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in savedFrame(controlName, allowMissing: true) != nil }, object: nil)
-        XCTAssertEqual(XCTWaiter.wait(for: [saved], timeout: 10), .completed)
-        XCTAssertNotNil(savedFrame(controlName), "The reader must observe a frame written by this test build")
-        let before = savedViewerFrameNames()
-        let live = savedFrame("HolodeckViewer-live")
-        let app = try app(suite: nil) // The fixture environment alone selects implicit in-memory storage.
+        let before = try inspectPreferences()
+        XCTAssertNotNil(before[controlKey], "The probe must observe a frame written by this test build")
+        let app = try app(suite: nil)
         try launch(app)
         waitForTitle("Plasma", in: app)
         resizeWindow(in: app)
         app.terminate()
-        // Earlier cleanup writes may still be flushing; only new frames indicate a leak.
-        XCTAssertTrue(savedViewerFrameNames().subtracting(before).isEmpty)
-        XCTAssertEqual(savedFrame("HolodeckViewer-live"), live)
-        XCTAssertNotNil(savedFrame(controlName))
+        let after = try inspectPreferences()
+        XCTAssertTrue(Set(after.keys).subtracting(before.keys).isEmpty)
+        XCTAssertEqual(after[liveKey], before[liveKey])
+        XCTAssertEqual(after[controlKey], before[controlKey])
     }
 
-    func testPreferencesReaderRejectsMissingAndMalformedFiles() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        XCTAssertThrowsError(try AppPreferencesReader.read(at: directory, allowMissing: true))
-        let url = directory.appendingPathComponent("preferences.plist")
-        XCTAssertThrowsError(try AppPreferencesReader.read(at: url))
-        XCTAssertTrue(try AppPreferencesReader.read(at: url, allowMissing: true).isEmpty)
-        try Data("invalid plist".utf8).write(to: url)
-        XCTAssertThrowsError(try AppPreferencesReader.read(at: url, allowMissing: true))
-        try PropertyListSerialization.data(fromPropertyList: ["unexpected root"], format: .binary, options: 0).write(to: url)
-        XCTAssertThrowsError(try AppPreferencesReader.read(at: url))
+    func testPreferencesInspectionDoesNotCreateViewerFramesOrStartLibrary() throws {
+        let before = try inspectPreferences(allowMissing: true)
+        let after = try inspectPreferences(allowMissing: true)
+        XCTAssertEqual(after, before)
     }
 
-    private func savedFrame(_ name: String, allowMissing: Bool = false) -> String? {
-        savedAppDefaults(allowMissing: allowMissing)["NSWindow Frame " + name] as? String
-    }
-
-    private func savedViewerFrameNames() -> Set<String> {
-        Set(savedAppDefaults().keys.filter { $0.hasPrefix("NSWindow Frame HolodeckViewer-") })
-    }
-
-    private func savedAppDefaults(allowMissing: Bool = false) -> [String: Any] {
-        do { return try AppPreferencesReader.read(at: AppPreferencesReader.appURL(bundleIdentifier: MacUITestSettings.bundleIdentifier), allowMissing: allowMissing) }
-        catch {
-            XCTFail("Unable to read viewer preferences: \(error)")
-            return [:]
+    func testPreferencesReaderRejectsMalformedOrMismatchedSnapshots() throws {
+        func payload(_ overrides: [String: Any] = [:]) throws -> String {
+            var raw: [String: Any] = ["schemaVersion": 1, "bundleIdentifier": MacUITestSettings.bundleIdentifier,
+                "domainExists": true, "frames": ["NSWindow Frame HolodeckViewer-test": "saved frame"]]
+            for (key, value) in overrides { raw[key] = value }
+            return String(decoding: try JSONSerialization.data(withJSONObject: raw), as: UTF8.self)
         }
+        func read(_ text: String, allowMissing: Bool = false) throws -> [String: String] {
+            try AppPreferencesReader.read(text, bundleIdentifier: MacUITestSettings.bundleIdentifier, allowMissing: allowMissing)
+        }
+        XCTAssertEqual(try read(payload())["NSWindow Frame HolodeckViewer-test"], "saved frame")
+        for text in ["invalid JSON", "[]", "{}", try payload(["frames": ["NSWindow Frame HolodeckViewer-test": 2]]),
+                     try payload(["frames": ["unexpected": "value"]]), try payload(["domainExists": false])] {
+            XCTAssertThrowsError(try read(text, allowMissing: true))
+        }
+        XCTAssertThrowsError(try read(payload(["schemaVersion": 2])))
+        XCTAssertThrowsError(try read(payload(["bundleIdentifier": "another.app"])))
+        let missing = try payload(["domainExists": false, "frames": [String: String]()])
+        XCTAssertThrowsError(try read(missing))
+        XCTAssertTrue(try read(missing, allowMissing: true).isEmpty)
+    }
+
+    private func inspectPreferences(allowMissing: Bool = false) throws -> [String: String] {
+        let probe = XCUIApplication()
+        guard probe.state == .notRunning else { throw TestHelperError(description: "Terminate the viewer before inspecting saved preferences") }
+        probe.launchEnvironment.removeAll()
+        probe.launchArguments = MacUITestSettings.ignoreSavedStateArguments + ["--ui-test-inspect-preferences"]
+        probe.launch()
+        defer { probe.terminate() }
+        let snapshot = element("ui-test-preferences-snapshot", in: probe)
+        guard snapshot.waitForExistence(timeout: 15), let payload = snapshot.value as? String else {
+            throw TestHelperError(description: "Preferences snapshot unavailable: " + probe.debugDescription)
+        }
+        XCTAssertFalse(element("holodeck-viewer-window", in: probe).exists)
+        XCTAssertFalse(element("shader-serving-status", in: probe).exists)
+        return try AppPreferencesReader.read(payload, bundleIdentifier: MacUITestSettings.bundleIdentifier, allowMissing: allowMissing)
     }
 
     private func resizeWindow(in app: XCUIApplication) {

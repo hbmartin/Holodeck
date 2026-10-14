@@ -1,30 +1,25 @@
 import Foundation
-import Darwin
 
 nonisolated enum AppPreferencesReader {
     enum ReadError: Error {
-        case homeDirectoryUnavailable
-        case missingFile(URL)
-        case invalidDictionary(URL)
+        case invalidSnapshot, incompatibleSchema, wrongApplication, missingDomain
+    }
+    private struct Snapshot: Decodable {
+        let schemaVersion: Int
+        let bundleIdentifier: String
+        let domainExists: Bool
+        let frames: [String: String]
     }
 
-    static func appURL(bundleIdentifier: String = "me.haroldmartin.HolodeckMac") throws -> URL {
-        // The app and UI runner use separate preferences domains. Xcode also redirects
-        // the runner's home, so resolve the sandboxed app's path from the real user home.
-        guard let directory = getpwuid(getuid())?.pointee.pw_dir else { throw ReadError.homeDirectoryUnavailable }
-        return URL(fileURLWithPath: String(cString: directory), isDirectory: true)
-            .appendingPathComponent("Library/Containers/\(bundleIdentifier)/Data/Library/Preferences/\(bundleIdentifier).plist")
-    }
-
-    static func read(at url: URL, allowMissing: Bool = false) throws -> [String: Any] {
-        let data: Data
-        do { data = try Data(contentsOf: url) }
-        catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            if allowMissing { return [:] }
-            throw ReadError.missingFile(url)
-        }
-        guard let values = try PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any]
-        else { throw ReadError.invalidDictionary(url) }
-        return values
+    static func read(_ payload: String, bundleIdentifier: String, allowMissing: Bool = false) throws -> [String: String] {
+        let snapshot: Snapshot
+        do { snapshot = try JSONDecoder().decode(Snapshot.self, from: Data(payload.utf8)) }
+        catch { throw ReadError.invalidSnapshot }
+        guard snapshot.schemaVersion == 1 else { throw ReadError.incompatibleSchema }
+        guard snapshot.bundleIdentifier == bundleIdentifier else { throw ReadError.wrongApplication }
+        guard snapshot.frames.keys.allSatisfy({ $0.hasPrefix("NSWindow Frame HolodeckViewer-") }),
+              snapshot.domainExists || snapshot.frames.isEmpty else { throw ReadError.invalidSnapshot }
+        guard snapshot.domainExists || allowMissing else { throw ReadError.missingDomain }
+        return snapshot.frames
     }
 }

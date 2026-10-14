@@ -4,30 +4,50 @@ import SwiftUI
 @main
 struct HolodeckMacApp: App {
     @NSApplicationDelegateAdaptor(MacAppDelegate.self) private var delegate
-    @State private var model = MacModel()
+    @State private var model: MacModel?
+
+    init() {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--ui-test-inspect-preferences") {
+            _model = State(initialValue: nil)
+            return
+        }
+        #endif
+        _model = State(initialValue: MacModel())
+    }
     var body: some Scene {
         Window("Holodeck", id: "viewer") {
-            ViewerView(model: model)
-                .frame(minWidth: 740, minHeight: 480)
+            if let model {
+                ViewerView(model: model)
+                    .frame(minWidth: 740, minHeight: 480)
+            } else {
+                #if DEBUG
+                PreferencesInspectionView()
+                #endif
+            }
         }
         .defaultSize(width: 1100, height: 720)
         .commands {
             CommandGroup(replacing: .newItem) { }
             CommandGroup(after: .sidebar) {
-                Button(model.sidebarVisible ? "Hide Sidebar" : "Show Sidebar") { model.sidebarVisible.toggle() }
-                    .keyboardShortcut("s", modifiers: [.command, .control])
-                Button("Search Scenes") { model.focusSearch() }
-                    .keyboardShortcut("f", modifiers: .command)
+                if let model {
+                    Button(model.sidebarVisible ? "Hide Sidebar" : "Show Sidebar") { model.sidebarVisible.toggle() }
+                        .keyboardShortcut("s", modifiers: [.command, .control])
+                    Button("Search Scenes") { model.focusSearch() }
+                        .keyboardShortcut("f", modifiers: .command)
+                }
             }
             CommandGroup(after: .appInfo) {
-                Button(model.library == nil ? "Check for Scene Updates" : "Reload Shaders") {
-                    if let library = model.library { library.reload() } else { model.session.refresh(force: true) }
+                if let model {
+                    Button(model.library == nil ? "Check for Scene Updates" : "Reload Shaders") {
+                        if let library = model.library { library.reload() } else { model.session.refresh(force: true) }
+                    }
+                        .disabled(model.session.isRefreshing)
                 }
-                    .disabled(model.session.isRefreshing)
             }
         }
         Settings {
-            if let library = model.library { ShaderLibrarySettings(library: library) }
+            if let library = model?.library { ShaderLibrarySettings(library: library) }
         }
     }
 }

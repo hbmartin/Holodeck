@@ -143,6 +143,34 @@ final class LocalClientRecoveryTests: XCTestCase {
         XCTAssertEqual(channel.cancellations.value, 0)
     }
 
+    func testResponseExceedingRequestLimitPreservesConnection() async throws {
+        let (client, channel, _) = try fixture(clock: TestClock())
+        await client.start(); try await discover([mac], client: client); try await connected(client)
+        let before = await client.currentState
+        do { _ = try await client.source.get(.head, 1); XCTFail("Request limit ignored") }
+        catch CatalogError.oversizedResponse {}
+        let after = await client.currentState
+        XCTAssertEqual(after.status, before.status); XCTAssertEqual(after.generation, before.generation)
+        XCTAssertEqual(channel.cancellations.value, 0)
+        let head = try await client.source.get(.head, 65_536)
+        XCTAssertFalse(head.isEmpty)
+        let recovered = await client.currentState
+        XCTAssertEqual(recovered.status, before.status); XCTAssertEqual(recovered.generation, before.generation)
+        XCTAssertEqual(channel.cancellations.value, 0)
+    }
+
+    func testOversizedExchangeFailureDisconnects() async throws {
+        let (client, channel, _) = try fixture(clock: TestClock())
+        await client.start(); try await discover([mac], client: client); try await connected(client)
+        let before = await client.currentState.generation
+        await channel.setOversizedFrameFailure(true)
+        do { _ = try await client.source.get(.head, 65_536); XCTFail("Oversized frame accepted") }
+        catch CatalogError.oversizedResponse {}
+        let after = await client.currentState
+        XCTAssertEqual(after.status, .disconnected); XCTAssertEqual(after.generation, before)
+        XCTAssertEqual(channel.cancellations.value, 1)
+    }
+
     func testSetupWaiterCancellationDoesNotCancelSharedConnection() async throws {
         for _ in 0..<20 {
             let gate = RecoveryGate()
@@ -288,12 +316,14 @@ private actor RecoveryChannel: LocalRequestConnection {
     private var revoked = false
     private var startFailure = false
     private var assetTransportFailure = false
+    private var oversizedFrameFailure = false
     private(set) var operations: [String] = []
     init(startGate: RecoveryGate? = nil) { self.startGate = startGate }
     func setPending(_ value: Bool) { pending = value }
     func setRevoked(_ value: Bool) { revoked = value }
     func setStartFailure(_ value: Bool) { startFailure = value }
     func setAssetTransportFailure(_ value: Bool) { assetTransportFailure = value }
+    func setOversizedFrameFailure(_ value: Bool) { oversizedFrameFailure = value }
     func start() async throws {
         if startFailure { throw LocalCatalogError.disconnected }
         try await startGate?.wait()
@@ -310,6 +340,7 @@ private actor RecoveryChannel: LocalRequestConnection {
             if pending { message.operation = "pending" } else { message.token = "new-token" }
         case "asset":
             if assetTransportFailure { throw LocalCatalogError.disconnected }
+            if oversizedFrameFailure { throw CatalogError.oversizedResponse }
             if packet.message.request?.isHead == true {
                 return LocalPacket(message: message, payload: Data("{\"revision\":\"\(String(repeating: "c", count: 64))\"}".utf8))
             }

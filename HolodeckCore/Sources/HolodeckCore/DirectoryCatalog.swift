@@ -1,16 +1,40 @@
 #if os(macOS)
 import Foundation
 import ImageIO
+import Darwin
+
+nonisolated struct DirectoryCatalogFileOperations: Sendable {
+    var swap: @Sendable (URL, URL) throws -> Void = { stage, destination in
+        let failure = stage.withUnsafeFileSystemRepresentation { source -> Int32 in
+            guard let source else { return EINVAL }
+            return destination.withUnsafeFileSystemRepresentation { target in
+                guard let target else { return EINVAL }
+                return renamex_np(source, target, UInt32(RENAME_SWAP)) == 0 ? 0 : errno
+            }
+        }
+        guard failure == 0 else { throw POSIXError(POSIXErrorCode(rawValue: failure) ?? .EIO) }
+    }
+    var writeMarker: @Sendable (Data, URL) throws -> Void = { data, url in
+        try data.write(to: url, options: .atomic)
+    }
+}
 
 /// App-owned immutable publications. Requests never read the authoring directory.
 public actor DirectoryCatalog {
     private let directory: URL
+    private let files: DirectoryCatalogFileOperations
     private var currentRevision: String?
     private var allowed: [String: Set<String>] = [:]
     private var leases: [UUID: String] = [:]
 
     public init(directory: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("Holodeck/LocalCatalog", isDirectory: true)) { self.directory = directory }
+        .appendingPathComponent("Holodeck/LocalCatalog", isDirectory: true)) {
+        self.directory = directory; files = DirectoryCatalogFileOperations()
+    }
+
+    init(directory: URL, files: DirectoryCatalogFileOperations) {
+        self.directory = directory; self.files = files
+    }
 
     public nonisolated var source: CatalogSource {
         CatalogSource { [self] request, limit in try await get(request, limit: limit) }
@@ -27,11 +51,7 @@ public actor DirectoryCatalog {
         guard CatalogHash.isSHA(head.revision) else { throw CatalogError.invalidManifest }
         let publication = directory.appendingPathComponent(head.revision)
         func read(_ path: String, limit: Int) throws -> Data {
-            let url = publication.appendingPathComponent(path)
-            guard (try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= limit else { throw CatalogError.oversizedResponse }
-            let data = try Data(contentsOf: url)
-            guard data.count <= limit else { throw CatalogError.oversizedResponse }
-            return data
+            try readPublicationFile(publication.appendingPathComponent(path), limit: limit)
         }
         let manifest = try JSONDecoder().decode(CatalogManifest.self, from: read("catalog.json", limit: 2_097_152))
         var builder = try CatalogBuilder(manifest: manifest), paths: Set<String> = ["catalog.json"]
@@ -139,10 +159,17 @@ public actor DirectoryCatalog {
         let revision = CatalogHash.sha256(try JSONSerialization.data(withJSONObject: canonical, options: [.sortedKeys]))
         manifest.sourceRevision = revision
         let catalog = try CatalogSnapshot(manifest: manifest, sources: sources, publicationRevision: revision).validated()
-        try encoder.encode(catalog.snapshot.manifest).write(to: stage.appendingPathComponent("catalog.json"), options: .atomic)
+        let publishedManifest = try encoder.encode(catalog.snapshot.manifest)
+        try publishedManifest.write(to: stage.appendingPathComponent("catalog.json"), options: .atomic)
         let destination = directory.appendingPathComponent(revision)
-        if !fm.fileExists(atPath: destination.path) { try fm.moveItem(at: stage, to: destination) }
-        try JSONEncoder().encode(CatalogHead(revision: revision)).write(to: directory.appendingPathComponent("current.json"), options: .atomic)
+        if fm.fileExists(atPath: destination.path) {
+            if (try? publicationMatches(catalog, manifest: publishedManifest, at: destination)) != true {
+                // Both paths are siblings. A failed swap leaves the existing publication intact;
+                // a successful swap leaves its damaged contents at stage for deferred cleanup.
+                try files.swap(stage, destination)
+            }
+        } else { try fm.moveItem(at: stage, to: destination) }
+        try files.writeMarker(JSONEncoder().encode(CatalogHead(revision: revision)), directory.appendingPathComponent("current.json"))
         let previous = currentRevision
         allowed[revision] = paths; currentRevision = revision
         // Retain the previous publication as well as all connection-pinned publications.
@@ -150,11 +177,29 @@ public actor DirectoryCatalog {
         return catalog
     }
 
+    private func readPublicationFile(_ url: URL, limit: Int) throws -> Data {
+        guard (try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= limit else { throw CatalogError.oversizedResponse }
+        let data = try Data(contentsOf: url)
+        guard data.count <= limit else { throw CatalogError.oversizedResponse }
+        return data
+    }
+
+    private func publicationMatches(_ catalog: ValidatedCatalog, manifest: Data, at publication: URL) throws -> Bool {
+        guard try readPublicationFile(publication.appendingPathComponent("catalog.json"), limit: 2_097_152) == manifest else { return false }
+        for entry in catalog.snapshot.manifest.shaders {
+            let source = try readPublicationFile(publication.appendingPathComponent(entry.sourcePath), limit: 1_048_576)
+            let preview = try readPublicationFile(publication.appendingPathComponent(entry.previewPath), limit: 8_388_608)
+            guard CatalogHash.sha256(source) == entry.sourceSHA256,
+                  CatalogHash.sha256(preview) == entry.previewSHA256 else { return false }
+        }
+        return true
+    }
+
     public func get(_ request: CatalogRequest, limit: Int, pinFor connection: UUID? = nil) throws -> Data {
         let data: Data
         switch request {
         case .head:
-            guard let currentRevision else { throw LocalCatalogError.disconnected }
+            guard let currentRevision else { throw CatalogError.invalidResponse }
             if let connection { leases[connection] = currentRevision }
             data = try JSONEncoder().encode(CatalogHead(revision: currentRevision))
         case .asset(let revision, let path):
