@@ -54,9 +54,6 @@ final class HolodeckMacUITests: XCTestCase {
         try Data(source.utf8).write(to: shader.appendingPathComponent("body.metal"))
         for name in ["common", "fragment"] { try Data().write(to: root.appendingPathComponent("shared/\(name).metal")) }
         try JSONSerialization.data(withJSONObject: ["shaders": ["plasma"], "defaultShaderID": "plasma"]).write(to: root.appendingPathComponent("index.json"))
-        let previewURL = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "preview-" + (metadata["previewSHA256"] as! String), withExtension: "png", subdirectory: "TestSupport"))
-        let preview = try Data(contentsOf: previewURL)
-        try preview.write(to: shader.appendingPathComponent("preview.png"))
 
         let app = try app(arguments: ["--ui-test-local-library"])
         app.launch()
@@ -75,17 +72,36 @@ final class HolodeckMacUITests: XCTestCase {
         let reload = element("reload-shaders", in: app)
         XCTAssertTrue(reload.waitForExistence(timeout: 10)); reload.click()
         waitForTitle("Edited Plasma", in: app)
-        try Data("invalid preview".utf8).write(to: shader.appendingPathComponent("preview.png"))
+        try Data("invalid JSON".utf8).write(to: metadataURL)
         reload.click()
         let failure = app.windows["com_apple_SwiftUI_Settings_window"].descendants(matching: .any).matching(identifier: "shader-library-error").firstMatch
         let namedFile = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value CONTAINS %@ OR label CONTAINS %@",
-            "shaders/plasma/preview.png", "shaders/plasma/preview.png"), object: failure)
+            "shaders/plasma/metadata.json", "shaders/plasma/metadata.json"), object: failure)
         XCTAssertEqual(XCTWaiter.wait(for: [namedFile], timeout: 10), .completed)
         waitForTitle("Edited Plasma", in: app)
-        try preview.write(to: shader.appendingPathComponent("preview.png"))
+        try JSONSerialization.data(withJSONObject: metadata).write(to: metadataURL)
         app.terminate(); app.launch()
         waitForTitle("Edited Plasma", in: app)
         XCTAssertFalse(element("choose-shader-folder", in: app).exists)
+
+        // A failed preview for an unselected scene must not block local publication or playback.
+        let broken = root.appendingPathComponent("shaders/broken")
+        try FileManager.default.createDirectory(at: broken, withIntermediateDirectories: true)
+        var brokenMetadata = metadata
+        brokenMetadata["id"] = "broken"; brokenMetadata["name"] = "Broken preview"
+        try JSONSerialization.data(withJSONObject: brokenMetadata).write(to: broken.appendingPathComponent("metadata.json"))
+        try Data("invalid Metal".utf8).write(to: broken.appendingPathComponent("body.metal"))
+        try JSONSerialization.data(withJSONObject: ["shaders": ["plasma", "broken"], "defaultShaderID": "plasma"])
+            .write(to: root.appendingPathComponent("index.json"))
+        element("shader-library-settings", in: app).click()
+        element("reload-shaders", in: app).click()
+        let warning = element("shader-preview-warning-broken", in: app)
+        XCTAssertTrue(warning.waitForExistence(timeout: 20))
+        waitForTitle("Edited Plasma", in: app)
+        try Data(source.utf8).write(to: broken.appendingPathComponent("body.metal"))
+        element("reload-shaders", in: app).click()
+        let recovered = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: warning)
+        XCTAssertEqual(XCTWaiter.wait(for: [recovered], timeout: 20), .completed)
     }
     private func authoringFolderWithInvalidShader() throws -> URL {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("HolodeckBrokenShader-" + UUID().uuidString)

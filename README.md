@@ -36,9 +36,9 @@ Both viewers support ordered curated collections and mood/motion filters. TV ret
 
 Start with the [user quickstart](docs/quickstart.md). The [workflow guide](docs/shader-catalog-workflow.md) covers authoring; the [technical reference](docs/local-shader-serving.md) details transport, storage, and playback behavior.
 
-Choose a local [HolodeckShaders](https://github.com/hbmartin/HolodeckShaders) authoring folder in **HolodeckMac → Settings → Shader Library**. It must contain `index.json`, `shared/`, and `shaders/`, including each indexed shader's metadata, body, and supplied `preview.png`. Folder access is saved with a read-only security-scoped bookmark. The Mac assembles sources natively and hashes the supplied previews; serving requires no Git commits, Python, repository scripts, or Xcode installation.
+Choose a local [HolodeckShaders](https://github.com/hbmartin/HolodeckShaders) authoring folder in **HolodeckMac → Settings → Shader Library**. It must contain `index.json`, `shared/`, and `shaders/`, including each indexed shader's metadata and body. Folder access is saved with a read-only security-scoped bookmark. The Mac assembles sources natively and generates cached previews; serving requires no Git commits, Python, repository scripts, or Xcode installation.
 
-The Mac loads this folder at startup and when you press **Reload Shaders**. Directory edits remain unpublished until reload. A complete candidate is validated before replacing the current immutable, app-owned publication. Revisions are canonical SHA-256 content digests; update dates use authoring-file modification times. Collections, discovery labels, and source comments are preserved. Sharing continues with the viewer window closed, stops during sleep or quit, and resumes after wake.
+The Mac loads this folder at startup and when you press **Reload Shaders**. Directory edits remain unpublished until reload. A complete candidate is validated before replacing the current immutable, app-owned publication. Revisions are canonical SHA-256 content digests; update dates use authoring-file modification times. Collections, discovery labels, and source comments are preserved. Previews render at 1280×720 and three seconds; failed renders use metadata-color gradients with per-shader diagnostics in Settings, and reload retries them. Sharing continues with the viewer window closed, stops during sleep or quit, and resumes after wake.
 
 The TV browses `_holodeck._tcp` in Bonjour's `local.` domain. One Mac connects automatically; several Macs show a chooser. A remembered Mac is retained when unavailable. If alternatives remain available for five seconds while no connection or pairing is viable, the TV opens the chooser once for that absence. **Change Mac** also allows an explicit switch; discovery churn does not close a working connection. On first connection, compare the six-digit code on TV with **Settings → Shader Library** on Mac and click **Approve**. The code comes from that TLS connection. A persistent Mac public-key pin and random per-TV Keychain credential authenticate later connections. **Revoke** stops further downloads; cached playback remains usable. The TV removes the revoked token from its saved pairing while retaining the Mac selection and public-key pin.
 
@@ -62,7 +62,7 @@ Preferences store `holodeck.lastShaderID` in UserDefaults only after a current s
 
 ## Validation
 
-Run portable tests from the package on Mac, and the same **HolodeckCore** scheme on a TV simulator. They cover catalog validation, cache behavior, forced/throttled/coalesced refreshes, rendering and animation, source-aware pipelines, differing startup/update policies, cancellation, failure recovery, favorites/search, and adaptive resolution. Test-only catalog resources are excluded from both shipping apps. Local authoring verification is opt-in and never downloads a public catalog.
+Run portable shared-core tests from the package on Mac and the TV app unit tests on a TV simulator. They cover catalog validation, cache behavior, forced/throttled/coalesced refreshes, rendering and animation, source-aware pipelines, differing startup/update policies, cancellation, failure recovery, favorites/search, and adaptive resolution. Test-only catalog resources are excluded from both shipping apps. Local authoring verification is opt-in and never downloads a public catalog.
 
 See [local serving validation](docs/local-serving-validation.md) for current checks. [Catalog runtime validation](docs/catalog-runtime-validation.md) records historical download/preview measurements. Run the opt-in comparisons with `HOLODECK_PROFILE=1 swift test --package-path HolodeckCore -c release --filter CatalogPerformanceTests`.
 
@@ -76,10 +76,9 @@ xcodebuild -project Holodeck.xcodeproj -scheme HolodeckMac \
   -destination 'platform=macOS,arch=arm64' -parallel-testing-enabled NO \
   HOLODECK_TEST_BUNDLE_SUFFIX=.RecoveryTests test
 
-# From HolodeckCore/:
-xcodebuild -scheme HolodeckCore \
+xcodebuild -project Holodeck.xcodeproj -scheme Holodeck \
   -destination 'platform=tvOS Simulator,name=Apple TV 4K (3rd generation)' \
-  -parallel-testing-enabled NO test
+  -parallel-testing-enabled NO -only-testing:HolodeckTests test
 ```
 
 ```sh
@@ -92,3 +91,20 @@ xcodebuild -project Holodeck.xcodeproj -scheme Holodeck \
 The test bundle suffix isolates app installations and containers from the normal development apps. It changes only app and test target identifiers; dependencies retain their own identifiers. Production builds omit it.
 
 Deployment targets are tvOS 26.0 and macOS 15.0; the Mac app builds only for arm64. This is a local-development target, without a notarization or App Store distribution workflow. Verify on the minimum OS versions and physical devices before release; a deployment target alone does not confirm runtime compatibility.
+
+## Shader tooling
+
+The shared package also provides a macOS CLI for sample renders and GPU regression probes:
+
+```sh
+swift build --package-path HolodeckCore -c release --product holodeck-shader-tool
+mkdir -p "$HOME/.local/bin"
+install HolodeckCore/.build/release/holodeck-shader-tool "$HOME/.local/bin/holodeck-shader-tool"
+holodeck-shader-tool --version
+holodeck-shader-tool render scene.metal preview.png --time 3
+holodeck-shader-tool probe render scene.metal times.json frames.json
+```
+
+The CLI shares offscreen rendering, pipeline construction, PNG encoding, and the 16-byte uniform contract with the native loader. `probe compute` accepts two-number sample rows and returns unsigned 32-bit results from `regressionProbe`; `probe render` returns raw float frames, nonfinite counts, and GPU timings. Invalid arguments and GPU failures return nonzero with diagnostics. Gradient fallback is limited to native catalog publication.
+
+HolodeckShaders resolves an installed major-version-1 CLI through `HOLODECK_SHADER_TOOL` or `PATH`; it does not build a sibling checkout. The CLI is separate from the shipping Mac/TV app targets. GitHub shader publication is retired, with the existing legacy `published` branch frozen.

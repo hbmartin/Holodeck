@@ -4,7 +4,8 @@ import PackageDescription
 let package = Package(
     name: "HolodeckCore",
     platforms: [.macOS(.v15), .tvOS(.v26)],
-    products: [.library(name: "HolodeckCore", targets: ["HolodeckCore"])],
+    products: [.library(name: "HolodeckCore", targets: ["HolodeckCore"]),
+               .executable(name: "holodeck-shader-tool", targets: ["HolodeckShaderTool"])],
     dependencies: [
         .package(url: "https://github.com/pointfreeco/swift-dependencies", from: "1.17.1"),
         .package(url: "https://github.com/pointfreeco/swift-clocks", from: "1.1.1"),
@@ -18,6 +19,7 @@ let package = Package(
             .product(name: "IssueReporting", package: "swift-issue-reporting"),
             .product(name: "X509", package: "swift-certificates", condition: .when(platforms: [.macOS]))
         ]),
+        .executableTarget(name: "HolodeckShaderTool", dependencies: ["HolodeckCore"]),
         .testTarget(name: "HolodeckCoreTests", dependencies: ["HolodeckCore"],
                     resources: [.copy("TestSupport")])
     ]

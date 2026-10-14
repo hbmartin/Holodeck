@@ -26,7 +26,7 @@ final class DirectoryCatalogTests: XCTestCase {
 
     func testTLSApprovalCredentialReconnectRevocationAndHostPin() async throws {
         let (root, store) = try fixture()
-        let catalog = try await store.reload(from: root)
+        let catalog = try await store.reload(from: root).catalog
         let namespace = "test-" + UUID().uuidString
         let server = LocalCatalogServer(catalog: store, testingNamespace: namespace)
         addTeardownBlock { try await server.clearTestSecrets() }
@@ -99,7 +99,7 @@ final class DirectoryCatalogTests: XCTestCase {
             throw XCTSkip("Set HOLODECK_LAN_TEST=1 on a Mac with local-network access.")
         }
         let (root, store) = try fixture()
-        let catalog = try await store.reload(from: root)
+        let catalog = try await store.reload(from: root).catalog
         let namespace = "test-lan-" + UUID().uuidString
         let server = LocalCatalogServer(catalog: store, testingNamespace: namespace, advertise: true)
         let client = LocalCatalogClient(testingNamespace: namespace)
@@ -160,9 +160,12 @@ final class DirectoryCatalogTests: XCTestCase {
         metadata["shared"] = ["common", "fragment"]
         try JSONSerialization.data(withJSONObject: metadata).write(to: directory.appendingPathComponent("metadata.json"))
         try Data("BODY\n".utf8).write(to: directory.appendingPathComponent("body.metal"))
-        try TestCatalog.preview(named: "preview-\(entry.previewSHA256).png").write(to: directory.appendingPathComponent("preview.png"))
         try JSONSerialization.data(withJSONObject: ["shaders": [entry.id], "defaultShaderID": entry.id]).write(to: root.appendingPathComponent("index.json"))
-        return (root, DirectoryCatalog(directory: base.appendingPathComponent("head")))
+        let cache = base.appendingPathComponent("head/preview-cache")
+        let previews = ShaderPreviewGenerator(directory: cache) { _ in
+            try ShaderPNG.gradient(colors: entry.colors)
+        }
+        return (root, DirectoryCatalog(directory: base.appendingPathComponent("head"), previewGenerator: previews))
     }
 
     func testUnpublishedHeadIsAnInvalidResponse() async throws {
@@ -173,12 +176,12 @@ final class DirectoryCatalogTests: XCTestCase {
         } catch CatalogError.invalidResponse {}
     }
 
-    func testAssemblyRevisionAndProvidedPreviewAreStableWithoutGit() async throws {
+    func testAssemblyRevisionAndGeneratedPreviewAreStableWithoutGit() async throws {
         let (root, store) = try fixture()
-        let first = try await store.reload(from: root)
+        let first = try await store.reload(from: root).catalog
         XCTAssertEqual(first.shaders[0].source, "COMMON\nBODY\nFRAGMENT\n")
         XCTAssertEqual(first.publicationRevision.count, 64)
-        let again = try await store.reload(from: root)
+        let again = try await store.reload(from: root).catalog
         XCTAssertEqual(first.publicationRevision, again.publicationRevision)
         let image = try await store.source.get(.asset(revision: first.publicationRevision, path: first.shaders[0].preview!.path), 8_388_608)
         XCTAssertEqual(CatalogHash.sha256(image), first.shaders[0].preview!.hash)
@@ -198,7 +201,7 @@ final class DirectoryCatalogTests: XCTestCase {
         let encodedCollection = try JSONSerialization.jsonObject(with: JSONEncoder().encode(collection))
         try JSONSerialization.data(withJSONObject: ["shaders": ["plasma"], "defaultShaderID": "plasma", "collections": [encodedCollection]])
             .write(to: root.appendingPathComponent("index.json"))
-        let loaded = try await store.reload(from: root)
+        let loaded = try await store.reload(from: root).catalog
         XCTAssertEqual(loaded.shaders[0].source, "COMMON\nMATERIAL\n// Source: author attribution\nBODY\nFRAGMENT\n")
         XCTAssertEqual(loaded.snapshot.manifest.collections, [collection])
         XCTAssertEqual(loaded.shaders[0].discovery?.tags, ["warm"])
@@ -212,38 +215,42 @@ final class DirectoryCatalogTests: XCTestCase {
         let root = URL(fileURLWithPath: path), destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         addTeardownBlock { try? FileManager.default.removeItem(at: destination) }
         let store = DirectoryCatalog(directory: destination)
-        let loaded = try await store.reload(from: root)
+        let result = try await store.reload(from: root)
+        XCTAssertTrue(result.previewWarnings.isEmpty, "All repository previews should render successfully")
+        let loaded = result.catalog
         let index = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("index.json"))) as? [String: Any])
         XCTAssertEqual(loaded.shaders.map(\.id), index["shaders"] as? [String])
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let compiler = ShaderCompiler(device: device)
         for shader in loaded.shaders {
             _ = try await compiler.pipeline(for: shader)
-            let supplied = try Data(contentsOf: root.appendingPathComponent("shaders/\(shader.id)/preview.png"))
-            XCTAssertEqual(shader.preview?.hash, CatalogHash.sha256(supplied))
+            let preview = try XCTUnwrap(shader.preview)
+            let generated = try await store.get(.asset(revision: loaded.publicationRevision, path: preview.path), limit: 8_388_608)
+            XCTAssertTrue(ShaderPNG.isValid(generated))
+            XCTAssertEqual(preview.hash, CatalogHash.sha256(generated))
         }
     }
 
     func testEditsStayUnpublishedUntilManualReloadAndSourcesAreImmutable() async throws {
         let (root, store) = try fixture()
-        let first = try await store.reload(from: root)
+        let first = try await store.reload(from: root).catalog
         try Data("EDITED\n".utf8).write(to: root.appendingPathComponent("shaders/plasma/body.metal"))
         let before = try JSONDecoder().decode(CatalogHead.self, from: await store.source.get(.head, 65_536))
         XCTAssertEqual(before.revision, first.publicationRevision)
         let copied = try await store.source.get(.asset(revision: first.publicationRevision, path: "sources/plasma.metal"), 1_048_576)
         XCTAssertEqual(String(decoding: copied, as: UTF8.self), first.shaders[0].source)
-        let second = try await store.reload(from: root)
+        let second = try await store.reload(from: root).catalog
         XCTAssertNotEqual(second.publicationRevision, first.publicationRevision)
         XCTAssertEqual(second.shaders[0].source, "COMMON\nEDITED\nFRAGMENT\n")
     }
 
     func testInvalidReloadNamesFileAndRetainsCurrentSnapshot() async throws {
         let (root, store) = try fixture()
-        let first = try await store.reload(from: root)
-        let preview = root.appendingPathComponent("shaders/plasma/preview.png")
-        try Data("not a PNG".utf8).write(to: preview)
-        do { _ = try await store.reload(from: root); XCTFail("Invalid preview accepted") }
-        catch { XCTAssertTrue(error.localizedDescription.contains("shaders/plasma/preview.png")) }
+        let first = try await store.reload(from: root).catalog
+        let metadata = root.appendingPathComponent("shaders/plasma/metadata.json")
+        try Data("not JSON".utf8).write(to: metadata)
+        do { _ = try await store.reload(from: root); XCTFail("Invalid metadata accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("shaders/plasma/metadata.json")) }
         let head = try JSONDecoder().decode(CatalogHead.self, from: await store.source.get(.head, 65_536))
         XCTAssertEqual(head.revision, first.publicationRevision)
         let restarted = DirectoryCatalog(directory: root.deletingLastPathComponent().appendingPathComponent("head"))
@@ -253,7 +260,7 @@ final class DirectoryCatalogTests: XCTestCase {
 
     func testAllowlistAndSourceBoundsRejectArbitraryFiles() async throws {
         let (root, store) = try fixture()
-        let catalog = try await store.reload(from: root)
+        let catalog = try await store.reload(from: root).catalog
         for path in ["../index.json", "shaders/plasma/body.metal", "index.json", "/etc/passwd", "https://example.com/catalog.json", "https://example.com/preview.png"] {
             do { _ = try await store.source.get(.asset(revision: catalog.publicationRevision, path: path), 100); XCTFail(path) }
             catch CatalogError.invalidResponse {}
@@ -268,7 +275,7 @@ final class DirectoryCatalogTests: XCTestCase {
 
     func testConnectionPinsRetainOldAssetsAcrossSeveralReloads() async throws {
         let (root, store) = try fixture()
-        let first = try await store.reload(from: root), connection = UUID()
+        let first = try await store.reload(from: root).catalog, connection = UUID()
         _ = try await store.get(.head, limit: 65_536, pinFor: connection)
         for text in ["SECOND", "THIRD", "FOURTH"] {
             try Data(text.utf8).write(to: root.appendingPathComponent("shaders/plasma/body.metal"))
@@ -293,7 +300,7 @@ extension DirectoryCatalogTests {
         for path in ["sources/plasma.metal", "previews/plasma.png", "catalog.json"] {
             for missing in [false, true] {
                 let (root, store) = try fixture()
-                let first = try await store.reload(from: root)
+                let first = try await store.reload(from: root).catalog
                 let directory = root.deletingLastPathComponent().appendingPathComponent("head")
                 let asset = directory.appendingPathComponent(first.publicationRevision).appendingPathComponent(path)
                 let expected = try Data(contentsOf: asset)
@@ -301,7 +308,7 @@ extension DirectoryCatalogTests {
                 else { try Data("CORRUPT".utf8).write(to: asset) }
                 let restarted = DirectoryCatalog(directory: directory)
                 do { _ = try await restarted.cached(); XCTFail("Damaged publication restored: \(path)") } catch {}
-                let repaired = try await restarted.reload(from: root)
+                let repaired = try await restarted.reload(from: root).catalog
                 XCTAssertEqual(repaired.publicationRevision, first.publicationRevision)
                 let served = try await restarted.get(.asset(revision: repaired.publicationRevision, path: path), limit: 8_388_608)
                 XCTAssertEqual(served, expected)
@@ -315,7 +322,7 @@ extension DirectoryCatalogTests {
     func testOversizedPublicationAssetsAreRepairedWithinExistingBounds() async throws {
         for (path, limit) in [("sources/plasma.metal", 1_048_576), ("previews/plasma.png", 8_388_608), ("catalog.json", 2_097_152)] {
             let (root, store) = try fixture()
-            let first = try await store.reload(from: root)
+            let first = try await store.reload(from: root).catalog
             let directory = root.deletingLastPathComponent().appendingPathComponent("head")
             let asset = directory.appendingPathComponent(first.publicationRevision).appendingPathComponent(path)
             let expected = try Data(contentsOf: asset)
@@ -329,14 +336,14 @@ extension DirectoryCatalogTests {
 
     func testIntactPublicationIsReusedWithoutSwappingItsFiles() async throws {
         let (root, store) = try fixture()
-        let first = try await store.reload(from: root)
+        let first = try await store.reload(from: root).catalog
         let directory = root.deletingLastPathComponent().appendingPathComponent("head")
         let asset = directory.appendingPathComponent(first.publicationRevision).appendingPathComponent("sources/plasma.metal")
         let inode = try FileManager.default.attributesOfItem(atPath: asset.path)[.systemFileNumber] as? NSNumber
         var files = DirectoryCatalogFileOperations()
         files.swap = { _, _ in throw POSIXError(.EIO) }
         let restarted = DirectoryCatalog(directory: directory, files: files)
-        let reused = try await restarted.reload(from: root)
+        let reused = try await restarted.reload(from: root).catalog
         XCTAssertEqual(reused.publicationRevision, first.publicationRevision)
         XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: asset.path)[.systemFileNumber] as? NSNumber, inode)
         try assertNoStages(directory)
@@ -344,7 +351,7 @@ extension DirectoryCatalogTests {
 
     func testExistingManifestMustMatchCandidateEvenWhenAssetHashesAreValid() async throws {
         let (root, store) = try fixture()
-        let first = try await store.reload(from: root)
+        let first = try await store.reload(from: root).catalog
         let directory = root.deletingLastPathComponent().appendingPathComponent("head")
         let manifestURL = directory.appendingPathComponent(first.publicationRevision).appendingPathComponent("catalog.json")
         let expected = try Data(contentsOf: manifestURL)
@@ -355,7 +362,7 @@ extension DirectoryCatalogTests {
         let restarted = DirectoryCatalog(directory: directory)
         let altered = try await restarted.cached()
         XCTAssertEqual(altered?.shaders[0].title, "Unexpected title")
-        let repaired = try await restarted.reload(from: root)
+        let repaired = try await restarted.reload(from: root).catalog
         XCTAssertEqual(repaired.publicationRevision, first.publicationRevision)
         let served = try await restarted.get(.asset(revision: repaired.publicationRevision, path: "catalog.json"), limit: 2_097_152)
         XCTAssertEqual(served, expected)
@@ -365,11 +372,11 @@ extension DirectoryCatalogTests {
     func testSwapAndMarkerFailuresPreserveCurrentPublicationAndCleanupStages() async throws {
         for failure in ["swap", "marker"] {
             let (root, store) = try fixture()
-            let first = try await store.reload(from: root)
+            let first = try await store.reload(from: root).catalog
             let other = root.deletingLastPathComponent().appendingPathComponent("other-authoring")
             try FileManager.default.copyItem(at: root, to: other)
             try Data("SECOND\n".utf8).write(to: other.appendingPathComponent("shaders/plasma/body.metal"))
-            let current = try await store.reload(from: other)
+            let current = try await store.reload(from: other).catalog
             let directory = root.deletingLastPathComponent().appendingPathComponent("head")
             let marker = directory.appendingPathComponent("current.json")
             let markerBefore = try Data(contentsOf: marker)
@@ -396,7 +403,7 @@ extension DirectoryCatalogTests {
 
     func testRepairedPublicationRemainsLeasedAcrossFurtherReloads() async throws {
         let (root, store) = try fixture()
-        let first = try await store.reload(from: root)
+        let first = try await store.reload(from: root).catalog
         let directory = root.deletingLastPathComponent().appendingPathComponent("head")
         let connection = UUID()
         _ = try await store.get(.head, limit: 65_536, pinFor: connection)
@@ -445,7 +452,7 @@ extension DirectoryCatalogTests {
     }
     func testApprovedIdleSessionOutlivesDeadlineAndEveryClosureReleasesItsPublication() async throws {
         for mode in ["close", "revoke", "stop"] {
-            let (root, store) = try fixture(); let first = try await store.reload(from: root)
+            let (root, store) = try fixture(); let first = try await store.reload(from: root).catalog
             let clock = TestClock()
             let server = LocalCatalogServer(catalog: store, testingNamespace: "test-" + UUID().uuidString, clock: clock)
             addTeardownBlock { try await server.clearTestSecrets() }
@@ -499,7 +506,7 @@ extension DirectoryCatalogTests {
 
     func testClosureWaitsForLateCatalogReadBeforeReleasingItsLease() async throws {
         for mode in ["close", "revoke", "stop"] {
-            let (root, store) = try fixture(); let first = try await store.reload(from: root)
+            let (root, store) = try fixture(); let first = try await store.reload(from: root).catalog
             let gate = RecoveryGate()
             let server = LocalCatalogServer(catalog: store, testingNamespace: "test-" + UUID().uuidString,
                 readAsset: { request, limit, id in

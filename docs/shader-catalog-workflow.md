@@ -23,12 +23,15 @@ shared/material.metal               # required by shaders that declare material 
 shared/fragment.metal
 shaders/<id>/metadata.json           # id, name, category, description, colors, shared, discovery
 shaders/<id>/body.metal
-shaders/<id>/preview.png             # supplied PNG, served byte-for-byte
 ```
 
 Only indexed shaders are loaded, in index order. Shared declarations must be `["common", "fragment"]` or `["common", "material", "fragment"]`. Sources concatenate common helpers, optional material helpers, body, and fragment wrapper without rewriting source bytes or attribution comments. Collections and supported metadata use the existing catalog schema. Discovery labels retain existing normalization and optional-field recovery.
 
-The loader neither generates previews nor checks `preview.json`. Authors supply preview images themselves. Git, Python, repository scripts, commits, and Xcode tools are unnecessary for publication from the app. Update dates use the latest modification time of a shader's metadata, body, and declared helpers.
+The loader generates previews and ignores legacy `preview.png`/`preview.json` files in the authoring folder. Git, Python, repository scripts, commits, and Xcode tools are unnecessary for publication from the app. Update dates use the latest modification time of a shader's metadata, body, and declared helpers.
+
+Preview generation uses the shared offscreen renderer at 1280×720 and three seconds with the sRGB target. Successful PNGs are cached in app-owned storage by assembled-source hash, settings, and renderer version. Cache hashes and decoded images are checked before reuse; corrupt entries are regenerated, and unused cache entries are pruned after successful reload. Source or helper changes regenerate affected previews; metadata-only changes reuse successful renders.
+
+A failed shader compile, GPU render, or PNG encoding uses an opaque gradient from the two metadata colors and displays a per-shader warning in Settings. Fallbacks are retried on each reload; successful regeneration clears their warning. Missing source files, invalid metadata, or storage failures reject reload and preserve the previous publication. Reloads are serialized while the current immutable assets remain available to connected TVs during generation. `DirectoryCatalog.reload(from:)` returns a `CatalogReloadResult` containing the validated catalog and preview warnings. The catalog wire format is unchanged.
 
 The selected directory is persisted with a read-only security-scoped bookmark. The Mac sandbox allows user-selected read access and incoming connections. The directory is read at startup and on explicit reload, with no watcher or background helper. Copying a complete candidate into app-owned storage keeps served bytes independent of subsequent edits. Validation failure names its file and leaves the previous publication available. The copied publication can also be restored when authoring access fails after restart.
 
@@ -67,7 +70,7 @@ No usable TV cache means the user must configure and open the Mac app and approv
 
 ## Validation
 
-Run `swift test --package-path HolodeckCore`. Set `HOLODECK_AUTHORING_FIXTURE=/absolute/path/to/HolodeckShaders` to additionally load, compile, render, animate, and verify previews from a local authoring repository. Run both app schemes' tests with injected fixtures. The Mac UI includes a real folder-picker, manual-reload, invalid-file rollback, and bookmark-relaunch test.
+Run `swift test --package-path HolodeckCore`. Set `HOLODECK_AUTHORING_FIXTURE=/absolute/path/to/HolodeckShaders` to additionally load, compile, render, animate, and verify generated previews from a local authoring repository without supplied PNGs. Run both app schemes' tests with injected fixtures. The Mac UI includes a real folder-picker, manual-reload, invalid-file rollback, and bookmark-relaunch test.
 
 Set `HOLODECK_LAN_TEST=1` for the shared-core test that advertises a real Bonjour service, resolves it using multicast-only DNS-SD on a private interface, compares the TLS pairing codes, approves the client, downloads a revision, and reconnects using its saved Keychain credential. Test identities and approvals use isolated namespaces and are removed afterward.
 

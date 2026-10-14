@@ -6,6 +6,14 @@ nonisolated public struct ShaderUniforms {
     public var resolution: SIMD2<Float>
     public var time: Float
     public var padding: Float = 0
+    public static func validateLayout() throws {
+        guard MemoryLayout<Self>.size == 16, MemoryLayout<Self>.stride == 16,
+              MemoryLayout<Self>.offset(of: \.resolution) == 0,
+              MemoryLayout<Self>.offset(of: \.time) == 8,
+              MemoryLayout<Self>.offset(of: \.padding) == 12 else {
+            throw ShaderCompilationError.invalidUniformLayout
+        }
+    }
     public init(resolution: SIMD2<Float>, time: Float, padding: Float = 0) {
         self.resolution = resolution; self.time = time; self.padding = padding
     }
