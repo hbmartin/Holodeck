@@ -1,0 +1,278 @@
+[
+  {
+    "comment_id": "PRRC_kwDOVB37g87-vSEy",
+    "author_name": "chatgpt-codex-connector",
+    "minimal_comment_summary": "Claim that staged changes bypass scope enforcement",
+    "severity": 3,
+    "category": "security",
+    "reviewing_agent": "Codex /root",
+    "decision": "should not be fixed",
+    "review_target_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "current_head_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "validity": "invalid",
+    "actionability": "not-applicable",
+    "confidence": 1.0,
+    "root_cause": "The review reads git diff as an index/worktree comparison, but the actual commands explicitly compare the worktree to the base commit and therefore include staged changes.",
+    "evidence": [
+      "Reviewed shader_requests.py:172-177 fingerprints git diff --binary base; :209-214 enumerates git diff --name-only base.",
+      "/Users/haroldmartin/Downloads/Holodeck/reviews_triage/pr-18-evidence.json: staging a forbidden tools/library.py edit still raises Forbidden change and changes the candidate fingerprint.",
+      "Current committed HEAD is d3b704dbae3284db04ff9d7f53be10abaebbe118; merged main 5ee08e1c78abfdf203fd2b256a15d14cd31338d0 has the same tree. Relevant uncommitted diffs do not remedy this finding."
+    ],
+    "comment_url": "https://github.com/hbmartin/Holodeck/pull/18#discussion_r4273807666"
+  },
+  {
+    "comment_id": "PRRC_kwDOVB37g87-vSFE",
+    "author_name": "chatgpt-codex-connector",
+    "minimal_comment_summary": "Commit hooks can push a different tree than the verified publication",
+    "severity": 2,
+    "category": "state",
+    "reviewing_agent": "Codex /root",
+    "decision": "should be fixed",
+    "review_target_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "current_head_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "validity": "confirmed",
+    "actionability": "fix-now",
+    "confidence": 1.0,
+    "root_cause": "The last fingerprint comparison and publication preparation precede git commit; local hooks remain enabled and no post-commit tree comparison or re-verification runs.",
+    "evidence": [
+      "Reviewed shader_requests.py:513-535 verifies/prepares before git commit; :536-563 pushes and returns that commit without validating hook mutations.",
+      "/Users/haroldmartin/Downloads/Holodeck/reviews_triage/pr-18-evidence.json: an actual pre-commit hook produced prepared EDIT source but pushed HOOK source with exit 0.",
+      "Current committed HEAD is d3b704dbae3284db04ff9d7f53be10abaebbe118; merged main 5ee08e1c78abfdf203fd2b256a15d14cd31338d0 has the same tree. Relevant uncommitted diffs do not remedy this finding."
+    ],
+    "comment_url": "https://github.com/hbmartin/Holodeck/pull/18#discussion_r4273807684",
+    "regression_expectation": "Use a disposable checkout with a pre-commit hook that changes and stages source; assert pushed source, reviewed hashes and installed publication match. Bypass host-owned hooks or detect mutation and repeat verification before push."
+  },
+  {
+    "comment_id": "PRRC_kwDOVB37g87-vZ_6",
+    "author_name": "coderabbitai",
+    "minimal_comment_summary": "Fix the Gallery instruction grammar",
+    "severity": 0,
+    "category": "docs",
+    "reviewing_agent": "Codex /root",
+    "decision": "should be fixed",
+    "review_target_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "current_head_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "validity": "confirmed",
+    "actionability": "fix-now",
+    "confidence": 1.0,
+    "root_cause": "The picker instruction has an extra comma before the infinitive phrase and omits a connector between the two commands.",
+    "evidence": [
+      "Reviewed docs/quickstart.md:47 says Press Select, choose Gallery, to open the scene picker.",
+      "Current committed HEAD is d3b704dbae3284db04ff9d7f53be10abaebbe118; merged main 5ee08e1c78abfdf203fd2b256a15d14cd31338d0 has the same tree. Relevant uncommitted diffs do not remedy this finding."
+    ],
+    "comment_url": "https://github.com/hbmartin/Holodeck/pull/18#discussion_r4273840122",
+    "regression_expectation": "Read the corrected instruction; no automated regression test is needed for this prose edit."
+  },
+  {
+    "comment_id": "PRRC_kwDOVB37g87-vaAD",
+    "author_name": "coderabbitai",
+    "minimal_comment_summary": "Claim that the bundled shader tool phase is skipped in incremental builds",
+    "severity": 1,
+    "category": "ci",
+    "reviewing_agent": "Codex /root",
+    "decision": "should not be fixed",
+    "review_target_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "current_head_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "validity": "invalid",
+    "actionability": "not-applicable",
+    "confidence": 0.99,
+    "root_cause": "The review incorrectly assumes that declaring an output alone enables skipping; Xcode runs scripts with no declared inputs on every build.",
+    "evidence": [
+      "Reviewed project.pbxproj:300 has inputPaths = () and no input-file lists.",
+      "Apple official incremental-build documentation explicitly lists no input files as a condition that runs the script: https://developer.apple.com/documentation/xcode/improving-the-speed-of-incremental-builds",
+      "The completed Mac build records PhaseScriptExecution Bundle Shader Tool; setting alwaysOutOfDate would be redundant for this phase.",
+      "Current committed HEAD is d3b704dbae3284db04ff9d7f53be10abaebbe118; merged main 5ee08e1c78abfdf203fd2b256a15d14cd31338d0 has the same tree. Relevant uncommitted diffs do not remedy this finding."
+    ],
+    "comment_url": "https://github.com/hbmartin/Holodeck/pull/18#discussion_r4273840131"
+  },
+  {
+    "comment_id": "PRRC_kwDOVB37g87-vaAR",
+    "author_name": "coderabbitai",
+    "minimal_comment_summary": "Keep the performance submission guard until the network reply finishes",
+    "severity": 1,
+    "category": "performance",
+    "reviewing_agent": "Codex /root",
+    "decision": "should be fixed",
+    "review_target_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "current_head_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "validity": "partial",
+    "actionability": "fix-now",
+    "confidence": 0.98,
+    "root_cause": "submit launches an unstructured Task and returns immediately, so the outer defer clears the guard while a performance request is still pending. The claim of a duplicate on the next tick overstates the timing: the monitor resets and needs another 12 seconds of observation.",
+    "evidence": [
+      "Reviewed TVRequestsController.swift:171-190 starts the asynchronous request Task; :272-285 defers clearing submittingPerformance but calls submit synchronously.",
+      "Reviewed ShaderRequests.swift:199-218 resets a two-second warm-up and ten slow windows after emitting evidence. LocalTransport.swift uses a 30-second timeout, so a delayed response can outlast the observation interval.",
+      "ShaderRequestService.swift:285-288 deduplicates pending device/shader/source requests; this limits the issue to redundant capture/encoding/traffic rather than duplicate host work.",
+      "Current committed HEAD is d3b704dbae3284db04ff9d7f53be10abaebbe118; merged main 5ee08e1c78abfdf203fd2b256a15d14cd31338d0 has the same tree. Relevant uncommitted diffs do not remedy this finding."
+    ],
+    "comment_url": "https://github.com/hbmartin/Holodeck/pull/18#discussion_r4273840145",
+    "regression_expectation": "Delay request acknowledgement with a deterministic clock for longer than the observation interval. Assert one capture/submission until it resolves, preserve server deduplication, and use a bounded wall-clock backstop for any asynchronous test."
+  },
+  {
+    "comment_id": "PRRC_kwDOVB37g87-vaAp",
+    "author_name": "coderabbitai",
+    "minimal_comment_summary": "Claim that renderer deallocation leaks a pending snapshot continuation",
+    "severity": 1,
+    "category": "state",
+    "reviewing_agent": "Codex /root",
+    "decision": "should not be fixed",
+    "review_target_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "current_head_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "validity": "partial",
+    "actionability": "not-applicable",
+    "confidence": 0.97,
+    "root_cause": "A captureSnapshot async invocation retains its receiver across suspension; the pending snapshot prevents deallocation until its timeout or frame completion resumes it. The uncancelled weak timeout task after a successful capture is optional cleanup, not the alleged hanging-caller defect.",
+    "evidence": [
+      "Reviewed Renderer.swift:84-95 awaits the checked continuation in an instance method and schedules a weak ten-second fallback; :98-101 clears and resumes it.",
+      "TVRequestsController holds the renderer strongly and its snapshot Tasks also retain the controller while awaiting capture.",
+      "/Users/haroldmartin/Downloads/Holodeck/reviews_triage/pr-18-evidence.json: an optimized Swift 6 reproduction of the same async/continuation/weak-timeout pattern kept the receiver alive after external references were dropped, resumed successfully at timeout, then deallocated.",
+      "Current committed HEAD is d3b704dbae3284db04ff9d7f53be10abaebbe118; merged main 5ee08e1c78abfdf203fd2b256a15d14cd31338d0 has the same tree. Relevant uncommitted diffs do not remedy this finding."
+    ],
+    "comment_url": "https://github.com/hbmartin/Holodeck/pull/18#discussion_r4273840169"
+  },
+  {
+    "comment_id": "PRRC_kwDOVB37g87-vaAy",
+    "author_name": "coderabbitai",
+    "minimal_comment_summary": "Old publication SHA prevents cleanup of a failed activation repair",
+    "severity": 2,
+    "category": "state",
+    "reviewing_agent": "Codex /root",
+    "decision": "should be fixed",
+    "review_target_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "current_head_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "validity": "confirmed",
+    "actionability": "fix-now",
+    "confidence": 1.0,
+    "root_cause": "commitSHA from a previous successful publication remains in the checkpoint when a new repair starts; failure/discard treats that historical commit as proof that the current unpublished work is already published and only removes ownership.",
+    "evidence": [
+      "Reviewed shader_requests.py:465-494 skips old-result recovery when repair.json exists but does not clear old commitSHA; :629-640 and :159-167 use it for cleanup decisions.",
+      "/Users/haroldmartin/Downloads/Holodeck/reviews_triage/pr-18-evidence.json: successful publication followed by a repair that writes source and fails leaves a dirty body with no owner; discard also leaves it dirty and the old remote commit remains intact.",
+      "Current committed HEAD is d3b704dbae3284db04ff9d7f53be10abaebbe118; merged main 5ee08e1c78abfdf203fd2b256a15d14cd31338d0 has the same tree. Relevant uncommitted diffs do not remedy this finding."
+    ],
+    "comment_url": "https://github.com/hbmartin/Holodeck/pull/18#discussion_r4273840178",
+    "regression_expectation": "Publish once, begin activation repair, modify owned source, fail before a new commit, and run failure/discard cleanup. Assert checkout is clean, next request can start, and prior pushed commit/evidence are preserved. Keep lost-push-ack recovery for a newly created repair commit."
+  },
+  {
+    "comment_id": "PRRC_kwDOVB37g87-vaA6",
+    "author_name": "coderabbitai",
+    "minimal_comment_summary": "Non-candidate baseline or environment failures repeatedly invoke Codex",
+    "severity": 2,
+    "category": "state",
+    "reviewing_agent": "Codex /root",
+    "decision": "should be fixed",
+    "review_target_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "current_head_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "validity": "partial",
+    "actionability": "fix-now",
+    "confidence": 1.0,
+    "root_cause": "technical classifies every validation/test exit as a shader CandidateError and the loop retries it indefinitely, including failures on an unchanged baseline. The proposed attempt cap or active-job cancellation conflicts with explicit product requirements.",
+    "evidence": [
+      "Reviewed shader_requests.py:380-388 converts every failing technical subprocess into CandidateError; :502-573 catches and sends it back into another implementation attempt.",
+      "/Users/haroldmartin/Downloads/Holodeck/reviews_triage/pr-18-evidence.json: an unchanged failing baseline validator caused two repair cycles and a third implementation invocation; the fixture CLI deliberately exited on attempt 3 to bound the reproduction.",
+      "Preflight verifies SDK/tool availability but does not run the complete baseline authoring/license/GPU suite. synchronize also restores parked patches, so baseline validation must precede restoration or use an immutable baseline.",
+      "The accepted product plan explicitly requires indefinite shader-defect repair and Mac cancellation of queued jobs only; preserve those rules while classifying unrecoverable baseline/configuration/runtime failures as operational.",
+      "Current committed HEAD is d3b704dbae3284db04ff9d7f53be10abaebbe118; merged main 5ee08e1c78abfdf203fd2b256a15d14cd31338d0 has the same tree. Relevant uncommitted diffs do not remedy this finding."
+    ],
+    "comment_url": "https://github.com/hbmartin/Holodeck/pull/18#discussion_r4273840186",
+    "regression_expectation": "A failing immutable baseline must fail the request without invoking Codex. Simulate an operational compiler/GPU failure after a valid baseline and assert terminal cleanup; separately assert true candidate defects still repair repeatedly without an arbitrary limit. Recheck a new baseline after remote main advances."
+  },
+  {
+    "comment_id": "PRRC_kwDOVB37g87-vaBD",
+    "author_name": "coderabbitai",
+    "minimal_comment_summary": "Revoked parked or suspended repairing jobs never become terminal",
+    "severity": 2,
+    "category": "state",
+    "reviewing_agent": "Codex /root",
+    "decision": "should be fixed",
+    "review_target_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "current_head_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "validity": "confirmed",
+    "actionability": "fix-now",
+    "confidence": 0.99,
+    "root_cause": "revoke marks repairing records revoked but does not terminalize them, while scheduling permanently excludes revoked records; execute also preserves suspended records for recovery without resolving this state.",
+    "evidence": [
+      "Reviewed ShaderRequestService.swift:261-271 terminalizes queued and clarification/activation waits but omits non-active repairing jobs; :347-350 excludes revoked records.",
+      "The same file :440-442 moves a suspended active request to repairing; :423-438 skips terminal cleanup while suspended. verify/disable reject any non-terminal record at :225-246.",
+      "Existing tests cover queued revocation and interrupted repairing recovery separately, with no test of revocation during repairing.",
+      "Current committed HEAD is d3b704dbae3284db04ff9d7f53be10abaebbe118; merged main 5ee08e1c78abfdf203fd2b256a15d14cd31338d0 has the same tree. Relevant uncommitted diffs do not remedy this finding."
+    ],
+    "comment_url": "https://github.com/hbmartin/Holodeck/pull/18#discussion_r4273840195",
+    "regression_expectation": "Assert terminal state and persisted unlock after revoking activation-repair, recovered, and suspended jobs, including revoke during process teardown. Preserve permission for an actively running job to finish its push, retain pushed commits, and repeat deterministic scheduler interleavings with a bounded wall-clock backstop."
+  },
+  {
+    "comment_id": "IC_kwDOVB37g88AAAABb_q7Iw",
+    "author_name": "chatgpt-codex-connector",
+    "minimal_comment_summary": "Codex review completion status",
+    "severity": 0,
+    "category": "docs",
+    "reviewing_agent": "Codex /root",
+    "decision": "high-level",
+    "review_target_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "current_head_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "validity": "confirmed",
+    "actionability": "not-applicable",
+    "confidence": 1.0,
+    "evidence": [
+      "The status table reports the completed review of d3b704d.",
+      "Current committed HEAD is d3b704dbae3284db04ff9d7f53be10abaebbe118; merged main 5ee08e1c78abfdf203fd2b256a15d14cd31338d0 has the same tree. Relevant uncommitted diffs do not remedy this finding."
+    ],
+    "root_cause": "Administrative summary/status; no additional independent fix."
+  },
+  {
+    "comment_id": "IC_kwDOVB37g88AAAABb_rHMQ",
+    "author_name": "coderabbitai",
+    "minimal_comment_summary": "Review walkthrough and risk summary duplicate the inline findings",
+    "severity": 2,
+    "category": "state",
+    "reviewing_agent": "Codex /root",
+    "decision": "high-level",
+    "review_target_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "current_head_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "validity": "confirmed",
+    "actionability": "not-applicable",
+    "confidence": 1.0,
+    "evidence": [
+      "The body identifies reviewed commit d3b704d; substantive recovery warnings are accounted for in their distinct inline records.",
+      "Current committed HEAD is d3b704dbae3284db04ff9d7f53be10abaebbe118; merged main 5ee08e1c78abfdf203fd2b256a15d14cd31338d0 has the same tree. Relevant uncommitted diffs do not remedy this finding."
+    ],
+    "root_cause": "Administrative summary/status; no additional independent fix."
+  },
+  {
+    "comment_id": "PRR_kwDOVB37g88AAAABSR0Y3A",
+    "author_name": "chatgpt-codex-connector",
+    "minimal_comment_summary": "Review summary references separately triaged inline suggestions",
+    "severity": 0,
+    "category": "docs",
+    "reviewing_agent": "Codex /root",
+    "decision": "high-level",
+    "review_target_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "current_head_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "validity": "confirmed",
+    "actionability": "not-applicable",
+    "confidence": 1.0,
+    "evidence": [
+      "The review contains 2 inline items, each stored as a distinct record. Its remaining body is review metadata/instructions rather than new evidence.",
+      "Current committed HEAD is d3b704dbae3284db04ff9d7f53be10abaebbe118; merged main 5ee08e1c78abfdf203fd2b256a15d14cd31338d0 has the same tree. Relevant uncommitted diffs do not remedy this finding."
+    ],
+    "root_cause": "Duplicate review summary; no separate actionable finding."
+  },
+  {
+    "comment_id": "PRR_kwDOVB37g88AAAABSR2xZg",
+    "author_name": "coderabbitai",
+    "minimal_comment_summary": "Review summary references separately triaged inline suggestions",
+    "severity": 0,
+    "category": "docs",
+    "reviewing_agent": "Codex /root",
+    "decision": "high-level",
+    "review_target_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "current_head_sha": "d3b704dbae3284db04ff9d7f53be10abaebbe118",
+    "validity": "confirmed",
+    "actionability": "not-applicable",
+    "confidence": 1.0,
+    "evidence": [
+      "The review contains 7 inline items, each stored as a distinct record. Its remaining body is review metadata/instructions rather than new evidence.",
+      "Current committed HEAD is d3b704dbae3284db04ff9d7f53be10abaebbe118; merged main 5ee08e1c78abfdf203fd2b256a15d14cd31338d0 has the same tree. Relevant uncommitted diffs do not remedy this finding."
+    ],
+    "root_cause": "Duplicate review summary; no separate actionable finding."
+  }
+]

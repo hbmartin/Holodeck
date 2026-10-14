@@ -43,7 +43,7 @@ extension DirectoryCatalogTests {
         _ = try await restarted.cached()
         do { _ = try await restarted.reload(from: root); XCTFail("Final oversized manifest installed") }
         catch LocalCatalogError.invalidFile(let path, let reason) {
-            XCTAssertEqual(path, "index.json"); XCTAssertTrue(reason.contains("2 MiB"))
+            XCTAssertEqual(path, "index.json"); XCTAssertTrue(reason.contains("\(CatalogLimits.manifestBytes) bytes"), reason)
         }
         let head = try JSONDecoder().decode(CatalogHead.self, from: await restarted.get(.head, limit: 65_536))
         XCTAssertEqual(head.revision, first.publicationRevision)

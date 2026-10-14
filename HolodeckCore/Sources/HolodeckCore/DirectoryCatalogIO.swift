@@ -92,11 +92,12 @@ nonisolated final class DirectoryCatalogIO: @unchecked Sendable {
                         throw LocalCatalogError.invalidFile(path, "File must stay inside the selected folder.")
                     }
                     let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-                    guard size <= limit else { throw CatalogError.oversizedResponse }
+                    try CatalogLimits.checkByteCount(size, limit: limit, path: path, kind: "File")
                     let bytes = try Data(contentsOf: url)
-                    guard bytes.count <= limit else { throw CatalogError.oversizedResponse }
+                    try CatalogLimits.checkByteCount(bytes.count, limit: limit, path: path, kind: "File")
                     return bytes
-                } catch { throw LocalCatalogError.invalidFile(path, error.localizedDescription) }
+                } catch let error as LocalCatalogError { throw error }
+                catch { throw LocalCatalogError.invalidFile(path, error.localizedDescription) }
             }
             func json(_ path: String) throws -> [String: Any] {
                 do {
@@ -104,7 +105,8 @@ nonisolated final class DirectoryCatalogIO: @unchecked Sendable {
                         throw CatalogError.invalidManifest
                     }
                     return value
-                } catch { throw LocalCatalogError.invalidFile(path, error.localizedDescription) }
+                } catch let error as LocalCatalogError { throw error }
+                catch { throw LocalCatalogError.invalidFile(path, error.localizedDescription) }
             }
             let index = try json("index.json")
             guard let ids = index["shaders"] as? [String], (1...CatalogLimits.shaderCount).contains(ids.count),
@@ -125,9 +127,16 @@ nonisolated final class DirectoryCatalogIO: @unchecked Sendable {
                 var bytes = Data()
                 for path in sourcePaths { bytes.append(try read(path, limit: CatalogLimits.sourceBytes)) }
                 total += bytes.count
-                guard !bytes.isEmpty, bytes.count <= CatalogLimits.sourceBytes, total <= CatalogLimits.totalSourceBytes,
-                      let text = String(validating: bytes, as: UTF8.self) else {
-                    throw LocalCatalogError.invalidFile(folder + "body.metal", "Assembled source must be UTF-8 and within the source size limits.")
+                let bodyPath = folder + "body.metal"
+                guard !bytes.isEmpty else {
+                    throw LocalCatalogError.invalidFile(bodyPath, "Assembled source for \(id) is empty.")
+                }
+                try CatalogLimits.checkByteCount(bytes.count, limit: CatalogLimits.sourceBytes,
+                                                 path: bodyPath, kind: "Assembled source for \(id)")
+                try CatalogLimits.checkByteCount(total, limit: CatalogLimits.totalSourceBytes,
+                                                 path: "index.json", kind: "Catalog source total after shader \(id)")
+                guard let text = String(validating: bytes, as: UTF8.self) else {
+                    throw LocalCatalogError.invalidFile(bodyPath, "Assembled source for \(id) is not valid UTF-8.")
                 }
                 let dependencies = sourcePaths + [metadataPath]
                 let date = try dependencies.map { path in
@@ -151,7 +160,8 @@ nonisolated final class DirectoryCatalogIO: @unchecked Sendable {
             if let collections = index["collections"] { wire["collections"] = collections }
             wire["sourceRevision"] = String(repeating: "0", count: 64)
             let manifestData = try JSONSerialization.data(withJSONObject: wire, options: [.sortedKeys])
-            guard manifestData.count <= CatalogLimits.manifestBytes else { throw LocalCatalogError.invalidFile("index.json", "Catalog exceeds 2 MiB.") }
+            try CatalogLimits.checkByteCount(manifestData.count, limit: CatalogLimits.manifestBytes,
+                                             path: "index.json", kind: "Catalog manifest")
             let manifest: CatalogManifest
             do { manifest = try CatalogBuilder(manifest: JSONDecoder().decode(CatalogManifest.self, from: manifestData)).manifest }
             catch { throw LocalCatalogError.invalidFile("index.json", error.localizedDescription) }

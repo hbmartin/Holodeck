@@ -7,6 +7,12 @@ nonisolated enum CatalogLimits {
     static let totalSourceBytes = 16_777_216
     static let previewBytes = 8_388_608
     static let shaderCount = 500
+
+    static func checkByteCount(_ count: Int, limit: Int, path: String, kind: String) throws {
+        guard count <= limit else {
+            throw LocalCatalogError.invalidFile(path, "\(kind) is \(count) bytes; limit is \(limit) bytes.")
+        }
+    }
 }
 
 /// Proof is created only after hashing the exact schema-2 wire bytes.
@@ -36,9 +42,8 @@ nonisolated enum CatalogPublication {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(Manifest(schemaVersion: 2, defaultShaderID: manifest.defaultShaderID,
             shaders: manifest.shaders, collections: manifest.collections))
-        guard data.count <= CatalogLimits.manifestBytes else {
-            throw LocalCatalogError.invalidFile("index.json", "Catalog exceeds 2 MiB.")
-        }
+        try CatalogLimits.checkByteCount(data.count, limit: CatalogLimits.manifestBytes,
+                                         path: "index.json", kind: "Catalog manifest")
         return data
     }
 
