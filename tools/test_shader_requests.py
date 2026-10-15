@@ -85,8 +85,22 @@ else:
 Path(value('--output-last-message')).write_text(json.dumps(output))
 '''
 TOOL = r'''#!/usr/bin/env python3
-import sys
+import json, os, signal, sys, time
 from pathlib import Path
+args = sys.argv[1:]
+if args == ['--version']:
+    print('holodeck-shader-tool 1.1.0'); raise SystemExit(0)
+if args[:2] == ['library', 'info']:
+    print(json.dumps({'interfaceVersion':1,'checkerVersion':'1.0.0'})); raise SystemExit(0)
+if args[:2] == ['library', 'validate']:
+    assert '--gpu' in args and '--python' in args
+    fixture = Path('.fixture-validation.json')
+    config = json.loads(fixture.read_text()) if fixture.exists() else {}
+    if config.get('fail') or (config.get('outage') and Path(config['outage']).exists()): raise SystemExit(1)
+    if config.get('signalIfEdited') and 'EDIT' in Path('shaders/alpha/body.metal').read_text(): os.kill(os.getpid(),signal.SIGTERM)
+    if config.get('writeIgnoredOutput'): Path('ignored/host-output').write_text(str(time.time_ns()))
+    if any('BAD' in p.read_text() for p in Path('shaders').glob('*/body.metal')): raise SystemExit(1)
+    raise SystemExit(0)
 Path(sys.argv[3]).write_bytes((Path(__file__).parent/'frame.png').read_bytes())
 '''
 LIBRARY = '''import sys\nfrom pathlib import Path\nif any('BAD' in p.read_text() for p in Path('shaders').glob('*/body.metal')): sys.exit(1)\n'''
@@ -114,7 +128,7 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         (self.root/'tools').mkdir()
         (self.root/'tools/library.py').write_text(LIBRARY)
         (self.root/'tools/test_authoring.py').write_text('import unittest\nclass Tests(unittest.TestCase):\n def test_authoring(self): self.assertTrue(True)\n')
-        (self.root/'tools/test_licenses.py').write_text("SOURCE_REQUIREMENTS = {'shaders/alpha/body.metal': ['Author']}\nUPSTREAM_REQUIREMENTS = {'source': {'license':'MIT'}}\n")
+        (self.root/'authoring.json').write_text(json.dumps({"schemaVersion":1,"sourceRequirements":{"shaders/alpha/body.metal":["Author"]},"upstreamRequirements":{"source":{"license":"MIT"}},"regressionProfiles":[]}))
         self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Baseline');self.git(self.root,'push','-u','origin','main')
         self.base_sha=self.git(self.root,'rev-parse','HEAD').strip()
         self.codex=self.base/'codex'; self.codex.write_text(CODEX); self.codex.chmod(0o755)
@@ -230,8 +244,8 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         (self.root/'shaders/beta/body.metal').write_text('OTHER\n')
         with self.assertRaises(worker_module.CandidateError):worker.scope(outcome)
         self.git(self.root,'reset','--hard',self.base_sha)
-        (self.root/'tools/test_licenses.py').write_text("SOURCE_REQUIREMENTS = {'shaders/alpha/body.metal':['Author']}\nUPSTREAM_REQUIREMENTS = {'source': {'license':'MIT'}}\nprint('bypass')\n")
-        with self.assertRaisesRegex(worker_module.CandidateError,'logic'):worker.scope()
+        (self.root/'authoring.json').write_text(json.dumps({"schemaVersion":2,"sourceRequirements":{"shaders/alpha/body.metal":["Author"]},"upstreamRequirements":{"source":{"license":"MIT"}},"regressionProfiles":[]}))
+        with self.assertRaisesRegex(worker_module.CandidateError,'schema'):worker.scope()
         self.git(self.root,'reset','--hard',self.base_sha)
         with self.assertRaisesRegex(worker_module.CandidateError,'identity'):worker.scope({'shaderID':'alpha','outputKind':'new','changed':True})
         (self.root/'tools/library.py').write_text('pass\n')
@@ -264,9 +278,9 @@ class ShaderRequestWorkerTests(unittest.TestCase):
 
     def test_data_only_attribution_update_is_allowed_but_not_weakened(self):
         worker=worker_module.Worker(self.config,self.job);worker.request=self.request;worker.save(base=self.base_sha)
-        (self.root/'tools/test_licenses.py').write_text("SOURCE_REQUIREMENTS = {'shaders/alpha/body.metal':['Author','New notice']}\nUPSTREAM_REQUIREMENTS = {'source': {'license':'MIT'}}\n")
+        (self.root/'authoring.json').write_text(json.dumps({"schemaVersion":1,"sourceRequirements":{"shaders/alpha/body.metal":["Author","New notice"]},"upstreamRequirements":{"source":{"license":"MIT"}},"regressionProfiles":[]}))
         worker.scope()
-        (self.root/'tools/test_licenses.py').write_text("SOURCE_REQUIREMENTS = {'shaders/alpha/body.metal':[]}\nUPSTREAM_REQUIREMENTS = {'source': {'license':'MIT'}}\n")
+        (self.root/'authoring.json').write_text(json.dumps({"schemaVersion":1,"sourceRequirements":{"shaders/alpha/body.metal":[]},"upstreamRequirements":{"source":{"license":"MIT"}},"regressionProfiles":[]}))
         with self.assertRaisesRegex(worker_module.CandidateError,'weakened'):worker.scope()
 
     def test_activation_repair_keeps_new_classification_and_same_request(self):
@@ -384,7 +398,7 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         self.assertFalse((self.job/'repair.json').exists())
 
     def test_failed_pristine_baseline_does_not_invoke_codex_or_restore_patch(self):
-        (self.root/'tools/library.py').write_text('raise SystemExit(1)\n')
+        (self.root/'.fixture-validation.json').write_text(json.dumps({'fail':True}))
         self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Broken baseline');self.git(self.root,'push','origin','main')
         (self.job/'untracked.json').write_text(json.dumps({'shaders/gamma/body.metal':base64.b64encode(b'PARKED').decode()}))
         code,events=self.run_worker();self.assertNotEqual(code,0)
@@ -394,7 +408,7 @@ class ShaderRequestWorkerTests(unittest.TestCase):
 
     def test_host_outage_after_baseline_is_operational_without_another_codex_call(self):
         outage=self.base/'host-outage'
-        (self.root/'tools/library.py').write_text('from pathlib import Path\nif Path('+repr(str(outage))+').exists(): raise SystemExit(1)\n')
+        (self.root/'.fixture-validation.json').write_text(json.dumps({'outage':str(outage)}))
         self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Outage-aware fixture');self.git(self.root,'push','origin','main')
         self.codex.write_text(CODEX.replace("if status=='completed':", "Path("+repr(str(outage))+ ").touch()\n    if status=='completed':"))
         code,events=self.run_worker();self.assertNotEqual(code,0)
@@ -415,7 +429,7 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         advanced=[]
         def race(event):
             if event['event']=='preparePublication' and not advanced:
-                (upstream/'tools/library.py').write_text('raise SystemExit(1)\n')
+                (upstream/'.fixture-validation.json').write_text(json.dumps({'fail':True}))
                 self.git(upstream,'add','--all');self.git(upstream,'commit','-m','Broken new baseline');self.git(upstream,'push','origin','main');advanced.append(True)
         code,events=self.run_worker(race);self.assertNotEqual(code,0)
         self.assertEqual((self.job/'implementation-count').read_text(),'1')
@@ -504,7 +518,7 @@ class ShaderRequestWorkerTests(unittest.TestCase):
 
     def test_host_ignored_outputs_do_not_trigger_shader_repair(self):
         self.ignored_worker()
-        (self.root/'tools/library.py').write_text(LIBRARY+"\nimport time\nPath('ignored/host-output').write_text(str(time.time_ns()))\n")
+        (self.root/'.fixture-validation.json').write_text(json.dumps({'writeIgnoredOutput':True}))
         self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Validator output fixture');self.git(self.root,'push','origin','main')
         code,events=self.run_worker();self.assertEqual(code,0,events)
         self.assertEqual((self.job/'implementation-count').read_text(),'1')
@@ -522,7 +536,7 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         self.assertEqual(self.git(self.root,'rev-parse','origin/main'),before)
 
     def detached_setup_worker(self):
-        (self.root/'tools/shader_tool.py').touch()
+        (self.root/'setup-fixture.txt').write_text('setup')
         self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Setup fixture');self.git(self.root,'push','origin','main')
         worker=worker_module.Worker(self.config,self.job)
         worker.checkout_identity.write_text('checkout-fixture')
@@ -533,7 +547,7 @@ class ShaderRequestWorkerTests(unittest.TestCase):
 
     def test_detached_owner_retires_only_after_successful_setup(self):
         worker,owner=self.detached_setup_worker()
-        with patch.object(worker_module,'run',return_value=subprocess.CompletedProcess([],0,'','')):
+        with patch.object(worker_module,'run',return_value=subprocess.CompletedProcess([],0,json.dumps({'interfaceVersion':1,'checkerVersion':'1.0.0'}),'')):
             worker.preflight()
         self.assertFalse(worker.owner.exists())
         self.assertEqual(worker.checkout_identity.read_text(),'checkout-fixture')
@@ -595,7 +609,7 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         self.assertFalse((self.job/'invocations.jsonl').exists())
 
     def test_signalled_candidate_validator_repairs_after_baseline_succeeds(self):
-        (self.root/'tools/library.py').write_text('import os,signal\nfrom pathlib import Path\nif "EDIT" in Path("shaders/alpha/body.metal").read_text(): os.kill(os.getpid(),signal.SIGTERM)\n')
+        (self.root/'.fixture-validation.json').write_text(json.dumps({'signalIfEdited':True}))
         self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Signalled candidate fixture');self.git(self.root,'push','origin','main')
         self.codex.write_text(CODEX.replace("write_text('EDIT\\n')", "write_text('EDIT\\n' if count == 1 else 'FIXED\\n')"))
         code,events=self.run_worker();self.assertEqual(code,0,events)
@@ -703,10 +717,39 @@ worker.main()
         self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Ignored scratch');self.git(self.root,'push','origin','main')
         code,events=self.run_worker();self.assertEqual(code,0,events)
         (self.root/'ignored').mkdir();(self.root/'ignored/user-data').write_bytes(b'created after publication')
-        (self.root/'tools/library.py').write_text('raise SystemExit(1)\n')
+        (self.root/'.fixture-validation.json').write_text(json.dumps({'fail':True}))
         self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Broken new baseline');self.git(self.root,'push','origin','main')
         (self.job/'repair.json').write_text(json.dumps({'attemptID':'new','shaderID':'alpha','diagnostic':'Repair activation'}))
         code,events=self.run_worker();self.assertNotEqual(code,0)
         self.assertEqual((self.root/'ignored/user-data').read_bytes(),b'created after publication')
+
+    def test_authoring_profiles_and_inventory_shape_are_protected(self):
+        worker=worker_module.Worker(self.config,self.job);worker.request=self.request;worker.save(base=self.base_sha)
+        original=json.loads((self.root/'authoring.json').read_text())
+        for change in ({'regressionProfiles':['unknown']}, {'schemaVersion':2}, {'sourceRequirements':{}}, {'upstreamRequirements':{}}, {'sourceRequirements':{'unrelated.metal':[]}}):
+            (self.root/'authoring.json').write_text(json.dumps(dict(original,**change)))
+            with self.assertRaises(worker_module.CandidateError):worker.scope()
+        (self.root/'authoring.json').write_text('{"schemaVersion":1,"schemaVersion":2}')
+        with self.assertRaises(worker_module.CandidateError):worker.scope()
+
+    def test_unavailable_checker_is_operational_and_checkout_code_is_never_executed(self):
+        worker=worker_module.Worker(self.config,self.job);worker.request=self.request;worker.save(base=self.base_sha)
+        marker=self.base/'executed'
+        (self.root/'tools/library.py').write_text('from pathlib import Path\nPath('+repr(str(marker))+').touch()\n')
+        worker.technical(baseline=True)
+        self.assertFalse(marker.exists())
+        self.tool.write_text(TOOL.replace("if args[:2] == ['library', 'validate']:", "if args[:2] == ['library', 'validate']: raise SystemExit(2)\nif False:"))
+        with self.assertRaisesRegex(worker_module.OperationalError,'tooling is unavailable'):worker.technical()
+
+    def test_attribution_checkout_conversion_fails_before_codex(self):
+        file=self.root/'authoring.json';file.write_text(file.read_text()+'\n')
+        (self.root/'.gitattributes').write_text('authoring.json text eol=crlf\n')
+        self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Attribution conversion fixture');self.git(self.root,'push','origin','main')
+        file.unlink();self.git(self.root,'checkout','--','authoring.json')
+        self.assertIn(b'\r\n',file.read_bytes())
+        self.assertFalse(self.git(self.root,'status','--porcelain').strip())
+        code,events=self.run_worker();self.assertNotEqual(code,0,events)
+        self.assertTrue(any('checkout bytes differ' in e.get('message','') for e in events),events)
+        self.assertFalse((self.job/'invocations.jsonl').exists())
 
 if __name__=='__main__': unittest.main()

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Single-checkout Codex worker. JSONL bridge; no shell interpolation or model-owned Git writes."""
-import ast
 import base64
 import contextlib
 import fcntl
@@ -273,7 +272,7 @@ class Worker:
         tree = self.git_tree("HEAD")
         self.require_publication_inputs(tree)
         for name, entry in tree.items():
-            if name == "index.json" or (name.startswith("shared/") and name.endswith(".metal")) or (name.startswith("shaders/") and name.endswith(("/body.metal", "/metadata.json"))):
+            if name in ("index.json", "authoring.json") or (name.startswith("shared/") and name.endswith(".metal")) or (name.startswith("shaders/") and name.endswith(("/body.metal", "/metadata.json"))):
                 with self.workspace_parent(name) as (parent, leaf):
                     fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
                     with os.fdopen(fd, "rb") as file:
@@ -414,7 +413,7 @@ class Worker:
             parts = name.split("/")
             if len(parts) == 3 and parts[0] == "shaders" and parts[2] in ("body.metal", "metadata.json"):
                 primary.add(parts[1])
-            elif name not in ("index.json", "shared/common.metal", "shared/material.metal", "shared/fragment.metal", "tools/test_licenses.py"):
+            elif name not in ("index.json", "shared/common.metal", "shared/material.metal", "shared/fragment.metal", "authoring.json"):
                 raise CandidateError("Forbidden change: " + name)
             path = self.root / name
             if not path.is_file() or path.is_symlink():
@@ -478,38 +477,38 @@ class Worker:
                     raise CandidateError("Only the output shader's collection memberships may change")
             if bool(paths) != outcome["changed"]:
                 raise CandidateError("Changed flag disagrees with the actual diff")
-        if "tools/test_licenses.py" in paths:
-            before_bytes = self.git("show", f"{base}:tools/test_licenses.py", raw=True)
-            after_bytes = (self.root / "tools/test_licenses.py").read_bytes()
-            before = ast.parse(before_bytes)
-            after = ast.parse(after_bytes)
-            def inventory(tree, source):
-                values = {}
-                keep = []
-                ranges = []
-                lines = source.splitlines(keepends=True)
-                for node in tree.body:
-                    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id in ("SOURCE_REQUIREMENTS", "UPSTREAM_REQUIREMENTS"):
-                        values[node.targets[0].id] = ast.literal_eval(node.value)
-                        ranges.append((sum(map(len, lines[:node.lineno - 1])) + node.col_offset,
-                                       sum(map(len, lines[:node.end_lineno - 1])) + node.end_col_offset))
-                    else:
-                        keep.append(node)
-                for start, end in reversed(ranges):
-                    source = source[:start] + b"<notice-inventory>" + source[end:]
-                return ast.dump(ast.Module(body=keep, type_ignores=[]), include_attributes=False), values, source
-            old_logic, old_records, old_outside = inventory(before, before_bytes)
-            new_logic, new_records, new_outside = inventory(after, after_bytes)
-            if old_logic != new_logic or old_outside != new_outside:
-                raise CandidateError("License validation logic cannot change")
-            for path, notices in old_records["SOURCE_REQUIREMENTS"].items():
-                if not set(notices) <= set(new_records["SOURCE_REQUIREMENTS"].get(path, [])):
+        if "authoring.json" in paths:
+            def inventory(data):
+                def unique(pairs):
+                    result = {}
+                    for key, value in pairs:
+                        if key in result:
+                            raise CandidateError("Duplicate attribution key: " + key)
+                        result[key] = value
+                    return result
+                try:
+                    value = json.loads(data, object_pairs_hook=unique)
+                    if not isinstance(value, dict) or not isinstance(value.get("sourceRequirements"), dict) or not isinstance(value.get("upstreamRequirements"), dict):
+                        raise CandidateError("Invalid attribution inventory")
+                    for required in value["sourceRequirements"].values():
+                        if not isinstance(required, list) or any(not isinstance(item, str) for item in required) or len(required) != len(set(required)):
+                            raise CandidateError("Invalid attribution obligations")
+                    return value
+                except (ValueError, TypeError) as error:
+                    raise CandidateError("Invalid attribution data: " + str(error)) from error
+            old_records = inventory(self.git("show", f"{base}:authoring.json", raw=True))
+            new_records = inventory((self.root / "authoring.json").read_bytes())
+            protected = lambda value: {k: v for k, v in value.items() if k not in ("sourceRequirements", "upstreamRequirements")}
+            if protected(old_records) != protected(new_records):
+                raise CandidateError("Authoring schema and regression profiles cannot change")
+            for path, notices in old_records["sourceRequirements"].items():
+                if path not in new_records["sourceRequirements"] or not set(notices) <= set(new_records["sourceRequirements"][path]):
                     raise CandidateError("Existing attribution obligations cannot be weakened")
-            allowed_sources = set(old_records["SOURCE_REQUIREMENTS"]) | {f"shaders/{sid}/body.metal" for sid in primary}
-            if not set(new_records["SOURCE_REQUIREMENTS"]) <= allowed_sources:
+            allowed_sources = set(old_records["sourceRequirements"]) | {f"shaders/{sid}/body.metal" for sid in primary}
+            if not set(new_records["sourceRequirements"]) <= allowed_sources:
                 raise CandidateError("Unrelated notice records cannot be introduced")
-            for key, value in old_records["UPSTREAM_REQUIREMENTS"].items():
-                if new_records["UPSTREAM_REQUIREMENTS"].get(key) != value:
+            for key, value in old_records["upstreamRequirements"].items():
+                if new_records["upstreamRequirements"].get(key) != value:
                     raise CandidateError("Existing upstream provenance cannot change")
         if self.git("diff", "--name-only", "--diff-filter=U").strip():
             raise CandidateError("Resolve all merge conflicts")
@@ -558,12 +557,12 @@ class Worker:
         answer = json.loads(answer_path.read_text()) if answer_path.exists() else None
         repair_path = self.directory / "repair.json"
         repair = json.loads(repair_path.read_text()) if repair_path.exists() else None
-        return """Implement one Holodeck shader request. Read AGENTS.md and the authoring/library docs, search techniques, and preserve attribution.
+        return """Implement one Holodeck shader request. Read AGENTS.md, skills/holodeck-authoring/SKILL.md and the authoring/library docs. Search assets with file search and direct reads, scaffold from templates, and preserve attribution.
 The user is viewing the captured source below; the checkout is latest origin/main and may differ. Preserve intervening edits.
 Choose any ONE existing shader ID to EDIT, retaining its ID, or create ONE unused ID. If the context was deleted, recreate under a fresh ID.
 Ask a concise clarification only if intent is ambiguous. Unsupported audio/textures/multipass/app capabilities must be approximated using this runtime and disclosed.
 New output: append to index.shaders and relevant EXISTING collections; preserve the default and existing ordering. Generate a name, metadata and discovery tags/moods/motion. If editing an unlisted existing shader, append its ID too so the TV can download it.
-Allowed changes: one primary shader body/metadata, index membership, canonical shared helpers, and DATA ONLY in SOURCE_REQUIREMENTS/UPSTREAM_REQUIREMENTS of tools/test_licenses.py.
+Allowed changes: one primary shader body/metadata, index membership, canonical shared helpers, and DATA ONLY in sourceRequirements/upstreamRequirements of authoring.json. Preserve schemaVersion and regressionProfiles.
 No tooling, test logic, other shader bodies, originals, previews, or app changes. Do NOT commit, push, change branches, or alter Git configuration.
 For PERFORMANCE purpose: optimize the context ID (unless deleted), preserve composition/colors/motion/detail for all affected shaders; report no changes if latest already addresses the old evidence. Timings refer to the observed old source, not necessarily latest.
 For activation repair: repair the failed OUTPUT ID from the diagnostic, preserving the creative intent. Recreate it if deleted. Classification belongs to the logical request: retain "new" for an output this request already created and published. The changed flag describes only this candidate diff; the host records earlier changes too.
@@ -577,8 +576,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
     def technical(self, baseline=False, commands=None):
         self.stage("validating", "Compiling macOS and tvOS shaders and running authoring/GPU tests")
         env = dict(self.env, HOLODECK_GPU_TESTS="1")
-        commands = commands or [[self.config["python"], "tools/library.py", "validate", "--compile"],
-                    [self.config["python"], "-m", "unittest", "discover", "-s", "tools", "-p", "test_*.py"]]
+        commands = commands or [[self.config["shaderTool"], "library", "validate", str(self.root), "--gpu", "--python", self.config["python"]]]
         for command in commands:
             try:
                 result = run(command, self.root, env, check=False)
@@ -586,6 +584,8 @@ An unchanged existing shader may be successful if it already satisfies the promp
                 if baseline: raise OperationalError("Baseline validation timed out") from error
                 raise VerificationError("Candidate validation timed out", command=command) from error
             if result.returncode:
+                if result.returncode == 2:
+                    raise OperationalError("Checker tooling is unavailable: " + (result.stdout + result.stderr)[-12000:])
                 message = (result.stdout + result.stderr)[-12000:] or f"Validation exited {result.returncode}"
                 if baseline:
                     raise OperationalError("Baseline or host validation failed: " + message)
@@ -877,8 +877,16 @@ An unchanged existing shader may be successful if it already satisfies the promp
         self.git("checkout", "-B", "main", "origin/main")
         self.check_checkout_inputs()
         self.git("push", "--dry-run", "origin", "HEAD:main")
-        if not (self.root / "tools/shader_tool.py").is_file():
-            raise OperationalError("Complete the native shader-tool and preview migration on origin/main before enabling requests.")
+        info = run([self.config["shaderTool"], "library", "info", "--json", "--python", self.config["python"]], self.root, self.env)
+        try:
+            checker = json.loads(info.stdout)
+            if checker["interfaceVersion"] != 1 or not checker["checkerVersion"].startswith("1."):
+                raise ValueError("incompatible interface")
+            configuration = self.root / "authoring.json"
+            if configuration.is_symlink() or json.loads(configuration.read_bytes()).get("schemaVersion") != 1:
+                raise ValueError("missing authoring schema 1")
+        except (ValueError, TypeError, KeyError, OSError) as error:
+            raise OperationalError("Update Holodeck and the shader library together before enabling requests: " + str(error)) from error
         sid = json.loads((self.root / "index.json").read_text())["defaultShaderID"]
         source = self.directory / "setup.metal"
         source.write_text(self.source(sid))

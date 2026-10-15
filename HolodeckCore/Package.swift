@@ -18,7 +18,7 @@ let package = Package(
             .product(name: "Clocks", package: "swift-clocks"),
             .product(name: "IssueReporting", package: "swift-issue-reporting"),
             .product(name: "X509", package: "swift-certificates", condition: .when(platforms: [.macOS]))
-        ], resources: [.copy("Resources/shader_requests.py")]),
+        ], resources: [.copy("Resources/shader_requests.py"), .copy("Resources/shader_checker.pyz"), .copy("Resources/shader_checker.lock.json")]),
         .executableTarget(name: "HolodeckShaderTool", dependencies: ["HolodeckCore"]),
         .testTarget(name: "HolodeckCoreTests", dependencies: ["HolodeckCore"],
                     resources: [.copy("TestSupport")])
