@@ -1015,6 +1015,273 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertEqual(monitor.targetFramesPerSecond, 24)
     }
 
+    private func publicationRecoveryFixture(gate: RequestPreparationGate? = nil,
+        reconcile: @escaping @Sendable (URL) async throws -> Void = { try RequestWorkerProcess.reconcileOrphan(in: $0) }
+    ) async throws -> (root: URL, script: URL, authoring: URL, catalog: DirectoryCatalog, service: ShaderRequestService) {
+        let (root, script) = try recoveryFixture()
+        let authoring = try requestAuthoringFixture(root.appendingPathComponent("authoring"))
+        _ = try initializeRecoveryGit(authoring)
+        var source = try String(contentsOf: script, encoding: .utf8)
+        source = source.replacingOccurrences(of: "if mode=='preflight':", with: """
+        with (job.parent/'operations').open('a') as log: log.write(mode+':'+job.name+'\\n')
+        if mode=='publication':
+            count=job/'publication-count'
+            count.write_text(str(int(count.read_text())+1 if count.exists() else 1))
+            if (job/'fail-publication').exists(): emit('failure',message='Automatic fixture publication failed'); raise SystemExit(1)
+            emit('preparePublication',requiredPreviewShaderIDs=[])
+            reply=json.loads(sys.stdin.readline())
+            assert reply['ok'],reply
+            emit('publicationReady'); raise SystemExit(0)
+        if mode=='preflight':
+        """)
+        source = source.replacingOccurrences(of: "emit('discarded'); raise SystemExit(0)", with: """
+        marker=Path(json.loads(Path(sys.argv[2]).read_text())['repository'])/'.git/holodeck-request-owner.json'
+            if marker.exists() and json.loads(marker.read_text())['id']==job.name: marker.unlink()
+            emit('discarded'); raise SystemExit(0)
+        """)
+        try source.write(to: script, atomically: true, encoding: .utf8)
+        let previews = ShaderPreviewGenerator(directory: root.appendingPathComponent("previews")) { _ in
+            if let gate { await gate.hold() }
+            return try ShaderPNG.gradient(colors: [[0,0,0],[1,1,1]])
+        }
+        let catalog = DirectoryCatalog(directory: root.appendingPathComponent("catalog"), previewGenerator: previews)
+        let service = ShaderRequestService(catalog: catalog, directory: root, workerScript: script, reconcileWorker: reconcile)
+        await service.suspend()
+        try await service.initialize(configuration: .init(repository: authoring.path, enabled: true))
+        return (root, script, authoring, catalog, service)
+    }
+    private func brokenReconciliation(_ root: URL) throws -> URL {
+        let setup = root.appendingPathComponent("setup")
+        try FileManager.default.createDirectory(at: setup, withIntermediateDirectories: true)
+        let marker = setup.appendingPathComponent("process.json")
+        try Data("{}".utf8).write(to: marker)
+        return marker
+    }
+    private func recoveryFailure(_ task: Task<Void, Error>) async throws -> ShaderRequestPublicationFailure {
+        let backstop = Task { try await Task.sleep(for: .seconds(8)); task.cancel() }
+        defer { backstop.cancel() }
+        do { try await task.value; XCTFail("Blocked publication succeeded") }
+        catch let failure as ShaderRequestPublicationFailure {
+            XCTAssertTrue(failure.recoveryRequired)
+            XCTAssertTrue(failure.message.contains("recovery"))
+            return failure
+        }
+        throw ShaderRequestError.unavailable("Expected typed recovery failure")
+    }
+
+    func testRecoveryFailureSettlesCoalescedWaitersAndAutomaticallyForcesPublicationBeforeJobs() async throws {
+        for _ in 0..<3 {
+            let f = try await publicationRecoveryFixture(), service = f.service
+            let original = try await f.catalog.reload(from: f.authoring)
+            try Data("UPDATED\n".utf8).write(to: f.authoring.appendingPathComponent("shaders/plasma/body.metal"))
+            let marker = try brokenReconciliation(f.root)
+            let queued = ShaderRequest(prompt: "After recovery", context: try context())
+            _ = try await service.control(operation: "requestSubmit", payload: .init(request: queued), deviceID: "TV")
+            let cache = Task { try await service.ensurePublication() }, forced = Task { try await service.ensurePublication(force: true) }
+            try await waitFor { await service.pendingPublicationWaiterCount == 2 }
+            await service.resume()
+            let first = try await recoveryFailure(cache), second = try await recoveryFailure(forced)
+            XCTAssertEqual(first, second)
+            let failed = await service.publicationOperationStatus(), pending = await service.pendingPublicationWaiterCount
+            XCTAssertEqual(failed.phase, .failed); XCTAssertEqual(failed.failure, first); XCTAssertEqual(pending, 0)
+            let head = try JSONDecoder().decode(CatalogHead.self, from: await f.catalog.get(.head, limit: CatalogLimits.headBytes))
+            XCTAssertEqual(head.revision, original.catalog.publicationRevision)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.root.appendingPathComponent("operations").path))
+            // An old caller's cancellation cannot cancel the service-owned retry intent.
+            cache.cancel(); forced.cancel()
+            try FileManager.default.removeItem(at: marker)
+            await service.activateScheduling()
+            try await service.retryReconciliation()
+            try await waitFor { FileManager.default.fileExists(atPath: f.root.appendingPathComponent(queued.id.uuidString).appendingPathComponent("worker-started").path) }
+            let publication = await service.publicationStatus()
+            XCTAssertNotEqual(publication?.revision, original.catalog.publicationRevision)
+            let operations = try String(contentsOf: f.root.appendingPathComponent("operations"), encoding: .utf8).split(separator: "\n").map(String.init)
+            XCTAssertEqual(operations, ["publication:publication", "run:" + queued.id.uuidString])
+            try await service.detachCheckout(queued.id)
+        }
+    }
+
+    func testOwnerAndRemainingFailedCleanupRejectPublicationThenRetryAutomatically() async throws {
+        let f = try await publicationRecoveryFixture(), a = ShaderRequest(prompt: "Cleanup A", context: try context()), b = ShaderRequest(prompt: "Cleanup B", context: try context())
+        for request in [a,b] { _ = try await f.service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: request.id.uuidString) }
+        let journal = f.root.appendingPathComponent("journal.json")
+        var rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: journal)) as? [[String: Any]])
+        for i in rows.indices {
+            var status = rows[i]["status"] as! [String: Any]; status["stage"] = "failed"
+            rows[i]["status"] = status; rows[i]["cleanupPending"] = true
+        }
+        try JSONSerialization.data(withJSONObject: rows).write(to: journal)
+        let aJob = f.root.appendingPathComponent(a.id.uuidString), owner = f.authoring.appendingPathComponent(".git/holodeck-request-owner.json")
+        try Data().write(to: aJob.appendingPathComponent("fail-cleanup"))
+        try Data().write(to: aJob.appendingPathComponent("hold-cleanup"))
+        func setOwner(_ request: ShaderRequest) throws {
+            try JSONSerialization.data(withJSONObject: ["id": request.id.uuidString, "directory": f.root.appendingPathComponent(request.id.uuidString).path]).write(to: owner)
+        }
+        try setOwner(a)
+        let service = ShaderRequestService(catalog: f.catalog, directory: f.root, workerScript: f.script)
+        await service.suspend(); try await service.initialize(configuration: .init(repository: f.authoring.path, enabled: true))
+        let first = Task { try await service.ensurePublication(force: true) }
+        try await waitFor { await service.pendingPublicationWaiterCount == 1 }; await service.resume()
+        try await waitFor { FileManager.default.fileExists(atPath: aJob.appendingPathComponent("cleanup-started").path) }
+        let waiting = await service.pendingPublicationWaiterCount
+        XCTAssertEqual(waiting, 1, "Active cleanup is contention, not a terminal publication failure")
+        try FileManager.default.removeItem(at: aJob.appendingPathComponent("hold-cleanup"))
+        _ = try await recoveryFailure(first)
+        // A newly reconciled owner B cleans successfully; the remaining A failure must also settle callers.
+        await service.suspend(); try setOwner(b)
+        let second = Task { try await service.ensurePublication() }
+        try await waitFor { await service.pendingPublicationWaiterCount == 1 }
+        try await service.retryReconciliation(); await service.resume()
+        _ = try await recoveryFailure(second)
+        let jobs = await service.allJobs()
+        XCTAssertTrue(jobs.allSatisfy { $0.stage == .failed })
+        let recoveries = await service.recoveryStatuses()
+        XCTAssertEqual(recoveries.map(\.id), [a.id])
+        try FileManager.default.removeItem(at: aJob.appendingPathComponent("fail-cleanup")); try setOwner(a)
+        try await service.retryCleanup(a.id, repository: f.authoring.path, python: "/usr/bin/python3", git: "/usr/bin/git")
+        try await waitFor { await service.publicationOperationStatus().revision != nil }
+        let cleanup = await service.hasPendingCleanup()
+        XCTAssertFalse(cleanup)
+        XCTAssertEqual(try String(contentsOf: f.root.appendingPathComponent("publication/publication-count"), encoding: .utf8), "1")
+    }
+
+    func testAutomaticPublicationSurvivesSleepWithoutWaitersAndIndividualCancellation() async throws {
+        let gate = RequestPreparationGate(), f = try await publicationRecoveryFixture(gate: gate)
+        let marker = try brokenReconciliation(f.root)
+        let request = Task { try await f.service.ensurePublication(force: true) }
+        try await waitFor { await f.service.pendingPublicationWaiterCount == 1 }; await f.service.resume()
+        _ = try await recoveryFailure(request)
+        try FileManager.default.removeItem(at: marker); try await f.service.retryReconciliation()
+        try await waitFor { await gate.entered }
+        await f.service.suspend()
+        let cancelled = Task { try await f.service.ensurePublication() }
+        try await waitFor { await f.service.pendingPublicationWaiterCount == 1 }; cancelled.cancel()
+        do { try await cancelled.value; XCTFail("Cancelled caller completed") } catch is CancellationError {}
+        await f.service.resume(); await gate.release()
+        try await waitFor { await f.service.publicationOperationStatus().revision != nil }
+        XCTAssertEqual(try String(contentsOf: f.root.appendingPathComponent("publication/publication-count"), encoding: .utf8), "2")
+        let pending = await f.service.pendingPublicationWaiterCount
+        XCTAssertEqual(pending, 0)
+    }
+
+    func testNativeAutomaticPublicationReportsDirtyCheckoutFailure() async throws {
+        let f = try await publicationRecoveryFixture()
+        for arguments in [["symbolic-ref", "HEAD", "refs/heads/main"], ["add", "--all"]] {
+            let git = Process(); git.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            git.currentDirectoryURL = f.authoring; git.arguments = arguments
+            try git.run(); git.waitUntilExit(); XCTAssertEqual(git.terminationStatus, 0)
+        }
+        try commitFixture(f.authoring)
+        let directory = f.root.appendingPathComponent("native")
+        let marker = try brokenReconciliation(directory)
+        let service = ShaderRequestService(catalog: f.catalog, directory: directory)
+        try await service.initialize(configuration: .init(repository: f.authoring.path, enabled: true))
+        let first = Task { try await service.ensurePublication(force: true) }
+        _ = try await recoveryFailure(first)
+        try Data("dirty".utf8).write(to: f.authoring.appendingPathComponent("shaders/plasma/body.metal"))
+        try FileManager.default.removeItem(at: marker); try await service.retryReconciliation()
+        try await waitFor { await service.publicationOperationStatus().failure?.recoveryRequired == false }
+        let failure = await service.publicationOperationStatus().failure
+        XCTAssertTrue(failure?.message.contains("clean main checkout") == true, "Observed \(String(describing: failure))")
+    }
+
+    func testAutomaticOperationalFailureIsVisibleAndDoesNotLoopThenExplicitRetrySucceeds() async throws {
+        let f = try await publicationRecoveryFixture(), marker = try brokenReconciliation(f.root)
+        let publication = f.root.appendingPathComponent("publication")
+        try FileManager.default.createDirectory(at: publication, withIntermediateDirectories: true)
+        try Data().write(to: publication.appendingPathComponent("fail-publication"))
+        let request = Task { try await f.service.ensurePublication(force: true) }
+        try await waitFor { await f.service.pendingPublicationWaiterCount == 1 }; await f.service.resume()
+        let recovery = try await recoveryFailure(request)
+        try FileManager.default.removeItem(at: marker); try await f.service.retryReconciliation()
+        try await waitFor { await f.service.publicationOperationStatus().failure?.recoveryRequired == false }
+        let failed = await f.service.publicationOperationStatus()
+        XCTAssertGreaterThan(failed.sequence, recovery.operationSequence)
+        XCTAssertTrue(failed.failure?.message.contains("Automatic fixture publication failed") == true)
+        try await f.service.retryReconciliation()
+        XCTAssertEqual(try String(contentsOf: publication.appendingPathComponent("publication-count"), encoding: .utf8), "1")
+        try FileManager.default.removeItem(at: publication.appendingPathComponent("fail-publication"))
+        try await f.service.ensurePublication(force: true)
+        let restored = await f.service.publicationStatus()
+        XCTAssertNotNil(restored)
+    }
+
+    func testDisableDetachAndCheckoutReplacementClearAutomaticPublicationIntent() async throws {
+        for mode in ["disable", "detach", "replace"] {
+            let f = try await publicationRecoveryFixture(), marker = try brokenReconciliation(f.root)
+            let request = Task { try await f.service.ensurePublication(force: true) }
+            try await waitFor { await f.service.pendingPublicationWaiterCount == 1 }; await f.service.resume()
+            _ = try await recoveryFailure(request)
+            if mode == "disable" { try await f.service.disable() }
+            if mode == "detach" { try await f.service.detachCheckout() }
+            if mode == "replace" {
+                let other = try requestAuthoringFixture(f.root.appendingPathComponent("other"))
+                try await f.service.initialize(configuration: .init(repository: other.path, enabled: true))
+            }
+            if FileManager.default.fileExists(atPath: marker.path) { try FileManager.default.removeItem(at: marker) }
+            try await f.service.retryReconciliation()
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.root.appendingPathComponent("publication/publication-count").path))
+            let state = await f.service.publicationOperationStatus()
+            XCTAssertEqual(state.phase, .idle)
+        }
+    }
+
+    func testStaleReconciliationCannotRejectNewerPreparingPublication() async throws {
+        for _ in 0..<3 {
+            let reconciliation = ReconciliationRetryGate(), preparation = RequestPreparationGate()
+            let f = try await publicationRecoveryFixture(gate: preparation, reconcile: { try await reconciliation.reconcile($0) })
+            let old = Task { try await f.service.retryReconciliation() }
+            try await waitFor { await reconciliation.entered }
+            let request = Task { try await f.service.ensurePublication(force: true) }
+            try await waitFor { await f.service.pendingPublicationWaiterCount == 1 }
+            await f.service.resume(); try await f.service.retryReconciliation()
+            try await waitFor { await preparation.entered }
+            await reconciliation.release()
+            do { try await old.value; XCTFail("Old reconciliation unexpectedly succeeded") } catch {}
+            let state = await f.service.publicationOperationStatus()
+            XCTAssertEqual(state.phase, .preparing); XCTAssertNil(state.failure)
+            await preparation.release(); try await request.value
+        }
+    }
+
+    func testDetachedCopyCannotConsumeOriginalProofAndAliasConsumesOnlyItsOwnPath() async throws {
+        let (root, script) = try recoveryFixture(), original = root.appendingPathComponent("original"), copy = root.appendingPathComponent("copy")
+        let gitdir = try initializeRecoveryGit(original), id = UUID(), other = UUID(), identity = UUID().uuidString
+        let job = root.appendingPathComponent(id.uuidString), otherJob = root.appendingPathComponent(other.uuidString)
+        let marker = gitdir.appendingPathComponent("holodeck-request-owner.json")
+        try Data(identity.utf8).write(to: gitdir.appendingPathComponent("holodeck-checkout-id"))
+        try JSONSerialization.data(withJSONObject: ["id": id.uuidString, "directory": job.path]).write(to: marker)
+        try FileManager.default.copyItem(at: original, to: copy)
+        let proofs = [DetachedCheckoutAcknowledgement(requestID: id, directory: job.path, repository: original.path, checkoutID: identity),
+                      DetachedCheckoutAcknowledgement(requestID: other, directory: otherJob.path, repository: copy.path, checkoutID: identity)]
+        let acknowledgements = root.appendingPathComponent("detached-checkouts.json")
+        try JSONEncoder().encode(proofs).write(to: acknowledgements)
+        try """
+        import json,sys
+        from pathlib import Path
+        config=json.loads(Path(sys.argv[2]).read_text()); proof=config.get('detachedOwner')
+        if not proof:
+            print(json.dumps({'event':'failure','message':'Unacknowledged checkout owner'}),flush=True); raise SystemExit(1)
+        assert Path(proof['repository']).resolve()==Path(config['repository']).resolve()
+        marker=Path(config['repository'])/'.git/holodeck-request-owner.json'; marker.unlink()
+        print(json.dumps({'event':'preflight','checkoutID':'\(identity)'}),flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script)
+        try await service.initialize(configuration: .init(repository: original.path))
+        do { try await service.verify(configuration: .init(repository: copy.path)); XCTFail("Copied owner was accepted") } catch {}
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: copy.appendingPathComponent(".git/holodeck-request-owner.json").path))
+        XCTAssertEqual(try JSONDecoder().decode([DetachedCheckoutAcknowledgement].self, from: Data(contentsOf: acknowledgements)), proofs)
+        let alias = root.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: original)
+        try await service.verify(configuration: .init(repository: alias.path))
+        XCTAssertEqual(try JSONDecoder().decode([DetachedCheckoutAcknowledgement].self, from: Data(contentsOf: acknowledgements)), [proofs[1]])
+        let restarted = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script)
+        try await restarted.initialize(configuration: .init())
+        let config = await restarted.configurationValue()
+        XCTAssertTrue(config.enabled, "A proof for a different path with the same UUID must not disable this checkout")
+    }
+
     func testPerformanceDedupPerDeviceShaderVersionAndRevocation() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }

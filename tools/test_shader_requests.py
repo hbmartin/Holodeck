@@ -568,6 +568,33 @@ class ShaderRequestWorkerTests(unittest.TestCase):
             fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
             with self.assertRaises(BlockingIOError):worker.preflight()
 
+    def test_detached_setup_rejects_copy_and_move_with_identical_identity(self):
+        original,owner=self.detached_setup_worker()
+        copied=self.base/'copied-checkout';shutil.copytree(self.root,copied)
+        config=dict(self.config,repository=str(copied))
+        copy=worker_module.Worker(config,self.job)
+        with self.assertRaisesRegex(worker_module.OperationalError,'owned checkout'): copy.preflight()
+        self.assertEqual(json.loads(copy.owner.read_text()),owner)
+        self.assertEqual(json.loads(original.owner.read_text()),owner)
+        self.assertEqual(copy.checkout_identity.read_text(),original.checkout_identity.read_text())
+        moved=self.base/'moved-checkout';self.root.rename(moved)
+        worker=worker_module.Worker(dict(self.config,repository=str(moved)),self.job)
+        with self.assertRaisesRegex(worker_module.OperationalError,'owned checkout'): worker.preflight()
+        self.assertEqual(json.loads(worker.owner.read_text()),owner)
+
+    def test_detached_setup_accepts_canonical_alias_and_rejects_missing_proof(self):
+        original,owner=self.detached_setup_worker()
+        proof=self.config.pop('detachedOwner')
+        with self.assertRaisesRegex(worker_module.OperationalError,'owned checkout'): original.preflight()
+        self.assertEqual(json.loads(original.owner.read_text()),owner)
+        alias=self.base/'checkout-alias';alias.symlink_to(self.root,target_is_directory=True)
+        proof['repository']=str(alias);self.config['detachedOwner']=proof
+        worker=worker_module.Worker(dict(self.config,repository=str(alias)),self.job)
+        worker.codex=lambda *args,**kwargs:{'imageDescription':'Fixture'}
+        with patch.object(worker_module,'run',return_value=subprocess.CompletedProcess([],0,json.dumps({'interfaceVersion':1,'checkerVersion':'1.0.0'}),'')):
+            worker.preflight()
+        self.assertFalse(original.owner.exists())
+
     def test_unrelated_crlf_checkout_is_supported_without_weakening_source_proof(self):
         (self.root/'notes.txt').write_bytes(b'notes\n')
         (self.root/'.gitattributes').write_text('notes.txt text eol=crlf\n')

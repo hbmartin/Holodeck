@@ -851,7 +851,9 @@ An unchanged existing shader may be successful if it already satisfies the promp
             identity = self.checkout_identity.read_text().strip() if self.checkout_identity.exists() else None
             matches = detached and str(owner.get("id")).lower() == detached["requestID"].lower()
             matches = matches and Path(owner.get("directory", "")).resolve() == Path(detached["directory"]).resolve()
-            matches = matches and (identity == detached["checkoutID"] if detached.get("checkoutID") else self.root == Path(detached["repository"]).resolve())
+            matches = matches and self.root == Path(detached["repository"]).resolve()
+            if detached and detached.get("checkoutID"):
+                matches = matches and identity == detached["checkoutID"]
             if not matches:
                 raise OperationalError("An owned checkout must be cleaned or explicitly detached before setup")
         self.git_tree("HEAD")

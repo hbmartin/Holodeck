@@ -12,11 +12,13 @@ final class MacRequestsModel {
     var message = "Configure Codex and enable requests."
     var error: String?
     var onPublication: (@MainActor (ShaderRequestPublicationStatus) -> Void)?
+    var onPublicationOperation: (@MainActor (ShaderRequestPublicationOperationStatus) -> Void)?
     let service: ShaderRequestService
     let directory: URL
     @ObservationIgnored private let defaults: UserDefaults?
     @ObservationIgnored private var observation: Task<Void, Never>?
     @ObservationIgnored private var publicationSequence: UInt64?
+    @ObservationIgnored private var publicationOperationSequence: UInt64?
     @ObservationIgnored private var initialization: Task<Void, Error>?
 
     init(catalog: DirectoryCatalog, defaults: UserDefaults?, namespace: String?) {
@@ -60,6 +62,10 @@ final class MacRequestsModel {
                 self.jobs = jobs
                 self.pendingCleanup = await service.hasPendingCleanup()
                 self.recoveries = await service.recoveryStatuses()
+                let operation = await service.publicationOperationStatus()
+                if operation.sequence != self.publicationOperationSequence {
+                    self.publicationOperationSequence = operation.sequence; self.onPublicationOperation?(operation)
+                }
                 if let status = await service.publicationStatus(), status.sequence != self.publicationSequence {
                     self.publicationSequence = status.sequence; self.onPublication?(status)
                 }
