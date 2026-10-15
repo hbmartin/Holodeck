@@ -119,9 +119,9 @@ Deployment targets are tvOS 26.0 and macOS 15.0; the Mac app builds only for arm
 The shared package provides a macOS CLI for native renders/probes and library verification through its bundled [HolodeckShaderCheck](https://github.com/hbmartin/HolodeckShaderCheck) artifact. Version 1.1.0 adds the `library` interface without changing raw render/probe syntax.
 
 ```sh
-swift build --package-path HolodeckCore -c release --product holodeck-shader-tool
+swift build --package-path HolodeckCore -c release --product holodeck-shader-tool --force-resolved-versions
 mkdir -p "$HOME/.local/bin"
-task_shader_tool_bin=$(swift build --package-path HolodeckCore -c release --show-bin-path)
+task_shader_tool_bin=$(swift build --package-path HolodeckCore -c release --show-bin-path --force-resolved-versions)
 install "$task_shader_tool_bin/holodeck-shader-tool" "$HOME/.local/bin/holodeck-shader-tool"
 ditto "$task_shader_tool_bin/HolodeckCore_HolodeckCore.bundle" "$HOME/.local/bin/HolodeckCore_HolodeckCore.bundle"
 holodeck-shader-tool --version
@@ -132,6 +132,8 @@ holodeck-shader-tool library render /path/to/HolodeckShaders shader plasma --tim
 holodeck-shader-tool render scene.metal preview.png --time 3
 holodeck-shader-tool probe render scene.metal times.json frames.json
 ```
+
+Use Xcode 27 / Swift 6.4 for the checked-in native dependency graph and keep resolved dependency versions frozen. Shader CI uses the `xcode-27` runner image.
 
 Install the resource bundle beside the executable; a bare binary remains sufficient only for the legacy raw GPU commands. Mac app packaging copies both automatically. Library commands verify the bundled zipapp against `shader_checker.lock.json` (release, source commit, interface and SHA-256), then launch isolated Python with disconnected stdin. They accept `--python /absolute/interpreter`, defaulting to `/usr/bin/python3` (3.9 or later). No downloads, package installation, sibling checkout or candidate-checkout Python imports occur at runtime. Missing, modified or incompatible checker resources return exit 2. The checker release and its checksum must be updated together; copy a verified release artifact without rebuilding or editing its bytes.
 
