@@ -5,6 +5,9 @@ import base64
 import importlib.util
 import json
 import os
+import fcntl
+import socket
+from unittest.mock import patch
 from pathlib import Path
 import select
 import shutil
@@ -12,6 +15,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 import zlib
@@ -438,7 +442,7 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         self.assertEqual(len(self.invocations()),count)
 
 
-    def protected_worker(self):
+    def ignored_worker(self):
         (self.root/'.gitignore').write_text('ignored/\n')
         self.git(self.root,'add','.gitignore');self.git(self.root,'commit','-m','Ignore scratch')
         self.git(self.root,'push','origin','main')
@@ -448,40 +452,107 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         worker=worker_module.Worker(self.config,self.job);worker.request=self.request
         worker.save(base=self.git(self.root,'rev-parse','HEAD').strip())
         worker_module.write(worker.owner,{'id':self.request['id'],'directory':str(self.job)})
-        worker.snapshot_ignored()
         return worker
 
-    def test_ignored_changes_are_scoped_fingerprinted_and_restored_across_restart(self):
-        worker=self.protected_worker();frozen=worker.fingerprint()
+    def test_ignored_changes_and_special_files_are_untouched_across_restart(self):
+        worker=self.ignored_worker();frozen=worker.fingerprint()
         (self.root/'ignored/original').write_bytes(b'modified')
         (self.root/'ignored/deleted').unlink()
-        (self.root/'ignored/new').write_bytes(b'unapproved')
-        with self.assertRaisesRegex(worker_module.CandidateError,'Ignored'):worker.scope()
-        self.assertNotEqual(worker.fingerprint(),frozen)
+        (self.root/'ignored/new').write_bytes(b'new data')
+        (self.root/'ignored/link').symlink_to(self.base/'nonexistent')
+        os.mkfifo(self.root/'ignored/pipe')
+        nested=self.root/'ignored/dep';nested.mkdir();self.git(nested,'init')
+        sock=socket.socket(socket.AF_UNIX);self.addCleanup(sock.close)
+        sock.bind(str(self.root/'ignored/socket'))
+        legacy=self.job/'ignored-baseline.json';legacy.write_text('unreadable legacy metadata')
+        (self.job/'ignored-backup').mkdir();(self.job/'ignored-backup/evidence').write_bytes(b'retained')
+        worker.scope();self.assertEqual(worker.fingerprint(),frozen)
         restarted=worker_module.Worker(self.config,self.job);restarted.request=self.request;restarted.clean()
-        self.assertEqual((self.root/'ignored/original').read_bytes(),b'original')
-        self.assertEqual((self.root/'ignored/original').stat().st_mode & 0o777,0o600)
-        self.assertEqual((self.root/'ignored/deleted').read_bytes(),b'keep')
-        self.assertFalse((self.root/'ignored/new').exists());self.assertFalse(worker.owner.exists())
+        self.assertEqual((self.root/'ignored/original').read_bytes(),b'modified')
+        self.assertFalse((self.root/'ignored/deleted').exists())
+        self.assertEqual((self.root/'ignored/new').read_bytes(),b'new data')
+        self.assertTrue((self.root/'ignored/link').is_symlink())
+        self.assertTrue((self.root/'ignored/pipe').exists());self.assertTrue((self.root/'ignored/socket').exists())
+        self.assertTrue((nested/'.git').is_dir());self.assertFalse(worker.owner.exists())
+        self.assertEqual(legacy.read_text(),'unreadable legacy metadata')
+        self.assertEqual((self.job/'ignored-backup/evidence').read_bytes(),b'retained')
 
-    def test_ignored_state_is_not_adopted_by_park_or_failure(self):
-        worker=self.protected_worker()
+    def test_parking_preserves_ignored_edits_and_candidate_patch(self):
+        worker=self.ignored_worker()
         (self.root/'ignored/original').write_bytes(b'modified')
         (self.root/'shaders/alpha/body.metal').write_text('PARKED\n')
         worker.park()
-        self.assertEqual((self.root/'ignored/original').read_bytes(),b'original')
+        self.assertEqual((self.root/'ignored/original').read_bytes(),b'modified')
         worker.restore_patch()
         self.assertEqual((self.root/'shaders/alpha/body.metal').read_text(),'PARKED\n')
-        self.assertEqual((self.root/'ignored/original').read_bytes(),b'original')
 
-    def test_ignored_restore_failure_retains_owner_and_patch(self):
-        worker=self.protected_worker()
-        record=json.loads((self.job/'ignored-baseline.json').read_text())['ignored/original']
-        (self.job/'ignored-backup'/record['hash']).unlink()
-        (self.root/'ignored/original').write_bytes(b'modified')
-        with self.assertRaises(FileNotFoundError):worker.clean()
-        self.assertTrue(worker.owner.exists())
-        self.assertEqual((self.root/'ignored/original').read_bytes(),b'modified')
+    def test_ignored_agent_edits_survive_clarification_success_and_failure(self):
+        self.ignored_worker()
+        self.codex.write_text(CODEX.replace("count_file.write_text(str(count))", "count_file.write_text(str(count)); Path('ignored/original').write_text('agent data'); Path('ignored/deleted').unlink(missing_ok=True); Path('ignored/new').write_text('agent output')"))
+        self.request['prompt']='ambiguous';self.save_request()
+        code,events=self.run_worker();self.assertEqual(code,0,events)
+        self.assertTrue(any(e['event']=='clarification' for e in events))
+        self.assertEqual((self.root/'ignored/original').read_text(),'agent data')
+        (self.job/'answer.json').write_text(json.dumps({'answer':'Edit'}))
+        code,events=self.run_worker();self.assertEqual(code,0,events)
+        self.assertFalse((self.root/'ignored/deleted').exists())
+        self.assertEqual((self.root/'ignored/new').read_text(),'agent output')
+        (self.job/'repair.json').write_text(json.dumps({'attemptID':'failure','shaderID':'alpha','diagnostic':'fixture'}))
+        self.codex.write_text(self.codex.read_text().replace("if status=='completed':", "Path('ignored/original').write_text('failed attempt data'); raise SystemExit(1)\n    if status=='completed':"))
+        code,events=self.run_worker();self.assertNotEqual(code,0)
+        self.assertEqual((self.root/'ignored/original').read_text(),'failed attempt data')
+
+    def test_host_ignored_outputs_do_not_trigger_shader_repair(self):
+        self.ignored_worker()
+        (self.root/'tools/library.py').write_text(LIBRARY+"\nimport time\nPath('ignored/host-output').write_text(str(time.time_ns()))\n")
+        self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Validator output fixture');self.git(self.root,'push','origin','main')
+        code,events=self.run_worker();self.assertEqual(code,0,events)
+        self.assertEqual((self.job/'implementation-count').read_text(),'1')
+        self.assertTrue((self.root/'ignored/host-output').exists())
+
+    def test_ignored_publication_input_cannot_be_published(self):
+        (self.root/'.gitignore').write_text('shaders/gamma/\n')
+        self.git(self.root,'add','.gitignore');self.git(self.root,'commit','-m','Ignored new shader');self.git(self.root,'push','origin','main')
+        before=self.git(self.root,'rev-parse','origin/main')
+        self.request['prompt']='new';self.save_request()
+        self.codex.write_text(CODEX.replace("count_file.write_text(str(count))", "count_file.write_text(str(count))\n    if count>1: raise SystemExit(1)"))
+        code,events=self.run_worker();self.assertNotEqual(code,0)
+        self.assertTrue(any('Publication input must be included' in e.get('text','') for e in events),events)
+        self.assertFalse(any(e['event']=='preparePublication' for e in events))
+        self.assertEqual(self.git(self.root,'rev-parse','origin/main'),before)
+
+    def detached_setup_worker(self):
+        (self.root/'tools/shader_tool.py').touch()
+        self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Setup fixture');self.git(self.root,'push','origin','main')
+        worker=worker_module.Worker(self.config,self.job)
+        worker.checkout_identity.write_text('checkout-fixture')
+        owner={'id':self.request['id'],'directory':str(self.job.resolve())};worker_module.write(worker.owner,owner)
+        self.config['detachedOwner']={'requestID':self.request['id'],'directory':str(self.job),'repository':str(self.root),'checkoutID':'checkout-fixture'}
+        worker.codex=lambda *args,**kwargs:{'imageDescription':'Fixture'}
+        return worker,owner
+
+    def test_detached_owner_retires_only_after_successful_setup(self):
+        worker,owner=self.detached_setup_worker()
+        with patch.object(worker_module,'run',return_value=subprocess.CompletedProcess([],0,'','')):
+            worker.preflight()
+        self.assertFalse(worker.owner.exists())
+        self.assertEqual(worker.checkout_identity.read_text(),'checkout-fixture')
+
+    def test_detached_setup_rejects_dirty_foreign_and_failed_checks(self):
+        worker,owner=self.detached_setup_worker()
+        (self.root/'shaders/alpha/body.metal').write_text('dirty')
+        with self.assertRaisesRegex(worker_module.OperationalError,'uncommitted'): worker.preflight()
+        self.assertEqual(json.loads(worker.owner.read_text()),owner)
+        self.git(self.root,'checkout','--','shaders/alpha/body.metal')
+        self.config['detachedOwner']['checkoutID']='foreign'
+        with self.assertRaisesRegex(worker_module.OperationalError,'owned checkout'): worker.preflight()
+        self.config['detachedOwner']['checkoutID']='checkout-fixture'
+        with patch.object(worker_module,'run',side_effect=worker_module.OperationalError('fixture tools failed')):
+            with self.assertRaisesRegex(worker_module.OperationalError,'fixture tools failed'): worker.preflight()
+        self.assertEqual(json.loads(worker.owner.read_text()),owner)
+        with (worker.gitdir/'holodeck-requests.lock').open('w') as lease:
+            fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            with self.assertRaises(BlockingIOError):worker.preflight()
 
     def test_unrelated_crlf_checkout_is_supported_without_weakening_source_proof(self):
         (self.root/'notes.txt').write_bytes(b'notes\n')
@@ -533,7 +604,7 @@ class ShaderRequestWorkerTests(unittest.TestCase):
 
     def test_candidate_timeout_repeats_same_operation_on_pristine_baseline(self):
         from unittest.mock import patch
-        worker=self.protected_worker()
+        worker=self.ignored_worker()
         (self.root/'shaders/alpha/body.metal').write_text('EDIT\n')
         observed=[]
         def operation(command,*args,**kwargs):
@@ -566,6 +637,34 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         (self.root/'shaders/alpha/body.metal').write_text('dirty')
         code,events=self.run_worker(mode='publication');self.assertNotEqual(code,0)
         self.assertEqual((self.root/'shaders/alpha/body.metal').read_text(),'dirty')
+
+    def test_bootstrap_waits_for_temporary_checkout_lease(self):
+        entered=self.base/'lease-entered'
+        wrapper=self.base/'blocked-publication.py'
+        wrapper.write_text(f"""import importlib.util,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('worker',{str(SCRIPT)!r})
+worker=importlib.util.module_from_spec(spec);spec.loader.exec_module(worker)
+original=worker.fcntl.flock
+def gated(fd,operation):
+    Path({str(entered)!r}).touch()
+    original(fd,operation)
+worker.fcntl.flock=gated
+sys.argv=[{str(SCRIPT)!r},'publication',{str(self.config_path)!r},{str(self.job)!r}]
+worker.main()
+""")
+        with (self.root/'.git/holodeck-requests.lock').open('w') as lease:
+            fcntl.flock(lease,fcntl.LOCK_EX)
+            process=subprocess.Popen([sys.executable,'-B','-u',str(wrapper)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            self.addCleanup(lambda: process.kill() if process.poll() is None else None)
+            deadline=time.monotonic()+5
+            while not entered.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.005)
+            self.assertTrue(entered.exists())
+            self.assertIsNone(process.poll())
+            fcntl.flock(lease,fcntl.LOCK_UN)
+        stdout,stderr=process.communicate('{"ok":true}\n',timeout=10)
+        self.assertEqual(process.returncode,0,stdout+stderr)
+        self.assertIn('publicationReady',stdout)
 
     def test_clean_filter_cannot_hide_a_forbidden_workspace_edit(self):
         original=(self.root/'tools/library.py').read_text()

@@ -11,23 +11,32 @@ final class MacRequestsModel {
     var checking = false
     var message = "Configure Codex and enable requests."
     var error: String?
-    var onPublication: (@MainActor ([ShaderPreviewWarning]) -> Void)?
+    var onPublication: (@MainActor (ShaderRequestPublicationStatus) -> Void)?
     let service: ShaderRequestService
     let directory: URL
     @ObservationIgnored private let defaults: UserDefaults?
     @ObservationIgnored private var observation: Task<Void, Never>?
-    @ObservationIgnored private var revision: String?
-    @ObservationIgnored private var publicationWarnings: [ShaderPreviewWarning] = []
+    @ObservationIgnored private var publicationSequence: UInt64?
+    @ObservationIgnored private var initialization: Task<Void, Error>?
 
     init(catalog: DirectoryCatalog, defaults: UserDefaults?, namespace: String?) {
         self.defaults = defaults
-        directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let defaultDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(namespace.map { "Holodeck/Requests-tests-\($0)" } ?? "Holodeck/Requests")
+        #if DEBUG
+        let fixture = UITestConfiguration(applicationID: "me.haroldmartin.HolodeckMac")
+        // The sandboxed UI runner and app must inspect the same isolated request evidence.
+        if namespace != nil, fixture.hasExplicitStorageSuite,
+           let path = ProcessInfo.processInfo.environment["HOLODECK_UI_TEST_REQUEST_DIRECTORY"] {
+            directory = URL(fileURLWithPath: path)
+        } else { directory = defaultDirectory }
+        #else
+        directory = defaultDirectory
+        #endif
         service = ShaderRequestService(catalog: catalog, directory: directory)
         configuration = ((try? Data(contentsOf: directory.appendingPathComponent("preferences.json"))) ?? defaults?.data(forKey: "holodeck.requestConfiguration")).flatMap { try? JSONDecoder().decode(ShaderRequestConfiguration.self, from: $0) } ?? .init()
         configuration.shaderTool = Bundle.main.resourceURL?.appendingPathComponent("Tools/holodeck-shader-tool").path ?? ""
         #if DEBUG
-        let fixture = UITestConfiguration(applicationID: "me.haroldmartin.HolodeckMac")
         if namespace != nil, fixture.hasExplicitStorageSuite, let journal = ProcessInfo.processInfo.environment["HOLODECK_UI_TEST_REQUEST_JOURNAL"],
            let bytes = journal.data(using: .utf8),
            let records = try? JSONSerialization.jsonObject(with: bytes) as? [[String: Any]] {
@@ -41,23 +50,27 @@ final class MacRequestsModel {
         }
         #endif
         let service = service, config = configuration
+        let initialization = Task { try await service.initialize(configuration: config) }
+        self.initialization = initialization
         observation = Task { [weak self] in
-            do { try await service.start(configuration: config) }
+            do { try await initialization.value }
             catch { self?.error = error.localizedDescription }
             for await jobs in await service.updates() {
                 guard let self else { break }
                 self.jobs = jobs
                 self.pendingCleanup = await service.hasPendingCleanup()
                 self.recoveries = await service.recoveryStatuses()
-                let current = await catalog.publicationRevisionValue()
-                let warnings = await service.publicationWarnings()
-                if let current, current != self.revision || warnings != self.publicationWarnings {
-                    self.revision = current; self.publicationWarnings = warnings; self.onPublication?(warnings)
+                if let status = await service.publicationStatus(), status.sequence != self.publicationSequence {
+                    self.publicationSequence = status.sequence; self.onPublication?(status)
                 }
             }
         }
     }
     isolated deinit { observation?.cancel() }
+    func initialized() async throws {
+        try await initialization?.value
+        configuration = await service.configurationValue()
+    }
     var hasUnfinishedJobs: Bool { pendingCleanup || jobs.contains { !$0.stage.terminal } }
     func setRepository(_ url: URL) {
         guard !configuration.enabled, !hasUnfinishedJobs else { return }
@@ -94,7 +107,15 @@ final class MacRequestsModel {
             catch { self.error = error.localizedDescription }
         }
     }
-    func detach(_ id: UUID) {
+    func retryReconciliation() {
+        checking = true; error = nil
+        Task {
+            defer { checking = false }
+            do { try await service.retryReconciliation() }
+            catch { self.error = error.localizedDescription }
+        }
+    }
+    func detach(_ id: UUID?) {
         checking = true; error = nil
         Task {
             defer { checking = false }

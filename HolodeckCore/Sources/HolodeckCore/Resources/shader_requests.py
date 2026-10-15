@@ -11,10 +11,8 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
-import tempfile
 import struct
 import re
-import shutil
 import stat
 import uuid
 
@@ -126,7 +124,7 @@ class Worker:
         finally:
             os.close(fd)
 
-    def workspace_record(self, name, backup=False, preserve_permissions=False):
+    def workspace_record(self, name):
         with self.workspace_parent(name) as (parent, leaf):
             info = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
             if stat.S_ISLNK(info.st_mode):
@@ -138,80 +136,12 @@ class Worker:
                 if not stat.S_ISREG(info.st_mode):
                     raise OperationalError("Workspace path must be a regular file: " + name)
                 hasher = hashlib.sha256()
-                destination = tempfile.TemporaryFile(dir=self.directory) if backup else None
-                try:
-                    while True:
-                        chunk = source.read(65536)
-                        if not chunk: break
-                        hasher.update(chunk)
-                        if destination: destination.write(chunk)
-                    record = {"mode": "100755" if info.st_mode & stat.S_IXUSR else "100644", "hash": hasher.hexdigest()}
-                    if preserve_permissions: record["permissions"] = stat.S_IMODE(info.st_mode)
-                    if destination:
-                        directory = self.directory / "ignored-backup"; directory.mkdir(mode=0o700, exist_ok=True)
-                        directory.chmod(0o700)
-                        destination.seek(0)
-                        with tempfile.NamedTemporaryFile(dir=directory, delete=False) as target:
-                            temporary = Path(target.name)
-                            try:
-                                shutil.copyfileobj(destination, target); target.flush()
-                                temporary.replace(directory / record["hash"])
-                            finally: temporary.unlink(missing_ok=True)
-                    return record
-                finally:
-                    if destination: destination.close()
-
-    def ignored_manifest(self, backup=False):
-        names = filter(None, self.git("ls-files", "--others", "--ignored", "--exclude-standard", "-z").split("\0"))
-        return {name: self.workspace_record(name, backup, preserve_permissions=True) for name in sorted(names)}
-
-    def snapshot_ignored(self):
-        write(self.directory / "ignored-baseline.json", self.ignored_manifest(backup=True))
-
-    def check_ignored(self):
-        baseline = self.directory / "ignored-baseline.json"
-        owned = self.owner.exists() and str(json.loads(self.owner.read_text()).get("id")).lower() == str(self.request.get("id")).lower()
-        if owned and baseline.exists() and self.ignored_manifest() != json.loads(baseline.read_text()):
-            raise CandidateError("Ignored files are protected; restore changed/deleted files and remove new ignored outputs")
-
-    def restore_ignored(self):
-        baseline = self.directory / "ignored-baseline.json"
-        if not baseline.exists(): return
-        saved = json.loads(baseline.read_text())
-        current = self.ignored_manifest()
-        for name in sorted(current.keys() - saved.keys(), reverse=True):
-            with self.workspace_parent(name) as (parent, leaf): os.unlink(leaf, dir_fd=parent)
-        for name, record in saved.items():
-            if current.get(name) == record: continue
-            source = None
-            try:
-                if record["mode"] != "120000":
-                    if re.fullmatch(r"[0-9a-f]{64}", record["hash"]) is None:
-                        raise OperationalError("Invalid ignored-file backup identity")
-                    source = (self.directory / "ignored-backup" / record["hash"]).open("rb")
-                    hasher = hashlib.sha256()
-                    for chunk in iter(lambda: source.read(65536), b""): hasher.update(chunk)
-                    if hasher.hexdigest() != record["hash"]:
-                        raise OperationalError("Ignored-file backup is corrupted; checkout data was retained")
-                    source.seek(0)
-                with self.workspace_parent(name, create=True) as (parent, leaf):
-                    try: os.unlink(leaf, dir_fd=parent)
-                    except FileNotFoundError: pass
-                    except IsADirectoryError: os.rmdir(leaf, dir_fd=parent)
-                    if record["mode"] == "120000":
-                        os.symlink(record["link"], leaf, dir_fd=parent)
-                    else:
-                        fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
-                        with os.fdopen(fd, "wb") as target:
-                            shutil.copyfileobj(source, target)
-                            os.fchmod(target.fileno(), record.get("permissions", 0o755 if record["mode"] == "100755" else 0o644))
-            finally:
-                if source: source.close()
-        if self.ignored_manifest() != saved:
-            raise OperationalError("Ignored workspace files could not be restored; ownership is retained")
+                for chunk in iter(lambda: source.read(65536), b""):
+                    hasher.update(chunk)
+                return {"mode": "100755" if info.st_mode & stat.S_IXUSR else "100644", "hash": hasher.hexdigest()}
 
     def clean(self, revision=None):
-        # Retain ownership until both tracked and ignored data are restored.
+        # Only tracked and non-ignored candidate files belong to host cleanup.
         if self.owner.exists() and str(json.loads(self.owner.read_text()).get("id")).lower() == str(self.request.get("id")).lower():
             others = self.git("ls-files", "--others", "--exclude-standard", "-z").split("\0")
             raw_changes = self.raw_workspace_changes()
@@ -227,7 +157,6 @@ class Worker:
                 with self.workspace_parent(name) as (parent, leaf):
                     try: os.unlink(leaf, dir_fd=parent)
                     except FileNotFoundError: pass
-            self.restore_ignored()
             self.owner.unlink(missing_ok=True)
 
     def park(self):
@@ -282,12 +211,10 @@ class Worker:
         self.git("checkout", "-B", "main", "origin/main")
         self.save(base=remote, commitSHA=None)
         # Old publication snapshots must never become the baseline of a new attempt.
-        for name in ("ignored-baseline.json", "baseline-workspace.json"):
-            (self.directory / name).unlink(missing_ok=True)
+        (self.directory / "baseline-workspace.json").unlink(missing_ok=True)
         write(self.owner, {"id": self.request["id"], "directory": str(self.directory)})
         self.check_checkout_inputs()
         self.validate_baseline()
-        self.snapshot_ignored()
         write(self.directory / "baseline-workspace.json", self.candidate_manifest(compare_baseline=False))
         self.restore_patch()
 
@@ -322,8 +249,29 @@ class Worker:
     def blob_oid(self, data):
         return hashlib.new(self.object_format, b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
 
+    def publication_inputs(self):
+        index = json.loads((self.root / "index.json").read_text())
+        paths = {"index.json"}
+        for sid in index["shaders"]:
+            if not isinstance(sid, str) or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", sid) is None:
+                raise CandidateError("Invalid indexed shader ID")
+            folder = f"shaders/{sid}/"
+            paths.update((folder + "metadata.json", folder + "body.metal"))
+            metadata = json.loads((self.root / folder / "metadata.json").read_text())
+            shared = metadata["shared"]
+            if shared not in (["common", "fragment"], ["common", "material", "fragment"]):
+                raise CandidateError("Invalid shared declaration: " + sid)
+            paths.update(f"shared/{part}.metal" for part in shared)
+        return paths
+
+    def require_publication_inputs(self, manifest):
+        missing = self.publication_inputs() - manifest.keys()
+        if missing:
+            raise CandidateError("Publication input must be included in the verified commit: " + sorted(missing)[0])
+
     def check_checkout_inputs(self):
         tree = self.git_tree("HEAD")
+        self.require_publication_inputs(tree)
         for name, entry in tree.items():
             if name == "index.json" or (name.startswith("shared/") and name.endswith(".metal")) or (name.startswith("shaders/") and name.endswith(("/body.metal", "/metadata.json"))):
                 with self.workspace_parent(name) as (parent, leaf):
@@ -367,6 +315,7 @@ class Worker:
             else:
                 record["oid"] = self.blob_oid((self.root / name).read_bytes())
             manifest[name] = record
+        self.require_publication_inputs(manifest)
         return manifest
 
     def verify_commit(self, sha, manifest, check_workspace=True):
@@ -381,7 +330,6 @@ class Worker:
         workspace_matches = not check_workspace or self.candidate_manifest() == manifest
         if not matches or not workspace_matches:
             raise OperationalError("Committed tree differs from verified source; publication filters or external changes must be corrected")
-        self.check_ignored()
 
     def begin_attempt(self):
         repair = self.directory / "repair.json"
@@ -422,7 +370,6 @@ class Worker:
             path = self.root / name
             value += name.encode("utf-8") + digest(path.read_bytes()).encode("ascii")
         value += json.dumps(self.candidate_manifest(), sort_keys=True).encode()
-        value += json.dumps(self.ignored_manifest(), sort_keys=True).encode()
         return digest(value)
 
     def source(self, shader_id, revision=None):
@@ -456,7 +403,6 @@ class Worker:
         return [p.split("/")[1] for p in names if p.startswith("shaders/") and p.endswith("/metadata.json")]
 
     def scope(self, outcome=None):
-        self.check_ignored()
         base = self.checkpoint["base"]
         if self.git("rev-parse", "HEAD").strip() != base:
             raise OperationalError("Codex changed Git state; only the host may commit")
@@ -767,7 +713,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
 
     def prepare_current(self):
         with (self.gitdir / "holodeck-requests.lock").open("w") as lease:
-            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lease, fcntl.LOCK_EX)
             if self.owner.exists(): raise OperationalError("An owned request must be recovered before rebuilding the library")
             if self.git("branch", "--show-current").strip() != "main" or self.git("status", "--porcelain", "--untracked-files=all").strip():
                 raise OperationalError("Rebuilding requires a clean main checkout; no files or branches have been changed")
@@ -894,8 +840,20 @@ An unchanged existing shader may be successful if it already satisfies the promp
                     self.save_patch()
 
     def preflight(self):
-        if self.owner.exists():
-            raise OperationalError("An owned checkout must be cleaned or explicitly detached before setup")
+        with (self.gitdir / "holodeck-requests.lock").open("w") as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.preflight_locked()
+
+    def preflight_locked(self):
+        detached = self.config.get("detachedOwner")
+        owner = json.loads(self.owner.read_text()) if self.owner.exists() else None
+        if owner:
+            identity = self.checkout_identity.read_text().strip() if self.checkout_identity.exists() else None
+            matches = detached and str(owner.get("id")).lower() == detached["requestID"].lower()
+            matches = matches and Path(owner.get("directory", "")).resolve() == Path(detached["directory"]).resolve()
+            matches = matches and (identity == detached["checkoutID"] if detached.get("checkoutID") else self.root == Path(detached["repository"]).resolve())
+            if not matches:
+                raise OperationalError("An owned checkout must be cleaned or explicitly detached before setup")
         self.git_tree("HEAD")
         if self.git("rev-parse", "--show-toplevel").strip() != str(self.root):
             raise OperationalError("Choose the repository root")
@@ -932,6 +890,10 @@ An unchanged existing shader may be successful if it already satisfies the promp
         self.codex("Describe the attached shader image in one sentence and return the required JSON. Do not change files.", schema, "setup", [image])
         if not self.checkout_identity.exists():
             self.checkout_identity.write_text(str(uuid.uuid4()))
+        if owner:
+            if json.loads(self.owner.read_text()) != owner:
+                raise OperationalError("Checkout ownership changed during setup")
+            self.owner.unlink()
         emit("preflight", message="Ready for shader requests", checkoutID=self.checkout_identity.read_text().strip())
 
 
