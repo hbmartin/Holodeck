@@ -14,7 +14,7 @@ final class ShaderLibraryToolTests: XCTestCase {
         let data = Data("checker fixture".utf8)
         try data.write(to: artifact)
         let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        var pin: [String: Any] = ["version": "1.0.1", "interfaceVersion": 1,
+        var pin: [String: Any] = ["version": "1.0.2", "interfaceVersion": 1,
                                   "sourceCommit": String(repeating: "a", count: 40), "sha256": hash]
         try JSONSerialization.data(withJSONObject: pin).write(to: lock)
         XCTAssertEqual(try ShaderLibraryTool.checkedArtifact(artifact: artifact, lock: lock), artifact)
