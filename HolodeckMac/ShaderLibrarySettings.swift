@@ -8,7 +8,9 @@ final class MacLibraryModel {
     let requests: MacRequestsModel
     var folder: URL?
     var isReloading = false
-    var error: String?
+    private enum ErrorOrigin: Hashable { case folder, publication, manualReload, server }
+    private var errors: [ErrorOrigin: String] = [:]
+    var error: String? { errors[.folder] ?? errors[.server] ?? errors[.manualReload] ?? errors[.publication] }
     var previewWarnings: [ShaderPreviewWarning] = []
     var serverState = LocalServerState()
     @ObservationIgnored private let catalog: DirectoryCatalog
@@ -40,12 +42,12 @@ final class MacLibraryModel {
         let server = server
         let requestService = requests.service
         Task { await server.setRequestService(requestService) }
-        requests.onPublication = { [weak self] warnings in
-            guard let self else { return }
-            self.ready = true; self.previewWarnings = warnings; self.error = nil
+        requests.onPublication = { [weak self] status in
+            guard let self, self.requests.configuration.enabled else { return }
+            self.ready = true; self.previewWarnings = status.warnings; self.clearError(from: .publication)
             Task {
                 await self.session.refresh(force: true).value
-                if !self.sleeping { try? await self.server.start() }
+                if !self.sleeping { try? await self.startServer() }
             }
         }
         updates = Task { [weak self] in
@@ -64,26 +66,29 @@ final class MacLibraryModel {
                 let url = try URL(resolvingBookmarkData: bookmark, options: [], relativeTo: nil, bookmarkDataIsStale: &stale)
                 if url.startAccessingSecurityScopedResource() { scopedURL = url }
                 folder = url; requests.setRepository(url); refreshBookmark = stale
-            } catch { self.error = "Choose your shader folder again: \(error.localizedDescription)" }
+            } catch { self.setError("Choose your shader folder again: \(error.localizedDescription)", from: .folder) }
         }
         let shouldRefreshBookmark = refreshBookmark
         isReloading = true
         Task {
             do {
+                try await requests.initialized()
                 var restored = false
                 do { restored = try await catalog.cached() != nil }
-                catch { self.error = "Couldn’t restore the previous shader library: \(error.localizedDescription)" }
+                catch { self.setError("Couldn’t restore the previous shader library: \(error.localizedDescription)", from: .publication) }
                 if !restored, requests.configuration.enabled {
                     try await requests.service.ensurePublication()
                     restored = await catalog.publicationRevisionValue() != nil
-                    previewWarnings = await requests.service.publicationWarnings()
+                    if let status = await requests.service.publicationStatus() { previewWarnings = status.warnings }
+                    clearError(from: .publication)
                 }
                 if restored {
                     ready = true
                     await session.refresh(force: true).value
                     if !sleeping { try await startServer() }
                 }
-            } catch { self.error = "Couldn’t rebuild the shader library: \(error.localizedDescription)" }
+            } catch { setError("Couldn’t rebuild the shader library: \(error.localizedDescription)", from: .publication) }
+            await requests.service.activateScheduling()
             isReloading = false
             if !requests.configuration.enabled, folder != nil { reload(refreshBookmark: shouldRefreshBookmark) }
         }
@@ -112,30 +117,33 @@ final class MacLibraryModel {
     }
     func rebuildPublication() {
         guard !isReloading else { return }
-        isReloading = true; error = nil
+        isReloading = true; clearError(from: .publication)
         Task {
             defer { isReloading = false }
             do {
-                try await requests.service.ensurePublication()
-                previewWarnings = await requests.service.publicationWarnings()
+                try await requests.service.ensurePublication(force: true)
+                if let status = await requests.service.publicationStatus() { previewWarnings = status.warnings }
+                clearError(from: .publication)
                 ready = true
                 await session.refresh(force: true).value
                 if !sleeping { try await startServer() }
-            } catch { self.error = error.localizedDescription }
+            } catch { setError(error.localizedDescription, from: .publication) }
         }
     }
     private func load(_ url: URL, saveBookmark: Bool) {
         guard !isReloading, !requests.configuration.enabled, !requests.hasUnfinishedJobs else { return }
-        isReloading = true; error = nil
+        isReloading = true; clearError(from: .folder); clearError(from: .manualReload)
         let accessed = url.startAccessingSecurityScopedResource()
         Task {
             defer { isReloading = false; if accessed { url.stopAccessingSecurityScopedResource() } }
             do {
                 // Prepare the bookmark before replacing the current publication.
-                let bookmark = saveBookmark ? try url.bookmarkData(options: [],
-                    includingResourceValuesForKeys: nil, relativeTo: nil) : nil
+                let bookmark: Data?
+                do { bookmark = saveBookmark ? try url.bookmarkData(options: [],
+                    includingResourceValuesForKeys: nil, relativeTo: nil) : nil }
+                catch { setError(error.localizedDescription, from: .folder); throw error }
                 let result = try await catalog.reload(from: url)
-                previewWarnings = result.previewWarnings
+                previewWarnings = result.previewWarnings; clearError(from: .publication)
                 if let bookmark { defaults?.set(bookmark, forKey: "holodeck.shaderFolderBookmark") }
                 if folder != url {
                     scopedURL?.stopAccessingSecurityScopedResource(); scopedURL = nil
@@ -152,14 +160,17 @@ final class MacLibraryModel {
                 }
                 #endif
                 if !sleeping { try await startServer() }
-            } catch { self.error = error.localizedDescription }
+            } catch { setError(error.localizedDescription, from: .manualReload) }
         }
     }
+    private func setError(_ message: String, from origin: ErrorOrigin) { errors[origin] = message }
+    private func clearError(from origin: ErrorOrigin) { errors[origin] = nil }
     private func startServer() async throws {
         #if DEBUG
         MacInspectionLifecycle.snapshot.serverStartAttempts += 1
         #endif
-        try await server.start()
+        do { try await server.start(); clearError(from: .server) }
+        catch { setError(error.localizedDescription, from: .server); throw error }
     }
     func setSleeping(_ value: Bool) {
         sleeping = value
@@ -167,7 +178,7 @@ final class MacLibraryModel {
             if value { await requests.service.suspend(); await server.stop() }
             else {
                 await requests.service.resume()
-                if ready { do { try await startServer() } catch { self.error = error.localizedDescription } }
+                if ready { try? await startServer() }
             }
         }
     }
@@ -177,9 +188,9 @@ final class MacLibraryModel {
         testingReloadContinuation?.resume(); testingReloadContinuation = nil
     }
     #endif
-    func approve(_ id: UUID) { Task { do { try await server.approve(id) } catch { self.error = error.localizedDescription } } }
+    func approve(_ id: UUID) { Task { do { try await server.approve(id) } catch { self.setError(error.localizedDescription, from: .server) } } }
     func decline(_ id: UUID) { Task { await server.decline(id) } }
-    func revoke(_ id: String) { Task { do { try await server.revoke(id) } catch { self.error = error.localizedDescription } } }
+    func revoke(_ id: String) { Task { do { try await server.revoke(id) } catch { self.setError(error.localizedDescription, from: .server) } } }
 }
 
 struct ShaderLibrarySettings: View {

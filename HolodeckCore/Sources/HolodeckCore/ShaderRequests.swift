@@ -214,7 +214,9 @@ nonisolated public struct ShaderPerformanceMonitor: Sendable {
     public init() {}
     public static func attainableTarget(displayFramesPerSecond rate: Double, preferred: Double = 30) -> Double {
         guard rate.isFinite, rate > 0, preferred.isFinite, preferred > 0 else { return 30 }
-        return rate / max(1, ceil(rate / preferred - 0.000001))
+        let nearest = max(1, (rate / preferred).rounded())
+        let divisor = abs(rate - nearest * preferred) <= 0.01 + rate.ulp ? nearest : max(1, ceil(rate / preferred))
+        return min(preferred, rate / divisor)
     }
     public mutating func setTargetFramesPerSecond(_ target: Double, at time: Double) {
         guard target.isFinite, target > 0, target <= 30, abs(target - targetFramesPerSecond) > 0.1 else { return }

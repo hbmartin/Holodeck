@@ -112,17 +112,22 @@ private struct CheckoutRecoveryView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Checkout Recovery").bold()
             Text(recovery.message).textSelection(.enabled)
-            TextField("Owned checkout folder", text: $repository).accessibilityIdentifier("recovery-repository")
-            TextField("Python executable", text: $python).accessibilityIdentifier("recovery-python")
-            TextField("Git executable", text: $git).accessibilityIdentifier("recovery-git")
+            if recovery.kind == .cleanup {
+                TextField("Owned checkout folder", text: $repository).accessibilityIdentifier("recovery-repository")
+                TextField("Python executable", text: $python).accessibilityIdentifier("recovery-python")
+                TextField("Git executable", text: $git).accessibilityIdentifier("recovery-git")
+            }
             HStack {
-                Button("Retry Cleanup") { model.retryCleanup(recovery.id, repository: repository, python: python, git: git) }
+                Button(recovery.kind == .cleanup ? "Retry Cleanup" : "Retry Recovery") {
+                    if recovery.kind == .cleanup { model.retryCleanup(recovery.id, repository: repository, python: python, git: git) }
+                    else { model.retryReconciliation() }
+                }
                     .disabled(model.checking || recovery.isRunning).accessibilityIdentifier("retry-checkout-cleanup")
                 Button("Detach Checkout…", role: .destructive) { confirmsDetach = true }
                     .disabled(model.checking).accessibilityIdentifier("detach-checkout")
             }
         }.confirmationDialog("Detach this checkout and disable shader requests?", isPresented: $confirmsDetach) {
-            Button("Detach and Keep Files", role: .destructive) { model.detach(recovery.id) }
+            Button("Detach and Keep Files", role: .destructive) { model.detach(recovery.kind == .cleanup ? recovery.id : nil) }
         } message: { Text("Unpublished checkout files, patches, and logs will be retained. Verify setup before managing a checkout again.") }
     }
 }

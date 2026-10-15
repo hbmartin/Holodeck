@@ -2,6 +2,27 @@
 import Foundation
 import Darwin
 
+nonisolated enum RequestPaths {
+    static func canonical(_ url: URL, remainingLinks: Int = 40) -> String {
+        if let path = realpath(url.path, nil) { defer { free(path) }; return String(cString: path) }
+        if remainingLinks > 0, let target = try? FileManager.default.destinationOfSymbolicLink(atPath: url.path) {
+            let destination = target.hasPrefix("/") ? URL(fileURLWithPath: target)
+                : url.deletingLastPathComponent().appendingPathComponent(target)
+            return canonical(destination.standardizedFileURL, remainingLinks: remainingLinks - 1)
+        }
+        let parent = url.deletingLastPathComponent()
+        guard parent.path != url.path else { return url.standardizedFileURL.path }
+        return URL(fileURLWithPath: canonical(parent, remainingLinks: remainingLinks)).appendingPathComponent(url.lastPathComponent).path
+    }
+}
+
+nonisolated struct DetachedCheckoutAcknowledgement: Codable, Sendable, Equatable {
+    var requestID: UUID
+    var directory: String
+    var repository: String
+    var checkoutID: String?
+}
+
 nonisolated public struct ShaderRequestConfiguration: Codable, Sendable, Equatable {
     public var repository: String
     public var codex: String
@@ -11,6 +32,7 @@ nonisolated public struct ShaderRequestConfiguration: Codable, Sendable, Equatab
     public var model: String
     public var reasoning: String
     public var checkoutID: String?
+    var detachedOwner: DetachedCheckoutAcknowledgement?
     public var enabled: Bool
     public init(repository: String = "", codex: String = "/opt/homebrew/bin/codex", python: String = "/usr/bin/python3",
                 git: String = "/usr/bin/git", shaderTool: String = "", model: String = "", reasoning: String = "high", enabled: Bool = false) {
@@ -32,10 +54,16 @@ nonisolated struct RequestWorkerEvent: Decodable, Sendable {
 
 /// Reading subprocess pipes never occupies the UI or the catalog/server actor.
 nonisolated final class RequestWorkerProcess: @unchecked Sendable {
+    struct GroupOperations: Sendable {
+        var isAlive: @Sendable (Int32) -> Bool = { $0 > 1 && kill(-$0, 0) == 0 }
+        var signal: @Sendable (Int32, Int32) -> Int32 = { kill(-$0, $1) }
+        var schedule: @Sendable (DispatchWorkItem) -> Void = { DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: $0) }
+    }
     static var bundledScript: URL? { Bundle.module.url(forResource: "shader_requests", withExtension: "py") }
     let process = Process()
     private let scriptOverride: URL?
-    init(script: URL? = nil) { scriptOverride = script }
+    private let groups: GroupOperations
+    init(script: URL? = nil, groups: GroupOperations = .init()) { scriptOverride = script; self.groups = groups }
     private let input = Pipe()
     private let output = Pipe()
     private let error = Pipe()
@@ -43,6 +71,8 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     private let drained = DispatchGroup()
     private var started = false
     private var stopping = false
+    private var groupRetired = false
+    private var completed = false
     private var escalation: DispatchWorkItem?
     var beforeReplyWrite: (() -> Void)?
     func reply(_ accepted: Bool, message: String? = nil) throws {
@@ -56,30 +86,41 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     }
     func stop() {
         lock.withLock {
+            guard !completed, !groupRetired else { return }
             stopping = true
             guard started else { return }
+            guard groupIsLiveLocked() else { return }
             // The Python worker and its descendants form one process group.
-            if kill(-process.processIdentifier, SIGTERM) != 0, process.isRunning { process.terminate() }
+            if groups.signal(process.processIdentifier, SIGTERM) != 0, process.isRunning { process.terminate() }
             if escalation == nil {
                 let escalation = DispatchWorkItem { [weak self] in
                     guard let self else { return }
                     self.lock.withLock {
-                        guard self.stopping else { return }
-                        if kill(-self.process.processIdentifier, 0) == 0 { kill(-self.process.processIdentifier, SIGKILL) }
+                        guard self.stopping, !self.completed, self.groupIsLiveLocked() else { return }
+                        if self.groups.isAlive(self.process.processIdentifier) { _ = self.groups.signal(self.process.processIdentifier, SIGKILL) }
                         else if self.process.isRunning { self.process.terminate() }
                     }
                 }
                 self.escalation = escalation
-                DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: escalation)
+                groups.schedule(escalation)
             }
         }
+    }
+    // Once disappearance is observed, this instance never consults or signals that PGID again.
+    private func groupIsLiveLocked() -> Bool {
+        guard started, !groupRetired else { return false }
+        if !process.isRunning, !groups.isAlive(process.processIdentifier) {
+            groupRetired = true; escalation?.cancel(); escalation = nil
+            return false
+        }
+        return true
     }
     func run(mode: String, configuration: ShaderRequestConfiguration, directory: URL) -> AsyncThrowingStream<RequestWorkerEvent, Error> {
         AsyncThrowingStream { continuation in
             drained.enter()
             DispatchQueue(label: "Holodeck.request-worker").async { [self] in
                 defer {
-                    lock.withLock { escalation?.cancel(); escalation = nil }
+                    lock.withLock { completed = !started || !groupIsLiveLocked() }
                     drained.leave()
                 }
                 do {
@@ -155,25 +196,29 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         await Task.detached { [self] in
             let pid = process.processIdentifier
             for _ in 0..<100 {
-                let descendants = pid > 1 && kill(-pid, 0) == 0
-                if !process.isRunning, !descendants { return }
+                if !lock.withLock({ groupIsLiveLocked() }) { return }
                 try? await Task.sleep(for: .milliseconds(50))
             }
-            if pid > 1 { kill(-pid, SIGKILL) }
+            lock.withLock { if groupIsLiveLocked(), pid > 1 { _ = groups.signal(pid, SIGKILL) } }
             if process.isRunning { process.terminate(); process.waitUntilExit() }
-            while pid > 1, kill(-pid, 0) == 0 { try? await Task.sleep(for: .milliseconds(50)) }
+            while lock.withLock({ groupIsLiveLocked() }) { try? await Task.sleep(for: .milliseconds(50)) }
         }.value
         // Also finish pipe draining and identity-file cleanup before reusing this journal.
         await withCheckedContinuation { continuation in
             drained.notify(queue: .global()) { continuation.resume() }
         }
+        lock.withLock { completed = true; groupRetired = true; escalation?.cancel(); escalation = nil }
     }
 
     private struct WorkerIdentity: Codable { let pid: Int32; let script: String; let directory: String }
     static func reconcileOrphan(in directory: URL) throws {
         let file = directory.appendingPathComponent("process.json")
-        guard let bytes = try? Data(contentsOf: file), let identity = try? JSONDecoder().decode(WorkerIdentity.self, from: bytes) else { return }
-        guard identity.pid > 1, URL(fileURLWithPath: identity.directory).standardizedFileURL == directory.standardizedFileURL else {
+        guard FileManager.default.fileExists(atPath: file.path) else { return }
+        let bytes = try Data(contentsOf: file)
+        guard let identity = try? JSONDecoder().decode(WorkerIdentity.self, from: bytes) else {
+            throw ShaderRequestError.unavailable("Worker identity is unreadable. Repair the journal marker or detach the checkout while retaining its evidence.")
+        }
+        guard identity.pid > 1, RequestPaths.canonical(URL(fileURLWithPath: identity.directory)) == RequestPaths.canonical(directory) else {
             throw ShaderRequestError.unavailable("Worker identity does not belong to this request journal.")
         }
         let task = Process(), pipe = Pipe()
@@ -211,12 +256,20 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
 }
 
 public struct ShaderRequestRecoveryStatus: Sendable, Identifiable {
+    public enum Kind: Sendable { case cleanup, reconciliation }
     public let id: UUID
+    public let kind: Kind
     public let repository: String
     public let python: String
     public let git: String
     public let message: String
     public let isRunning: Bool
+}
+
+public struct ShaderRequestPublicationStatus: Sendable {
+    public let revision: String
+    public let sequence: UInt64
+    public let warnings: [ShaderPreviewWarning]
 }
 
 public actor ShaderRequestService {
@@ -235,6 +288,7 @@ public actor ShaderRequestService {
     private let directory: URL
     private let catalog: DirectoryCatalog
     private let workerScript: URL?
+    private let reconcileWorker: @Sendable (URL) async throws -> Void
     private var configuration = ShaderRequestConfiguration()
     private var records: [UUID: Record] = [:]
     private var observers: [UUID: AsyncStream<[ShaderRequestStatus]>.Continuation] = [:]
@@ -245,10 +299,22 @@ public actor ShaderRequestService {
     private struct Execution { let id = UUID(); var interrupted = false }
     private var execution: Execution?
     private var maintenanceBusy = false
-    private var reconciliationTask: Task<UUID?, Error>?
+    private struct ReconciliationAttempt { let id = UUID(); let task: Task<UUID?, Error> }
+    private var reconciliationTask: ReconciliationAttempt?
     private var reconciled = false
-    private var reconciling = false
-    private var latestWarnings: [ShaderPreviewWarning] = []
+    private var reconciliationKickID: UUID?
+    private var reconciliationFailure: String?
+    private static let reconciliationStatusID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+    private var latestPublication: ShaderRequestPublicationStatus?
+    private var publicationSequence: UInt64 = 0
+    private struct PublicationWaiter { let id: UUID; let continuation: CheckedContinuation<Void, Error> }
+    private struct PublicationRequest { var force: Bool; var waiters: [PublicationWaiter] }
+    private var pendingPublication: PublicationRequest?
+    private var activePublication: PublicationRequest?
+    private enum ScheduledWork { case execute(UUID), cleanup(UUID), publication }
+    private var schedulingActive = false
+    private var initialized = false
+    private var detachedOwners: [DetachedCheckoutAcknowledgement] = []
     private var suspended = false
     private var loaded = false
     private var recoveryID: UUID?
@@ -256,24 +322,38 @@ public actor ShaderRequestService {
 
     public init(catalog: DirectoryCatalog, directory: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Holodeck/Requests")) {
         self.catalog = catalog; self.directory = directory; self.workerScript = nil
+        self.reconcileWorker = { try RequestWorkerProcess.reconcileOrphan(in: $0) }
     }
-    init(catalog: DirectoryCatalog, directory: URL, workerScript: URL) {
+    init(catalog: DirectoryCatalog, directory: URL, workerScript: URL,
+         reconcileWorker: @escaping @Sendable (URL) async throws -> Void = { try RequestWorkerProcess.reconcileOrphan(in: $0) }) {
         self.catalog = catalog; self.directory = directory; self.workerScript = workerScript
+        self.reconcileWorker = reconcileWorker
     }
     private func workerProcess() -> RequestWorkerProcess { RequestWorkerProcess(script: workerScript) }
 
     public func start(configuration: ShaderRequestConfiguration) throws {
+        try initialize(configuration: configuration)
+        activateScheduling()
+    }
+    public func initialize(configuration: ShaderRequestConfiguration) throws {
         try load()
         let preferences = directory.appendingPathComponent("preferences.json")
         self.configuration = (try? Data(contentsOf: preferences)).flatMap { try? JSONDecoder().decode(ShaderRequestConfiguration.self, from: $0) } ?? configuration
         if !configuration.shaderTool.isEmpty { self.configuration.shaderTool = configuration.shaderTool }
+        if detachedOwners.contains(where: { Self.sameCheckout(self.configuration, repository: $0.repository, checkoutID: $0.checkoutID) }) {
+            self.configuration.enabled = false
+        }
+        initialized = true
         setupMessage = self.configuration.enabled ? "Ready for shader requests" : "Enable shader requests in Mac Settings."
-        kick()
     }
+    public func activateScheduling() { schedulingActive = true; kick() }
     private func load() throws {
         guard !loaded else { return }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let file = directory.appendingPathComponent("journal.json")
+        let acknowledgements = directory.appendingPathComponent("detached-checkouts.json")
+        let hasAcknowledgements = FileManager.default.fileExists(atPath: acknowledgements.path)
+        if hasAcknowledgements { detachedOwners = try JSONDecoder().decode([DetachedCheckoutAcknowledgement].self, from: Data(contentsOf: acknowledgements)) }
         if FileManager.default.fileExists(atPath: file.path) {
             let saved = try JSONDecoder().decode([Record].self, from: Data(contentsOf: file))
             records = Dictionary(uniqueKeysWithValues: saved.map { ($0.status.id, $0) })
@@ -288,6 +368,16 @@ public actor ShaderRequestService {
             }
         }
         for id in records.keys {
+            if !hasAcknowledgements, records[id]?.detached == true, let record = records[id] {
+                detachedOwners.append(Self.acknowledgement(id: id, job: folder(id), configuration: record.configuration))
+            }
+            if detachedOwners.contains(where: { $0.requestID == id }) {
+                records[id]?.detached = true; records[id]?.cleanupPending = false
+                if records[id]?.status.stage.terminal == false {
+                    records[id]?.status.stage = .failed
+                    records[id]?.status.message = "Checkout detached; unpublished files and evidence were retained"
+                }
+            }
             if records[id]?.revoked == true, records[id]?.status.stage.terminal == false, records[id]?.detached != true {
                 records[id]?.cleanupPending = true
                 records[id]?.cleanupMessage = "TV access was revoked; any pushed commit remains"
@@ -304,23 +394,41 @@ public actor ShaderRequestService {
     public func artifacts(for id: UUID) -> URL { folder(id) }
     public func configurationValue() -> ShaderRequestConfiguration { configuration }
     public func hasPendingCleanup() -> Bool { records.values.contains { $0.cleanupPending == true } }
-    public func publicationWarnings() -> [ShaderPreviewWarning] { latestWarnings }
+    public func publicationStatus() async -> ShaderRequestPublicationStatus? {
+        let revision = await catalog.publicationRevisionValue()
+        guard let latestPublication, latestPublication.revision == revision else { return nil }
+        return latestPublication
+    }
+    var pendingPublicationWaiterCount: Int { pendingPublication?.waiters.count ?? 0 }
+    private func published(_ publication: CatalogReloadResult) {
+        publicationSequence &+= 1
+        latestPublication = ShaderRequestPublicationStatus(revision: publication.catalog.publicationRevision,
+            sequence: publicationSequence, warnings: publication.previewWarnings)
+    }
     public func recoveryStatuses() -> [ShaderRequestRecoveryStatus] {
-        records.values.filter { $0.cleanupPending == true }.map {
-            ShaderRequestRecoveryStatus(id: $0.status.id, repository: $0.configuration.repository,
+        var statuses = records.values.filter { $0.cleanupPending == true }.map {
+            ShaderRequestRecoveryStatus(id: $0.status.id, kind: .cleanup, repository: $0.configuration.repository,
                 python: $0.configuration.python, git: $0.configuration.git,
                 message: $0.cleanupFailure ?? $0.cleanupMessage ?? "Checkout cleanup is pending",
                 isRunning: activeID == $0.status.id)
         }.sorted { $0.id.uuidString < $1.id.uuidString }
+        if let reconciliationFailure {
+            statuses.append(ShaderRequestRecoveryStatus(id: Self.reconciliationStatusID, kind: .reconciliation,
+                repository: configuration.repository, python: configuration.python, git: configuration.git,
+                message: reconciliationFailure, isRunning: reconciliationTask != nil))
+        }
+        return statuses
     }
 
     private func reconcileWorkers() async throws {
         guard !reconciled else { return }
         if reconciliationTask == nil {
-            let folders = records.keys.map { folder($0) } + [directory.appendingPathComponent("setup"), directory.appendingPathComponent("publication")]
+            let folders = records.values.filter { $0.detached != true }.map { folder($0.status.id) }
+                + [directory.appendingPathComponent("setup"), directory.appendingPathComponent("publication")]
             let known = records.values.filter { $0.detached != true }.map { ($0.status.id, $0.configuration, folder($0.status.id)) }
-            reconciliationTask = Task.detached {
-                for folder in folders { try RequestWorkerProcess.reconcileOrphan(in: folder) }
+            let reconcile = reconcileWorker
+            reconciliationTask = ReconciliationAttempt(task: Task.detached {
+                for folder in folders { try await reconcile(folder) }
                 var inspected: Set<String> = []
                 for (_, configuration, _) in known {
                     let key = configuration.repository + "\0" + configuration.git
@@ -328,24 +436,46 @@ public actor ShaderRequestService {
                           let bytes = try? BoundedCatalogReader(root: gitdir).read("holodeck-request-owner.json", limit: CatalogLimits.headBytes).bytes,
                           let owner = try? JSONSerialization.jsonObject(with: bytes) as? [String: String],
                           let ownerID = owner["id"].flatMap(UUID.init(uuidString:)) else { continue }
-                    // Only journal-owned identities and their exact artifact directory are eligible.
-                    if let match = known.first(where: { $0.0 == ownerID && $0.2.path == owner["directory"] }) { return match.0 }
+                    if let match = known.first(where: {
+                        $0.0 == ownerID && owner["directory"].map { RequestPaths.canonical(URL(fileURLWithPath: $0)) } == RequestPaths.canonical($0.2)
+                    }) { return match.0 }
                 }
                 return nil
-            }
+            })
         }
-        let discoveredOwner = try await reconciliationTask?.value
-        guard !reconciled else { return }
-        if let owner = discoveredOwner, records[owner]?.detached != true {
-            recoveryID = owner
-            if let stage = records[owner]?.status.stage, stage.terminal || stage == .awaitingActivation || stage == .awaitingClarification {
-                records[owner]?.cleanupPending = true
-                records[owner]?.cleanupMessage = "Cleaning interrupted owned work; pushed commits are retained"
-                if !stage.terminal { try update(owner, stage: .failed, message: "Interrupted checkout cleanup is required") }
-                else { try persist() }
+        guard let attempt = reconciliationTask else { return }
+        do {
+            let discoveredOwner = try await attempt.task.value
+            guard reconciliationTask?.id == attempt.id else { return }
+            if let owner = discoveredOwner, records[owner]?.detached != true {
+                recoveryID = owner
+                if let stage = records[owner]?.status.stage, stage.terminal || stage == .awaitingActivation || stage == .awaitingClarification {
+                    records[owner]?.cleanupPending = true
+                    records[owner]?.cleanupMessage = "Cleaning interrupted owned work; pushed commits are retained"
+                    if !stage.terminal { try update(owner, stage: .failed, message: "Interrupted checkout cleanup is required") }
+                    else { try persist() }
+                } else if records[owner]?.status.stage != .repairing {
+                    try update(owner, stage: .repairing, message: "Recovering interrupted owned work")
+                }
             }
+            reconciled = true; reconciliationTask = nil; reconciliationFailure = nil
+        } catch {
+            if reconciliationTask?.id == attempt.id {
+                reconciliationTask = nil; reconciliationFailure = "Worker recovery failed: " + error.localizedDescription
+                setupMessage = reconciliationFailure!
+                try? persist()
+            }
+            throw error
         }
-        reconciled = true
+    }
+
+    public func retryReconciliation() async throws {
+        guard activeID == nil, !maintenanceBusy else { throw ShaderRequestError.unavailable("Wait for active checkout work to finish.") }
+        reconciled = false
+        // Existing waiters retain their own attempt identity and cannot clear a subsequent retry.
+        reconciliationTask = nil; reconciliationKickID = nil
+        try await reconcileWorkers()
+        try persist(); kick()
     }
 
     public func retryCleanup(_ id: UUID, repository: String, python: String, git: String) async throws {
@@ -357,7 +487,6 @@ public actor ShaderRequestService {
         var corrected = record.configuration
         corrected.repository = repository; corrected.python = python; corrected.git = git
         let job = folder(id)
-        try await reconcileWorkers()
         try await Task.detached { try Self.validateRecoveryCheckout(corrected, id: id, job: job) }.value
         guard records[id]?.detached != true else { throw CancellationError() }
         let previous = record.configuration
@@ -376,74 +505,137 @@ public actor ShaderRequestService {
             try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
         }
         records[id]?.cleanupFailure = nil; recoveryID = id
+        reconciled = false; reconciliationTask = nil; reconciliationKickID = nil
         try persist()
+        try await reconcileWorkers()
     }
 
     public func detachCheckout(_ id: UUID? = nil) async throws {
         let selected = id.flatMap { records[$0]?.configuration } ?? configuration
         let ids = records.keys.filter { key in
             guard let candidate = records[key]?.configuration else { return false }
-            if let identity = selected.checkoutID, let other = candidate.checkoutID { return identity == other }
-            return URL(fileURLWithPath: candidate.repository).standardizedFileURL == URL(fileURLWithPath: selected.repository).standardizedFileURL
+            return Self.sameCheckout(candidate, repository: selected.repository, checkoutID: selected.checkoutID)
         }
         guard activeID == nil || ids.contains(activeID!) else {
             throw ShaderRequestError.unavailable("Wait for the other checkout’s active request before detaching this checkout.")
         }
         configuration.enabled = false
         execution?.interrupted = true
-        activeProcess?.stop()
         for key in ids {
+            guard let record = records[key] else { continue }
+            let acknowledgement = Self.acknowledgement(id: key, job: folder(key), configuration: record.configuration)
+            detachedOwners.removeAll { $0.requestID == key }; detachedOwners.append(acknowledgement)
             records[key]?.detached = true; records[key]?.interrupted = true
             records[key]?.cleanupPending = false; records[key]?.cleanupFailure = nil
-            if records[key]?.status.stage.terminal == false {
-                try update(key, stage: .failed, message: "Checkout detached; unpublished files and evidence were retained")
+            if !record.status.stage.terminal {
+                records[key]?.status.stage = .failed
+                records[key]?.status.message = "Checkout detached; unpublished files and evidence were retained"
             }
         }
+        // Durable intent precedes all asynchronous teardown, including for terminal records.
+        try persist()
         try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
+        let cancellation = CancellationError()
+        for waiter in pendingPublication?.waiters ?? [] { waiter.continuation.resume(throwing: cancellation) }
+        pendingPublication = nil
+        for waiter in activePublication?.waiters ?? [] { waiter.continuation.resume(throwing: cancellation) }
+        activePublication?.waiters = []
+        activeProcess?.stop()
         if let activeProcess { await activeProcess.waitForExit() }
         if let workerTask { await workerTask.value }
-        try await reconcileWorkers()
+        let folders = ids.map { folder($0) } + [directory.appendingPathComponent("setup"), directory.appendingPathComponent("publication")]
+        for folder in folders {
+            do { try await Task.detached { try RequestWorkerProcess.reconcileOrphan(in: folder) }.value }
+            catch {
+                // Quarantine an unverifiable app-owned marker as evidence; never signal its PID.
+                let marker = folder.appendingPathComponent("process.json")
+                if FileManager.default.fileExists(atPath: marker.path) {
+                    try FileManager.default.moveItem(at: marker, to: folder.appendingPathComponent("process-detached-" + UUID().uuidString + ".json"))
+                }
+            }
+        }
+        reconciled = false; reconciliationTask = nil; reconciliationKickID = nil; reconciliationFailure = nil
         setupMessage = "Requests disabled. Select a checkout and verify setup before enabling requests again."
         try persist()
     }
 
-    /// Rebuild from a clean checkout under the Python worker's existing cross-process lease.
-    public func ensurePublication() async throws {
-        guard !maintenanceBusy, activeID == nil, !hasPendingCleanup() else {
-            throw ShaderRequestError.unavailable("Finish checkout recovery before rebuilding the library.")
+    /// Cache restoration and forced rebuilds share the checkout scheduler with recovery and jobs.
+    public func ensurePublication(force: Bool = false) async throws {
+        guard initialized else { throw ShaderRequestError.unavailable("Initialize shader requests before preparing the library.") }
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                if Task.isCancelled { continuation.resume(throwing: CancellationError()); return }
+                var request = pendingPublication ?? PublicationRequest(force: force, waiters: [])
+                request.force = request.force || force
+                request.waiters.append(PublicationWaiter(id: id, continuation: continuation))
+                pendingPublication = request
+                kick()
+            }
+        } onCancel: { Task { await self.cancelPublicationWaiter(id) } }
+    }
+    private func cancelPublicationWaiter(_ id: UUID) {
+        if let index = pendingPublication?.waiters.firstIndex(where: { $0.id == id }) {
+            pendingPublication?.waiters.remove(at: index).continuation.resume(throwing: CancellationError())
+            if pendingPublication?.waiters.isEmpty == true { pendingPublication = nil }
         }
-        maintenanceBusy = true
-        let operation = Execution(); execution = operation
+        if let index = activePublication?.waiters.firstIndex(where: { $0.id == id }) {
+            activePublication?.waiters.remove(at: index).continuation.resume(throwing: CancellationError())
+            if activePublication?.waiters.isEmpty == true { execution?.interrupted = true; activeProcess?.stop() }
+        }
+    }
+    private func runPublication(operation: UUID) async {
         let process = workerProcess(); activeProcess = process
-        defer { activeProcess = nil; execution = nil; maintenanceBusy = false; kick() }
-        try await reconcileWorkers()
-        try checkExecution(operation.id)
         do {
-            if try await catalog.cached() != nil { return }
-        } catch is CancellationError { throw CancellationError() }
-        catch { Diagnostics.catalog.error("Previous publication unavailable; rebuilding from the authoring checkout: \(error.localizedDescription, privacy: .public)") }
-        do {
+            if activePublication?.force != true {
+                do {
+                    if try await catalog.cached() != nil { try checkExecution(operation); finishPublication(); return }
+                } catch is CancellationError { throw CancellationError() }
+                catch { Diagnostics.catalog.error("Previous publication unavailable; rebuilding: \(error.localizedDescription, privacy: .public)") }
+            }
+            try checkExecution(operation)
             var ready = false
             for try await event in process.run(mode: "publication", configuration: configuration, directory: directory.appendingPathComponent("publication")) {
-                try checkExecution(operation.id)
+                try checkExecution(operation)
                 switch event.event {
-                case "preparePublication": try await preparePublication(event, process: process, operation: operation.id)
+                case "preparePublication": try await preparePublication(event, process: process, operation: operation)
                 case "publicationReady": ready = true
                 case "failure": throw ShaderRequestError.unavailable(event.message ?? "Publication rebuild failed")
                 default: break
                 }
             }
             await process.waitForExit()
-            try checkExecution(operation.id)
+            try checkExecution(operation)
             guard ready, let preparedID else { throw ShaderRequestError.unavailable("Publication rebuild did not complete.") }
             let publication = try await catalog.install(preparedID)
-            self.preparedID = nil; latestWarnings = publication.previewWarnings
+            self.preparedID = nil; published(publication)
             try persist()
+            finishPublication()
         } catch {
             process.stop(); await process.waitForExit()
             if let preparedID { await catalog.discard(preparedID); self.preparedID = nil }
-            throw error
+            if execution?.interrupted == true, activePublication?.waiters.isEmpty == false {
+                let request = activePublication!
+                if pendingPublication == nil { pendingPublication = request }
+                else {
+                    var pending = pendingPublication!
+                    pending.force = pending.force || request.force; pending.waiters += request.waiters
+                    pendingPublication = pending
+                }
+                activePublication = nil
+                finishPublication()
+            } else { finishPublication(error: error) }
         }
+    }
+    private func finishPublication(error: Error? = nil) {
+        let waiters = activePublication?.waiters ?? []
+        activePublication = nil; activeProcess = nil; execution = nil; maintenanceBusy = false; workerTask = nil
+        for waiter in waiters {
+            if let error { waiter.continuation.resume(throwing: error) }
+            else { waiter.continuation.resume() }
+        }
+        kick()
     }
 
     private func checkExecution(_ id: UUID) throws {
@@ -488,6 +680,7 @@ public actor ShaderRequestService {
     }
     private func removeObserver(_ id: UUID) { observers[id] = nil }
     private func persist() throws {
+        try JSONEncoder().encode(detachedOwners).write(to: directory.appendingPathComponent("detached-checkouts.json"), options: .atomic)
         try JSONEncoder().encode(Array(records.values)).write(to: directory.appendingPathComponent("journal.json"), options: .atomic)
         for observer in observers.values { observer.yield(allJobs()) }
     }
@@ -502,15 +695,35 @@ public actor ShaderRequestService {
             throw ShaderRequestError.unavailable("Finish or cancel queued requests before changing setup.")
         }
         var candidate = candidate
+        maintenanceBusy = true
+        defer { maintenanceBusy = false; kick() }
+        try await reconcileWorkers()
+        let acknowledgements = detachedOwners
+        let checkout = candidate
+        candidate.detachedOwner = try await Task.detached { try Self.detachedOwner(for: checkout, acknowledgements: acknowledgements) }.value
         candidate.checkoutID = nil
-        let process = workerProcess()
+        let process = workerProcess(), operation = Execution()
+        activeProcess = process; execution = operation
+        defer { activeProcess = nil; execution = nil }
         var verified = false
-        for try await event in process.run(mode: "preflight", configuration: candidate, directory: directory.appendingPathComponent("setup")) {
-            if event.event == "failure" { throw ShaderRequestError.unavailable(event.message ?? "Setup failed") }
-            if event.event == "preflight" { verified = true; candidate.checkoutID = event.checkoutID }
+        do {
+            for try await event in process.run(mode: "preflight", configuration: candidate, directory: directory.appendingPathComponent("setup")) {
+                try checkExecution(operation.id)
+                if event.event == "failure" { throw ShaderRequestError.unavailable(event.message ?? "Setup failed") }
+                if event.event == "preflight" { verified = true; candidate.checkoutID = event.checkoutID }
+            }
+            await process.waitForExit()
+            try checkExecution(operation.id)
+            guard verified else { throw ShaderRequestError.unavailable("Setup did not complete.") }
+        } catch {
+            process.stop(); await process.waitForExit()
+            throw error
         }
-        guard verified else { throw ShaderRequestError.unavailable("Setup did not complete.") }
+        candidate.detachedOwner = nil
         configuration = candidate; configuration.enabled = true
+        detachedOwners.removeAll { Self.sameCheckout(candidate, repository: $0.repository, checkoutID: $0.checkoutID) }
+        if !initialized { initialized = true; schedulingActive = true }
+        try persist()
         try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
         setupMessage = "Ready for shader requests"
         try persist(); kick()
@@ -623,13 +836,19 @@ public actor ShaderRequestService {
                                         publicationRevision: await catalog.publicationRevisionValue())
     }
     private func kick() {
-        guard loaded, !suspended, !maintenanceBusy, activeID == nil else { return }
+        guard loaded, initialized, !suspended, !maintenanceBusy, activeID == nil, workerTask == nil else { return }
         if !reconciled {
-            guard !reconciling else { return }
-            reconciling = true
+            guard reconciliationKickID == nil else { return }
+            let id = UUID(); reconciliationKickID = id
             Task {
-                do { try await reconcileWorkers(); reconciling = false; kick() }
-                catch { reconciling = false; setupMessage = "Worker recovery failed: " + error.localizedDescription; try? persist() }
+                do {
+                    try await reconcileWorkers()
+                    guard reconciliationKickID == id else { return }
+                    reconciliationKickID = nil; kick()
+                } catch {
+                    guard reconciliationKickID == id else { return }
+                    reconciliationKickID = nil
+                }
             }
             return
         }
@@ -638,16 +857,30 @@ public actor ShaderRequestService {
         let ownerCleanup = recoveryID.flatMap { records[$0]?.cleanupPending == true ? $0 : nil }
         let cleanupID = ownerCleanup ?? records.values.filter { $0.cleanupPending == true && $0.cleanupFailure == nil }.sorted { $0.status.createdAt < $1.status.createdAt }.first?.status.id
         let interrupted = recoveryID.flatMap { id -> UUID? in
-            guard configuration.enabled, let value = records[id], !value.revoked, value.detached != true,
+            guard configuration.enabled, schedulingActive || pendingPublication != nil,
+                  let value = records[id], !value.revoked, value.detached != true,
                   value.cleanupPending != true, value.status.stage == .repairing || value.status.stage == .queued else { return nil }
             return id
         }
-        guard let id = interrupted ?? cleanupID ?? (configuration.enabled && !hasPendingCleanup() ? ShaderRequestScheduling.next(in: eligible, recoveringID: recoveryID) : nil) else { return }
+        let work: ScheduledWork
+        if let interrupted { work = .execute(interrupted) }
+        else if let cleanupID { work = .cleanup(cleanupID) }
+        else if hasPendingCleanup() { return }
+        else if pendingPublication != nil { work = .publication }
+        else if schedulingActive, configuration.enabled, let id = ShaderRequestScheduling.next(in: eligible, recoveringID: recoveryID) { work = .execute(id) }
+        else { return }
         let operation = Execution(); execution = operation
+        if case .publication = work {
+            activePublication = pendingPublication; pendingPublication = nil; maintenanceBusy = true
+            workerTask = Task { [weak self] in await self?.runPublication(operation: operation.id) }
+            return
+        }
+        let id: UUID
+        switch work { case .execute(let job), .cleanup(let job): id = job; case .publication: return }
         do {
             try JSONEncoder().encode(id).write(to: directory.appendingPathComponent("active.json"), options: .atomic)
             records[id]?.executionID = operation.id; records[id]?.interrupted = false
-            if cleanupID == nil { try update(id, stage: .implementing, message: "Preparing the managed checkout") }
+            if case .execute = work { try update(id, stage: .implementing, message: "Preparing the managed checkout") }
             else { try persist() }
         } catch {
             execution = nil; try? update(id, stage: .failed, message: error.localizedDescription)
@@ -655,8 +888,11 @@ public actor ShaderRequestService {
         }
         activeID = id
         workerTask = Task { [weak self] in
-            if cleanupID != nil { await self?.cleanup(id, operation: operation.id) }
-            else { await self?.execute(id, operation: operation.id) }
+            switch work {
+            case .cleanup(let id): await self?.cleanup(id, operation: operation.id)
+            case .execute(let id): await self?.execute(id, operation: operation.id)
+            case .publication: break
+            }
         }
     }
     private func cleanup(_ id: UUID, operation: UUID) async {
@@ -731,7 +967,7 @@ public actor ShaderRequestService {
                     try update(id, stage: .publishing, message: "Installing the committed library")
                     let publication = try await catalog.install(preparedID)
                     self.preparedID = nil
-                    latestWarnings = publication.previewWarnings
+                    published(publication)
                     records[id]?.status.result = result
                     if records[id]?.revoked == true {
                         try update(id, stage: .failed, message: "Pushed successfully; TV access was revoked")
@@ -786,6 +1022,28 @@ public actor ShaderRequestService {
     }
     public func resume() { suspended = false; kick() }
 
+    nonisolated private static func sameCheckout(_ configuration: ShaderRequestConfiguration, repository: String, checkoutID: String?) -> Bool {
+        if let identity = configuration.checkoutID, let checkoutID { return identity == checkoutID }
+        return RequestPaths.canonical(URL(fileURLWithPath: configuration.repository)) == RequestPaths.canonical(URL(fileURLWithPath: repository))
+    }
+    nonisolated private static func acknowledgement(id: UUID, job: URL, configuration: ShaderRequestConfiguration) -> DetachedCheckoutAcknowledgement {
+        DetachedCheckoutAcknowledgement(requestID: id, directory: RequestPaths.canonical(job),
+            repository: RequestPaths.canonical(URL(fileURLWithPath: configuration.repository)), checkoutID: configuration.checkoutID)
+    }
+    nonisolated private static func detachedOwner(for configuration: ShaderRequestConfiguration, acknowledgements: [DetachedCheckoutAcknowledgement]) throws -> DetachedCheckoutAcknowledgement? {
+        guard !acknowledgements.isEmpty else { return nil }
+        let gitdir = try gitDirectory(configuration)
+        guard let bytes = try? BoundedCatalogReader(root: gitdir).read("holodeck-request-owner.json", limit: CatalogLimits.headBytes).bytes,
+              let marker = try? JSONSerialization.jsonObject(with: bytes) as? [String: String],
+              let id = marker["id"].flatMap(UUID.init(uuidString:)), let path = marker["directory"] else { return nil }
+        let identity = (try? String(contentsOf: gitdir.appendingPathComponent("holodeck-checkout-id"), encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return acknowledgements.first {
+            guard $0.requestID == id, RequestPaths.canonical(URL(fileURLWithPath: $0.directory)) == RequestPaths.canonical(URL(fileURLWithPath: path)) else { return false }
+            if let expected = $0.checkoutID { return identity == expected }
+            return RequestPaths.canonical(URL(fileURLWithPath: $0.repository)) == RequestPaths.canonical(URL(fileURLWithPath: configuration.repository))
+        }
+    }
+
     nonisolated private static func gitDirectory(_ configuration: ShaderRequestConfiguration) throws -> URL {
         let process = Process(), output = Pipe(), errors = Pipe()
         process.executableURL = URL(fileURLWithPath: configuration.git)
@@ -807,7 +1065,7 @@ public actor ShaderRequestService {
         let gitdir = try gitDirectory(configuration)
         let owner = (try? Data(contentsOf: gitdir.appendingPathComponent("holodeck-request-owner.json"))).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: String] }
         let identity = (try? String(contentsOf: gitdir.appendingPathComponent("holodeck-checkout-id"), encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let owned = owner?["id"]?.lowercased() == id.uuidString.lowercased() && owner?["directory"] == job.path
+        let owned = owner?["id"]?.lowercased() == id.uuidString.lowercased() && owner?["directory"].map { RequestPaths.canonical(URL(fileURLWithPath: $0)) } == RequestPaths.canonical(job)
         let sameCheckout = configuration.checkoutID != nil && identity == configuration.checkoutID
         guard owned || sameCheckout, owner == nil || owned else {
             throw ShaderRequestError.unavailable("Selected checkout does not belong to this request. Locate its owned checkout or detach it without deleting files.")
