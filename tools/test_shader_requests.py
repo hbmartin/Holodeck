@@ -752,4 +752,20 @@ worker.main()
         self.assertTrue(any('checkout bytes differ' in e.get('message','') for e in events),events)
         self.assertFalse((self.job/'invocations.jsonl').exists())
 
+    def test_setup_rejects_old_python_before_reporting_checker_ready(self):
+        worker,owner=self.detached_setup_worker()
+        calls=[]
+        def incompatible(command,*args,**kwargs):
+            calls.append(command)
+            if '-c' in command:
+                self.assertIn('-I',command)
+                self.assertEqual(kwargs['timeout'],5)
+                self.assertFalse(kwargs['check'])
+                return subprocess.CompletedProcess(command,1,'','')
+            return subprocess.CompletedProcess(command,0,'','')
+        with patch.object(worker_module,'run',side_effect=incompatible):
+            with self.assertRaisesRegex(worker_module.OperationalError,'Python 3.9 or later'):worker.preflight()
+        self.assertFalse(any('info' in command for command in calls))
+        self.assertEqual(json.loads(worker.owner.read_text()),owner)
+
 if __name__=='__main__': unittest.main()

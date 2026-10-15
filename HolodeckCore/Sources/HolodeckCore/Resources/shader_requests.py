@@ -869,6 +869,11 @@ An unchanged existing shader may be successful if it already satisfies the promp
         run([self.config["codex"], "--version"], self.root, self.env)
         run([self.config["codex"], "login", "status"], self.root, self.env)
         run([self.config["python"], "--version"], self.root, self.env)
+        compatibility = run([self.config["python"], "-I", "-c",
+                             "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)"],
+                            self.root, self.env, timeout=5, check=False)
+        if compatibility.returncode:
+            raise OperationalError("The shader checker requires Python 3.9 or later; choose a supported interpreter.")
         run([self.config["shaderTool"], "--version"], self.root, self.env)
         for sdk in ("appletvos", "macosx"):
             run(["/usr/bin/xcrun", "-sdk", sdk, "--find", "metal"], self.root, self.env)
