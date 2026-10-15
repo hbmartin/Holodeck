@@ -3,6 +3,7 @@ import Foundation
 
 nonisolated struct DirectoryPreparation: Sendable {
     let stage: URL
+    let authoringManifestByteCount: Int
     var manifest: CatalogManifest
     let sources: [String: String]
     var paths: Set<String>
@@ -84,20 +85,14 @@ nonisolated final class DirectoryCatalogIO: @unchecked Sendable {
         do {
             try fm.createDirectory(at: stage.appendingPathComponent("sources"), withIntermediateDirectories: true)
             try fm.createDirectory(at: stage.appendingPathComponent("previews"), withIntermediateDirectories: true)
+            let reader = try BoundedCatalogReader(root: root)
+            var modificationDates: [String: Date] = [:]
             func read(_ path: String, limit: Int) throws -> Data {
-                let url = root.appendingPathComponent(path)
                 do {
-                    let resolved = url.resolvingSymlinksInPath().standardizedFileURL.path
-                    guard resolved.hasPrefix(root.resolvingSymlinksInPath().standardizedFileURL.path + "/") else {
-                        throw LocalCatalogError.invalidFile(path, "File must stay inside the selected folder.")
-                    }
-                    let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-                    try CatalogLimits.checkByteCount(size, limit: limit, path: path, kind: "File")
-                    let bytes = try Data(contentsOf: url)
-                    try CatalogLimits.checkByteCount(bytes.count, limit: limit, path: path, kind: "File")
-                    return bytes
-                } catch let error as LocalCatalogError { throw error }
-                catch { throw LocalCatalogError.invalidFile(path, error.localizedDescription) }
+                    let file = try reader.read(path, limit: limit)
+                    modificationDates[path] = file.modified
+                    return file.bytes
+                } catch let error as CatalogFileSizeError { throw error.localError }
             }
             func json(_ path: String) throws -> [String: Any] {
                 do {
@@ -125,7 +120,13 @@ nonisolated final class DirectoryCatalogIO: @unchecked Sendable {
                 }
                 let sourcePaths = shared.dropLast().map { "shared/\($0).metal" } + [folder + "body.metal", "shared/fragment.metal"]
                 var bytes = Data()
-                for path in sourcePaths { bytes.append(try read(path, limit: CatalogLimits.sourceBytes)) }
+                for path in sourcePaths {
+                    let component = try read(path, limit: CatalogLimits.sourceBytes)
+                    guard String(validating: component, as: UTF8.self) != nil else {
+                        throw LocalCatalogError.invalidFile(path, "Source component is not valid UTF-8.")
+                    }
+                    bytes.append(component)
+                }
                 total += bytes.count
                 let bodyPath = folder + "body.metal"
                 guard !bytes.isEmpty else {
@@ -139,9 +140,7 @@ nonisolated final class DirectoryCatalogIO: @unchecked Sendable {
                     throw LocalCatalogError.invalidFile(bodyPath, "Assembled source for \(id) is not valid UTF-8.")
                 }
                 let dependencies = sourcePaths + [metadataPath]
-                let date = try dependencies.map { path in
-                    try root.appendingPathComponent(path).resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate ?? .distantPast
-                }.max() ?? .distantPast
+                let date = dependencies.compactMap { modificationDates[$0] }.max() ?? .distantPast
                 var entry = metadata.filter { ["id", "name", "category", "description", "colors", "discovery"].contains($0.key) }
                 entry["updatedAt"] = date.ISO8601Format(.init(includingFractionalSeconds: true))
                 entry["sourcePath"] = "sources/\(id).metal"; entry["sourceSHA256"] = CatalogHash.sha256(bytes)
@@ -161,11 +160,11 @@ nonisolated final class DirectoryCatalogIO: @unchecked Sendable {
             wire["sourceRevision"] = String(repeating: "0", count: 64)
             let manifestData = try JSONSerialization.data(withJSONObject: wire, options: [.sortedKeys])
             try CatalogLimits.checkByteCount(manifestData.count, limit: CatalogLimits.manifestBytes,
-                                             path: "index.json", kind: "Catalog manifest")
+                                             path: "index.json", kind: "Authoring manifest before normalization")
             let manifest: CatalogManifest
             do { manifest = try CatalogBuilder(manifest: JSONDecoder().decode(CatalogManifest.self, from: manifestData)).manifest }
             catch { throw LocalCatalogError.invalidFile("index.json", error.localizedDescription) }
-            return DirectoryPreparation(stage: stage, manifest: manifest, sources: sources, paths: paths)
+            return DirectoryPreparation(stage: stage, authoringManifestByteCount: manifestData.count, manifest: manifest, sources: sources, paths: paths)
         } catch {
             removeStage(stage)
             throw error
@@ -174,7 +173,7 @@ nonisolated final class DirectoryCatalogIO: @unchecked Sendable {
 
     func writePreview(_ png: Data, path: String, stage: URL) async throws -> String {
         try await run {
-            guard png.count <= CatalogLimits.previewBytes else { throw CatalogError.oversizedResponse }
+            try CatalogLimits.checkByteCount(png.count, limit: CatalogLimits.previewBytes, path: path, kind: "Preview")
             try png.write(to: stage.appendingPathComponent(path), options: .atomic)
             return CatalogHash.sha256(png)
         }
@@ -224,14 +223,14 @@ nonisolated final class DirectoryCatalogIO: @unchecked Sendable {
 
     private func verify(revision: String, expected: Data? = nil) throws -> ValidatedCatalog {
         let publication = directory.appendingPathComponent(revision)
-        let bytes = try CatalogPublicationFiles.read(publication.appendingPathComponent("catalog.json"), limit: CatalogLimits.manifestBytes)
+        let bytes = try CatalogPublicationFiles.read(publication.appendingPathComponent("catalog.json"), limit: CatalogLimits.manifestBytes, root: directory)
         if let expected, expected != bytes { throw CatalogError.invalidManifest }
         var builder = try CatalogPublication.builder(bytes, revision: revision, kind: .localPublication)
         for entry in builder.manifest.shaders {
             try builder.addSource(CatalogPublicationFiles.read(publication.appendingPathComponent(entry.sourcePath),
-                limit: CatalogLimits.sourceBytes), for: entry)
+                limit: CatalogLimits.sourceBytes, root: directory), for: entry)
             _ = try CatalogPublicationFiles.verified(publication.appendingPathComponent(entry.previewPath),
-                hash: entry.previewSHA256, limit: CatalogLimits.previewBytes, error: .invalidPreview)
+                hash: entry.previewSHA256, limit: CatalogLimits.previewBytes, error: .invalidPreview, root: directory)
         }
         return try builder.finish(revision: revision)
     }

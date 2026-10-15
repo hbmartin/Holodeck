@@ -10,7 +10,7 @@ nonisolated enum CatalogLimits {
 
     static func checkByteCount(_ count: Int, limit: Int, path: String, kind: String) throws {
         guard count <= limit else {
-            throw LocalCatalogError.invalidFile(path, "\(kind) is \(count) bytes; limit is \(limit) bytes.")
+            throw LocalCatalogError.invalidFile(path, CatalogError.sizeLimit(kind: kind, actual: count, limit: limit).localizedDescription)
         }
     }
 }
@@ -97,14 +97,14 @@ nonisolated enum CatalogPublication {
 }
 
 nonisolated enum CatalogPublicationFiles {
-    static func read(_ url: URL, limit: Int) throws -> Data {
-        guard (try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= limit else { throw CatalogError.oversizedResponse }
-        let data = try Data(contentsOf: url)
-        guard data.count <= limit else { throw CatalogError.oversizedResponse }
-        return data
+    static func read(_ url: URL, limit: Int, root: URL? = nil) throws -> Data {
+        let root = root ?? url.deletingLastPathComponent()
+        let prefix = root.path + "/"
+        guard url.path.hasPrefix(prefix) else { throw CatalogError.invalidResponse }
+        return try BoundedCatalogReader(root: root).read(String(url.path.dropFirst(prefix.count)), limit: limit).bytes
     }
-    static func verified(_ url: URL, hash: String, limit: Int, error: CatalogError) throws -> Data {
-        let data = try read(url, limit: limit)
+    static func verified(_ url: URL, hash: String, limit: Int, error: CatalogError, root: URL? = nil) throws -> Data {
+        let data = try read(url, limit: limit, root: root)
         guard CatalogHash.sha256(data) == hash else { throw error }
         return data
     }

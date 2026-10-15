@@ -73,6 +73,47 @@ final class HolodeckMacUITests: XCTestCase {
         XCTAssertFalse(element("shader-request-" + id, in: app).exists)
     }
 
+    func testCheckoutRecoveryPathsAndDetachKeepEvidence() throws {
+        let suite = "HolodeckMacUITests-" + UUID().uuidString, id = UUID().uuidString
+        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Holodeck/Requests-tests-\(suite)")
+        let job = directory.appendingPathComponent(id)
+        try FileManager.default.createDirectory(at: job, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let evidence = job.appendingPathComponent("changes.patch")
+        try Data("retained unpublished evidence".utf8).write(to: evidence)
+        let request: [String: Any] = ["id": id, "purpose": "creative", "origin": "manual", "prompt": "Recovery fixture", "context": [
+            "shaderID": "plasma", "name": "Plasma", "category": "PROCEDURAL", "description": "Captured scene", "colors": [[0.0,0.0,0.0],[1.0,1.0,1.0]],
+            "source": "", "sourceHash": String(repeating: "0", count: 64), "screenshot": "", "animationTime": 3.0, "drawableWidth": 1920, "drawableHeight": 1080]]
+        let status: [String: Any] = ["id": id, "request": request, "deviceID": "fixture-TV", "createdAt": Date().timeIntervalSinceReferenceDate,
+            "updatedAt": Date().timeIntervalSinceReferenceDate, "stage": "failed", "message": "Cleanup pending", "sequence": 0]
+        let config: [String: Any] = ["repository": directory.appendingPathComponent("missing-checkout").path, "codex": "/unavailable/codex",
+            "python": "/unavailable/python", "git": "/usr/bin/git", "shaderTool": "", "model": "", "reasoning": "high", "enabled": false]
+        let journal = try JSONSerialization.data(withJSONObject: [["status": status, "configuration": config, "revoked": false, "cleanupPending": true]])
+        let app = try app(suite: suite, arguments: ["--ui-test-local-library"])
+        app.launchEnvironment["HOLODECK_UI_TEST_REQUEST_JOURNAL"] = String(decoding: journal, as: UTF8.self)
+        app.launch(); app.activate()
+        let settings = element("shader-library-settings", in: app)
+        XCTAssertTrue(settings.waitForExistence(timeout: 15)); settings.click()
+        let retry = element("retry-checkout-cleanup", in: app)
+        XCTAssertTrue(retry.waitForExistence(timeout: 10))
+        let available = XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: retry)
+        XCTAssertEqual(XCTWaiter.wait(for: [available], timeout: 10), .completed)
+        let python = element("recovery-python", in: app)
+        python.click(); python.typeKey("a", modifierFlags: .command); python.typeText("/usr/bin/python3")
+        XCTAssertTrue(element("recovery-repository", in: app).exists)
+        XCTAssertTrue(element("recovery-git", in: app).exists)
+        retry.click()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: retry)], timeout: 10), .completed)
+        element("detach-checkout", in: app).click()
+        let detach = app.windows.buttons["Detach and Keep Files"].firstMatch
+        XCTAssertTrue(detach.waitForExistence(timeout: 10)); detach.click()
+        let removed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: retry)
+        XCTAssertEqual(XCTWaiter.wait(for: [removed], timeout: 10), .completed)
+        XCTAssertTrue(element("choose-shader-folder", in: app).isEnabled)
+        XCTAssertEqual(try String(contentsOf: evidence, encoding: .utf8), "retained unpublished evidence")
+    }
+
     func testLocalFolderManualReloadRollbackAndBookmarkRestoration() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("HolodeckAuthoring-" + UUID().uuidString)
         let shader = root.appendingPathComponent("shaders/plasma")

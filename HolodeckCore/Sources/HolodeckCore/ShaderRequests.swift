@@ -45,11 +45,13 @@ nonisolated public struct ShaderRequestContext: Codable, Sendable, Equatable {
 }
 
 nonisolated public struct PerformanceEvidence: Codable, Sendable, Equatable {
+    public var targetFramesPerSecond: Double?
     public var framesPerSecond: [Double]
     public var gpuMilliseconds: [Double]
     public var device: String
     public var sourceHash: String
-    public init(framesPerSecond: [Double], gpuMilliseconds: [Double], device: String, sourceHash: String) {
+    public init(framesPerSecond: [Double], gpuMilliseconds: [Double], device: String, sourceHash: String, targetFramesPerSecond: Double? = nil) {
+        self.targetFramesPerSecond = targetFramesPerSecond
         self.framesPerSecond = framesPerSecond; self.gpuMilliseconds = gpuMilliseconds
         self.device = device; self.sourceHash = sourceHash
     }
@@ -80,9 +82,11 @@ nonisolated public struct ShaderRequest: Codable, Sendable, Equatable, Identifia
             throw ShaderRequestError.invalidRequest
         }
         if purpose == .performance {
-            guard let performance, performance.sourceHash == context.sourceHash,
+            guard let performance else { throw ShaderRequestError.invalidRequest }
+            let target = performance.targetFramesPerSecond ?? 30
+            guard target.isFinite, target > 0, target <= 30, performance.sourceHash == context.sourceHash,
                   performance.framesPerSecond.count == 10,
-                  performance.framesPerSecond.allSatisfy({ $0.isFinite && $0 >= 0 && $0 < 27 }),
+                  performance.framesPerSecond.allSatisfy({ $0.isFinite && $0 >= 0 && $0 < target * 0.9 }),
                   performance.gpuMilliseconds.count <= 10,
                   performance.gpuMilliseconds.allSatisfy({ $0.isFinite && $0 >= 0 }),
                   performance.device.count <= 200 else { throw ShaderRequestError.invalidRequest }
@@ -186,6 +190,17 @@ nonisolated public enum ShaderRequestError: Error, LocalizedError {
     }
 }
 
+/// Only these output-specific failures request an implementation repair on the Mac.
+nonisolated public enum ShaderDeliveryDefect: Error, LocalizedError {
+    case outputMissing(String), activation(String)
+    public var errorDescription: String? {
+        switch self {
+        case .outputMissing(let id): "Output shader \(id) is no longer in the freshly checked library."
+        case .activation(let diagnostic): diagnostic
+        }
+    }
+}
+
 /// Measures presented frames, independently of GPU timing or adaptive resolution.
 nonisolated public struct ShaderPerformanceMonitor: Sendable {
     private var warmUntil = 0.0
@@ -195,7 +210,16 @@ nonisolated public struct ShaderPerformanceMonitor: Sendable {
     private var gpuCount = 0
     private var slow: [Double] = []
     private var gpu: [Double] = []
+    public private(set) var targetFramesPerSecond = 30.0
     public init() {}
+    public static func attainableTarget(displayFramesPerSecond rate: Double, preferred: Double = 30) -> Double {
+        guard rate.isFinite, rate > 0, preferred.isFinite, preferred > 0 else { return 30 }
+        return rate / max(1, ceil(rate / preferred - 0.000001))
+    }
+    public mutating func setTargetFramesPerSecond(_ target: Double, at time: Double) {
+        guard target.isFinite, target > 0, target <= 30, abs(target - targetFramesPerSecond) > 0.1 else { return }
+        targetFramesPerSecond = target; reset(at: time)
+    }
     public mutating func reset(at time: Double) {
         warmUntil = time + 2; start = warmUntil; frames = 0; gpuTotal = 0; gpuCount = 0
         slow.removeAll(); gpu.removeAll()
@@ -209,7 +233,7 @@ nonisolated public struct ShaderPerformanceMonitor: Sendable {
             let elapsed = time - start
             if elapsed < 2 {
                 let fps = Double(frames) / elapsed
-                if fps < 27 { slow.append(fps); gpu.append(gpuCount > 0 ? gpuTotal / Double(gpuCount) : 0) }
+                if fps < targetFramesPerSecond * 0.9 { slow.append(fps); gpu.append(gpuCount > 0 ? gpuTotal / Double(gpuCount) : 0) }
                 else { slow.removeAll(); gpu.removeAll() }
             } else { slow.removeAll(); gpu.removeAll() }
             start = time; frames = 0; gpuTotal = 0; gpuCount = 0

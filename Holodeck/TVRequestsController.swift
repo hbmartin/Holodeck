@@ -2,9 +2,19 @@ import UIKit
 import HolodeckCore
 
 @MainActor
+struct TVRequestOperations {
+    var control: (String, ShaderRequestControl) async throws -> ShaderRequestControlReply
+    var capture: () async throws -> ShaderRequestContext
+    func requestControl(operation: String, payload: ShaderRequestControl = .init()) async throws -> ShaderRequestControlReply {
+        try await control(operation, payload)
+    }
+}
+
+@MainActor
 final class TVRequestsController {
     private weak var presenter: UIViewController?
     private let renderer: Renderer
+    private let operations: TVRequestOperations
     private let client: LocalCatalogClient
     private let session: ViewerSession
     private let defaults: UserDefaults?
@@ -41,9 +51,12 @@ final class TVRequestsController {
     var availabilityMessage = "Connect to a configured Mac to submit requests."
 
     init(presenter: UIViewController, renderer: Renderer, client: LocalCatalogClient,
-         session: ViewerSession, defaults: UserDefaults?, covered: @escaping () -> Bool) {
+         session: ViewerSession, defaults: UserDefaults?, covered: @escaping () -> Bool, operations: TVRequestOperations? = nil) {
         self.presenter = presenter; self.renderer = renderer; self.client = client
         self.session = session; self.defaults = defaults; self.covered = covered
+        self.operations = operations ?? TVRequestOperations(
+            control: { operation, payload in try await client.requestControl(operation: operation, payload: payload) },
+            capture: { try await renderer.captureSnapshot() })
         label.numberOfLines = 4; label.font = .systemFont(ofSize: 21, weight: .medium); label.textColor = .white
         label.translatesAutoresizingMaskIntoConstraints = false
         overlay.translatesAutoresizingMaskIntoConstraints = false; overlay.isHidden = true
@@ -61,6 +74,9 @@ final class TVRequestsController {
         ])
         ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.displayProgress() }
+        }
+        renderer.onDisplayCadence = { [weak self] target in
+            self?.monitor.setTargetFramesPerSecond(target, at: ProcessInfo.processInfo.systemUptime)
         }
         renderer.onPresentedFrame = { [weak self] time, gpu in self?.presented(time: time, gpu: gpu) }
         renderer.onDisplayObservation = { [weak self] time in self?.presented(time: time, gpu: nil, deliveredFrames: 0) }
@@ -100,16 +116,16 @@ final class TVRequestsController {
                 hostID = mac
                 pendingManual = pendingKey.flatMap { defaults?.string(forKey: $0) }.flatMap(UUID.init(uuidString:))
             }
-            let reply = try await client.requestControl(operation: "requestStatus")
+            let reply = try await operations.requestControl(operation: "requestStatus")
             connected = true; enabled = reply.enabled; availabilityMessage = reply.message
             var current = reply.jobs
             if let pendingManual, !current.contains(where: { $0.id == pendingManual }) {
-                let specific = try await client.requestControl(operation: "requestStatus", payload: .init(requestID: pendingManual))
+                let specific = try await operations.requestControl(operation: "requestStatus", payload: .init(requestID: pendingManual))
                 current += specific.jobs
                 if specific.jobs.isEmpty { savePending(nil) }
             }
             for previous in jobs where !previous.stage.terminal && !current.contains(where: { $0.id == previous.id }) {
-                let terminal = try await client.requestControl(operation: "requestStatus", payload: .init(requestID: previous.id))
+                let terminal = try await operations.requestControl(operation: "requestStatus", payload: .init(requestID: previous.id))
                 current += terminal.jobs.filter { incoming in !current.contains { $0.id == incoming.id } }
             }
             jobs = current
@@ -147,7 +163,7 @@ final class TVRequestsController {
         guard canInput, let presenter else { showBanner(availabilityMessage); return }
         Task {
             do {
-                let context = try await renderer.captureSnapshot()
+                let context = try await operations.capture()
                 guard canInput, presenter.presentedViewController == nil else { return }
                 let alert = UIAlertController(title: "Shader Request", message: "Watching \(context.name). Describe a change or a new scene.", preferredStyle: .alert)
                 let submit = UIAlertAction(title: "Submit", style: .default) { [weak self, weak alert] _ in
@@ -171,12 +187,12 @@ final class TVRequestsController {
     @discardableResult
     private func submit(_ request: ShaderRequest) -> Task<Void, Never> {
         if request.purpose == .creative {
-            renderer.cancelPendingSelection()
+            session.cancelPendingSelection()
             savePending(request.id)
         }
         return Task {
             do {
-                let reply = try await client.requestControl(operation: "requestSubmit", payload: .init(request: request))
+                let reply = try await operations.requestControl(operation: "requestSubmit", payload: .init(request: request))
                 jobs += reply.jobs.filter { incoming in !jobs.contains { $0.id == incoming.id } }
                 connected = true
                 if request.purpose == .performance { showBanner("Requesting performance improvements for \(request.context.name)…") }
@@ -200,7 +216,7 @@ final class TVRequestsController {
                 guard let self else { return }
                 defer { self.answering.remove(job.id) }
                 do {
-                    let reply = try await self.client.requestControl(operation: "requestAnswer", payload: .init(requestID: job.id, answer: text))
+                    let reply = try await self.operations.requestControl(operation: "requestAnswer", payload: .init(requestID: job.id, answer: text))
                     if let updated = reply.jobs.first(where: { $0.id == job.id }), let index = self.jobs.firstIndex(where: { $0.id == job.id }) { self.jobs[index] = updated }
                 } catch { self.showBanner(error.localizedDescription) }
             }
@@ -217,48 +233,56 @@ final class TVRequestsController {
         clarificationAlert = alert
         presenter.present(alert, animated: true)
     }
-    private func deliver(_ job: ShaderRequestStatus) async {
+    func deliver(_ job: ShaderRequestStatus) async {
         guard let result = job.result else { return }
         deliveries.insert(job.id)
         defer { deliveries.remove(job.id) }
         do {
             if !requestedDeliveries.contains(job.id) {
-                _ = try await client.requestControl(operation: "requestDelivery", payload: .init(requestID: job.id, answer: deliveryNonce))
+                _ = try await operations.requestControl(operation: "requestDelivery", payload: .init(requestID: job.id, answer: deliveryNonce))
                 requestedDeliveries.insert(job.id)
                 return
             }
-            await session.refresh(force: true).value
+            try await session.refreshForDelivery()
             guard let output = session.shaders.first(where: { $0.id == result.shaderID }) else {
-                throw ShaderRequestError.unavailable("Output shader is no longer in the library.")
+                throw ShaderDeliveryDefect.outputMissing(result.shaderID)
             }
             if job.request.purpose == .performance {
                 attemptedVersions.insert(output.id + ":" + output.sourceHash)
                 optimizationRequests[output.id] = job.id
                 if session.activeShader?.id != job.request.context.shaderID || pendingManual != nil {
-                    _ = try await client.requestControl(operation: "requestActivated", payload: .init(requestID: job.id))
+                    _ = try await operations.requestControl(operation: "requestActivated", payload: .init(requestID: job.id))
                     return
                 }
             }
             if session.activeShader?.id != output.id || session.activeShader?.sourceHash != output.sourceHash {
-                await session.select(output).value
+                switch await session.selectForDelivery(output) {
+                case .activated: break
+                case .failed(let diagnostic): throw ShaderDeliveryDefect.activation(diagnostic)
+                case .superseded, .cancelled: return
+                case .unavailable: throw ShaderRequestError.unavailable("The TV renderer is unavailable. Delivery will retry.")
+                }
             }
             if job.request.purpose == .performance, session.activeShader?.id != output.id || pendingManual != nil {
-                _ = try await client.requestControl(operation: "requestActivated", payload: .init(requestID: job.id))
+                _ = try await operations.requestControl(operation: "requestActivated", payload: .init(requestID: job.id))
                 return
             }
             guard session.activeShader?.id == output.id, session.activeShader?.sourceHash == output.sourceHash else {
-                throw ShaderRequestError.unavailable(session.selectionDiagnostic ?? "TV activation failed")
+                throw ShaderRequestError.unavailable("Playback changed during delivery. Delivery will retry.")
             }
-            let activated = try await renderer.captureSnapshot()
+            let activated = try await operations.capture()
             guard activated.sourceHash == output.sourceHash else { throw ShaderRequestError.unavailable("The activated frame does not match the delivered shader.") }
-            _ = try await client.requestControl(operation: "requestActivated", payload: .init(requestID: job.id, sourceHash: output.sourceHash))
+            _ = try await operations.requestControl(operation: "requestActivated", payload: .init(requestID: job.id, sourceHash: output.sourceHash))
             monitor.reset(at: ProcessInfo.processInfo.systemUptime)
         } catch {
             guard foreground, !covered() else { return }
-            if error is ShaderRequestError {
-                _ = try? await client.requestControl(operation: "requestActivated", payload: .init(requestID: job.id, diagnostic: error.localizedDescription))
+            if error is ShaderDeliveryDefect {
+                _ = try? await operations.requestControl(operation: "requestActivated", payload: .init(requestID: job.id, diagnostic: error.localizedDescription))
                 requestedDeliveries.remove(job.id)
-            } else { connected = false; onLockChanged?() }
+            } else if !(error is CancellationError) {
+                showBanner(error.localizedDescription)
+                if !(error is ShaderRequestError) { connected = false; onLockChanged?() }
+            }
         }
     }
     private func presented(time: Double, gpu: Double?, deliveredFrames: Int = 1) {
@@ -271,10 +295,10 @@ final class TVRequestsController {
               let evidence = monitor.observe(at: time, deliveredFrames: deliveredFrames, gpuMilliseconds: gpu) else { return }
         performanceSubmission.start { [self] in
             do {
-                let context = try await renderer.captureSnapshot()
+                let context = try await operations.capture()
                 guard context.sourceHash == shader.sourceHash else { return }
                 let evidence = PerformanceEvidence(framesPerSecond: evidence.fps, gpuMilliseconds: evidence.gpu,
-                                                   device: "\(UIDevice.current.model) / \(renderer.device.name) / \(UIDevice.current.systemVersion)", sourceHash: shader.sourceHash)
+                                                   device: "\(UIDevice.current.model) / \(renderer.device.name) / \(UIDevice.current.systemVersion)", sourceHash: shader.sourceHash, targetFramesPerSecond: monitor.targetFramesPerSecond)
                 if attemptedVersions.contains(shader.id + ":" + shader.sourceHash) {
                     offerPerformanceRetry(context: context, evidence: evidence)
                 } else {
@@ -285,7 +309,7 @@ final class TVRequestsController {
     }
     private func performanceRequest(context: ShaderRequestContext, evidence: PerformanceEvidence, origin: ShaderRequest.Origin) -> ShaderRequest {
         ShaderRequest(purpose: .performance, origin: origin,
-                      prompt: "Improve playback performance of \(context.name) without changing composition, colors, motion or visible detail. Observed playback remains below 27 fps at a 30 fps target.",
+                      prompt: "Improve playback performance of \(context.name) without changing composition, colors, motion or visible detail. Observed playback remains below \((evidence.targetFramesPerSecond ?? 30) * 0.9) fps at an attainable \(evidence.targetFramesPerSecond ?? 30) fps target.",
                       context: context, performance: evidence, parentRequestID: origin == .manual ? optimizationRequests[context.shaderID] : nil)
     }
     private func offerPerformanceRetry(context: ShaderRequestContext, evidence: PerformanceEvidence) {

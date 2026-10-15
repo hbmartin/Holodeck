@@ -9,6 +9,49 @@ import ConcurrencyExtras
 
 @MainActor
 final class HolodeckTests: XCTestCase {
+    func testDeliveryReportsOnlyOutputDefectsAndRetriesTransientFailures() async throws {
+        for scenario in ["capture", "refresh", "control", "activation", "missing", "superseded", "success"] {
+            let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+            let renderer = try makeRenderer(view: MTKView(frame: .zero, device: device))
+            let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource(kind: .standard) { request, _ in
+                if scenario == "refresh" { throw LocalCatalogError.timeout }
+                guard case .head = request else { throw CatalogError.invalidResponse }
+                return try JSONEncoder().encode(CatalogHead(revision: TestCatalog.catalog.publicationRevision))
+            }, storage: .disabled)
+            let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .tv)
+            let scenes = DeliverySceneRenderer(); session.attach(scenes)
+            await session.refreshTask?.value; await session.selectionTask?.value
+            scenes.mode = scenario
+            let shader = scenario == "activation" || scenario == "superseded" ? TestCatalog.shaders[1] : TestCatalog.initialShader
+            let png = try RequestScreenshot.encode(pixels: Data([128,64,32,255]), width: 1, height: 1, bytesPerRow: 4)
+            let context = ShaderRequestContext(shader: shader, screenshot: png, animationTime: 0, width: 1280, height: 720)
+            var diagnostics: [String] = [], acknowledgements = 0
+            let operations = TVRequestOperations(control: { operation, payload in
+                if scenario == "control" { throw ShaderRequestError.unavailable("Host temporarily busy") }
+                if operation == "requestActivated" {
+                    if let diagnostic = payload.diagnostic { diagnostics.append(diagnostic) }
+                    else { acknowledgements += 1 }
+                }
+                return ShaderRequestControlReply(enabled: true, message: "Fixture")
+            }, capture: {
+                if scenario == "capture" { throw ShaderRequestError.unavailable("Frame capture temporarily unavailable") }
+                return context
+            })
+            let presenter = UIViewController()
+            let controller = TVRequestsController(presenter: presenter, renderer: renderer, client: LocalCatalogClient(), session: session,
+                defaults: nil, covered: { false }, operations: operations)
+            var job = ShaderRequestStatus(request: ShaderRequest(prompt: "Fixture", context: context), deviceID: "TV")
+            job.stage = .awaitingActivation
+            job.result = ShaderRequestResult(outputKind: .edited, shaderID: scenario == "missing" ? "removed" : shader.id,
+                changed: true, summary: "Fixture", approximations: [])
+            controller.setForeground(true)
+            await controller.deliver(job) // Delivery nonce handshake.
+            await controller.deliver(job)
+            controller.setForeground(false)
+            XCTAssertEqual(diagnostics.count, scenario == "missing" || scenario == "activation" ? 1 : 0, scenario)
+            XCTAssertEqual(acknowledgements, scenario == "success" ? 1 : 0, scenario)
+        }
+    }
     func testPerformanceSubmissionGuardSpansCaptureAndDelayedAcknowledgement() async throws {
         let gate = PerformanceSubmissionGate()
         let capture = AsyncStream<Void>.makeStream()
@@ -1224,4 +1267,16 @@ private nonisolated final class TVRecoveryChannel: LocalRequestConnection, @unch
         else { message.operation = "pending" }
         return LocalPacket(message: message)
     }
+}
+
+@MainActor private final class DeliverySceneRenderer: SceneRendering {
+    var activeShader: ShaderDefinition?
+    var mode = "success"
+    func select(_ shader: ShaderDefinition) async throws -> Bool {
+        if mode == "activation" { throw ShaderCompilationError.missingFunction("fragmentShader") }
+        if mode == "superseded" { return false }
+        activeShader = shader; return true
+    }
+    func cancelPendingSelection() {}
+    func setActive(_ active: Bool) {}
 }

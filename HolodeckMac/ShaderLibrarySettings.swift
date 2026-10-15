@@ -40,9 +40,9 @@ final class MacLibraryModel {
         let server = server
         let requestService = requests.service
         Task { await server.setRequestService(requestService) }
-        requests.onPublication = { [weak self] in
+        requests.onPublication = { [weak self] warnings in
             guard let self else { return }
-            self.ready = true
+            self.ready = true; self.previewWarnings = warnings; self.error = nil
             Task {
                 await self.session.refresh(force: true).value
                 if !self.sleeping { try? await self.server.start() }
@@ -57,26 +57,35 @@ final class MacLibraryModel {
                 Task { @MainActor in self?.setSleeping(sleeping) }
             })
         }
+        var refreshBookmark = false
         if let bookmark = defaults?.data(forKey: "holodeck.shaderFolderBookmark") {
             do {
                 var stale = false
                 let url = try URL(resolvingBookmarkData: bookmark, options: [], relativeTo: nil, bookmarkDataIsStale: &stale)
                 if url.startAccessingSecurityScopedResource() { scopedURL = url }
-                folder = url
-                requests.setRepository(url)
-                isReloading = true
-                Task {
-                    do {
-                        if try await catalog.cached() != nil {
-                            ready = true
-                            await session.refresh(force: true).value
-                            if !sleeping { try await startServer() }
-                        }
-                    } catch { self.error = "Couldn’t restore the previous shader library: \(error.localizedDescription)" }
-                    isReloading = false
-                    if !requests.configuration.enabled { reload(refreshBookmark: stale) }
-                }
+                folder = url; requests.setRepository(url); refreshBookmark = stale
             } catch { self.error = "Choose your shader folder again: \(error.localizedDescription)" }
+        }
+        let shouldRefreshBookmark = refreshBookmark
+        isReloading = true
+        Task {
+            do {
+                var restored = false
+                do { restored = try await catalog.cached() != nil }
+                catch { self.error = "Couldn’t restore the previous shader library: \(error.localizedDescription)" }
+                if !restored, requests.configuration.enabled {
+                    try await requests.service.ensurePublication()
+                    restored = await catalog.publicationRevisionValue() != nil
+                    previewWarnings = await requests.service.publicationWarnings()
+                }
+                if restored {
+                    ready = true
+                    await session.refresh(force: true).value
+                    if !sleeping { try await startServer() }
+                }
+            } catch { self.error = "Couldn’t rebuild the shader library: \(error.localizedDescription)" }
+            isReloading = false
+            if !requests.configuration.enabled, folder != nil { reload(refreshBookmark: shouldRefreshBookmark) }
         }
     }
 
@@ -100,6 +109,20 @@ final class MacLibraryModel {
         guard !requests.configuration.enabled, !requests.hasUnfinishedJobs else { return }
         guard let folder else { chooseFolder(); return }
         load(folder, saveBookmark: refreshBookmark)
+    }
+    func rebuildPublication() {
+        guard !isReloading else { return }
+        isReloading = true; error = nil
+        Task {
+            defer { isReloading = false }
+            do {
+                try await requests.service.ensurePublication()
+                previewWarnings = await requests.service.publicationWarnings()
+                ready = true
+                await session.refresh(force: true).value
+                if !sleeping { try await startServer() }
+            } catch { self.error = error.localizedDescription }
+        }
     }
     private func load(_ url: URL, saveBookmark: Bool) {
         guard !isReloading, !requests.configuration.enabled, !requests.hasUnfinishedJobs else { return }
@@ -172,6 +195,11 @@ struct ShaderLibrarySettings: View {
                         .accessibilityIdentifier("reload-shaders")
                     if library.isReloading { ProgressView().controlSize(.small) }
                 }.disabled(library.isReloading || library.requests.configuration.enabled || library.requests.hasUnfinishedJobs)
+                if library.requests.configuration.enabled {
+                    Button("Rebuild Library", action: library.rebuildPublication)
+                        .disabled(library.isReloading || library.requests.hasUnfinishedJobs)
+                        .accessibilityIdentifier("rebuild-shader-library")
+                }
                 HStack { Text(library.serverState.message); Spacer() }
                     .accessibilityElement(children: .combine).accessibilityIdentifier("shader-serving-status")
                 if let error = library.error {

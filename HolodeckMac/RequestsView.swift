@@ -84,10 +84,45 @@ struct RequestSettingsView: View {
                 Button("Open Requests") { openWindow(id: "requests") }
                 if model.checking { ProgressView().controlSize(.small) }
             }
+            ForEach(model.recoveries) { recovery in
+                CheckoutRecoveryView(model: model, recovery: recovery)
+            }
             Text(model.configuration.enabled ? "Requests enabled" : model.message).accessibilityIdentifier("request-setup-status")
             if let error = model.error { Text(error).foregroundStyle(.red).textSelection(.enabled) }
             Text("Requires Codex login, Git credentials and identity, Python 3, and Xcode Metal compilers. Implementation and independent image review share this model setting. Verify setup again to apply changed settings.")
                 .font(.caption).foregroundStyle(.secondary)
         }
+    }
+}
+
+private struct CheckoutRecoveryView: View {
+    let model: MacRequestsModel
+    let recovery: ShaderRequestRecoveryStatus
+    @State private var repository: String
+    @State private var python: String
+    @State private var git: String
+    @State private var confirmsDetach = false
+    init(model: MacRequestsModel, recovery: ShaderRequestRecoveryStatus) {
+        self.model = model; self.recovery = recovery
+        _repository = State(initialValue: recovery.repository)
+        _python = State(initialValue: recovery.python)
+        _git = State(initialValue: recovery.git)
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Checkout Recovery").bold()
+            Text(recovery.message).textSelection(.enabled)
+            TextField("Owned checkout folder", text: $repository).accessibilityIdentifier("recovery-repository")
+            TextField("Python executable", text: $python).accessibilityIdentifier("recovery-python")
+            TextField("Git executable", text: $git).accessibilityIdentifier("recovery-git")
+            HStack {
+                Button("Retry Cleanup") { model.retryCleanup(recovery.id, repository: repository, python: python, git: git) }
+                    .disabled(model.checking || recovery.isRunning).accessibilityIdentifier("retry-checkout-cleanup")
+                Button("Detach Checkout…", role: .destructive) { confirmsDetach = true }
+                    .disabled(model.checking).accessibilityIdentifier("detach-checkout")
+            }
+        }.confirmationDialog("Detach this checkout and disable shader requests?", isPresented: $confirmsDetach) {
+            Button("Detach and Keep Files", role: .destructive) { model.detach(recovery.id) }
+        } message: { Text("Unpublished checkout files, patches, and logs will be retained. Verify setup before managing a checkout again.") }
     }
 }

@@ -20,6 +20,10 @@ extension DirectoryCatalogTests {
             for fragment in fragments { XCTAssertTrue(reason.contains(fragment), reason, file: file, line: line) }
             XCTAssertFalse(reason.hasPrefix(path + ":"), reason, file: file, line: line)
         }
+        let servedHead = try JSONDecoder().decode(CatalogHead.self, from: await store.get(.head, limit: CatalogLimits.headBytes))
+        XCTAssertEqual(servedHead.revision, previous.publicationRevision, file: file, line: line)
+        let servedBeforeRestoration = try await store.get(request, limit: CatalogLimits.sourceBytes)
+        XCTAssertEqual(servedBeforeRestoration, bytes, file: file, line: line)
         let restored = try await store.cached()
         XCTAssertEqual(restored?.publicationRevision, previous.publicationRevision, file: file, line: line)
         let served = try await store.get(request, limit: CatalogLimits.sourceBytes)
@@ -110,9 +114,9 @@ extension DirectoryCatalogTests {
                 reason = "Assembled source for plasma is empty."
             } else {
                 try Data([0xff]).write(to: root.appendingPathComponent(invalidPath))
-                reason = "Assembled source for plasma is not valid UTF-8."
+                reason = "Source component is not valid UTF-8."
             }
-            try await assertSizeReloadRejected(root, store: store, path: "shaders/plasma/body.metal", fragments: [reason])
+            try await assertSizeReloadRejected(root, store: store, path: invalidPath == "empty" ? "shaders/plasma/body.metal" : invalidPath, fragments: [reason])
         }
     }
 
@@ -128,7 +132,7 @@ extension DirectoryCatalogTests {
         for id in ids { try writeSizeShader(id, root: root, metadata: metadata, bodySize: 1) }
         try writeSizeIndex(ids, root: root)
         try await assertSizeReloadRejected(root, store: store, path: "index.json",
-            fragments: ["Catalog manifest is", "bytes; limit is 2097152 bytes"])
+            fragments: ["Authoring manifest before normalization is", "bytes; limit is 2097152 bytes"])
     }
 
     func testEncodedManifestAcceptsExactLimitAndRejectsOneMoreByte() throws {
