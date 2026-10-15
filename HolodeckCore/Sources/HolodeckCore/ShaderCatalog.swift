@@ -93,8 +93,19 @@ nonisolated public enum CatalogHash {
     }
 }
 
-nonisolated public enum CatalogError: Error {
+nonisolated public enum CatalogError: Error, LocalizedError {
     case invalidManifest, invalidSource, invalidPreview, invalidResponse, oversizedResponse
+    case sizeLimit(kind: String, actual: Int, limit: Int)
+    public var errorDescription: String? {
+        switch self {
+        case .invalidManifest: "The catalog metadata is invalid or its publication identity does not match."
+        case .invalidSource: "Shader source is empty, invalid UTF-8, oversized, or does not match its recorded hash."
+        case .invalidPreview: "The preview does not match its recorded hash or image format."
+        case .invalidResponse: "The requested catalog publication or asset is unavailable."
+        case .oversizedResponse: "The response exceeds the permitted size."
+        case .sizeLimit(let kind, let actual, let limit): "\(kind) is \(actual) bytes; limit is \(limit) bytes."
+        }
+    }
 
     public static func isCancellation(_ error: any Error) -> Bool {
         error is CancellationError || (error as? URLError)?.code == .cancelled

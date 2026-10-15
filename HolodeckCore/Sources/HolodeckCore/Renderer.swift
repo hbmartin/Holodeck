@@ -68,6 +68,8 @@ public final class Renderer: NSObject, MTKViewDelegate, SceneRendering {
     public var onPresentedFrame: (@MainActor @Sendable (Double, Double?) -> Void)?
     public var onMeasurementReset: (@MainActor @Sendable () -> Void)?
     #if os(tvOS)
+    public var onDisplayCadence: (@MainActor @Sendable (Double) -> Void)?
+    private var displayCadence: Double?
     private var displayLink: CADisplayLink?
     private var completedFrame = false
     private var completedGPU: Double?
@@ -247,7 +249,7 @@ public final class Renderer: NSObject, MTKViewDelegate, SceneRendering {
         metalKitView.isPaused = !isActive
         metalKitView.delegate = self
         #if os(tvOS)
-        displayLink?.invalidate()
+        displayLink?.invalidate(); displayCadence = nil
         let displayLink = CADisplayLink(target: RequestDisplayLinkTarget(self), selector: #selector(RequestDisplayLinkTarget.tick(_:)))
         displayLink.add(to: .main, forMode: .common)
         self.displayLink = displayLink
@@ -275,6 +277,12 @@ public final class Renderer: NSObject, MTKViewDelegate, SceneRendering {
     #if os(tvOS)
     fileprivate func displayTick(_ link: CADisplayLink) {
         guard isActive else { return }
+        let target = ShaderPerformanceMonitor.attainableTarget(displayFramesPerSecond: 1 / link.duration, preferred: Double(policy.framesPerSecond))
+        if displayCadence == nil || abs(target - displayCadence!) > 0.1 {
+            displayCadence = target
+            view?.preferredFramesPerSecond = max(1, Int(target.rounded()))
+            resetMeasurements(); onDisplayCadence?(target)
+        }
         if completedFrame { onPresentedFrame?(link.timestamp, completedGPU) }
         else { onDisplayObservation?(link.timestamp) }
         completedFrame = false; completedGPU = nil

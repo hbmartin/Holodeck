@@ -14,6 +14,9 @@ import sys
 import tempfile
 import struct
 import re
+import shutil
+import stat
+import uuid
 
 
 class OperationalError(RuntimeError):
@@ -75,6 +78,8 @@ class Worker:
             raise OperationalError("App-owned hooks directory must be empty")
         self.git_arguments = [self.git_executable, "-c", "core.hooksPath=" + str(self.hooks)]
         self.env = dict(os.environ, GIT_TERMINAL_PROMPT="0", HOLODECK_SHADER_TOOL=config["shaderTool"], PYTHONDONTWRITEBYTECODE="1")
+        scratch = self.directory / "tmp"; scratch.mkdir(exist_ok=True)
+        self.env["TMPDIR"] = str(scratch)
         self.env["PATH"] = os.pathsep.join([str(Path(config["codex"]).parent), str(Path(config["python"]).parent),
                                              "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"])
         self.request = {}
@@ -82,6 +87,11 @@ class Worker:
         self.checkpoint = json.loads(self.checkpoint_path.read_text()) if self.checkpoint_path.exists() else {}
         self.gitdir = Path(self.git("rev-parse", "--absolute-git-dir").strip())
         self.owner = self.gitdir / "holodeck-request-owner.json"
+        self.checkout_identity = self.gitdir / "holodeck-checkout-id"
+        if config.get("checkoutID") and (not self.checkout_identity.exists() or self.checkout_identity.read_text().strip() != config["checkoutID"]):
+            raise OperationalError("Selected checkout identity does not match the request journal")
+        self.object_format = self.git("rev-parse", "--show-object-format").strip()
+        self.file_mode = self.git("config", "--bool", "core.fileMode", check=False).stdout.strip() != "false"
 
     def git(self, *args, check=True, raw=False):
         result = subprocess.run([*self.git_arguments, *args], cwd=self.root, env=self.env,
@@ -99,15 +109,125 @@ class Worker:
         self.save(stage=name)
         emit("stage", stage=name, message=message)
 
+    @contextlib.contextmanager
+    def workspace_parent(self, name, create=False):
+        parts = name.split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            raise OperationalError("Invalid workspace path: " + name)
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            for part in parts[:-1]:
+                if create:
+                    try: os.mkdir(part, dir_fd=fd)
+                    except FileExistsError: pass
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd); fd = child
+            yield fd, parts[-1]
+        finally:
+            os.close(fd)
+
+    def workspace_record(self, name, backup=False, preserve_permissions=False):
+        with self.workspace_parent(name) as (parent, leaf):
+            info = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                link = os.readlink(leaf, dir_fd=parent)
+                return {"mode": "120000", "hash": digest(os.fsencode(link)), "link": link}
+            fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            with os.fdopen(fd, "rb") as source:
+                info = os.fstat(source.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise OperationalError("Workspace path must be a regular file: " + name)
+                hasher = hashlib.sha256()
+                destination = tempfile.TemporaryFile(dir=self.directory) if backup else None
+                try:
+                    while True:
+                        chunk = source.read(65536)
+                        if not chunk: break
+                        hasher.update(chunk)
+                        if destination: destination.write(chunk)
+                    record = {"mode": "100755" if info.st_mode & stat.S_IXUSR else "100644", "hash": hasher.hexdigest()}
+                    if preserve_permissions: record["permissions"] = stat.S_IMODE(info.st_mode)
+                    if destination:
+                        directory = self.directory / "ignored-backup"; directory.mkdir(mode=0o700, exist_ok=True)
+                        directory.chmod(0o700)
+                        destination.seek(0)
+                        with tempfile.NamedTemporaryFile(dir=directory, delete=False) as target:
+                            temporary = Path(target.name)
+                            try:
+                                shutil.copyfileobj(destination, target); target.flush()
+                                temporary.replace(directory / record["hash"])
+                            finally: temporary.unlink(missing_ok=True)
+                    return record
+                finally:
+                    if destination: destination.close()
+
+    def ignored_manifest(self, backup=False):
+        names = filter(None, self.git("ls-files", "--others", "--ignored", "--exclude-standard", "-z").split("\0"))
+        return {name: self.workspace_record(name, backup, preserve_permissions=True) for name in sorted(names)}
+
+    def snapshot_ignored(self):
+        write(self.directory / "ignored-baseline.json", self.ignored_manifest(backup=True))
+
+    def check_ignored(self):
+        baseline = self.directory / "ignored-baseline.json"
+        owned = self.owner.exists() and str(json.loads(self.owner.read_text()).get("id")).lower() == str(self.request.get("id")).lower()
+        if owned and baseline.exists() and self.ignored_manifest() != json.loads(baseline.read_text()):
+            raise CandidateError("Ignored files are protected; restore changed/deleted files and remove new ignored outputs")
+
+    def restore_ignored(self):
+        baseline = self.directory / "ignored-baseline.json"
+        if not baseline.exists(): return
+        saved = json.loads(baseline.read_text())
+        current = self.ignored_manifest()
+        for name in sorted(current.keys() - saved.keys(), reverse=True):
+            with self.workspace_parent(name) as (parent, leaf): os.unlink(leaf, dir_fd=parent)
+        for name, record in saved.items():
+            if current.get(name) == record: continue
+            source = None
+            try:
+                if record["mode"] != "120000":
+                    if re.fullmatch(r"[0-9a-f]{64}", record["hash"]) is None:
+                        raise OperationalError("Invalid ignored-file backup identity")
+                    source = (self.directory / "ignored-backup" / record["hash"]).open("rb")
+                    hasher = hashlib.sha256()
+                    for chunk in iter(lambda: source.read(65536), b""): hasher.update(chunk)
+                    if hasher.hexdigest() != record["hash"]:
+                        raise OperationalError("Ignored-file backup is corrupted; checkout data was retained")
+                    source.seek(0)
+                with self.workspace_parent(name, create=True) as (parent, leaf):
+                    try: os.unlink(leaf, dir_fd=parent)
+                    except FileNotFoundError: pass
+                    except IsADirectoryError: os.rmdir(leaf, dir_fd=parent)
+                    if record["mode"] == "120000":
+                        os.symlink(record["link"], leaf, dir_fd=parent)
+                    else:
+                        fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+                        with os.fdopen(fd, "wb") as target:
+                            shutil.copyfileobj(source, target)
+                            os.fchmod(target.fileno(), record.get("permissions", 0o755 if record["mode"] == "100755" else 0o644))
+            finally:
+                if source: source.close()
+        if self.ignored_manifest() != saved:
+            raise OperationalError("Ignored workspace files could not be restored; ownership is retained")
+
     def clean(self, revision=None):
-        # Only files produced while this request holds the exclusive checkout lease.
-        if self.owner.exists() and json.loads(self.owner.read_text()).get("id") == self.request.get("id"):
+        # Retain ownership until both tracked and ignored data are restored.
+        if self.owner.exists() and str(json.loads(self.owner.read_text()).get("id")).lower() == str(self.request.get("id")).lower():
             others = self.git("ls-files", "--others", "--exclude-standard", "-z").split("\0")
+            raw_changes = self.raw_workspace_changes()
             self.git("reset", "--hard", revision or self.checkpoint.get("base", "HEAD"))
+            # Git can consider a filter-hidden edit clean even with checkout --force.
+            # Remove those owned files first so checkout must reconstruct their bytes.
+            for name in raw_changes:
+                try:
+                    with self.workspace_parent(name) as (parent, leaf): os.unlink(leaf, dir_fd=parent)
+                except FileNotFoundError: pass
+            self.git("checkout-index", "--all", "--force")
             for name in filter(None, others):
-                path = self.root / name
-                if path.is_symlink() or path.is_file():
-                    path.unlink()
+                with self.workspace_parent(name) as (parent, leaf):
+                    try: os.unlink(leaf, dir_fd=parent)
+                    except FileNotFoundError: pass
+            self.restore_ignored()
             self.owner.unlink(missing_ok=True)
 
     def park(self):
@@ -145,9 +265,10 @@ class Worker:
                     path.write_bytes(base64.b64decode(data))
 
     def synchronize(self):
+        self.git_tree("HEAD")
         if self.owner.exists():
             owner = json.loads(self.owner.read_text())
-            if owner.get("id") != self.request["id"]:
+            if str(owner.get("id")).lower() != self.request["id"].lower():
                 raise OperationalError("Another interrupted request owns this checkout; recover it first")
             self.save_patch()
             self.clean()
@@ -160,8 +281,14 @@ class Worker:
             raise OperationalError("Local commits are not on origin/main; commit/push them before enabling management")
         self.git("checkout", "-B", "main", "origin/main")
         self.save(base=remote, commitSHA=None)
+        # Old publication snapshots must never become the baseline of a new attempt.
+        for name in ("ignored-baseline.json", "baseline-workspace.json"):
+            (self.directory / name).unlink(missing_ok=True)
         write(self.owner, {"id": self.request["id"], "directory": str(self.directory)})
+        self.check_checkout_inputs()
         self.validate_baseline()
+        self.snapshot_ignored()
+        write(self.directory / "baseline-workspace.json", self.candidate_manifest(compare_baseline=False))
         self.restore_patch()
 
     def discard(self):
@@ -182,32 +309,79 @@ class Worker:
                 (self.directory / name).unlink(missing_ok=True)
         emit("discarded")
 
-    def candidate_manifest(self):
+    def git_tree(self, revision):
+        tree = {}
+        for entry in filter(None, self.git("ls-tree", "-r", "-z", revision).split("\0")):
+            descriptor, name = entry.split("\t", 1)
+            mode, kind, oid = descriptor.split()
+            if kind != "blob":
+                raise OperationalError("Submodules and non-blob Git entries are unsupported: " + name)
+            tree[name] = {"mode": mode, "oid": oid}
+        return tree
+
+    def blob_oid(self, data):
+        return hashlib.new(self.object_format, b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+
+    def check_checkout_inputs(self):
+        tree = self.git_tree("HEAD")
+        for name, entry in tree.items():
+            if name == "index.json" or (name.startswith("shared/") and name.endswith(".metal")) or (name.startswith("shaders/") and name.endswith(("/body.metal", "/metadata.json"))):
+                with self.workspace_parent(name) as (parent, leaf):
+                    fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                    with os.fdopen(fd, "rb") as file:
+                        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+                            raise OperationalError("Publication inputs must be regular files: " + name)
+                        actual = self.blob_oid(file.read())
+                if actual != entry["oid"]:
+                    raise OperationalError("Publication input checkout bytes differ from Git (disable source filters/EOL conversion): " + name)
+
+    def raw_workspace_changes(self):
+        baseline = self.directory / "baseline-workspace.json"
+        changed = set()
+        if baseline.exists():
+            for name, original in json.loads(baseline.read_text()).items():
+                try:
+                    current = self.workspace_record(name)
+                    if not self.file_mode: current["mode"] = original["mode"]
+                    differs = any(current[key] != original[key] for key in ("hash", "mode"))
+                except FileNotFoundError:
+                    differs = True
+                if differs: changed.add(name)
+        return changed
+
+    def candidate_manifest(self, compare_baseline=True):
+        base = self.checkpoint.get("base", "HEAD")
+        if not self.git("status", "--porcelain", "--untracked-files=all").strip(): base = "HEAD"
+        tree = self.git_tree(base)
+        changed = set(filter(None, self.git("diff", "--name-only", "-z", base).split("\0")))
+        owned = self.owner.exists() and str(json.loads(self.owner.read_text()).get("id")).lower() == str(self.request.get("id")).lower()
+        if compare_baseline and owned: changed.update(self.raw_workspace_changes())
         names = set(filter(None, self.git("ls-files", "-z").split("\0")))
         names.update(filter(None, self.git("ls-files", "--others", "--exclude-standard", "-z").split("\0")))
         manifest = {}
         for name in sorted(names):
-            path = self.root / name
-            if path.is_symlink():
-                data, mode = os.fsencode(os.readlink(path)), "120000"
-            elif path.is_file():
-                data = path.read_bytes()
-                mode = "100755" if path.stat().st_mode & 0o111 else "100644"
+            record = self.workspace_record(name)
+            if not self.file_mode and name in tree: record["mode"] = tree[name]["mode"]
+            if name in tree and name not in changed:
+                record["oid"] = tree[name]["oid"]
             else:
-                raise OperationalError("Cannot freeze candidate path: " + name)
-            manifest[name] = {"mode": mode, "hash": digest(data)}
+                record["oid"] = self.blob_oid((self.root / name).read_bytes())
+            manifest[name] = record
         return manifest
 
     def verify_commit(self, sha, manifest, check_workspace=True):
-        committed = {}
-        for entry in filter(None, self.git("ls-tree", "-r", "-z", sha).split("\0")):
-            descriptor, name = entry.split("\t", 1)
-            mode, kind, oid = descriptor.split()
-            if kind != "blob":
-                raise OperationalError("Managed source tree contains unsupported Git entries")
-            committed[name] = {"mode": mode, "hash": digest(self.git("cat-file", "blob", oid, raw=True))}
-        if committed != manifest or (check_workspace and self.candidate_manifest() != manifest):
-            raise OperationalError("Committed tree differs from verified source; Git filters or external changes must be corrected")
+        tree = self.git_tree(sha)
+        if all("oid" in value for value in manifest.values()):
+            expected = {name: {key: value[key] for key in ("mode", "oid")} for name, value in manifest.items()}
+            matches = tree == expected
+        else:
+            # Read old attempt journals without weakening their exact-byte proof.
+            committed = {name: {"mode": value["mode"], "hash": digest(self.git("cat-file", "blob", value["oid"], raw=True))} for name, value in tree.items()}
+            matches = committed == manifest
+        workspace_matches = not check_workspace or self.candidate_manifest() == manifest
+        if not matches or not workspace_matches:
+            raise OperationalError("Committed tree differs from verified source; publication filters or external changes must be corrected")
+        self.check_ignored()
 
     def begin_attempt(self):
         repair = self.directory / "repair.json"
@@ -247,6 +421,8 @@ class Worker:
         for name in sorted(filter(None, self.git("ls-files", "--others", "--exclude-standard", "-z").split("\0"))):
             path = self.root / name
             value += name.encode("utf-8") + digest(path.read_bytes()).encode("ascii")
+        value += json.dumps(self.candidate_manifest(), sort_keys=True).encode()
+        value += json.dumps(self.ignored_manifest(), sort_keys=True).encode()
         return digest(value)
 
     def source(self, shader_id, revision=None):
@@ -280,11 +456,13 @@ class Worker:
         return [p.split("/")[1] for p in names if p.startswith("shaders/") and p.endswith("/metadata.json")]
 
     def scope(self, outcome=None):
+        self.check_ignored()
         base = self.checkpoint["base"]
         if self.git("rev-parse", "HEAD").strip() != base:
             raise OperationalError("Codex changed Git state; only the host may commit")
         paths = self.git("diff", "--name-only", base).splitlines()
         paths += list(filter(None, self.git("ls-files", "--others", "--exclude-standard", "-z").split("\0")))
+        paths += sorted(self.raw_workspace_changes() - set(paths))
         primary = set()
         for name in paths:
             parts = name.split("/")
@@ -456,10 +634,14 @@ An unchanged existing shader may be successful if it already satisfies the promp
         commands = commands or [[self.config["python"], "tools/library.py", "validate", "--compile"],
                     [self.config["python"], "-m", "unittest", "discover", "-s", "tools", "-p", "test_*.py"]]
         for command in commands:
-            result = run(command, self.root, env, check=False)
+            try:
+                result = run(command, self.root, env, check=False)
+            except subprocess.TimeoutExpired as error:
+                if baseline: raise OperationalError("Baseline validation timed out") from error
+                raise VerificationError("Candidate validation timed out", command=command) from error
             if result.returncode:
                 message = (result.stdout + result.stderr)[-12000:] or f"Validation exited {result.returncode}"
-                if baseline or result.returncode < 0:
+                if baseline:
                     raise OperationalError("Baseline or host validation failed: " + message)
                 raise VerificationError(message, command=command)
 
@@ -530,9 +712,13 @@ An unchanged existing shader may be successful if it already satisfies the promp
                 for time in (0, 3, 10):
                     png = path / f"{time}.png"
                     png.unlink(missing_ok=True)
-                    result = run([self.config["shaderTool"], "render", metal, png, "--width", "1280", "--height", "720", "--time", str(time)], self.root, self.env, timeout=60, check=False)
+                    try:
+                        result = run([self.config["shaderTool"], "render", metal, png, "--width", "1280", "--height", "720", "--time", str(time)], self.root, self.env, timeout=60, check=False)
+                    except subprocess.TimeoutExpired as error:
+                        if label == "before": raise OperationalError("Baseline render timed out: " + sid) from error
+                        raise VerificationError("Candidate render timed out: " + sid, shader_id=sid, time=time) from error
                     if result.returncode or not self.valid_image(png):
-                        if label == "before" or result.returncode < 0:
+                        if label == "before":
                             raise OperationalError("Baseline sample or host rendering failed: " + sid)
                         raise VerificationError("Missing, failed or incorrectly sized render evidence: " + sid, shader_id=sid, time=time)
                     images.append(png)
@@ -562,11 +748,36 @@ An unchanged existing shader may be successful if it already satisfies the promp
                 raise CandidateError("Independent visual review: " + verdict.get("reason", "invalid verdict"))
         write(evidence_root / "manifest.json", evidence)
 
-    def prepare_publication(self):
-        emit("preparePublication")
+    def required_previews(self, outcome=None):
+        if outcome:
+            base = self.checkpoint["base"]
+            before_ids = self.baseline_ids()
+            ids = json.loads((self.root / "index.json").read_text())["shaders"]
+            required = [sid for sid in ids if sid == outcome["shaderID"] or sid not in before_ids or self.source(sid) != self.source(sid, base)]
+            self.save(requiredPreviewShaderIDs=required)
+            return required
+        return self.checkpoint.get("requiredPreviewShaderIDs")
+
+    def prepare_publication(self, required=None):
+        emit("preparePublication", requiredPreviewShaderIDs=required if required is not None else self.required_previews())
         response = sys.stdin.readline()
-        if not response or json.loads(response).get("ok") is not True:
-            raise OperationalError("Mac could not prepare a complete publication")
+        reply = json.loads(response) if response else {}
+        if reply.get("ok") is not True:
+            raise OperationalError(reply.get("message") or "Mac could not prepare a complete publication")
+
+    def prepare_current(self):
+        with (self.gitdir / "holodeck-requests.lock").open("w") as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if self.owner.exists(): raise OperationalError("An owned request must be recovered before rebuilding the library")
+            if self.git("branch", "--show-current").strip() != "main" or self.git("status", "--porcelain", "--untracked-files=all").strip():
+                raise OperationalError("Rebuilding requires a clean main checkout; no files or branches have been changed")
+            self.check_checkout_inputs()
+            self.save(base=self.git("rev-parse", "HEAD").strip())
+            frozen = self.fingerprint(), self.candidate_manifest()
+            self.prepare_publication(required=[])
+            if frozen != (self.fingerprint(), self.candidate_manifest()):
+                raise OperationalError("Checkout changed while rebuilding the publication")
+            emit("publicationReady")
 
     def perform(self):
         self.request = json.loads((self.directory / "request.json").read_text())
@@ -583,6 +794,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
                 if self.git("merge-base", "--is-ancestor", result["commitSHA"], "origin/main", check=False).returncode:
                     raise OperationalError("The previously pushed commit is no longer on main")
                 self.git("checkout", "-B", "main", "origin/main")
+                self.check_checkout_inputs()
                 self.verify_commit("origin/main", self.candidate_manifest())
                 self.prepare_publication()
                 emit("result", result=result)
@@ -602,6 +814,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
                     if self.git("status", "--porcelain").strip():
                         raise OperationalError("Uncommitted files prevent recovery of the pushed result")
                     self.git("checkout", "-B", "main", "origin/main")
+                    self.check_checkout_inputs()
                     self.verify_commit("origin/main", self.candidate_manifest())
                     self.prepare_publication()
                     self.finish_publication(response)
@@ -637,7 +850,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
                         self.synchronize()
                         feedback = "Remote main changed; reapply the intent, resolve conflicts, and repeat verification."
                         continue
-                    self.prepare_publication()
+                    self.prepare_publication(self.required_previews(outcome))
                     if self.fingerprint() != frozen or self.candidate_manifest() != manifest:
                         emit("discardPublication")
                         raise CandidateError("Candidate changed while preparing publication")
@@ -681,6 +894,9 @@ An unchanged existing shader may be successful if it already satisfies the promp
                     self.save_patch()
 
     def preflight(self):
+        if self.owner.exists():
+            raise OperationalError("An owned checkout must be cleaned or explicitly detached before setup")
+        self.git_tree("HEAD")
         if self.git("rev-parse", "--show-toplevel").strip() != str(self.root):
             raise OperationalError("Choose the repository root")
         if self.git("status", "--porcelain", "--untracked-files=all").strip():
@@ -701,6 +917,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
         if not self.config.get("model", "").strip():
             raise OperationalError("Choose a Holodeck model")
         self.git("checkout", "-B", "main", "origin/main")
+        self.check_checkout_inputs()
         self.git("push", "--dry-run", "origin", "HEAD:main")
         if not (self.root / "tools/shader_tool.py").is_file():
             raise OperationalError("Complete the native shader-tool and preview migration on origin/main before enabling requests.")
@@ -713,7 +930,9 @@ An unchanged existing shader may be successful if it already satisfies the promp
         run([self.config["shaderTool"], "render", source, image], self.root, self.env)
         schema = {"type": "object", "properties": {"imageDescription": {"type": "string"}}, "required": ["imageDescription"], "additionalProperties": False}
         self.codex("Describe the attached shader image in one sentence and return the required JSON. Do not change files.", schema, "setup", [image])
-        emit("preflight", message="Ready for shader requests")
+        if not self.checkout_identity.exists():
+            self.checkout_identity.write_text(str(uuid.uuid4()))
+        emit("preflight", message="Ready for shader requests", checkoutID=self.checkout_identity.read_text().strip())
 
 
 def main():
@@ -726,6 +945,8 @@ def main():
         worker = Worker(config, sys.argv[3])
         if sys.argv[1] == "preflight":
             worker.preflight()
+        elif sys.argv[1] == "publication":
+            worker.prepare_current()
         elif sys.argv[1] == "discard":
             worker.discard()
         else:
@@ -740,10 +961,12 @@ def main():
                     worker.git("fetch", "origin", "main")
                     published = worker.git("merge-base", "--is-ancestor", sha, "origin/main", check=False).returncode == 0
             if not published:
-                with contextlib.suppress(Exception):
+                try:
                     worker.clean()
-                for name in ("changes.patch", "untracked.json"):
-                    (worker.directory / name).unlink(missing_ok=True)
+                    for name in ("changes.patch", "untracked.json"):
+                        (worker.directory / name).unlink(missing_ok=True)
+                except Exception as cleanup_error:
+                    emit("log", text="Cleanup remains pending: " + str(cleanup_error))
             else:
                 with contextlib.suppress(Exception):
                     worker.clean(revision=sha)

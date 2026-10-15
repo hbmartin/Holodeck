@@ -50,6 +50,8 @@ public actor DirectoryCatalog {
     private var restoring = false
     private var restorationRevision: String?
     private var reloadWaiters: [CheckedContinuation<Void, Never>] = []
+    private var markerRevision: String?
+    private var markerKnown = false
     private var currentRevision: String?
     private var allowed: [String: Set<String>] = [:]
     private var leases: [UUID: String] = [:]
@@ -87,7 +89,9 @@ public actor DirectoryCatalog {
             endTransition()
         }
         try Task.checkCancellation()
-        guard let head = try await io.marker() else { return nil }
+        markerKnown = false
+        guard let head = try await io.marker() else { markerRevision = nil; markerKnown = true; return nil }
+        markerRevision = head.revision; markerKnown = true
         restorationRevision = head.revision; verificationRevisions.insert(head.revision)
         let catalog = try await io.restore(head.revision)
         try Task.checkCancellation()
@@ -183,6 +187,7 @@ public actor DirectoryCatalog {
                 if !matches { try files.swap(preparation.stage, destination) }
             } else { try FileManager.default.moveItem(at: preparation.stage, to: destination) }
             try files.writeMarker(JSONEncoder().encode(CatalogHead(revision: revision)), directory.appendingPathComponent("current.json"))
+            markerRevision = revision; markerKnown = true
             let previous = currentRevision
             allowed[revision] = preparation.paths; currentRevision = revision
             prepared[id] = nil; releaseVerificationPin(revision)
@@ -206,8 +211,8 @@ public actor DirectoryCatalog {
         case .asset(let revision, let path):
             guard allowed[revision]?.contains(path) == true else { throw CatalogError.invalidResponse }
             let url = directory.appendingPathComponent(revision).appendingPathComponent(path)
-            guard (try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= limit else { throw CatalogError.oversizedResponse }
-            data = try Data(contentsOf: url)
+            do { data = try CatalogPublicationFiles.read(url, limit: limit, root: directory) }
+            catch is CatalogFileSizeError { throw CatalogError.oversizedResponse }
         }
         guard limit >= 0, data.count <= limit else { throw CatalogError.oversizedResponse }
         return data
@@ -216,8 +221,8 @@ public actor DirectoryCatalog {
     private var previousRevision: String?
     private func trim(previous: String? = nil) {
         if let previous, previous != currentRevision { previousRevision = previous }
-        guard !restoring || restorationRevision != nil else { return }
-        let keep = Set(leases.values).union(verificationRevisions).union([currentRevision, previousRevision].compactMap { $0 })
+        guard markerKnown, !restoring || restorationRevision != nil else { return }
+        let keep = Set(leases.values).union(verificationRevisions).union([currentRevision, previousRevision, markerRevision].compactMap { $0 })
         for revision in Array(allowed.keys) where !keep.contains(revision) {
             allowed[revision] = nil
             try? FileManager.default.removeItem(at: directory.appendingPathComponent(revision))

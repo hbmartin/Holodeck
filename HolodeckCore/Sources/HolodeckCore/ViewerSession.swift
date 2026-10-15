@@ -30,6 +30,13 @@ nonisolated public struct ViewerPolicy: Sendable {
 
 @MainActor @Observable
 public final class ViewerSession {
+    public enum SelectionResult: Sendable, Equatable {
+        case activated, superseded, cancelled, unavailable
+        case failed(String)
+    }
+    public enum RefreshResult: Sendable, Equatable { case checked, skipped, cancelled; case failed(String) }
+    public private(set) var refreshResult: RefreshResult = .skipped
+    @ObservationIgnored private var lastSelectionResult: (generation: UInt64, result: SelectionResult)?
     public enum SelectionOrigin: Sendable { case startup, user, update }
     public struct PendingSelection {
         public let shader: ShaderDefinition
@@ -130,6 +137,7 @@ public final class ViewerSession {
             return refreshTask
         }
         isRefreshing = true
+        refreshResult = .cancelled
         let service = catalogService
         let task = Task { [weak self] in
             defer {
@@ -152,8 +160,10 @@ public final class ViewerSession {
                     if let current { self.applyCatalog(current) }
                     switch outcome {
                     case .updated, .unchanged:
+                        self.refreshResult = .checked
                         self.catalogFailure = nil
                     case .throttled, .disabled:
+                        self.refreshResult = .skipped
                         if self.catalog == nil {
                             if self.catalogFailure != nil { self.onEvent?(.catalogFailed) }
                             else { throw CatalogError.invalidManifest }
@@ -163,6 +173,7 @@ public final class ViewerSession {
                     let current = await service.current()
                     guard !Task.isCancelled, let self else { return }
                     if let current { self.applyCatalog(current) }
+                    self.refreshResult = error is CancellationError ? .cancelled : .failed(error.localizedDescription)
                     let message = self.catalogErrorMessage(error)
                     if self.catalogFailure?.message != message {
                         self.catalogFailure = Failure(message: message, operation: .catalog)
@@ -176,6 +187,27 @@ public final class ViewerSession {
         refreshTask = task
         onEvent?(.catalogLoading)
         return task
+    }
+
+    /// Waits for the coalesced forced refresh, including its final follow-up pass.
+    public func refreshForDelivery() async throws {
+        await refresh(force: true).value
+        try Task.checkCancellation()
+        switch refreshResult {
+        case .checked: return
+        case .cancelled: throw CancellationError()
+        case .failed(let message): throw ShaderRequestError.unavailable(message)
+        case .skipped: throw ShaderRequestError.unavailable("A fresh catalog check is required before delivery.")
+        }
+    }
+
+    public func selectForDelivery(_ shader: ShaderDefinition) async -> SelectionResult {
+        guard renderer != nil else { return .unavailable }
+        let task = select(shader), request = generation
+        await task.value
+        guard !Task.isCancelled else { return .cancelled }
+        guard generation == request, lastSelectionResult?.generation == request else { return .superseded }
+        return lastSelectionResult!.result
     }
 
     private func catalogErrorMessage(_ error: Error) -> String {
@@ -225,7 +257,11 @@ public final class ViewerSession {
         let task = Task { [weak self] in
             guard let self, self.generation == request else { return }
             do {
-                guard try await renderer.select(shader), self.generation == request else { return }
+                guard try await renderer.select(shader), self.generation == request else {
+                    if self.generation == request { self.lastSelectionResult = (request, .superseded); self.pendingSelection = nil }
+                    return
+                }
+                self.lastSelectionResult = (request, .activated)
                 self.activeShader = self.shaders.first { $0.id == shader.id && $0.sourceHash == shader.sourceHash } ?? shader
                 self.pendingSelection = nil
                 self.requiresExplicitSelection = false
@@ -248,6 +284,7 @@ public final class ViewerSession {
                 }
                 guard self.generation == request else { return }
                 self.pendingSelection = nil
+                self.lastSelectionResult = (request, error is CancellationError ? .cancelled : .failed(error.localizedDescription))
                 self.selectionDiagnostic = error.localizedDescription
                 if self.activeShader == nil { self.requiresExplicitSelection = true }
                 if origin != .update || !self.hasUserSelectionFailure {

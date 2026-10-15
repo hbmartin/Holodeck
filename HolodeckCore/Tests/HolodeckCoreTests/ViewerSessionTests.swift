@@ -27,6 +27,43 @@ final class ViewerSessionTests: XCTestCase {
         return snapshot
     }
 
+    func testDeliveryRequiresFreshSuccessEvenWithPlayableCachedCatalog() async throws {
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource(kind: .standard) { _, _ in throw LocalCatalogError.timeout }, storage: .disabled)
+        let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .tv)
+        do { try await session.refreshForDelivery(); XCTFail("Failed refresh was treated as fresh") }
+        catch { XCTAssertFalse(error is ShaderDeliveryDefect) }
+        XCTAssertEqual(session.shaders.count, TestCatalog.shaders.count)
+        guard case .failed = session.refreshResult else { return XCTFail("Refresh outcome was lost") }
+        let unavailable = await session.selectForDelivery(TestCatalog.initialShader)
+        XCTAssertEqual(unavailable, .unavailable)
+    }
+    func testDeliverySelectionDistinguishesFailureAndSupersededSelection() async throws {
+        let (session, renderer, _) = session(.tv)
+        await settled(session)
+        renderer.failNext = true
+        let failed = await session.selectForDelivery(TestCatalog.shaders[1])
+        guard case .failed = failed else { return XCTFail("Compilation failure was not attributed") }
+        renderer.held = true
+        let selecting = Task { await session.selectForDelivery(TestCatalog.shaders[2]) }
+        await renderer.waitForRequest("waves")
+        session.cancelPendingSelection()
+        renderer.finish("waves")
+        let superseded = await selecting.value
+        XCTAssertEqual(superseded, .superseded); XCTAssertNil(session.pendingSelection)
+        renderer.held = false
+        let activated = await session.selectForDelivery(TestCatalog.shaders[2])
+        XCTAssertEqual(activated, .activated)
+    }
+    func testDeliveryAcceptsSuccessfulFreshUnchangedCatalog() async throws {
+        let source = CatalogSource(kind: .standard) { request, _ in
+            guard case .head = request else { throw CatalogError.invalidResponse }
+            return try JSONEncoder().encode(CatalogHead(revision: TestCatalog.catalog.publicationRevision))
+        }
+        let service = CatalogService(initialCatalog: TestCatalog.catalog, source: source, storage: .disabled)
+        let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .tv)
+        try await session.refreshForDelivery()
+        XCTAssertEqual(session.refreshResult, .checked)
+    }
     func testDismissedRecoveryErrorNeverReturnsAndSuccessfulSelectionClearsPreviousError() async throws {
         let (session, renderer, _) = session()
         renderer.failNext = true

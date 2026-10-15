@@ -129,8 +129,8 @@ class ShaderRequestWorkerTests(unittest.TestCase):
 
     def save_request(self): (self.job/'request.json').write_text(json.dumps(self.request))
 
-    def run_worker(self, callback=None, accept=True):
-        process=subprocess.Popen([sys.executable,'-u',str(SCRIPT),'run',str(self.config_path),str(self.job)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1'))
+    def run_worker(self, callback=None, accept=True, mode="run"):
+        process=subprocess.Popen([sys.executable,'-u',str(SCRIPT),mode,str(self.config_path),str(self.job)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1'))
         self.addCleanup(lambda: process.kill() if process.poll() is None else None)
         events=[]
         # TextIO buffering requires readline rather than select for every buffered JSONL event.
@@ -437,5 +437,177 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         self.assertEqual((self.root/'shaders/beta/body.metal').read_text(),'NEWER MAIN\n')
         self.assertEqual(len(self.invocations()),count)
 
+
+    def protected_worker(self):
+        (self.root/'.gitignore').write_text('ignored/\n')
+        self.git(self.root,'add','.gitignore');self.git(self.root,'commit','-m','Ignore scratch')
+        self.git(self.root,'push','origin','main')
+        directory=self.root/'ignored';directory.mkdir()
+        (directory/'original').write_bytes(b'original');(directory/'original').chmod(0o600)
+        (directory/'deleted').write_bytes(b'keep')
+        worker=worker_module.Worker(self.config,self.job);worker.request=self.request
+        worker.save(base=self.git(self.root,'rev-parse','HEAD').strip())
+        worker_module.write(worker.owner,{'id':self.request['id'],'directory':str(self.job)})
+        worker.snapshot_ignored()
+        return worker
+
+    def test_ignored_changes_are_scoped_fingerprinted_and_restored_across_restart(self):
+        worker=self.protected_worker();frozen=worker.fingerprint()
+        (self.root/'ignored/original').write_bytes(b'modified')
+        (self.root/'ignored/deleted').unlink()
+        (self.root/'ignored/new').write_bytes(b'unapproved')
+        with self.assertRaisesRegex(worker_module.CandidateError,'Ignored'):worker.scope()
+        self.assertNotEqual(worker.fingerprint(),frozen)
+        restarted=worker_module.Worker(self.config,self.job);restarted.request=self.request;restarted.clean()
+        self.assertEqual((self.root/'ignored/original').read_bytes(),b'original')
+        self.assertEqual((self.root/'ignored/original').stat().st_mode & 0o777,0o600)
+        self.assertEqual((self.root/'ignored/deleted').read_bytes(),b'keep')
+        self.assertFalse((self.root/'ignored/new').exists());self.assertFalse(worker.owner.exists())
+
+    def test_ignored_state_is_not_adopted_by_park_or_failure(self):
+        worker=self.protected_worker()
+        (self.root/'ignored/original').write_bytes(b'modified')
+        (self.root/'shaders/alpha/body.metal').write_text('PARKED\n')
+        worker.park()
+        self.assertEqual((self.root/'ignored/original').read_bytes(),b'original')
+        worker.restore_patch()
+        self.assertEqual((self.root/'shaders/alpha/body.metal').read_text(),'PARKED\n')
+        self.assertEqual((self.root/'ignored/original').read_bytes(),b'original')
+
+    def test_ignored_restore_failure_retains_owner_and_patch(self):
+        worker=self.protected_worker()
+        record=json.loads((self.job/'ignored-baseline.json').read_text())['ignored/original']
+        (self.job/'ignored-backup'/record['hash']).unlink()
+        (self.root/'ignored/original').write_bytes(b'modified')
+        with self.assertRaises(FileNotFoundError):worker.clean()
+        self.assertTrue(worker.owner.exists())
+        self.assertEqual((self.root/'ignored/original').read_bytes(),b'modified')
+
+    def test_unrelated_crlf_checkout_is_supported_without_weakening_source_proof(self):
+        (self.root/'notes.txt').write_bytes(b'notes\n')
+        (self.root/'.gitattributes').write_text('notes.txt text eol=crlf\n')
+        self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Unrelated EOL rule');self.git(self.root,'push','origin','main')
+        (self.root/'notes.txt').unlink();self.git(self.root,'checkout','--','notes.txt')
+        self.assertEqual((self.root/'notes.txt').read_bytes(),b'notes\r\n')
+        self.assertFalse(self.git(self.root,'status','--porcelain'))
+        code,events=self.run_worker();self.assertEqual(code,0,events)
+        self.assertEqual(self.git(self.root,'show','HEAD:notes.txt'),'notes\n')
+
+    def test_unrelated_smudge_filter_and_ignored_executable_bits_are_supported(self):
+        executable=self.base/'filter';executable.write_text('#!'+sys.executable+'\nimport sys\nsys.stdout.write(sys.stdin.read().replace("POINTER", "EXPANDED"))\n');executable.chmod(0o755)
+        self.git(self.root,'config','filter.fixture.smudge',str(executable))
+        self.git(self.root,'config','filter.fixture.clean','cat')
+        (self.root/'unrelated.bin').write_text('POINTER\n')
+        (self.root/'.gitattributes').write_text('unrelated.bin filter=fixture\n')
+        self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Unrelated filter');self.git(self.root,'push','origin','main')
+        (self.root/'unrelated.bin').unlink();self.git(self.root,'checkout','--','unrelated.bin')
+        # A real LFS clean filter maps expanded content back to its pointer.
+        clean=self.base/'clean';clean.write_text('#!'+sys.executable+'\nimport sys\nsys.stdout.write(sys.stdin.read().replace("EXPANDED", "POINTER"))\n');clean.chmod(0o755)
+        self.git(self.root,'config','filter.fixture.clean',str(clean))
+        self.git(self.root,'config','core.fileMode','false');(self.root/'tools/library.py').chmod(0o654)
+        self.assertFalse(self.git(self.root,'status','--porcelain'))
+        code,events=self.run_worker();self.assertEqual(code,0,events)
+        self.assertEqual((self.root/'unrelated.bin').read_text(),'EXPANDED\n')
+
+    def test_source_checkout_conversion_and_submodules_fail_before_codex(self):
+        (self.root/'.gitattributes').write_text('shared/*.metal text eol=crlf\n')
+        self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Unsupported source conversion');self.git(self.root,'push','origin','main')
+        (self.root/'shared/common.metal').unlink();self.git(self.root,'checkout','--','shared/common.metal')
+        code,events=self.run_worker();self.assertNotEqual(code,0)
+        self.assertTrue(any('Publication input checkout bytes differ' in e.get('message','') for e in events))
+        self.assertFalse((self.job/'invocations.jsonl').exists())
+        (self.root/'.gitattributes').unlink();self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Remove conversion')
+        self.git(self.root,'update-index','--add','--cacheinfo','160000,'+self.base_sha+',submodule')
+        self.git(self.root,'commit','-m','Submodule');self.git(self.root,'push','origin','main')
+        code,events=self.run_worker();self.assertNotEqual(code,0)
+        self.assertTrue(any('Submodules' in e.get('message','') for e in events))
+        self.assertFalse((self.job/'invocations.jsonl').exists())
+
+    def test_signalled_candidate_validator_repairs_after_baseline_succeeds(self):
+        (self.root/'tools/library.py').write_text('import os,signal\nfrom pathlib import Path\nif "EDIT" in Path("shaders/alpha/body.metal").read_text(): os.kill(os.getpid(),signal.SIGTERM)\n')
+        self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Signalled candidate fixture');self.git(self.root,'push','origin','main')
+        self.codex.write_text(CODEX.replace("write_text('EDIT\\n')", "write_text('EDIT\\n' if count == 1 else 'FIXED\\n')"))
+        code,events=self.run_worker();self.assertEqual(code,0,events)
+        self.assertEqual((self.job/'implementation-count').read_text(),'2')
+        self.assertEqual(self.git(self.root,'show','HEAD:shaders/alpha/body.metal'),'FIXED\n')
+
+    def test_candidate_timeout_repeats_same_operation_on_pristine_baseline(self):
+        from unittest.mock import patch
+        worker=self.protected_worker()
+        (self.root/'shaders/alpha/body.metal').write_text('EDIT\n')
+        observed=[]
+        def operation(command,*args,**kwargs):
+            text=(self.root/'shaders/alpha/body.metal').read_text();observed.append(text)
+            if text=='EDIT\n':raise subprocess.TimeoutExpired(command,600)
+            return subprocess.CompletedProcess(command,0,'','')
+        with patch.object(worker_module,'run',side_effect=operation):
+            with self.assertRaises(worker_module.VerificationError) as failure:worker.technical()
+            worker.classify_verification_failure(failure.exception)
+        self.assertEqual(observed,['EDIT\n','ALPHA\n'])
+        self.assertEqual((self.root/'shaders/alpha/body.metal').read_text(),'EDIT\n')
+
+    def test_required_previews_follow_source_changes_and_survive_result_recovery(self):
+        self.request['prompt']='helper';self.save_request()
+        code,events=self.run_worker();self.assertEqual(code,0,events)
+        event=next(e for e in events if e['event']=='preparePublication')
+        self.assertEqual(set(event['requiredPreviewShaderIDs']),{'alpha','beta'})
+        code,events=self.run_worker();self.assertEqual(code,0,events)
+        self.assertEqual(next(e for e in events if e['event']=='preparePublication')['requiredPreviewShaderIDs'],event['requiredPreviewShaderIDs'])
+
+    def test_bootstrap_is_read_only_and_does_not_require_remote_or_codex(self):
+        self.git(self.root,'remote','set-url','origin',str(self.base/'unavailable.git'))
+        before=self.git(self.root,'rev-parse','HEAD')
+        code,events=self.run_worker(mode='publication');self.assertEqual(code,0,events)
+        self.assertTrue(any(e['event']=='publicationReady' for e in events))
+        self.assertEqual(next(e for e in events if e['event']=='preparePublication')['requiredPreviewShaderIDs'],[])
+        self.assertEqual(self.git(self.root,'rev-parse','HEAD'),before)
+        self.assertFalse(self.git(self.root,'status','--porcelain'))
+        self.assertFalse((self.job/'invocations.jsonl').exists())
+        (self.root/'shaders/alpha/body.metal').write_text('dirty')
+        code,events=self.run_worker(mode='publication');self.assertNotEqual(code,0)
+        self.assertEqual((self.root/'shaders/alpha/body.metal').read_text(),'dirty')
+
+    def test_clean_filter_cannot_hide_a_forbidden_workspace_edit(self):
+        original=(self.root/'tools/library.py').read_text()
+        executable=self.base/'hide-change'
+        executable.write_text('#!'+sys.executable+'\nimport sys\nsys.stdin.read()\nsys.stdout.write('+repr(original)+')\n');executable.chmod(0o755)
+        (self.root/'.gitattributes').write_text('tools/library.py filter=hide\n')
+        self.git(self.root,'config','filter.hide.clean',str(executable))
+        self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Unrelated clean filter');self.git(self.root,'push','origin','main')
+        worker=worker_module.Worker(self.config,self.job);worker.request=self.request
+        worker.save(base=self.git(self.root,'rev-parse','HEAD').strip())
+        worker_module.write(worker.owner,{'id':self.request['id'],'directory':str(self.job)})
+        worker_module.write(self.job/'baseline-workspace.json',worker.candidate_manifest())
+        frozen=worker.fingerprint()
+        (self.root/'tools/library.py').write_text('print("forbidden validation logic")\n')
+        self.assertFalse(self.git(self.root,'diff','--name-only','HEAD'))
+        with self.assertRaisesRegex(worker_module.CandidateError,'Forbidden'):worker.scope()
+        self.assertNotEqual(worker.fingerprint(),frozen)
+        worker.clean()
+        self.assertEqual((self.root/'tools/library.py').read_text(),original)
+
+    def test_clean_filter_hidden_source_change_cannot_be_published_with_metadata(self):
+        executable=self.base/'hide-source'
+        executable.write_text('#!'+sys.executable+'\nimport sys\nsys.stdin.read()\nsys.stdout.write("ALPHA\\n")\n');executable.chmod(0o755)
+        (self.root/'.gitattributes').write_text('shaders/alpha/body.metal filter=hide-source\n')
+        self.git(self.root,'config','filter.hide-source.clean',str(executable))
+        self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Source clean fixture');self.git(self.root,'push','origin','main')
+        baseline=self.git(self.root,'rev-parse','HEAD')
+        self.codex.write_text(CODEX.replace("if mode=='helper':", "meta_path=Path(f'shaders/{sid}/metadata.json');meta=json.loads(meta_path.read_text());meta['description']='candidate metadata';meta_path.write_text(json.dumps(meta))\n        if mode=='helper':"))
+        code,events=self.run_worker();self.assertNotEqual(code,0,events)
+        self.assertTrue(any('Committed tree differs' in event.get('message','') for event in events),events)
+        self.assertEqual(self.git(self.root,'rev-parse','origin/main'),baseline)
+        self.assertEqual((self.root/'shaders/alpha/body.metal').read_text(),'ALPHA\n')
+
+    def test_failed_new_baseline_preserves_ignored_files_created_after_publication(self):
+        (self.root/'.gitignore').write_text('ignored/\n')
+        self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Ignored scratch');self.git(self.root,'push','origin','main')
+        code,events=self.run_worker();self.assertEqual(code,0,events)
+        (self.root/'ignored').mkdir();(self.root/'ignored/user-data').write_bytes(b'created after publication')
+        (self.root/'tools/library.py').write_text('raise SystemExit(1)\n')
+        self.git(self.root,'add','--all');self.git(self.root,'commit','-m','Broken new baseline');self.git(self.root,'push','origin','main')
+        (self.job/'repair.json').write_text(json.dumps({'attemptID':'new','shaderID':'alpha','diagnostic':'Repair activation'}))
+        code,events=self.run_worker();self.assertNotEqual(code,0)
+        self.assertEqual((self.root/'ignored/user-data').read_bytes(),b'created after publication')
 
 if __name__=='__main__': unittest.main()

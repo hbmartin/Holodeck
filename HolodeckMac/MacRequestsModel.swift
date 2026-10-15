@@ -6,16 +6,18 @@ import Observation
 final class MacRequestsModel {
     var configuration: ShaderRequestConfiguration
     var jobs: [ShaderRequestStatus] = []
+    var recoveries: [ShaderRequestRecoveryStatus] = []
     private var pendingCleanup = false
     var checking = false
     var message = "Configure Codex and enable requests."
     var error: String?
-    var onPublication: (@MainActor () -> Void)?
+    var onPublication: (@MainActor ([ShaderPreviewWarning]) -> Void)?
     let service: ShaderRequestService
     let directory: URL
     @ObservationIgnored private let defaults: UserDefaults?
     @ObservationIgnored private var observation: Task<Void, Never>?
     @ObservationIgnored private var revision: String?
+    @ObservationIgnored private var publicationWarnings: [ShaderPreviewWarning] = []
 
     init(catalog: DirectoryCatalog, defaults: UserDefaults?, namespace: String?) {
         self.defaults = defaults
@@ -46,8 +48,12 @@ final class MacRequestsModel {
                 guard let self else { break }
                 self.jobs = jobs
                 self.pendingCleanup = await service.hasPendingCleanup()
+                self.recoveries = await service.recoveryStatuses()
                 let current = await catalog.publicationRevisionValue()
-                if let current, current != self.revision { self.revision = current; self.onPublication?() }
+                let warnings = await service.publicationWarnings()
+                if let current, current != self.revision || warnings != self.publicationWarnings {
+                    self.revision = current; self.publicationWarnings = warnings; self.onPublication?(warnings)
+                }
             }
         }
     }
@@ -55,7 +61,7 @@ final class MacRequestsModel {
     var hasUnfinishedJobs: Bool { pendingCleanup || jobs.contains { !$0.stage.terminal } }
     func setRepository(_ url: URL) {
         guard !configuration.enabled, !hasUnfinishedJobs else { return }
-        configuration.repository = url.path; save()
+        configuration.repository = url.path; configuration.checkoutID = nil; save()
     }
     private func save() { defaults?.set(try? JSONEncoder().encode(configuration), forKey: "holodeck.requestConfiguration") }
     func verify() {
@@ -75,6 +81,28 @@ final class MacRequestsModel {
         Task {
             do { try await service.disable(); configuration.enabled = false; save(); message = "Requests disabled" }
             catch { self.error = error.localizedDescription }
+        }
+    }
+    func retryCleanup(_ id: UUID, repository: String, python: String, git: String) {
+        checking = true; error = nil
+        Task {
+            defer { checking = false }
+            do {
+                try await service.retryCleanup(id, repository: repository, python: python, git: git)
+                configuration = await service.configurationValue(); save()
+            }
+            catch { self.error = error.localizedDescription }
+        }
+    }
+    func detach(_ id: UUID) {
+        checking = true; error = nil
+        Task {
+            defer { checking = false }
+            do {
+                try await service.detachCheckout(id)
+                configuration = await service.configurationValue(); save()
+                message = "Checkout detached; files and evidence retained. Verify setup to enable requests."
+            } catch { self.error = error.localizedDescription }
         }
     }
     func cancel(_ id: UUID) { Task { do { try await service.cancelQueued(id) } catch { self.error = error.localizedDescription } } }

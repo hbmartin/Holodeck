@@ -37,13 +37,20 @@ extension DirectoryCatalogTests {
         }
         try JSONSerialization.data(withJSONObject: ["shaders": ids, "defaultShaderID": ids[0]])
             .write(to: root.appendingPathComponent("index.json"))
+        let io = DirectoryCatalogIO(directory: base.appendingPathComponent("measurement"), files: DirectoryCatalogFileOperations())
+        let preparation = try await io.prepare(from: root)
+        XCTAssertLessThan(preparation.authoringManifestByteCount, CatalogLimits.manifestBytes)
+        let sourceRevisionField = Data(",\"sourceRevision\":\"\(preparation.manifest.sourceRevision)\"".utf8).count
+        let finalSize = try JSONEncoder().encode(preparation.manifest).count - sourceRevisionField
+        XCTAssertGreaterThan(finalSize, CatalogLimits.manifestBytes)
+        await io.cleanup(preparation.stage)
         let png = try ShaderPNG.gradient(colors: [[0, 0, 0], [1, 1, 1]])
         let generator = ShaderPreviewGenerator(directory: base.appendingPathComponent("size-previews")) { _ in png }
         let restarted = DirectoryCatalog(directory: directory, previewGenerator: generator)
         _ = try await restarted.cached()
         do { _ = try await restarted.reload(from: root); XCTFail("Final oversized manifest installed") }
         catch LocalCatalogError.invalidFile(let path, let reason) {
-            XCTAssertEqual(path, "index.json"); XCTAssertTrue(reason.contains("2 MiB"))
+            XCTAssertEqual(path, "index.json"); XCTAssertEqual(reason, "Catalog manifest is \(finalSize) bytes; limit is \(CatalogLimits.manifestBytes) bytes.")
         }
         let head = try JSONDecoder().decode(CatalogHead.self, from: await restarted.get(.head, limit: 65_536))
         XCTAssertEqual(head.revision, first.publicationRevision)

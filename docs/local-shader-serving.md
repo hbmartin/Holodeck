@@ -445,3 +445,11 @@ HOLODECK_GPU_TESTS=1 swift test --package-path HolodeckCore
 ```
 
 The opt-in `ShaderRequestTests.testConfiguredRealCodexPublicationAndActivation` accepts `HOLODECK_REQUEST_FIXTURE_CONFIG` pointing to a JSON `ShaderRequestConfiguration`. It requires a `/tmp/` checkout and a local bare `.git` origin and retains its evidence. Never point this live Codex test at a hosted production remote. UI tests use deterministic control peers; loopback TLS tests separately enforce real pairing, authentication and revocation. Physical device testing is application validation, separate from per-request publication gates.
+
+## Correctness follow-up
+
+Local schema-2 publication verification remains strict, with no legacy cache migration. File reads use pinned root/directory descriptors, reject symbolic links and non-regular files, and enforce byte bounds during the read. The durable marker revision remains protected when cold restoration fails or is cancelled.
+
+Request interruptions belong to an execution rather than the current sleep/wake flag. Startup reconciles known worker identities before scheduling checkout operations. Failed jobs remain terminal during cleanup; Settings offers owned checkout/tool-path repair and retry, or detachment that retains files/evidence and disables requests. Fresh publication rebuilding requires clean local main under the existing cross-process lease and performs no fetch, branch change or Codex invocation.
+
+Required preview coverage is persisted with the request attempt: output and source-affected shaders must render, while unrelated warnings may use gradients. TV delivery separates fresh refresh success, output-specific selection failure, and retryable capture/transport/supersession failures. Performance evidence includes an optional attainable target cadence, defaulting old evidence to 30 fps; slowdown means less than 90% of that cadence over the existing observation window.

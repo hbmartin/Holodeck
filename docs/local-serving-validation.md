@@ -260,3 +260,17 @@ Validated on 2026-10-14 after the PR #18 comment triage. Host Git commands bypas
 Actual before/after Plasma images were inspected and the independent source/image-bound verdict passed at 0, 3 and 10 seconds. This live run used a freshly seeded `/tmp/holodeck-request-fixes-live` checkout and local bare origin; no production shader push occurred. Evidence and logs remain there and under `/tmp/holodeck-request-fixes-*`. Physical TV validation remains the earlier isolated smoke test; it was not repeated for these fixes.
 
 The local cache-identity fixture correction is included in this follow-up. The byte-count expectation and renamed `CatalogRequest` fixture remain with the separate pending catalog-size work; that work and the authoring migration were preserved. The paired transport/wire types remain unchanged; the Mac model reads pending cleanup separately from terminal TV status.
+
+## Catalog and request correctness acceptance — 2026-10-14
+
+The `codex/catalog-size-diagnostics` follow-up preserves strict schema-2 identity and unlimited shader-defect retries. It adds bounded descriptor-relative reads, durable marker protection, ignored-file backup/restoration, separate Git tree and workspace verification, execution-scoped interruption, owned cleanup recovery/detachment, selective preview requirements, attributable delivery repair, and display-aware performance evidence. Terminal failures remain terminal while cleanup blocks checkout mutations.
+
+- Python worker suite: 42 tests passed against disposable repositories and command fixtures. Cases include ignored additions/modifications/deletions and backup failures, restart/clarification cleanup, unrelated CRLF and clean/smudge transformations, filter-hidden edits, executable-mode settings, transformed publication inputs, submodules, candidate signals/timeouts, baseline failures, preview coverage and clean-main bootstrap.
+- Full Mac core suite: 218 tests executed, 11 opt-in skips, zero failures. Gated lifecycle cases cover interrupted preparation, quick resume, orphan ownership ordering, corrected cleanup paths, detachment, descendants retaining a scheduling slot, stderr draining, and forced shutdown of a descendant holding an output pipe. Filesystem cases cover symlinks, special files, path replacement, growing inputs, exact limits, shared-component UTF-8 diagnostics, and failed/cancelled cold restoration followed by trimming.
+- Focused TV simulator tests passed for actual controller delivery classification and capture/acknowledgement submission exclusion. Capture, refresh and control failures do not report shader defects; missing outputs and output activation failures do.
+- All three focused Mac UI checks passed: recovery path editing/retry/detachment with retained evidence, folder reload/rollback/bookmark restoration, and queued cancellation/retained records.
+- Debug Mac and tvOS simulator app builds passed. `git diff --check` passed.
+
+Commands: `python3 -B tools/test_shader_requests.py`, `swift test --package-path HolodeckCore`, and focused `xcodebuild test` selections for `HolodeckMacUITests` and `HolodeckTests`. Logs for this pass are `/tmp/holodeck-worker-final.log`, `/tmp/holodeck-core-final.log`, `/tmp/holodeck-mac-ui-final.log`, `/tmp/holodeck-tv-tests.log`, and `/tmp/holodeck-{mac,tv}-final-build.log`.
+
+This acceptance pass did not rerun real Codex, authoring/GPU opt-ins, physical-device or live LAN checks. No legacy-cache migration, performance-only refactoring, push, PR, merge or deployment is included.
