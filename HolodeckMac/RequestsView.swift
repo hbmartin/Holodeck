@@ -89,7 +89,7 @@ struct RequestSettingsView: View {
             }
             Text(model.configuration.enabled ? "Requests enabled" : model.message).accessibilityIdentifier("request-setup-status")
             if let error = model.error { Text(error).foregroundStyle(.red).textSelection(.enabled) }
-            Text("Requires Codex login, Git credentials and identity, Python 3, and Xcode Metal compilers. Implementation and independent image review share this model setting. Verify setup again to apply changed settings.")
+            Text("Requires Codex login, Git credentials and identity, Python 3.9 or later, and Xcode Metal compilers. Implementation and independent image review share this model setting. Verify setup again to apply changed settings.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }

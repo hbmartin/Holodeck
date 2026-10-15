@@ -4,3 +4,4 @@
 DerivedData/
 *.xcresult
 reviews_triage/
+__pycache__/
