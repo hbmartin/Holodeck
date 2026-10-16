@@ -259,6 +259,7 @@ final class TVRequestsController {
                 switch await session.selectForDelivery(output) {
                 case .activated: break
                 case .failed(let diagnostic): throw ShaderDeliveryDefect.activation(diagnostic)
+                case .temporarilyUnavailable(let diagnostic): throw ShaderRequestError.unavailable("The TV renderer could not activate the scene. Delivery will retry. " + diagnostic)
                 case .superseded, .cancelled: return
                 case .unavailable: throw ShaderRequestError.unavailable("The TV renderer is unavailable. Delivery will retry.")
                 }

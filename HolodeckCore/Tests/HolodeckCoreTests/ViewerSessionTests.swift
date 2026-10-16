@@ -42,7 +42,7 @@ final class ViewerSessionTests: XCTestCase {
         await settled(session)
         renderer.failNext = true
         let failed = await session.selectForDelivery(TestCatalog.shaders[1])
-        guard case .failed = failed else { return XCTFail("Compilation failure was not attributed") }
+        guard case .temporarilyUnavailable = failed else { return XCTFail("Transient renderer failure was treated as a source defect") }
         renderer.held = true
         let selecting = Task { await session.selectForDelivery(TestCatalog.shaders[2]) }
         await renderer.waitForRequest("waves")
@@ -63,6 +63,16 @@ final class ViewerSessionTests: XCTestCase {
         let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .tv)
         try await session.refreshForDelivery()
         XCTAssertEqual(session.refreshResult, .checked)
+    }
+    func testDeliveryRepairsKnownSourceDefectsButRetriesUnknownRendererErrors() async throws {
+        let (session, renderer, _) = session(.tv)
+        await settled(session)
+        renderer.failure = ShaderCompilationError.missingFunction("fragmentShader")
+        let sourceFailure = await session.selectForDelivery(TestCatalog.shaders[1])
+        guard case .failed = sourceFailure else { return XCTFail("Known shader contract defect did not request repair") }
+        renderer.failure = NSError(domain: "MTLLibraryErrorDomain", code: 2)
+        let transient = await session.selectForDelivery(TestCatalog.shaders[1])
+        guard case .temporarilyUnavailable = transient else { return XCTFail("Internal renderer failure requested repair") }
     }
     func testDismissedRecoveryErrorNeverReturnsAndSuccessfulSelectionClearsPreviousError() async throws {
         let (session, renderer, _) = session()
@@ -532,6 +542,7 @@ private final class FakeRenderer: SceneRendering {
     var selections: [ShaderDefinition] = []
     var held = false
     var failNext = false
+    var failure: Error?
     var isActive = false
     private var generation = 0
     private var pending: [String: CheckedContinuation<Void, Error>] = [:]
@@ -546,6 +557,7 @@ private final class FakeRenderer: SceneRendering {
             }
         }
         if failNext { failNext = false; throw CatalogError.invalidSource }
+        if let failure { throw failure }
         guard request == generation else { return false }
         activeShader = shader
         activations.append(shader.id)

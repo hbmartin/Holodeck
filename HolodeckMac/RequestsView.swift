@@ -127,7 +127,7 @@ private struct CheckoutRecoveryView: View {
                     .disabled(model.checking).accessibilityIdentifier("detach-checkout")
             }
         }.confirmationDialog("Detach this checkout and disable shader requests?", isPresented: $confirmsDetach) {
-            Button("Detach and Keep Files", role: .destructive) { model.detach(recovery.kind == .cleanup ? recovery.id : nil) }
+            Button("Detach and Keep Files", role: .destructive) { model.detach(recovery.kind == .cleanup ? recovery.id : recovery.requestID) }
         } message: { Text("Unpublished checkout files, patches, and logs will be retained. Verify setup before managing a checkout again.") }
     }
 }
