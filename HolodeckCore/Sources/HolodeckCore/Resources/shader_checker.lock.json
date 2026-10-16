@@ -1,7 +1,7 @@
 {
-  "version": "1.0.3",
+  "version": "1.1.0",
   "interfaceVersion": 1,
-  "sourceCommit": "6f7619d0d379bfd2977d1c50051212ec48fd7646",
+  "sourceCommit": "0a430fefc522bc462a9369abd7a92d255f534f13",
   "repository": "hbmartin/HolodeckShaderCheck",
-  "sha256": "b7921f0fe4d4ddf218f03be09a19284c657b4594e96681d9cc15520badbc6082"
+  "sha256": "191c0f276d724202dc78bfcd5bd042d9e651b6886db57c3901bd8ca3d4bea537"
 }

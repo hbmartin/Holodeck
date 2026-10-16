@@ -32,7 +32,7 @@ public enum ShaderLibraryTool {
             throw ShaderToolError("Bundled shader checker is missing. Reinstall the CLI with its resource bundle.")
         }
         let pin = try JSONDecoder().decode(Lock.self, from: Data(contentsOf: lock))
-        guard pin.interfaceVersion == 1, pin.version == "1.0.3",
+        guard pin.interfaceVersion == 1, pin.version == "1.1.0",
               pin.sourceCommit.range(of: "^[0-9a-f]{40}$", options: .regularExpression) != nil else {
             throw ShaderToolError("Bundled shader checker interface/version is incompatible.")
         }
