@@ -78,7 +78,7 @@ For authoring requirements, see [the workflow guide](shader-catalog-workflow.md)
 
 Choose **Input** from Select during playback. Enter a change or describe a new scene, then Submit. The TV captures the scene as it looked when Input opened. A clarification may ask you to choose an answer or enter more detail. The completion message says whether the output is new or edited and discloses any runtime approximations.
 
-First enable **Codex Shader Requests** in Mac Settings. Select an explicit model and verify setup. Codex must be logged in; Git must have credentials and identity; Python 3 and Xcode's macOS/tvOS Metal compilers must work. The selected checkout must be clean, with its existing work on `origin/main` and the native shader-tool/preview migration completed. Requests are disabled until this setup succeeds. The app manages that checkout and pushes verified results directly to main.
+First enable **Codex Shader Requests** in Mac Settings. Select an explicit model and verify setup. Codex must be logged in; Git must have credentials and identity; Python 3.9 or later and Xcode's macOS/tvOS Metal compilers must work. The selected checkout must be clean, with its existing work on `origin/main` and the native shader-tool/preview migration completed. Requests are disabled until this setup succeeds. The app manages that checkout and pushes verified results directly to main.
 
 Manual requests show progress over playback and finish after the TV plays the result. Gallery and Input are locked while the Mac is connected. If the Mac disconnects, cached Gallery browsing becomes available; reconnecting restores the request lock. Backgrounding the TV leaves the Mac working and defers delivery. Keep the Mac awake for execution.
 

@@ -4,6 +4,12 @@ nonisolated public enum ShaderCompilationError: LocalizedError {
     case missingFunction(String)
     case invalidUniformLayout
 
+    public static func isSourceDefect(_ error: Error) -> Bool {
+        if error is ShaderCompilationError { return true }
+        let native = error as NSError
+        return native.domain == MTLLibraryErrorDomain && native.code == MTLLibraryError.compileFailure.rawValue
+    }
+
     public var errorDescription: String? {
         switch self {
         case .invalidUniformLayout: return "Uniforms must match the 16-byte buffer-0 contract"

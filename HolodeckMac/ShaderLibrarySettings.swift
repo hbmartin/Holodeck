@@ -12,9 +12,11 @@ final class MacLibraryModel {
     var isReloading: Bool { localReloading || servicePublishing }
     private var publicationOperationSequence: UInt64 = 0
     private var publicationFailureSequence: UInt64?
-    private enum ErrorOrigin: Hashable { case folder, publication, manualReload, server }
+    private var publicationGeneration: UUID?
+    private var publicationResolvedSequence: UInt64 = 0
+    private enum ErrorOrigin: Hashable { case folder, publication, manualReload, server, approval, revocation }
     private var errors: [ErrorOrigin: String] = [:]
-    var error: String? { errors[.folder] ?? errors[.server] ?? errors[.manualReload] ?? errors[.publication] }
+    var error: String? { errors[.folder] ?? errors[.server] ?? errors[.manualReload] ?? errors[.publication] ?? errors[.approval] ?? errors[.revocation] }
     var previewWarnings: [ShaderPreviewWarning] = []
     var serverState = LocalServerState()
     @ObservationIgnored private let catalog: DirectoryCatalog
@@ -55,7 +57,7 @@ final class MacLibraryModel {
                 if !self.sleeping { try? await self.startServer() }
             }
         }
-        requests.onPublicationOperation = { [weak self] status in self?.applyPublicationOperation(status) }
+        requests.onPublicationEvent = { [weak self] event in self?.applyPublicationEvent(event) }
         updates = Task { [weak self] in
             for await state in await server.updates() { self?.serverState = state }
         }
@@ -86,6 +88,9 @@ final class MacLibraryModel {
         Task {
             do {
                 try await requests.initialized()
+                if !requests.configuration.repository.isEmpty {
+                    folder = URL(fileURLWithPath: requests.configuration.repository)
+                }
                 var restored = false
                 do { restored = try await catalog.cached() != nil }
                 catch { self.setError("Couldn’t restore the previous shader library: \(error.localizedDescription)", from: .publication) }
@@ -129,7 +134,7 @@ final class MacLibraryModel {
     }
     func rebuildPublication() {
         guard !isReloading else { return }
-        localReloading = true; clearError(from: .publication)
+        localReloading = true
         Task {
             defer { localReloading = false }
             do {
@@ -140,6 +145,25 @@ final class MacLibraryModel {
                 if !sleeping { try await startServer() }
             } catch { showPublicationError(error) }
         }
+    }
+    var canCancelPreparation: Bool { servicePublishing }
+    func cancelLibraryPreparation() { Task { await requests.service.cancelPublication() } }
+    private func applyPublicationEvent(_ event: ShaderRequestPublicationEvent) {
+        if publicationGeneration != event.generation {
+            publicationGeneration = event.generation; publicationOperationSequence = 0; publicationResolvedSequence = 0
+            clearError(from: .publication)
+        }
+        guard event.operation.sequence >= publicationOperationSequence else { return }
+        publicationOperationSequence = event.operation.sequence
+        servicePublishing = event.operation.phase == .preparing
+        if let failure = event.unresolvedFailure {
+            publicationFailureSequence = failure.operationSequence
+            setError(failure.message, from: .publication)
+        } else {
+            publicationResolvedSequence = event.operation.sequence
+            clearError(from: .publication)
+        }
+        applyPublicationOperation(event.operation)
     }
     private func load(_ url: URL, saveBookmark: Bool) {
         guard !isReloading, !requests.configuration.enabled, !requests.hasUnfinishedJobs else { return }
@@ -194,8 +218,9 @@ final class MacLibraryModel {
     private func showPublicationError(_ error: Error, prefix: String = "") {
         guard !(error is CancellationError) else { return }
         if let failure = error as? ShaderRequestPublicationFailure {
-            guard failure.operationSequence >= publicationOperationSequence else { return }
-            publicationOperationSequence = failure.operationSequence
+            guard publicationGeneration == nil || failure.generation == publicationGeneration else { return }
+            guard failure.operationSequence > publicationResolvedSequence,
+                  failure.operationSequence >= (publicationFailureSequence ?? 0) else { return }
             publicationFailureSequence = failure.operationSequence
         } else { publicationFailureSequence = nil }
         setError(prefix + error.localizedDescription, from: .publication)
@@ -228,9 +253,9 @@ final class MacLibraryModel {
         testingReloadContinuation?.resume(); testingReloadContinuation = nil
     }
     #endif
-    func approve(_ id: UUID) { Task { do { try await server.approve(id) } catch { self.setError(error.localizedDescription, from: .server) } } }
+    func approve(_ id: UUID) { Task { do { try await server.approve(id); clearError(from: .approval) } catch { self.setError(error.localizedDescription, from: .approval) } } }
     func decline(_ id: UUID) { Task { await server.decline(id) } }
-    func revoke(_ id: String) { Task { do { try await server.revoke(id) } catch { self.setError(error.localizedDescription, from: .server) } } }
+    func revoke(_ id: String) { Task { do { try await server.revoke(id); clearError(from: .revocation) } catch { self.setError(error.localizedDescription, from: .revocation) } } }
 }
 
 struct ShaderLibrarySettings: View {
@@ -250,6 +275,10 @@ struct ShaderLibrarySettings: View {
                     Button("Rebuild Library", action: library.rebuildPublication)
                         .disabled(library.isReloading || library.requests.hasUnfinishedJobs)
                         .accessibilityIdentifier("rebuild-shader-library")
+                    if library.canCancelPreparation {
+                        Button("Cancel Library Preparation", action: library.cancelLibraryPreparation)
+                            .accessibilityIdentifier("cancel-library-preparation")
+                    }
                 }
                 HStack { Text(library.serverState.message); Spacer() }
                     .accessibilityElement(children: .combine).accessibilityIdentifier("shader-serving-status")

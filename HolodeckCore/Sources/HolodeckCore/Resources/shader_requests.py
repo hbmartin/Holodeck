@@ -14,14 +14,143 @@ import struct
 import re
 import stat
 import uuid
+import ctypes
+import time
 
 
 class OperationalError(RuntimeError):
     pass
 
 
+class ProcessRecoveryError(OperationalError):
+    pass
+
+
 class CandidateError(RuntimeError):
     pass
+
+
+class WorkspaceTypeError(CandidateError):
+    pass
+
+
+class WorkerInterrupted(BaseException):
+    pass
+
+
+def process_identity(pid):
+    """Birth identity shared with the native host; a PID alone is never ownership proof."""
+    if sys.platform == "darwin":
+        data = ctypes.create_string_buffer(136)  # Darwin proc_bsdinfo
+        library = ctypes.CDLL('/usr/lib/libproc.dylib')
+        if library.proc_pidinfo(pid, 3, 0, data, len(data)) != len(data):
+            return None
+        if struct.unpack_from('=I', data, 4)[0] == 5:  # zombie
+            return None
+        seconds, microseconds = struct.unpack_from('=QQ', data, 120)
+        return {"pid": pid, "seconds": seconds, "microseconds": microseconds}
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+        if fields[0] == 'Z': return None
+        return {"pid": pid, "seconds": int(fields[19]), "microseconds": 0}
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def group_members(pid):
+    listing = subprocess.run(['/bin/ps', '-axo', 'pid=,pgid='], capture_output=True, text=True, timeout=2)
+    return [identity for line in listing.stdout.splitlines() if len(parts := line.split()) == 2
+            and int(parts[1]) == pid and (identity := process_identity(int(parts[0]))) is not None]
+
+
+def merge_members(known, observed):
+    return list({(i['pid'], i['seconds'], i['microseconds']): i for i in known + observed}.values())
+
+
+def terminate_registered(directory):
+    file = Path(directory) / 'children.json'
+    if not file.exists(): return
+    try:
+        fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode): raise ValueError('Expected a regular process registry')
+            data = source.read(65537)
+            if len(data) > 65536: raise ValueError('Process registry exceeds its size limit')
+        entries = json.loads(data)
+        def valid(identity):
+            return isinstance(identity, dict) and all(type(identity.get(key)) is int for key in ('pid', 'seconds', 'microseconds')) and identity['pid'] > 1
+        if not isinstance(entries, list) or any(not isinstance(e, dict) or not valid(e.get('leader')) or not isinstance(e.get('members'), list) or not all(valid(i) for i in e['members']) for e in entries):
+            raise ValueError('Invalid process identities')
+    except (OSError, ValueError, TypeError) as error:
+        raise ProcessRecoveryError('Process registry is unreadable; retain the journal and recover or detach the checkout: ' + str(error)) from error
+    for entry in entries:
+        leader = entry['leader']
+        if process_identity(leader['pid']) == leader:
+            entry['members'] = merge_members(entry['members'], group_members(leader['pid']))
+    write(file, entries)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for entry in entries:
+            for identity in entry.get('members', [entry['leader']]):
+                if process_identity(identity['pid']) == identity:
+                    with contextlib.suppress(ProcessLookupError): os.kill(identity['pid'], sig)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if not any(process_identity(i['pid']) == i for e in entries for i in e.get('members', [e['leader']])):
+                for entry in entries:
+                    if group_members(entry['leader']['pid']):
+                        entry['unverified'] = True
+                        write(file, entries)
+                        raise ProcessRecoveryError('Unverified validation descendants remain; retain the journal and recover or detach the checkout')
+                file.unlink(missing_ok=True); return
+            time.sleep(.02)
+    raise ProcessRecoveryError('Validation processes did not exit; checkout recovery is required')
+
+
+def managed_run(args, cwd, env, timeout, input, text=True):
+    """Register a gated process group durably before any checker code can execute."""
+    directory = Path(env['HOLODECK_REQUEST_DIRECTORY'])
+    registry = directory / 'children.json'
+    if registry.exists(): terminate_registered(directory)
+    read_gate, write_gate = os.pipe()
+    bootstrap = 'import os,sys; gate=int(sys.argv[1]); go=os.read(gate,1); os.close(gate); go or sys.exit(125); os.execv(sys.argv[2],sys.argv[2:])'
+    process = None
+    try:
+        process = subprocess.Popen([sys.executable, '-I', '-c', bootstrap, str(read_gate), *args],
+            cwd=cwd, env=env, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text, start_new_session=True, pass_fds=(read_gate,))
+        identity = process_identity(process.pid)
+        if identity is None: raise OperationalError('Cannot establish validation process identity')
+        write(registry, [{'leader': identity, 'members': [identity]}])
+        members = [identity]
+        os.write(write_gate, b'1'); os.close(write_gate); write_gate = None
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                if process_identity(process.pid) == identity:
+                    members = merge_members(members, group_members(process.pid))
+                    write(registry, [{'leader': identity, 'members': members}])
+                remaining = deadline - time.monotonic()
+                if remaining <= 0: raise subprocess.TimeoutExpired(args, timeout)
+                try:
+                    stdout, stderr = process.communicate(input=input, timeout=min(.25, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    input = None
+        except BaseException:
+            terminate_registered(directory)
+            process.wait(timeout=5)
+            raise
+        # A checker must not leave a compiler/probe behind, even after a successful exit.
+        terminate_registered(directory)
+        return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+    finally:
+        os.close(read_gate)
+        if write_gate is not None: os.close(write_gate)
+        if process is not None and process.poll() is None:
+            process.kill(); process.wait(timeout=5)
+        if process is not None:
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                if pipe is not None: pipe.close()
 
 
 class VerificationError(CandidateError):
@@ -51,8 +180,11 @@ def digest(value):
 
 
 def run(args, cwd, env=None, timeout=600, check=True, input=None):
-    result = subprocess.run([str(a) for a in args], cwd=cwd, env=env, input=input,
-                            capture_output=True, text=True, timeout=timeout)
+    args = [str(a) for a in args]
+    if env and env.get('HOLODECK_REQUEST_DIRECTORY'):
+        result = managed_run(args, cwd, env, timeout, input)
+    else:
+        result = subprocess.run(args, cwd=cwd, env=env, input=input, capture_output=True, text=True, timeout=timeout)
     if result.stdout:
         emit("log", text=result.stdout[-32000:])
     if result.stderr:
@@ -77,6 +209,7 @@ class Worker:
         self.env = dict(os.environ, GIT_TERMINAL_PROMPT="0", HOLODECK_SHADER_TOOL=config["shaderTool"], PYTHONDONTWRITEBYTECODE="1")
         scratch = self.directory / "tmp"; scratch.mkdir(exist_ok=True)
         self.env["TMPDIR"] = str(scratch)
+        self.env['HOLODECK_REQUEST_DIRECTORY'] = str(self.directory)
         self.env["PATH"] = os.pathsep.join([str(Path(config["codex"]).parent), str(Path(config["python"]).parent),
                                              "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"])
         self.request = {}
@@ -91,8 +224,7 @@ class Worker:
         self.file_mode = self.git("config", "--bool", "core.fileMode", check=False).stdout.strip() != "false"
 
     def git(self, *args, check=True, raw=False):
-        result = subprocess.run([*self.git_arguments, *args], cwd=self.root, env=self.env,
-                                capture_output=True, text=not raw, timeout=60)
+        result = managed_run([*self.git_arguments, *args], self.root, self.env, timeout=60, input=None, text=not raw)
         if check and result.returncode:
             detail = result.stderr.decode("utf-8", errors="replace") if raw else result.stderr
             raise OperationalError("Git: " + detail[-4000:])
@@ -129,21 +261,58 @@ class Worker:
             if stat.S_ISLNK(info.st_mode):
                 link = os.readlink(leaf, dir_fd=parent)
                 return {"mode": "120000", "hash": digest(os.fsencode(link)), "link": link}
+            if not stat.S_ISREG(info.st_mode):
+                raise WorkspaceTypeError("Workspace path must be a regular file: " + name)
             fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             with os.fdopen(fd, "rb") as source:
                 info = os.fstat(source.fileno())
                 if not stat.S_ISREG(info.st_mode):
-                    raise OperationalError("Workspace path must be a regular file: " + name)
+                    raise WorkspaceTypeError("Workspace path must be a regular file: " + name)
                 hasher = hashlib.sha256()
                 for chunk in iter(lambda: source.read(65536), b""):
                     hasher.update(chunk)
                 return {"mode": "100755" if info.st_mode & stat.S_IXUSR else "100644", "hash": hasher.hexdigest()}
+
+    def read_workspace(self, name, limit=2097152):
+        with self.workspace_parent(name) as (parent, leaf):
+            fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            with os.fdopen(fd, 'rb') as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise WorkspaceTypeError('Publication input must be a regular file: ' + name)
+                data = source.read(limit + 1)
+                if len(data) > limit: raise CandidateError('Publication input exceeds size limit: ' + name)
+                return data
+
+    def quarantine_obstructions(self, names):
+        quarantine = self.gitdir / 'holodeck-recovery' / self.directory.name
+        for name in sorted(names):
+            parts = name.split('/')
+            fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                for index, part in enumerate(parts):
+                    try: info = os.stat(part, dir_fd=fd, follow_symlinks=False)
+                    except FileNotFoundError: break
+                    leaf = index == len(parts) - 1
+                    expected = stat.S_ISREG(info.st_mode) if leaf else stat.S_ISDIR(info.st_mode)
+                    if not expected:
+                        quarantine.mkdir(parents=True, exist_ok=True, mode=0o700)
+                        destination = quarantine / (str(uuid.uuid4()) + '-' + part)
+                        try: os.rename(part, destination, src_dir_fd=fd)
+                        except OSError as error:
+                            raise OperationalError('Cannot quarantine owned obstruction ' + name + '; files retained: ' + str(error)) from error
+                        write(destination.with_name(destination.name + '.json'), {'originalPath': '/'.join(parts[:index + 1])})
+                        break
+                    if not leaf:
+                        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                        os.close(fd); fd = child
+            finally: os.close(fd)
 
     def clean(self, revision=None):
         # Only tracked and non-ignored candidate files belong to host cleanup.
         if self.owner.exists() and str(json.loads(self.owner.read_text()).get("id")).lower() == str(self.request.get("id")).lower():
             others = self.git("ls-files", "--others", "--exclude-standard", "-z").split("\0")
             raw_changes = self.raw_workspace_changes()
+            self.quarantine_obstructions(raw_changes | set(filter(None, others)))
             self.git("reset", "--hard", revision or self.checkpoint.get("base", "HEAD"))
             # Git can consider a filter-hidden edit clean even with checkout --force.
             # Remove those owned files first so checkout must reconstruct their bytes.
@@ -152,10 +321,12 @@ class Worker:
                     with self.workspace_parent(name) as (parent, leaf): os.unlink(leaf, dir_fd=parent)
                 except FileNotFoundError: pass
             self.git("checkout-index", "--all", "--force")
+            tracked = set(filter(None, self.git('ls-files', '-z').split('\0')))
             for name in filter(None, others):
-                with self.workspace_parent(name) as (parent, leaf):
-                    try: os.unlink(leaf, dir_fd=parent)
-                    except FileNotFoundError: pass
+                if name in tracked or any(path.startswith(name + '/') for path in tracked): continue
+                try:
+                    with self.workspace_parent(name) as (parent, leaf): os.unlink(leaf, dir_fd=parent)
+                except (FileNotFoundError, NotADirectoryError): pass
             self.owner.unlink(missing_ok=True)
 
     def park(self):
@@ -249,14 +420,14 @@ class Worker:
         return hashlib.new(self.object_format, b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
 
     def publication_inputs(self):
-        index = json.loads((self.root / "index.json").read_text())
+        index = json.loads(self.read_workspace('index.json'))
         paths = {"index.json"}
         for sid in index["shaders"]:
             if not isinstance(sid, str) or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", sid) is None:
                 raise CandidateError("Invalid indexed shader ID")
             folder = f"shaders/{sid}/"
             paths.update((folder + "metadata.json", folder + "body.metal"))
-            metadata = json.loads((self.root / folder / "metadata.json").read_text())
+            metadata = json.loads(self.read_workspace(folder + 'metadata.json'))
             shared = metadata["shared"]
             if shared not in (["common", "fragment"], ["common", "material", "fragment"]):
                 raise CandidateError("Invalid shared declaration: " + sid)
@@ -291,7 +462,11 @@ class Worker:
                     current = self.workspace_record(name)
                     if not self.file_mode: current["mode"] = original["mode"]
                     differs = any(current[key] != original[key] for key in ("hash", "mode"))
-                except FileNotFoundError:
+                except (FileNotFoundError, NotADirectoryError, WorkspaceTypeError):
+                    differs = True
+                except OSError as error:
+                    # O_NOFOLLOW rejects a symlinked parent before it can be traversed.
+                    if error.errno not in (1, 20, 40, 62): raise
                     differs = True
                 if differs: changed.add(name)
         return changed
@@ -312,7 +487,7 @@ class Worker:
             if name in tree and name not in changed:
                 record["oid"] = tree[name]["oid"]
             else:
-                record["oid"] = self.blob_oid((self.root / name).read_bytes())
+                record["oid"] = self.blob_oid(os.fsencode(record['link']) if 'link' in record else self.read_workspace(name, limit=16777216))
             manifest[name] = record
         self.require_publication_inputs(manifest)
         return manifest
@@ -575,17 +750,15 @@ An unchanged existing shader may be successful if it already satisfies the promp
 
     def technical(self, baseline=False, commands=None):
         self.stage("validating", "Compiling macOS and tvOS shaders and running authoring/GPU tests")
-        env = dict(self.env, HOLODECK_GPU_TESTS="1")
-        commands = commands or [[self.config["shaderTool"], "library", "validate", str(self.root), "--gpu", "--python", self.config["python"]]]
+        commands = commands or [[self.config["shaderTool"], "library", "validate", str(self.root), phase, "--python", self.config["python"]]
+                                for phase in ('--compile', '--gpu-only')]
         for command in commands:
             try:
-                result = run(command, self.root, env, check=False)
+                result = run(command, self.root, self.env, timeout=600, check=False)
             except subprocess.TimeoutExpired as error:
                 if baseline: raise OperationalError("Baseline validation timed out") from error
                 raise VerificationError("Candidate validation timed out", command=command) from error
             if result.returncode:
-                if result.returncode == 2:
-                    raise OperationalError("Checker tooling is unavailable: " + (result.stdout + result.stderr)[-12000:])
                 message = (result.stdout + result.stderr)[-12000:] or f"Validation exited {result.returncode}"
                 if baseline:
                     raise OperationalError("Baseline or host validation failed: " + message)
@@ -713,7 +886,9 @@ An unchanged existing shader may be successful if it already satisfies the promp
 
     def prepare_current(self):
         with (self.gitdir / "holodeck-requests.lock").open("w") as lease:
-            fcntl.flock(lease, fcntl.LOCK_EX)
+            try: fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise OperationalError('Checkout is busy in another process; retry after it finishes.') from error
             if self.owner.exists(): raise OperationalError("An owned request must be recovered before rebuilding the library")
             if self.git("branch", "--show-current").strip() != "main" or self.git("status", "--porcelain", "--untracked-files=all").strip():
                 raise OperationalError("Rebuilding requires a clean main checkout; no files or branches have been changed")
@@ -855,7 +1030,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
             if detached and detached.get("checkoutID"):
                 matches = matches and identity == detached["checkoutID"]
             if not matches:
-                raise OperationalError("An owned checkout must be cleaned or explicitly detached before setup")
+                raise OperationalError("Restore the owned checkout's original path, or select a fresh clean checkout. Owned work must be cleaned or explicitly detached before setup.")
         self.git_tree("HEAD")
         if self.git("rev-parse", "--show-toplevel").strip() != str(self.root):
             raise OperationalError("Choose the repository root")
@@ -870,11 +1045,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
                 raise OperationalError("Configure Git " + key)
         run([self.config["codex"], "--version"], self.root, self.env)
         run([self.config["codex"], "login", "status"], self.root, self.env)
-        run([self.config["python"], "--version"], self.root, self.env)
-        compatibility = run([self.config["python"], "-I", "-c",
-                             "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)"],
-                            self.root, self.env, timeout=5, check=False)
-        if compatibility.returncode:
+        if sys.version_info < (3, 9):
             raise OperationalError("The shader checker requires Python 3.9 or later; choose a supported interpreter.")
         run([self.config["shaderTool"], "--version"], self.root, self.env)
         for sdk in ("appletvos", "macosx"):
@@ -887,10 +1058,10 @@ An unchanged existing shader may be successful if it already satisfies the promp
         info = run([self.config["shaderTool"], "library", "info", "--json", "--python", self.config["python"]], self.root, self.env)
         try:
             checker = json.loads(info.stdout)
-            if checker["interfaceVersion"] != 1 or not checker["checkerVersion"].startswith("1."):
+            if not isinstance(checker, dict) or type(checker.get('interfaceVersion')) is not int or checker['interfaceVersion'] != 1 or not isinstance(checker.get('checkerVersion'), str) or not checker['checkerVersion'].startswith('1.'):
                 raise ValueError("incompatible interface")
-            configuration = self.root / "authoring.json"
-            if configuration.is_symlink() or json.loads(configuration.read_bytes()).get("schemaVersion") != 1:
+            configuration = json.loads(self.read_workspace('authoring.json'))
+            if not isinstance(configuration, dict) or type(configuration.get('schemaVersion')) is not int or configuration['schemaVersion'] != 1:
                 raise ValueError("missing authoring schema 1")
         except (ValueError, TypeError, KeyError, OSError) as error:
             raise OperationalError("Update Holodeck and the shader library together before enabling requests: " + str(error)) from error
@@ -917,6 +1088,10 @@ def main():
     with contextlib.suppress(PermissionError):
         os.setsid()
     config = json.loads(Path(sys.argv[2]).read_text())
+    def interrupted(signum, frame):
+        raise WorkerInterrupted(signum)
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
     worker = None
     try:
         worker = Worker(config, sys.argv[3])
@@ -928,8 +1103,11 @@ def main():
             worker.discard()
         else:
             worker.perform()
+    except WorkerInterrupted:
+        terminate_registered(sys.argv[3])
+        sys.exit(130)
     except BaseException as error:
-        if worker and worker.request:
+        if worker and worker.request and not isinstance(error, ProcessRecoveryError):
             # A lost push acknowledgement is reconciled before any destructive cleanup.
             published = False
             sha = worker.checkpoint.get("commitSHA")

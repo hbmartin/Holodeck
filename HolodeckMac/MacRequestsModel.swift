@@ -12,13 +12,15 @@ final class MacRequestsModel {
     var message = "Configure Codex and enable requests."
     var error: String?
     var onPublication: (@MainActor (ShaderRequestPublicationStatus) -> Void)?
-    var onPublicationOperation: (@MainActor (ShaderRequestPublicationOperationStatus) -> Void)?
+    var onPublicationEvent: (@MainActor (ShaderRequestPublicationEvent) -> Void)?
     let service: ShaderRequestService
     let directory: URL
     @ObservationIgnored private let defaults: UserDefaults?
     @ObservationIgnored private var observation: Task<Void, Never>?
+    @ObservationIgnored private var publicationObservation: Task<Void, Never>?
+    @ObservationIgnored private var pendingRepository: URL?
+    @ObservationIgnored private var didInitialize = false
     @ObservationIgnored private var publicationSequence: UInt64?
-    @ObservationIgnored private var publicationOperationSequence: UInt64?
     @ObservationIgnored private var initialization: Task<Void, Error>?
 
     init(catalog: DirectoryCatalog, defaults: UserDefaults?, namespace: String?) {
@@ -62,34 +64,45 @@ final class MacRequestsModel {
                 self.jobs = jobs
                 self.pendingCleanup = await service.hasPendingCleanup()
                 self.recoveries = await service.recoveryStatuses()
-                let operation = await service.publicationOperationStatus()
-                if operation.sequence != self.publicationOperationSequence {
-                    self.publicationOperationSequence = operation.sequence; self.onPublicationOperation?(operation)
-                }
-                if let status = await service.publicationStatus(), status.sequence != self.publicationSequence {
+            }
+        }
+        publicationObservation = Task { [weak self] in
+            try? await initialization.value
+            var generation: UUID?
+            for await event in await service.publicationUpdates() {
+                guard let self else { break }
+                if generation != event.generation { generation = event.generation; self.publicationSequence = nil }
+                self.onPublicationEvent?(event)
+                if let status = event.publication, status.sequence != self.publicationSequence {
                     self.publicationSequence = status.sequence; self.onPublication?(status)
                 }
             }
         }
     }
-    isolated deinit { observation?.cancel() }
+    isolated deinit { observation?.cancel(); publicationObservation?.cancel() }
     func initialized() async throws {
         try await initialization?.value
+        guard !didInitialize else { return }
+        if let pendingRepository { try await service.selectRepository(pendingRepository); self.pendingRepository = nil }
         configuration = await service.configurationValue()
+        didInitialize = true
     }
     var hasUnfinishedJobs: Bool { pendingCleanup || jobs.contains { !$0.stage.terminal } }
     func setRepository(_ url: URL) {
         guard !configuration.enabled, !hasUnfinishedJobs else { return }
         configuration.repository = url.path; configuration.checkoutID = nil; save()
+        pendingRepository = url
     }
     private func save() { defaults?.set(try? JSONEncoder().encode(configuration), forKey: "holodeck.requestConfiguration") }
     func verify() {
         guard !checking else { return }
         checking = true; error = nil; message = "Checking tools, Git access, model and image review…"
-        let candidate = configuration
         Task {
             defer { checking = false }
             do {
+                try await initialized()
+                if let pendingRepository { try await service.selectRepository(pendingRepository); self.pendingRepository = nil }
+                let candidate = configuration
                 try await service.verify(configuration: candidate)
                 configuration = await service.configurationValue()
                 save(); message = "Ready for shader requests"

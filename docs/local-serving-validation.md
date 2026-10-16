@@ -315,3 +315,31 @@ Commands: `python3 -B tools/test_shader_requests.py`; focused `swift test --pack
 Logs: `/tmp/holodeck-recovery-worker.log`, `/tmp/holodeck-recovery-focused.log`, `/tmp/holodeck-recovery-native-error.log`, `/tmp/holodeck-recovery-core-final.log`, `/tmp/holodeck-recovery-mac-ui-final.log`, `/tmp/holodeck-recovery-tv-tests.log`, and `/tmp/holodeck-recovery-{mac,tv}-final-build.log`.
 
 The 11 skipped core checks are three profiling tests (`HOLODECK_PROFILE`), one live Bonjour/TLS test (`HOLODECK_LAN_TEST`), two supplied-authoring tests (`HOLODECK_AUTHORING_FIXTURE`), one real Codex publication test (`HOLODECK_REQUEST_FIXTURE_CONFIG`), and four GPU opt-ins (`HOLODECK_GPU_TESTS`). Physical-device testing was not rerun. No merge or deployment is included.
+
+
+## Shader request reliability acceptance — 2026-10-16
+
+Worker teardown now has a five-second graceful deadline and a five-second escalation deadline, independent pipe drains, process birth identities and durable validation descendant evidence. Cleanup quarantines owned type obstructions before restoring tracked files. Publication metadata rejects links and special files; checkout-lock contention fails promptly. A teardown failure retains its journal and prevents checkout reuse.
+
+Recovery uses operation-owned maintenance leases and the exact failed journal/configuration. Canonical original paths and compatible known IDs define one checkout. This supersedes earlier acceptance notes permitting owned-checkout relocation: restore its original location or detach it and select a fresh clean checkout. Verification persists the canonical path, so retargeting a selected alias cannot relocate ownership. Historical detached records without live ownership proof do not disable an enabled checkout. Failed reconciliation refuses new TV submissions while retaining accepted jobs.
+
+Publication uses a dedicated immutable event stream. Failures survive a subsequent preparing state and resolve after successful publication, verification or detachment. Cancel Library Preparation settles manual and automatic callers without cancelling queued requests. Renderer failures are classified before requesting source repair, and 60.02 Hz now selects a 30 fps cadence.
+
+The bundled checker is the published [v1.1.0 artifact](https://github.com/hbmartin/HolodeckShaderCheck/releases/tag/v1.1.0), source commit `0a430fefc522bc462a9369abd7a92d255f534f13`, SHA-256 `191c0f276d724202dc78bfcd5bd042d9e651b6886db57c3901bd8ca3d4bea537`. The downloaded release checksums and lock were verified. Compilation and GPU-only validation each receive 600 seconds; candidate nonzero exits, signals and timeouts repeat the same stage on pristine baseline. Compiler probes occur once per SDK with 30 seconds, and each compilation has 60 seconds. The native wrapper replaces itself with isolated configured Python.
+
+| Check | Result |
+| --- | --- |
+| Python worker suite | 60 passed. Includes tracked directory/FIFO/symlink-parent quarantine, ignored/external evidence preservation, metadata FIFOs, symlink blob IDs, immediate lock contention, stage budgets, exit-2 baseline classification and actual descendant timeout termination. |
+| Full core suite | 253 executed, five explicit opt-in skips, zero failures with `HOLODECK_AUTHORING_FIXTURE` and `HOLODECK_GPU_TESTS=1`. Includes a real native-wrapper timeout and signal test, a valid isolated-checker canary with checkout Python and ignored bytecode, orphan birth-identity verification and unrecorded-descendant evidence retention. |
+| Publication/recovery races | Deterministic gates and bounded polling cover detach, overlapping work, active cancellation and stale completion. Failure/preparing/success delivery and active publication cancellation each repeat ten times. |
+| Canonical ownership | Three focused final tests passed for setup interruption, detached alias reuse and persistent original-path binding after alias retargeting. |
+| Mac recovery/publication UI | Five passed: automatic failure/retry, unrelated bookmark-error preservation, immediate lock contention/rebuild, unmanaged bookmark initialization and deferred startup selection errors. |
+| Real Mac authoring/GPU integration | Both supplied-authoring core tests and four native GPU regressions passed. All 23 indexed scenes compiled, rendered and animated. Checker validation passed for 66 assets and seven GPU profiles; the packaged app CLI also passed GPU-only validation. |
+| Checker release | 73 local tests passed with real-library and GPU integration. Linux Python 3.9 and 3.15 CI and the tagged release pipeline passed, including library integration and packaged artifact verification. |
+| App builds | Mac app packaging and generic tvOS device compilation passed. The required checker resource bundle is asserted during packaging; dependency bundles remain included. |
+
+Commands include `python3 -m unittest discover -s tools -p test_shader_requests.py`; `HOLODECK_AUTHORING_FIXTURE=/absolute/library HOLODECK_GPU_TESTS=1 swift test --package-path HolodeckCore`; focused ownership tests; the five selected `HolodeckMacUITests` through `xcodebuild test`; `xcodebuild build` for HolodeckMac and generic tvOS with signing disabled; checker `tools/run_tests.py --gpu`; and separate actual `library validate ROOT --compile` and `--gpu-only` commands.
+
+Local logs: `/tmp/worker-reliability-final-3.log`, `/tmp/holodeck-full-integration-final.log`, `/tmp/holodeck-canonical-ownership-final.log`, `/tmp/holodeck-mac-ui-tests-final.log`, `/tmp/holodeck-mac-package-verified.log`, `/tmp/holodeck-tv-build.log`, `/tmp/checker-complete-integration.log`, `/tmp/checker-metal-validation.log`, `/tmp/checker-gpu-validation.log` and `/tmp/holodeck-packaged-checker-gpu.log`.
+
+The remaining five core skips are three profiling checks, live LAN/TLS and real Codex publication. Physical-device and tvOS simulator execution were not performed; the installed CoreSimulator runtime is incompatible with this Xcode. Bulk hashing optimization, checksum-to-execution hardening and automatic checkout relocation remain excluded.

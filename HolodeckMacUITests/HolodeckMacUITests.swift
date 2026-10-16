@@ -187,7 +187,7 @@ final class HolodeckMacUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [idle], timeout: 15), .completed)
     }
 
-    func testPublicationRecoveryAutomaticallyRetriesAndPreservesErrorWhilePreparing() throws {
+    func testPublicationRecoveryReportsLockContentionAndExplicitRebuildRecovers() throws {
         let f = try managedRecoveryFixture(), app = f.app
         let lease = open(f.authoring.appendingPathComponent(".git/holodeck-requests.lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
         XCTAssertGreaterThanOrEqual(lease, 0); XCTAssertEqual(flock(lease, LOCK_EX | LOCK_NB), 0)
@@ -199,9 +199,9 @@ final class HolodeckMacUITests: XCTestCase {
         XCTAssertTrue(element("rebuild-shader-library", in: app).isEnabled)
         try FileManager.default.removeItem(at: f.marker)
         app.buttons["Retry Recovery"].firstMatch.click()
-        XCTAssertTrue(element("shader-library-reloading", in: app).waitForExistence(timeout: 15))
-        waitForLibraryError("needs checkout recovery", in: app)
+        waitForLibraryError("Checkout is busy in another process", in: app); waitForLibraryIdle(in: app)
         XCTAssertEqual(flock(lease, LOCK_UN), 0)
+        element("rebuild-shader-library", in: app).click()
         waitForTitle(f.name, in: app); waitForLibraryIdle(in: app)
         XCTAssertFalse(element("shader-library-error", in: app).exists)
     }
@@ -222,6 +222,24 @@ final class HolodeckMacUITests: XCTestCase {
         rebuild.click()
         waitForTitle(f.name, in: app); waitForLibraryIdle(in: app)
         XCTAssertFalse(element("shader-library-error", in: app).exists)
+    }
+
+    func testUnmanagedBookmarkSelectionSurvivesRequestInitialization() throws {
+        let f = try managedRecoveryFixture(), app = f.app
+        try FileManager.default.removeItem(at: f.marker)
+        let preferences = f.marker.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("preferences.json")
+        var config = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: preferences)) as? [String: Any])
+        let previous = try authoringFolderWithInvalidShader()
+        config["enabled"] = false; config["repository"] = previous.path
+        try JSONSerialization.data(withJSONObject: config).write(to: preferences)
+        app.launchEnvironment["HOLODECK_UI_TEST_SHADER_BOOKMARK"] = try f.authoring.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil).base64EncodedString()
+        app.launch(); app.activate()
+        let settings = element("shader-library-settings", in: app)
+        XCTAssertTrue(settings.waitForExistence(timeout: 15)); settings.click()
+        waitForTitle(f.name, in: app); waitForLibraryIdle(in: app)
+        let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: preferences)) as? [String: Any])
+        let repository = URL(fileURLWithPath: try XCTUnwrap(saved["repository"] as? String))
+        XCTAssertEqual(repository.resolvingSymlinksInPath(), f.authoring.resolvingSymlinksInPath())
     }
 
     func testAutomaticPublicationRecoveryPreservesUnrelatedBookmarkError() throws {

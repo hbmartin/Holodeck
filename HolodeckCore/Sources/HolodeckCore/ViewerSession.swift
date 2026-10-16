@@ -33,6 +33,7 @@ public final class ViewerSession {
     public enum SelectionResult: Sendable, Equatable {
         case activated, superseded, cancelled, unavailable
         case failed(String)
+        case temporarilyUnavailable(String)
     }
     public enum RefreshResult: Sendable, Equatable { case checked, skipped, cancelled; case failed(String) }
     public private(set) var refreshResult: RefreshResult = .skipped
@@ -284,7 +285,9 @@ public final class ViewerSession {
                 }
                 guard self.generation == request else { return }
                 self.pendingSelection = nil
-                self.lastSelectionResult = (request, error is CancellationError ? .cancelled : .failed(error.localizedDescription))
+                let result: SelectionResult = error is CancellationError ? .cancelled :
+                    (ShaderCompilationError.isSourceDefect(error) ? .failed(error.localizedDescription) : .temporarilyUnavailable(error.localizedDescription))
+                self.lastSelectionResult = (request, result)
                 self.selectionDiagnostic = error.localizedDescription
                 if self.activeShader == nil { self.requiresExplicitSelection = true }
                 if origin != .update || !self.hasUserSelectionFailure {

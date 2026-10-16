@@ -93,7 +93,7 @@ if args == ['--version']:
 if args[:2] == ['library', 'info']:
     print(json.dumps({'interfaceVersion':1,'checkerVersion':'1.0.0'})); raise SystemExit(0)
 if args[:2] == ['library', 'validate']:
-    assert '--gpu' in args and '--python' in args
+    assert ('--compile' in args or '--gpu-only' in args) and '--python' in args
     fixture = Path('.fixture-validation.json')
     config = json.loads(fixture.read_text()) if fixture.exists() else {}
     if config.get('fail') or (config.get('outage') and Path(config['outage']).exists()): raise SystemExit(1)
@@ -679,7 +679,7 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         code,events=self.run_worker(mode='publication');self.assertNotEqual(code,0)
         self.assertEqual((self.root/'shaders/alpha/body.metal').read_text(),'dirty')
 
-    def test_bootstrap_waits_for_temporary_checkout_lease(self):
+    def test_bootstrap_refuses_temporary_checkout_lease(self):
         entered=self.base/'lease-entered'
         wrapper=self.base/'blocked-publication.py'
         wrapper.write_text(f"""import importlib.util,sys
@@ -701,11 +701,10 @@ worker.main()
             deadline=time.monotonic()+5
             while not entered.exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(.005)
             self.assertTrue(entered.exists())
-            self.assertIsNone(process.poll())
+            stdout,stderr=process.communicate('{"ok":true}\n',timeout=5)
+            self.assertNotEqual(process.returncode,0,stdout+stderr)
+            self.assertIn('Checkout is busy in another process',stdout)
             fcntl.flock(lease,fcntl.LOCK_UN)
-        stdout,stderr=process.communicate('{"ok":true}\n',timeout=10)
-        self.assertEqual(process.returncode,0,stdout+stderr)
-        self.assertIn('publicationReady',stdout)
 
     def test_clean_filter_cannot_hide_a_forbidden_workspace_edit(self):
         original=(self.root/'tools/library.py').read_text()
@@ -759,14 +758,16 @@ worker.main()
         (self.root/'authoring.json').write_text('{"schemaVersion":1,"schemaVersion":2}')
         with self.assertRaises(worker_module.CandidateError):worker.scope()
 
-    def test_unavailable_checker_is_operational_and_checkout_code_is_never_executed(self):
+    def test_candidate_checker_exit_two_requires_baseline_classification(self):
         worker=worker_module.Worker(self.config,self.job);worker.request=self.request;worker.save(base=self.base_sha)
         marker=self.base/'executed'
         (self.root/'tools/library.py').write_text('from pathlib import Path\nPath('+repr(str(marker))+').touch()\n')
         worker.technical(baseline=True)
         self.assertFalse(marker.exists())
         self.tool.write_text(TOOL.replace("if args[:2] == ['library', 'validate']:", "if args[:2] == ['library', 'validate']: raise SystemExit(2)\nif False:"))
-        with self.assertRaisesRegex(worker_module.OperationalError,'tooling is unavailable'):worker.technical()
+        with self.assertRaises(worker_module.VerificationError) as failure:worker.technical()
+        with self.assertRaisesRegex(worker_module.OperationalError,'Baseline or host validation failed'):
+            worker.classify_verification_failure(failure.exception)
 
     def test_attribution_checkout_conversion_fails_before_codex(self):
         file=self.root/'authoring.json';file.write_text(file.read_text()+'\n')
@@ -790,9 +791,90 @@ worker.main()
                 self.assertFalse(kwargs['check'])
                 return subprocess.CompletedProcess(command,1,'','')
             return subprocess.CompletedProcess(command,0,'','')
-        with patch.object(worker_module,'run',side_effect=incompatible):
+        with patch.object(worker_module,'run',side_effect=incompatible), patch.object(worker_module.sys,'version_info',(3,8,0)):
             with self.assertRaisesRegex(worker_module.OperationalError,'Python 3.9 or later'):worker.preflight()
         self.assertFalse(any('info' in command for command in calls))
         self.assertEqual(json.loads(worker.owner.read_text()),owner)
+
+    def test_cleanup_quarantines_type_changes_and_preserves_external_targets(self):
+        for kind in ('directory', 'fifo', 'link', 'parent-link'):
+            with self.subTest(kind=kind):
+                worker=worker_module.Worker(self.config,self.job);worker.request=self.request;worker.save(base=self.base_sha)
+                worker_module.write(worker.owner,{'id':self.request['id'],'directory':str(self.job)})
+                worker_module.write(self.job/'baseline-workspace.json',worker.candidate_manifest(compare_baseline=False))
+                source=self.root/'shaders/alpha/body.metal'
+                outside=self.base/('outside-'+kind);outside.mkdir();(outside/'kept').write_text('preserved')
+                if kind=='parent-link':
+                    shutil.rmtree(source.parent);source.parent.symlink_to(outside,target_is_directory=True)
+                else:
+                    source.unlink()
+                    if kind=='directory':source.mkdir();(source/'kept').write_text('preserved')
+                    elif kind=='fifo':os.mkfifo(source)
+                    else:source.symlink_to(outside/'kept')
+                worker.clean()
+                self.assertEqual(source.read_text(),'ALPHA\n')
+                self.assertEqual((outside/'kept').read_text(),'preserved')
+                self.assertFalse(worker.owner.exists())
+                self.assertTrue(list((worker.gitdir/'holodeck-recovery'/self.job.name).glob('*.json')))
+
+    def test_publication_rejects_fifo_and_symlink_metadata_without_reading(self):
+        worker=worker_module.Worker(self.config,self.job)
+        metadata=self.root/'shaders/alpha/metadata.json';original=metadata.read_bytes()
+        for kind in ('fifo','link'):
+            metadata.unlink()
+            if kind=='fifo':os.mkfifo(metadata)
+            else:metadata.symlink_to(self.root/'index.json')
+            started=time.monotonic()
+            with self.assertRaises((worker_module.CandidateError,OSError)):worker.publication_inputs()
+            self.assertLess(time.monotonic()-started,1)
+            metadata.unlink();metadata.write_bytes(original)
+
+    def test_symlink_manifest_hashes_link_bytes(self):
+        worker=worker_module.Worker(self.config,self.job);worker.save(base=self.base_sha)
+        link=self.root/'safe-link';link.symlink_to(self.base/'missing-outside')
+        record=worker.candidate_manifest()['safe-link']
+        self.assertEqual(record['oid'],worker.blob_oid(os.fsencode(str(self.base/'missing-outside'))))
+
+    def test_publication_lock_contention_is_immediate_and_actionable(self):
+        worker=worker_module.Worker(self.config,self.job)
+        with (worker.gitdir/'holodeck-requests.lock').open('w') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            started=time.monotonic()
+            with self.assertRaisesRegex(worker_module.OperationalError,'Checkout is busy in another process'):worker.prepare_current()
+            self.assertLess(time.monotonic()-started,1)
+
+    def test_validation_stages_have_independent_budgets_and_exit_two_reprobes_same_stage(self):
+        worker=self.ignored_worker();(self.root/'shaders/alpha/body.metal').write_text('EDIT\n')
+        calls=[]
+        def validate(command,*args,**kwargs):
+            phase='--gpu-only' if '--gpu-only' in command else '--compile'
+            text=(self.root/'shaders/alpha/body.metal').read_text()
+            calls.append((phase,kwargs['timeout'],text))
+            return subprocess.CompletedProcess(command,2 if phase=='--gpu-only' and text=='EDIT\n' else 0,'candidate probe timed out','')
+        with patch.object(worker_module,'run',side_effect=validate):
+            with self.assertRaises(worker_module.VerificationError) as failure:worker.technical()
+            worker.classify_verification_failure(failure.exception)
+        self.assertEqual([(c[0],c[1]) for c in calls],[('--compile',600),('--gpu-only',600),('--gpu-only',600)])
+        self.assertEqual(calls[-1][2],'ALPHA\n')
+        self.assertEqual((self.root/'shaders/alpha/body.metal').read_text(),'EDIT\n')
+
+    def test_validation_timeout_terminates_descendants_and_removes_registry(self):
+        worker=worker_module.Worker(self.config,self.job)
+        child_pid=self.base/'probe-pid'
+        script='import subprocess,sys,time;from pathlib import Path;p=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"]);Path(sys.argv[1]).write_text(str(p.pid));time.sleep(60)'
+        with self.assertRaises(subprocess.TimeoutExpired):
+            worker_module.run([sys.executable,'-c',script,str(child_pid)],self.root,worker.env,timeout=.5)
+        self.assertIsNone(worker_module.process_identity(int(child_pid.read_text())))
+        self.assertFalse((self.job/'children.json').exists())
+
+    def test_process_registry_rejects_special_files_and_malformed_identities(self):
+        registry=self.job/'children.json'
+        for value in ('fifo','{}','[{"leader":{"pid":1},"members":[]}]'):
+            if value=='fifo':os.mkfifo(registry)
+            else:registry.write_text(value)
+            started=time.monotonic()
+            with self.assertRaises(worker_module.ProcessRecoveryError):worker_module.terminate_registered(self.job)
+            self.assertLess(time.monotonic()-started,1)
+            registry.unlink()
 
 if __name__=='__main__': unittest.main()
