@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import XCTest
 
 private enum MacUITestSettings {
@@ -139,6 +140,102 @@ final class HolodeckMacUITests: XCTestCase {
         let recovered = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: retry)
         XCTAssertEqual(XCTWaiter.wait(for: [recovered], timeout: 10), .completed)
         XCTAssertTrue(element("choose-shader-folder", in: app).isEnabled)
+    }
+
+    private func managedRecoveryFixture() throws -> (app: XCUIApplication, authoring: URL, marker: URL, name: String, source: Data) {
+        let authoring = try authoringFolderWithInvalidShader()
+        let fixtureURL = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "CatalogFixture", withExtension: "json", subdirectory: "TestSupport"))
+        let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: fixtureURL)) as? [String: Any])
+        let sources = try XCTUnwrap(fixture["sources"] as? [String: String]), source = try XCTUnwrap(sources["plasma"]).data(using: .utf8)!
+        try source.write(to: authoring.appendingPathComponent("shaders/plasma/body.metal"))
+        for arguments in [["init", "--quiet", "-b", "main"], ["add", "--all"],
+                          ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "UI fixture"]] {
+            // /usr/bin/git invokes xcrun, which is unavailable in the sandboxed UI runner.
+            let developer = ProcessInfo.processInfo.environment["DEVELOPER_DIR"] ?? "/Applications/Xcode.app/Contents/Developer"
+            let git = Process(), errors = Pipe()
+            git.executableURL = URL(fileURLWithPath: developer).appendingPathComponent("usr/bin/git")
+            git.arguments = ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"] + arguments
+            git.environment = ProcessInfo.processInfo.environment.merging(["GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"]) { _, new in new }
+            git.currentDirectoryURL = authoring; git.standardOutput = Pipe(); git.standardError = errors
+            try git.run(); git.waitUntilExit()
+            guard git.terminationStatus == 0 else {
+                throw TestHelperError(description: "Fixture git \(arguments): " + String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
+            }
+        }
+        let suite = "HolodeckMacUITests-" + UUID().uuidString, directory = requestDirectory(suite: suite)
+        let setup = directory.appendingPathComponent("setup")
+        try FileManager.default.createDirectory(at: setup, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let marker = setup.appendingPathComponent("process.json")
+        try Data("{}".utf8).write(to: marker)
+        let config: [String: Any] = ["repository": authoring.path, "codex": "/unavailable/codex", "python": "/usr/bin/python3", "git": "/usr/bin/git",
+            "shaderTool": "", "model": "fixture", "reasoning": "high", "enabled": true]
+        try JSONSerialization.data(withJSONObject: config).write(to: directory.appendingPathComponent("preferences.json"))
+        let app = try app(suite: suite, arguments: ["--ui-test-local-library"])
+        let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: authoring.appendingPathComponent("shaders/plasma/metadata.json"))) as? [String: Any])
+        return (app, authoring, marker, metadata["name"] as! String, source)
+    }
+    private func waitForLibraryError(_ text: String, in app: XCUIApplication) {
+        let error = element("shader-library-error", in: app)
+        let expected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", text, text), object: error)
+        let result = XCTWaiter.wait(for: [expected], timeout: 15)
+        XCTAssertEqual(result, .completed, "Expected \(text); observed: \(error.exists ? String(describing: error.value) + " / " + error.label : app.debugDescription)")
+    }
+    private func waitForLibraryIdle(in app: XCUIApplication) {
+        let spinner = element("shader-library-reloading", in: app)
+        let idle = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: spinner)
+        XCTAssertEqual(XCTWaiter.wait(for: [idle], timeout: 15), .completed)
+    }
+
+    func testPublicationRecoveryAutomaticallyRetriesAndPreservesErrorWhilePreparing() throws {
+        let f = try managedRecoveryFixture(), app = f.app
+        let lease = open(f.authoring.appendingPathComponent(".git/holodeck-requests.lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        XCTAssertGreaterThanOrEqual(lease, 0); XCTAssertEqual(flock(lease, LOCK_EX | LOCK_NB), 0)
+        defer { flock(lease, LOCK_UN); close(lease) }
+        app.launch(); app.activate()
+        let settings = element("shader-library-settings", in: app)
+        XCTAssertTrue(settings.waitForExistence(timeout: 15)); settings.click()
+        waitForLibraryError("needs checkout recovery", in: app); waitForLibraryIdle(in: app)
+        XCTAssertTrue(element("rebuild-shader-library", in: app).isEnabled)
+        try FileManager.default.removeItem(at: f.marker)
+        app.buttons["Retry Recovery"].firstMatch.click()
+        XCTAssertTrue(element("shader-library-reloading", in: app).waitForExistence(timeout: 15))
+        waitForLibraryError("needs checkout recovery", in: app)
+        XCTAssertEqual(flock(lease, LOCK_UN), 0)
+        waitForTitle(f.name, in: app); waitForLibraryIdle(in: app)
+        XCTAssertFalse(element("shader-library-error", in: app).exists)
+    }
+
+    func testAutomaticPublicationFailureEndsSpinnerAndExplicitRetryRecovers() throws {
+        let f = try managedRecoveryFixture(), app = f.app
+        app.launch(); app.activate()
+        let settings = element("shader-library-settings", in: app)
+        XCTAssertTrue(settings.waitForExistence(timeout: 15)); settings.click()
+        waitForLibraryError("needs checkout recovery", in: app); waitForLibraryIdle(in: app)
+        try Data("dirty checkout".utf8).write(to: f.authoring.appendingPathComponent("shaders/plasma/body.metal"))
+        try FileManager.default.removeItem(at: f.marker)
+        app.buttons["Retry Recovery"].firstMatch.click()
+        waitForLibraryError("clean main checkout", in: app); waitForLibraryIdle(in: app)
+        let rebuild = element("rebuild-shader-library", in: app)
+        XCTAssertTrue(rebuild.isEnabled)
+        try f.source.write(to: f.authoring.appendingPathComponent("shaders/plasma/body.metal"))
+        rebuild.click()
+        waitForTitle(f.name, in: app); waitForLibraryIdle(in: app)
+        XCTAssertFalse(element("shader-library-error", in: app).exists)
+    }
+
+    func testAutomaticPublicationRecoveryPreservesUnrelatedBookmarkError() throws {
+        let f = try managedRecoveryFixture(), app = f.app
+        app.launchEnvironment["HOLODECK_UI_TEST_SHADER_BOOKMARK"] = Data("invalid bookmark".utf8).base64EncodedString()
+        app.launch(); app.activate()
+        let settings = element("shader-library-settings", in: app)
+        XCTAssertTrue(settings.waitForExistence(timeout: 15)); settings.click()
+        XCTAssertTrue(app.buttons["Retry Recovery"].firstMatch.waitForExistence(timeout: 10))
+        waitForLibraryIdle(in: app); waitForLibraryError("Choose your shader folder again", in: app)
+        try FileManager.default.removeItem(at: f.marker)
+        app.buttons["Retry Recovery"].firstMatch.click()
+        waitForTitle(f.name, in: app); waitForLibraryIdle(in: app)
+        waitForLibraryError("Choose your shader folder again", in: app)
     }
 
     func testLocalFolderManualReloadRollbackAndBookmarkRestoration() throws {

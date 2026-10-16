@@ -272,6 +272,23 @@ public struct ShaderRequestPublicationStatus: Sendable {
     public let warnings: [ShaderPreviewWarning]
 }
 
+/// Local publication failures are separate from the TV request protocol.
+public struct ShaderRequestPublicationFailure: LocalizedError, Sendable, Equatable {
+    public let operationSequence: UInt64
+    public let message: String
+    public let recoveryRequired: Bool
+    public var errorDescription: String? { message }
+}
+
+public struct ShaderRequestPublicationOperationStatus: Sendable, Equatable {
+    public enum Phase: Sendable { case idle, preparing, failed }
+    public let sequence: UInt64
+    public let phase: Phase
+    public let failure: ShaderRequestPublicationFailure?
+    /// Set only when this operation successfully restores or installs this revision.
+    public let revision: String?
+}
+
 public actor ShaderRequestService {
     private struct Record: Codable, Sendable {
         var status: ShaderRequestStatus
@@ -308,7 +325,14 @@ public actor ShaderRequestService {
     private var latestPublication: ShaderRequestPublicationStatus?
     private var publicationSequence: UInt64 = 0
     private struct PublicationWaiter { let id: UUID; let continuation: CheckedContinuation<Void, Error> }
-    private struct PublicationRequest { var force: Bool; var waiters: [PublicationWaiter] }
+    private struct PublicationRequest {
+        var force: Bool
+        var waiters: [PublicationWaiter]
+        var ownsRetry = false
+    }
+    // Independent of caller continuations; nil means no recovery-triggered retry.
+    private var retryPublicationForce: Bool?
+    private var publicationOperation = ShaderRequestPublicationOperationStatus(sequence: 0, phase: .idle, failure: nil, revision: nil)
     private var pendingPublication: PublicationRequest?
     private var activePublication: PublicationRequest?
     private enum ScheduledWork { case execute(UUID), cleanup(UUID), publication }
@@ -337,12 +361,17 @@ public actor ShaderRequestService {
     }
     public func initialize(configuration: ShaderRequestConfiguration) throws {
         try load()
+        let previous = self.configuration
         let preferences = directory.appendingPathComponent("preferences.json")
         self.configuration = (try? Data(contentsOf: preferences)).flatMap { try? JSONDecoder().decode(ShaderRequestConfiguration.self, from: $0) } ?? configuration
         if !configuration.shaderTool.isEmpty { self.configuration.shaderTool = configuration.shaderTool }
-        if detachedOwners.contains(where: { Self.sameCheckout(self.configuration, repository: $0.repository, checkoutID: $0.checkoutID) }) {
+        if detachedOwners.contains(where: {
+            Self.matchesDetachedCheckout(self.configuration, acknowledgement: $0, allowUnknownIdentity: true)
+        }) {
             self.configuration.enabled = false
         }
+        if initialized, !Self.samePublicationCheckout(previous, self.configuration) { cancelPublicationRequests() }
+        if !self.configuration.enabled { cancelPublicationRequests() }
         initialized = true
         setupMessage = self.configuration.enabled ? "Ready for shader requests" : "Enable shader requests in Mac Settings."
     }
@@ -398,6 +427,33 @@ public actor ShaderRequestService {
         let revision = await catalog.publicationRevisionValue()
         guard let latestPublication, latestPublication.revision == revision else { return nil }
         return latestPublication
+    }
+    public func publicationOperationStatus() -> ShaderRequestPublicationOperationStatus { publicationOperation }
+    private func publicationState(_ phase: ShaderRequestPublicationOperationStatus.Phase, message: String? = nil,
+                                  recoveryRequired: Bool = false, revision: String? = nil) -> ShaderRequestPublicationFailure? {
+        let sequence = publicationOperation.sequence &+ 1
+        let failure = message.map { ShaderRequestPublicationFailure(operationSequence: sequence, message: $0, recoveryRequired: recoveryRequired) }
+        publicationOperation = .init(sequence: sequence, phase: phase, failure: failure, revision: revision)
+        emitUpdates()
+        return failure
+    }
+    private func failPendingPublicationForRecovery(_ message: String) {
+        guard !suspended, let request = pendingPublication else { return }
+        pendingPublication = nil
+        retryPublicationForce = (retryPublicationForce ?? false) || request.force
+        let failure = publicationState(.failed, message: "Library preparation needs checkout recovery: " + message,
+                                       recoveryRequired: true)!
+        for waiter in request.waiters { waiter.continuation.resume(throwing: failure) }
+    }
+    private func cancelPublicationRequests() {
+        retryPublicationForce = nil
+        for waiter in pendingPublication?.waiters ?? [] { waiter.continuation.resume(throwing: CancellationError()) }
+        pendingPublication = nil
+        for waiter in activePublication?.waiters ?? [] { waiter.continuation.resume(throwing: CancellationError()) }
+        if activePublication != nil {
+            activePublication?.waiters = []; activePublication?.ownsRetry = false
+            execution?.interrupted = true; activeProcess?.stop()
+        } else { _ = publicationState(.idle) }
     }
     var pendingPublicationWaiterCount: Int { pendingPublication?.waiters.count ?? 0 }
     private func published(_ publication: CatalogReloadResult) {
@@ -464,6 +520,7 @@ public actor ShaderRequestService {
                 reconciliationTask = nil; reconciliationFailure = "Worker recovery failed: " + error.localizedDescription
                 setupMessage = reconciliationFailure!
                 try? persist()
+                failPendingPublicationForRecovery(reconciliationFailure!)
             }
             throw error
         }
@@ -535,11 +592,7 @@ public actor ShaderRequestService {
         // Durable intent precedes all asynchronous teardown, including for terminal records.
         try persist()
         try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
-        let cancellation = CancellationError()
-        for waiter in pendingPublication?.waiters ?? [] { waiter.continuation.resume(throwing: cancellation) }
-        pendingPublication = nil
-        for waiter in activePublication?.waiters ?? [] { waiter.continuation.resume(throwing: cancellation) }
-        activePublication?.waiters = []
+        cancelPublicationRequests()
         activeProcess?.stop()
         if let activeProcess { await activeProcess.waitForExit() }
         if let workerTask { await workerTask.value }
@@ -578,11 +631,13 @@ public actor ShaderRequestService {
     private func cancelPublicationWaiter(_ id: UUID) {
         if let index = pendingPublication?.waiters.firstIndex(where: { $0.id == id }) {
             pendingPublication?.waiters.remove(at: index).continuation.resume(throwing: CancellationError())
-            if pendingPublication?.waiters.isEmpty == true { pendingPublication = nil }
+            if pendingPublication?.waiters.isEmpty == true, pendingPublication?.ownsRetry != true { pendingPublication = nil }
         }
         if let index = activePublication?.waiters.firstIndex(where: { $0.id == id }) {
             activePublication?.waiters.remove(at: index).continuation.resume(throwing: CancellationError())
-            if activePublication?.waiters.isEmpty == true { execution?.interrupted = true; activeProcess?.stop() }
+            if activePublication?.waiters.isEmpty == true, activePublication?.ownsRetry != true {
+                execution?.interrupted = true; activeProcess?.stop()
+            }
         }
     }
     private func runPublication(operation: UUID) async {
@@ -590,7 +645,9 @@ public actor ShaderRequestService {
         do {
             if activePublication?.force != true {
                 do {
-                    if try await catalog.cached() != nil { try checkExecution(operation); finishPublication(); return }
+                    if let cached = try await catalog.cached() {
+                        try checkExecution(operation); finishPublication(revision: cached.publicationRevision); return
+                    }
                 } catch is CancellationError { throw CancellationError() }
                 catch { Diagnostics.catalog.error("Previous publication unavailable; rebuilding: \(error.localizedDescription, privacy: .public)") }
             }
@@ -611,16 +668,18 @@ public actor ShaderRequestService {
             let publication = try await catalog.install(preparedID)
             self.preparedID = nil; published(publication)
             try persist()
-            finishPublication()
+            finishPublication(revision: publication.catalog.publicationRevision)
         } catch {
             process.stop(); await process.waitForExit()
             if let preparedID { await catalog.discard(preparedID); self.preparedID = nil }
-            if execution?.interrupted == true, activePublication?.waiters.isEmpty == false {
+            if execution?.interrupted == true,
+               activePublication?.waiters.isEmpty == false || activePublication?.ownsRetry == true {
                 let request = activePublication!
                 if pendingPublication == nil { pendingPublication = request }
                 else {
                     var pending = pendingPublication!
                     pending.force = pending.force || request.force; pending.waiters += request.waiters
+                    pending.ownsRetry = pending.ownsRetry || request.ownsRetry
                     pendingPublication = pending
                 }
                 activePublication = nil
@@ -628,11 +687,18 @@ public actor ShaderRequestService {
             } else { finishPublication(error: error) }
         }
     }
-    private func finishPublication(error: Error? = nil) {
+    private func finishPublication(error: Error? = nil, revision: String? = nil) {
         let waiters = activePublication?.waiters ?? []
         activePublication = nil; activeProcess = nil; execution = nil; maintenanceBusy = false; workerTask = nil
+        let reported: Error?
+        if let error, !(error is CancellationError) {
+            reported = publicationState(.failed, message: error.localizedDescription)
+        } else {
+            _ = publicationState(.idle, revision: revision)
+            reported = error
+        }
         for waiter in waiters {
-            if let error { waiter.continuation.resume(throwing: error) }
+            if let reported { waiter.continuation.resume(throwing: reported) }
             else { waiter.continuation.resume() }
         }
         kick()
@@ -682,8 +748,9 @@ public actor ShaderRequestService {
     private func persist() throws {
         try JSONEncoder().encode(detachedOwners).write(to: directory.appendingPathComponent("detached-checkouts.json"), options: .atomic)
         try JSONEncoder().encode(Array(records.values)).write(to: directory.appendingPathComponent("journal.json"), options: .atomic)
-        for observer in observers.values { observer.yield(allJobs()) }
+        emitUpdates()
     }
+    private func emitUpdates() { for observer in observers.values { observer.yield(allJobs()) } }
     private func update(_ id: UUID, stage: ShaderRequestStatus.Stage, message: String) throws {
         records[id]?.status.stage = stage; records[id]?.status.message = message
         records[id]?.status.updatedAt = Date(); records[id]?.status.sequence &+= 1
@@ -720,8 +787,9 @@ public actor ShaderRequestService {
             throw error
         }
         candidate.detachedOwner = nil
+        if !Self.samePublicationCheckout(configuration, candidate) { cancelPublicationRequests() }
         configuration = candidate; configuration.enabled = true
-        detachedOwners.removeAll { Self.sameCheckout(candidate, repository: $0.repository, checkoutID: $0.checkoutID) }
+        detachedOwners.removeAll { Self.matchesDetachedCheckout(candidate, acknowledgement: $0) }
         if !initialized { initialized = true; schedulingActive = true }
         try persist()
         try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
@@ -733,6 +801,7 @@ public actor ShaderRequestService {
             throw ShaderRequestError.unavailable("Requests are still in progress.")
         }
         configuration.enabled = false; setupMessage = "Shader requests are disabled."
+        cancelPublicationRequests()
         try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
         try persist()
     }
@@ -838,7 +907,8 @@ public actor ShaderRequestService {
     private func kick() {
         guard loaded, initialized, !suspended, !maintenanceBusy, activeID == nil, workerTask == nil else { return }
         if !reconciled {
-            guard reconciliationKickID == nil else { return }
+            guard reconciliationKickID == nil, reconciliationTask == nil else { return }
+            if let reconciliationFailure { failPendingPublicationForRecovery(reconciliationFailure); return }
             let id = UUID(); reconciliationKickID = id
             Task {
                 do {
@@ -848,16 +918,19 @@ public actor ShaderRequestService {
                 } catch {
                     guard reconciliationKickID == id else { return }
                     reconciliationKickID = nil
+                    if let reconciliationFailure { failPendingPublicationForRecovery(reconciliationFailure) }
                 }
             }
             return
         }
         let eligible = records.values.filter { !$0.revoked && $0.detached != true }.map(\.status)
-        if let recoveryID, records[recoveryID]?.cleanupFailure != nil { return }
+        if let recoveryID, let failure = records[recoveryID]?.cleanupFailure {
+            failPendingPublicationForRecovery(failure); return
+        }
         let ownerCleanup = recoveryID.flatMap { records[$0]?.cleanupPending == true ? $0 : nil }
         let cleanupID = ownerCleanup ?? records.values.filter { $0.cleanupPending == true && $0.cleanupFailure == nil }.sorted { $0.status.createdAt < $1.status.createdAt }.first?.status.id
         let interrupted = recoveryID.flatMap { id -> UUID? in
-            guard configuration.enabled, schedulingActive || pendingPublication != nil,
+            guard configuration.enabled, schedulingActive || pendingPublication != nil || retryPublicationForce != nil,
                   let value = records[id], !value.revoked, value.detached != true,
                   value.cleanupPending != true, value.status.stage == .repairing || value.status.stage == .queued else { return nil }
             return id
@@ -865,13 +938,22 @@ public actor ShaderRequestService {
         let work: ScheduledWork
         if let interrupted { work = .execute(interrupted) }
         else if let cleanupID { work = .cleanup(cleanupID) }
-        else if hasPendingCleanup() { return }
-        else if pendingPublication != nil { work = .publication }
+        else if hasPendingCleanup() {
+            let failure = records.values.first { $0.cleanupPending == true && $0.cleanupFailure != nil }?.cleanupFailure
+            failPendingPublicationForRecovery(failure ?? "Checkout cleanup is required."); return
+        }
+        else if pendingPublication != nil || (retryPublicationForce != nil && configuration.enabled) { work = .publication }
         else if schedulingActive, configuration.enabled, let id = ShaderRequestScheduling.next(in: eligible, recoveringID: recoveryID) { work = .execute(id) }
         else { return }
         let operation = Execution(); execution = operation
         if case .publication = work {
+            if let force = retryPublicationForce, configuration.enabled {
+                var request = pendingPublication ?? PublicationRequest(force: force, waiters: [])
+                request.force = request.force || force; request.ownsRetry = true
+                pendingPublication = request; retryPublicationForce = nil
+            }
             activePublication = pendingPublication; pendingPublication = nil; maintenanceBusy = true
+            _ = publicationState(.preparing)
             workerTask = Task { [weak self] in await self?.runPublication(operation: operation.id) }
             return
         }
@@ -1022,6 +1104,18 @@ public actor ShaderRequestService {
     }
     public func resume() { suspended = false; kick() }
 
+    nonisolated private static func samePublicationCheckout(_ lhs: ShaderRequestConfiguration, _ rhs: ShaderRequestConfiguration) -> Bool {
+        guard RequestPaths.canonical(URL(fileURLWithPath: lhs.repository)) == RequestPaths.canonical(URL(fileURLWithPath: rhs.repository)) else { return false }
+        if let left = lhs.checkoutID, let right = rhs.checkoutID { return left == right }
+        return true
+    }
+    nonisolated private static func matchesDetachedCheckout(_ configuration: ShaderRequestConfiguration,
+        acknowledgement: DetachedCheckoutAcknowledgement, allowUnknownIdentity: Bool = false) -> Bool {
+        guard RequestPaths.canonical(URL(fileURLWithPath: configuration.repository)) == RequestPaths.canonical(URL(fileURLWithPath: acknowledgement.repository)) else { return false }
+        guard let expected = acknowledgement.checkoutID else { return true }
+        if allowUnknownIdentity, configuration.checkoutID == nil { return true } // Conservatively keep a detached path disabled.
+        return configuration.checkoutID == expected
+    }
     nonisolated private static func sameCheckout(_ configuration: ShaderRequestConfiguration, repository: String, checkoutID: String?) -> Bool {
         if let identity = configuration.checkoutID, let checkoutID { return identity == checkoutID }
         return RequestPaths.canonical(URL(fileURLWithPath: configuration.repository)) == RequestPaths.canonical(URL(fileURLWithPath: repository))
@@ -1039,8 +1133,8 @@ public actor ShaderRequestService {
         let identity = (try? String(contentsOf: gitdir.appendingPathComponent("holodeck-checkout-id"), encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
         return acknowledgements.first {
             guard $0.requestID == id, RequestPaths.canonical(URL(fileURLWithPath: $0.directory)) == RequestPaths.canonical(URL(fileURLWithPath: path)) else { return false }
-            if let expected = $0.checkoutID { return identity == expected }
-            return RequestPaths.canonical(URL(fileURLWithPath: $0.repository)) == RequestPaths.canonical(URL(fileURLWithPath: configuration.repository))
+            var checkout = configuration; checkout.checkoutID = identity
+            return matchesDetachedCheckout(checkout, acknowledgement: $0)
         }
     }
 

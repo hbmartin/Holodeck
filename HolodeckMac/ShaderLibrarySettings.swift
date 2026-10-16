@@ -7,7 +7,11 @@ import HolodeckCore
 final class MacLibraryModel {
     let requests: MacRequestsModel
     var folder: URL?
-    var isReloading = false
+    private var localReloading = false
+    private var servicePublishing = false
+    var isReloading: Bool { localReloading || servicePublishing }
+    private var publicationOperationSequence: UInt64 = 0
+    private var publicationFailureSequence: UInt64?
     private enum ErrorOrigin: Hashable { case folder, publication, manualReload, server }
     private var errors: [ErrorOrigin: String] = [:]
     var error: String? { errors[.folder] ?? errors[.server] ?? errors[.manualReload] ?? errors[.publication] }
@@ -44,12 +48,14 @@ final class MacLibraryModel {
         Task { await server.setRequestService(requestService) }
         requests.onPublication = { [weak self] status in
             guard let self, self.requests.configuration.enabled else { return }
-            self.ready = true; self.previewWarnings = status.warnings; self.clearError(from: .publication)
+            self.ready = true; self.previewWarnings = status.warnings
+            if self.publicationFailureSequence == nil { self.clearError(from: .publication) }
             Task {
                 await self.session.refresh(force: true).value
                 if !self.sleeping { try? await self.startServer() }
             }
         }
+        requests.onPublicationOperation = { [weak self] status in self?.applyPublicationOperation(status) }
         updates = Task { [weak self] in
             for await state in await server.updates() { self?.serverState = state }
         }
@@ -60,7 +66,14 @@ final class MacLibraryModel {
             })
         }
         var refreshBookmark = false
-        if let bookmark = defaults?.data(forKey: "holodeck.shaderFolderBookmark") {
+        #if DEBUG
+        let fixture = UITestConfiguration(applicationID: "me.haroldmartin.HolodeckMac")
+        let fixtureBookmark = testingNamespace != nil && fixture.hasExplicitStorageSuite
+            ? ProcessInfo.processInfo.environment["HOLODECK_UI_TEST_SHADER_BOOKMARK"].flatMap { Data(base64Encoded: $0) } : nil
+        #else
+        let fixtureBookmark: Data? = nil
+        #endif
+        if let bookmark = fixtureBookmark ?? defaults?.data(forKey: "holodeck.shaderFolderBookmark") {
             do {
                 var stale = false
                 let url = try URL(resolvingBookmarkData: bookmark, options: [], relativeTo: nil, bookmarkDataIsStale: &stale)
@@ -69,7 +82,7 @@ final class MacLibraryModel {
             } catch { self.setError("Choose your shader folder again: \(error.localizedDescription)", from: .folder) }
         }
         let shouldRefreshBookmark = refreshBookmark
-        isReloading = true
+        localReloading = true
         Task {
             do {
                 try await requests.initialized()
@@ -80,16 +93,15 @@ final class MacLibraryModel {
                     try await requests.service.ensurePublication()
                     restored = await catalog.publicationRevisionValue() != nil
                     if let status = await requests.service.publicationStatus() { previewWarnings = status.warnings }
-                    clearError(from: .publication)
                 }
                 if restored {
                     ready = true
                     await session.refresh(force: true).value
                     if !sleeping { try await startServer() }
                 }
-            } catch { setError("Couldn’t rebuild the shader library: \(error.localizedDescription)", from: .publication) }
+            } catch { showPublicationError(error, prefix: "Couldn’t rebuild the shader library: ") }
             await requests.service.activateScheduling()
-            isReloading = false
+            localReloading = false
             if !requests.configuration.enabled, folder != nil { reload(refreshBookmark: shouldRefreshBookmark) }
         }
     }
@@ -117,25 +129,24 @@ final class MacLibraryModel {
     }
     func rebuildPublication() {
         guard !isReloading else { return }
-        isReloading = true; clearError(from: .publication)
+        localReloading = true; clearError(from: .publication)
         Task {
-            defer { isReloading = false }
+            defer { localReloading = false }
             do {
                 try await requests.service.ensurePublication(force: true)
                 if let status = await requests.service.publicationStatus() { previewWarnings = status.warnings }
-                clearError(from: .publication)
                 ready = true
                 await session.refresh(force: true).value
                 if !sleeping { try await startServer() }
-            } catch { setError(error.localizedDescription, from: .publication) }
+            } catch { showPublicationError(error) }
         }
     }
     private func load(_ url: URL, saveBookmark: Bool) {
         guard !isReloading, !requests.configuration.enabled, !requests.hasUnfinishedJobs else { return }
-        isReloading = true; clearError(from: .folder); clearError(from: .manualReload)
+        localReloading = true; clearError(from: .folder); clearError(from: .manualReload)
         let accessed = url.startAccessingSecurityScopedResource()
         Task {
-            defer { isReloading = false; if accessed { url.stopAccessingSecurityScopedResource() } }
+            defer { localReloading = false; if accessed { url.stopAccessingSecurityScopedResource() } }
             do {
                 // Prepare the bookmark before replacing the current publication.
                 let bookmark: Data?
@@ -163,8 +174,37 @@ final class MacLibraryModel {
             } catch { setError(error.localizedDescription, from: .manualReload) }
         }
     }
+    private func applyPublicationOperation(_ status: ShaderRequestPublicationOperationStatus) {
+        guard status.sequence >= publicationOperationSequence else { return }
+        publicationOperationSequence = status.sequence
+        servicePublishing = status.phase == .preparing
+        if let failure = status.failure { showPublicationError(failure) }
+        guard let revision = status.revision else { return }
+        Task {
+            let current = await catalog.publicationRevisionValue()
+            guard publicationOperationSequence == status.sequence, revision == current else { return }
+            clearError(from: .publication)
+            if !ready {
+                ready = true
+                await session.refresh(force: true).value
+                if !sleeping { try? await startServer() }
+            }
+        }
+    }
+    private func showPublicationError(_ error: Error, prefix: String = "") {
+        guard !(error is CancellationError) else { return }
+        if let failure = error as? ShaderRequestPublicationFailure {
+            guard failure.operationSequence >= publicationOperationSequence else { return }
+            publicationOperationSequence = failure.operationSequence
+            publicationFailureSequence = failure.operationSequence
+        } else { publicationFailureSequence = nil }
+        setError(prefix + error.localizedDescription, from: .publication)
+    }
     private func setError(_ message: String, from origin: ErrorOrigin) { errors[origin] = message }
-    private func clearError(from origin: ErrorOrigin) { errors[origin] = nil }
+    private func clearError(from origin: ErrorOrigin) {
+        errors[origin] = nil
+        if origin == .publication { publicationFailureSequence = nil }
+    }
     private func startServer() async throws {
         #if DEBUG
         MacInspectionLifecycle.snapshot.serverStartAttempts += 1
@@ -204,7 +244,7 @@ struct ShaderLibrarySettings: View {
                     Button("Choose Folder…", action: library.chooseFolder).accessibilityIdentifier("choose-shader-folder")
                     Button("Reload Shaders") { library.reload() }.disabled(library.folder == nil)
                         .accessibilityIdentifier("reload-shaders")
-                    if library.isReloading { ProgressView().controlSize(.small) }
+                    if library.isReloading { ProgressView().controlSize(.small).accessibilityIdentifier("shader-library-reloading") }
                 }.disabled(library.isReloading || library.requests.configuration.enabled || library.requests.hasUnfinishedJobs)
                 if library.requests.configuration.enabled {
                     Button("Rebuild Library", action: library.rebuildPublication)
@@ -214,7 +254,8 @@ struct ShaderLibrarySettings: View {
                 HStack { Text(library.serverState.message); Spacer() }
                     .accessibilityElement(children: .combine).accessibilityIdentifier("shader-serving-status")
                 if let error = library.error {
-                    HStack { Text(error).foregroundStyle(.red).textSelection(.enabled); Spacer() }
+                    // Recreate the selectable native text when the diagnostic changes.
+                    HStack { Text(error).foregroundStyle(.red).textSelection(.enabled).id(error); Spacer() }
                         .accessibilityElement(children: .combine).accessibilityLabel(error).accessibilityIdentifier("shader-library-error")
                 }
                 ForEach(library.previewWarnings, id: \.shaderID) { warning in

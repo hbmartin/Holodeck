@@ -65,7 +65,8 @@ struct ViewerView: View {
                         .padding(.horizontal, 20).padding(.bottom, 12)
                 }
                 if let error = model.library?.error {
-                    Text(error).foregroundStyle(.red).textSelection(.enabled).padding(12)
+                    // Recreate the selectable native text when the diagnostic changes.
+                    Text(error).foregroundStyle(.red).textSelection(.enabled).id(error).padding(12)
                         .accessibilityIdentifier("shader-library-error")
                 }
                 if let updateFailure = session.catalogUpdateFailure {
