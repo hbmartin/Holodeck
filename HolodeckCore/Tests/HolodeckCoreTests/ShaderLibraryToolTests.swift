@@ -14,13 +14,17 @@ final class ShaderLibraryToolTests: XCTestCase {
         let data = Data("checker fixture".utf8)
         try data.write(to: artifact)
         let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        var pin: [String: Any] = ["version": "1.0.3", "interfaceVersion": 1,
+        var pin: [String: Any] = ["version": "1.1.0", "interfaceVersion": 1,
                                   "sourceCommit": String(repeating: "a", count: 40), "sha256": hash]
         try JSONSerialization.data(withJSONObject: pin).write(to: lock)
         XCTAssertEqual(try ShaderLibraryTool.checkedArtifact(artifact: artifact, lock: lock), artifact)
         try Data("modified".utf8).write(to: artifact)
         XCTAssertThrowsError(try ShaderLibraryTool.checkedArtifact(artifact: artifact, lock: lock))
         try data.write(to: artifact)
+        pin["version"] = "1.0.3"
+        try JSONSerialization.data(withJSONObject: pin).write(to: lock)
+        XCTAssertThrowsError(try ShaderLibraryTool.checkedArtifact(artifact: artifact, lock: lock))
+        pin["version"] = "1.1.0"
         pin["interfaceVersion"] = 2
         try JSONSerialization.data(withJSONObject: pin).write(to: lock)
         XCTAssertThrowsError(try ShaderLibraryTool.checkedArtifact(artifact: artifact, lock: lock))
