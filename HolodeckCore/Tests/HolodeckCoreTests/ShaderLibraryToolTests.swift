@@ -14,7 +14,7 @@ final class ShaderLibraryToolTests: XCTestCase {
         let data = Data("checker fixture".utf8)
         try data.write(to: artifact)
         let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        var pin: [String: Any] = ["version": "1.0.2", "interfaceVersion": 1,
+        var pin: [String: Any] = ["version": "1.0.3", "interfaceVersion": 1,
                                   "sourceCommit": String(repeating: "a", count: 40), "sha256": hash]
         try JSONSerialization.data(withJSONObject: pin).write(to: lock)
         XCTAssertEqual(try ShaderLibraryTool.checkedArtifact(artifact: artifact, lock: lock), artifact)
@@ -24,6 +24,29 @@ final class ShaderLibraryToolTests: XCTestCase {
         pin["interfaceVersion"] = 2
         try JSONSerialization.data(withJSONObject: pin).write(to: lock)
         XCTAssertThrowsError(try ShaderLibraryTool.checkedArtifact(artifact: artifact, lock: lock))
+    }
+
+    func testReleasedCheckerReportsLockedVersionAndInterface() throws {
+        let resources = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/HolodeckCore/Resources")
+        let lock = resources.appendingPathComponent("shader_checker.lock.json")
+        let artifact = try ShaderLibraryTool.checkedArtifact(
+            artifact: resources.appendingPathComponent("shader_checker.pyz"), lock: lock)
+        let pin = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: lock)) as? [String: Any])
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = ["-I", artifact.path, "info", "--json"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = output
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+        let info = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(info["checkerVersion"] as? String, pin["version"] as? String)
+        XCTAssertEqual(info["interfaceVersion"] as? Int, pin["interfaceVersion"] as? Int)
     }
 
     func testLibraryRejectsInvalidInterpreterAndBackendOverrides() {
