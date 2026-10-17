@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import selectors
 import subprocess
 import sys
 import struct
@@ -38,12 +39,20 @@ class WorkerInterrupted(BaseException):
     pass
 
 
+_libproc = ctypes.CDLL('/usr/lib/libproc.dylib') if sys.platform == 'darwin' else None
+REGISTRY_LIMIT = 65536
+PROCESS_SAMPLE_SECONDS = .25
+
+
+class ProcessObservationError(ProcessRecoveryError):
+    pass
+
+
 def process_identity(pid):
     """Birth identity shared with the native host; a PID alone is never ownership proof."""
     if sys.platform == "darwin":
         data = ctypes.create_string_buffer(136)  # Darwin proc_bsdinfo
-        library = ctypes.CDLL('/usr/lib/libproc.dylib')
-        if library.proc_pidinfo(pid, 3, 0, data, len(data)) != len(data):
+        if _libproc.proc_pidinfo(pid, 3, 0, data, len(data)) != len(data):
             return None
         if struct.unpack_from('=I', data, 4)[0] == 5:  # zombie
             return None
@@ -58,13 +67,17 @@ def process_identity(pid):
 
 
 def group_members(pid):
-    listing = subprocess.run(['/bin/ps', '-axo', 'pid=,pgid='], capture_output=True, text=True, timeout=2)
+    try:
+        listing = subprocess.run(['/bin/ps', '-axo', 'pid=,pgid='], capture_output=True, text=True, timeout=2, check=True)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ProcessObservationError('Cannot observe owned process group: ' + str(error)) from error
     return [identity for line in listing.stdout.splitlines() if len(parts := line.split()) == 2
             and int(parts[1]) == pid and (identity := process_identity(int(parts[0]))) is not None]
 
 
 def merge_members(known, observed):
-    return list({(i['pid'], i['seconds'], i['microseconds']): i for i in known + observed}.values())
+    return list({(i['pid'], i['seconds'], i['microseconds']): i for i in known + observed
+                 if process_identity(i['pid']) == i}.values())
 
 
 def terminate_registered(directory):
@@ -83,21 +96,24 @@ def terminate_registered(directory):
             raise ValueError('Invalid process identities')
     except (OSError, ValueError, TypeError) as error:
         raise ProcessRecoveryError('Process registry is unreadable; retain the journal and recover or detach the checkout: ' + str(error)) from error
-    for entry in entries:
-        leader = entry['leader']
-        if process_identity(leader['pid']) == leader:
-            entry['members'] = merge_members(entry['members'], group_members(leader['pid']))
-    write(file, entries)
     deadline = time.monotonic() + 10
     term_sent, kill_sent = set(), set()
     next_sample = 0
+    unknown = False
     while True:
         if time.monotonic() >= next_sample:
+            unknown = False
             for entry in entries:
-                if process_identity(entry['leader']['pid']) == entry['leader']:
-                    entry['members'] = merge_members(entry['members'], group_members(entry['leader']['pid']))
-            write(file, entries)
-            next_sample = time.monotonic() + .1
+                leader = entry['leader']
+                observed = group_members(leader['pid'])
+                if process_identity(leader['pid']) == leader:
+                    entry['members'] = merge_members(entry['members'], observed)
+                else:
+                    entry['members'] = merge_members(entry['members'], [])
+                    # A retired leader does not authorize adopting unfamiliar identities.
+                    unknown = unknown or (process_identity(leader['pid']) is None and any(i not in entry['members'] for i in observed))
+            save_registry(file, entries)
+            next_sample = time.monotonic() + PROCESS_SAMPLE_SECONDS
         sig = signal.SIGKILL if time.monotonic() >= deadline - 5 else signal.SIGTERM
         sent = kill_sent if sig == signal.SIGKILL else term_sent
         for entry in entries:
@@ -107,61 +123,135 @@ def terminate_registered(directory):
                     sent.add(key)
                     with contextlib.suppress(ProcessLookupError): os.kill(identity['pid'], sig)
         live = any(process_identity(i['pid']) == i for e in entries for i in e['members'])
-        unknown = any(process_identity(e['leader']['pid']) is None and group_members(e['leader']['pid']) for e in entries)
         if not live and not unknown:
             file.unlink(missing_ok=True); return
         if time.monotonic() >= deadline:
-            for entry in entries: entry['unverified'] = True
-            write(file, entries)
-            raise ProcessRecoveryError('Validation descendants did not settle; retain the journal and recover or detach the checkout')
+            raise ProcessRecoveryError('Owned descendants did not settle; retain the journal and recover or detach the checkout')
         time.sleep(.025)
 
 
-def managed_run(args, cwd, env, timeout, input, text=True):
-    """Register a gated process group durably before any checker code can execute."""
-    directory = Path(env['HOLODECK_REQUEST_DIRECTORY'])
-    registry = directory / 'children.json'
-    if registry.exists(): terminate_registered(directory)
-    read_gate, write_gate = os.pipe()
-    bootstrap = 'import os,sys; gate=int(sys.argv[1]); go=os.read(gate,1); os.close(gate); go or sys.exit(125); os.execv(sys.argv[2],sys.argv[2:])'
-    process = None
-    try:
-        process = subprocess.Popen([sys.executable, '-I', '-c', bootstrap, str(read_gate), *args],
-            cwd=cwd, env=env, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text, start_new_session=True, pass_fds=(read_gate,))
-        identity = process_identity(process.pid)
-        if identity is None: raise OperationalError('Cannot establish validation process identity')
-        write(registry, [{'leader': identity, 'members': [identity]}])
-        members = [identity]
-        os.write(write_gate, b'1'); os.close(write_gate); write_gate = None
+def save_registry(file, entries):
+    data = json.dumps(entries, separators=(',', ':')).encode()
+    if len(data) > REGISTRY_LIMIT:
+        raise ProcessRecoveryError('Live process registry exceeds 64 KiB; existing ownership evidence was retained')
+    # Avoid needless decoding/writes in the native supervisor when ownership has not changed.
+    if file.exists() and file.read_bytes() == data: return
+    temporary = file.with_suffix('.json.tmp')
+    temporary.write_bytes(data); temporary.replace(file)
+
+
+class ManagedChild:
+    """One registered session, shared by captured commands and streaming Codex calls."""
+    def __init__(self, args, cwd, env, *, stdin=False, stderr=subprocess.PIPE, text=True):
+        self.args, self.cwd, self.env = args, cwd, env
+        self.stdin, self.stderr, self.text = stdin, stderr, text
+        self.registry = Path(env['HOLODECK_REQUEST_DIRECTORY']) / 'children.json'
+        self.process = None
+        self.next_sample = 0
+
+    def __enter__(self):
+        if self.registry.exists(): terminate_registered(self.registry.parent)
+        read_gate, write_gate = os.pipe()
+        bootstrap = 'import os,sys; gate=int(sys.argv[1]); go=os.read(gate,1); os.close(gate); go or sys.exit(125); os.execv(sys.argv[2],sys.argv[2:])'
         try:
-            deadline = time.monotonic() + timeout
-            while True:
-                if process_identity(process.pid) == identity:
-                    members = merge_members(members, group_members(process.pid))
-                    write(registry, [{'leader': identity, 'members': members}])
-                remaining = deadline - time.monotonic()
-                if remaining <= 0: raise subprocess.TimeoutExpired(args, timeout)
-                try:
-                    stdout, stderr = process.communicate(input=input, timeout=min(.25, remaining))
-                    break
-                except subprocess.TimeoutExpired:
-                    input = None
+            self.process = subprocess.Popen([sys.executable, '-I', '-c', bootstrap, str(read_gate), *self.args],
+                cwd=self.cwd, env=self.env, stdin=subprocess.PIPE if self.stdin else subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=self.stderr, text=self.text, start_new_session=True, pass_fds=(read_gate,))
+            self.identity = process_identity(self.process.pid)
+            if self.identity is None: raise ProcessRecoveryError('Cannot establish managed process identity')
+            self.members = [self.identity]
+            save_registry(self.registry, [{'leader': self.identity, 'members': self.members}])
+            os.write(write_gate, b'1')
+            return self
         except BaseException:
-            terminate_registered(directory)
-            process.wait(timeout=5)
+            if self.process is not None: self.process.kill(); self.process.wait(timeout=5)
+            self.close_pipes()
             raise
-        # A checker must not leave a compiler/probe behind, even after a successful exit.
-        terminate_registered(directory)
-        return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
-    finally:
-        os.close(read_gate)
-        if write_gate is not None: os.close(write_gate)
-        if process is not None and process.poll() is None:
-            process.kill(); process.wait(timeout=5)
-        if process is not None:
-            for pipe in (process.stdin, process.stdout, process.stderr):
-                if pipe is not None: pipe.close()
+        finally:
+            os.close(read_gate); os.close(write_gate)
+
+    def sample(self):
+        if time.monotonic() < self.next_sample: return
+        if process_identity(self.process.pid) == self.identity:
+            self.members = merge_members(self.members, group_members(self.process.pid))
+            save_registry(self.registry, [{'leader': self.identity, 'members': self.members}])
+        self.next_sample = time.monotonic() + PROCESS_SAMPLE_SECONDS
+
+    def close_pipes(self):
+        if self.process is not None:
+            for pipe in (self.process.stdin, self.process.stdout, self.process.stderr):
+                if pipe is not None and hasattr(pipe, 'close'): pipe.close()
+
+    def __exit__(self, kind, error, traceback):
+        try:
+            # Successful commands must settle their descendants too. Unknown survivors fail closed.
+            terminate_registered(self.registry.parent)
+            self.process.wait(timeout=5)
+        finally:
+            if self.process.poll() is None: self.process.kill(); self.process.wait(timeout=5)
+            self.close_pipes()
+
+    def lines(self, prompt):
+        """Keep observing while stdin is backpressured or stdout is idle, without a job deadline."""
+        process = self.process
+        payload = memoryview(prompt.encode('utf-8')); pending = bytearray()
+        with selectors.DefaultSelector() as selector:
+            os.set_blocking(process.stdin.fileno(), False); os.set_blocking(process.stdout.fileno(), False)
+            selector.register(process.stdin, selectors.EVENT_WRITE)
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while selector.get_map():
+                self.sample()
+                for key, _ in selector.select(PROCESS_SAMPLE_SECONDS):
+                    if key.fileobj is process.stdin:
+                        try: count = os.write(process.stdin.fileno(), payload[:65536])
+                        except BrokenPipeError: count = len(payload)
+                        payload = payload[count:]
+                        if not payload:
+                            selector.unregister(process.stdin); process.stdin.close()
+                    else:
+                        chunk = os.read(process.stdout.fileno(), 65536)
+                        if not chunk:
+                            selector.unregister(process.stdout)
+                            if pending: yield pending.decode('utf-8', errors='replace')
+                            pending.clear()
+                        else:
+                            pending.extend(chunk)
+                            while b'\n' in pending:
+                                line, _, pending = pending.partition(b'\n')
+                                yield line.decode('utf-8', errors='replace')
+                if process.poll() is not None:
+                    # A descendant retaining stdout must not keep a finished Codex invocation alive.
+                    while True:
+                        try: chunk = os.read(process.stdout.fileno(), 65536)
+                        except BlockingIOError: break
+                        if not chunk: break
+                        pending.extend(chunk)
+                        while b'\n' in pending:
+                            line, _, pending = pending.partition(b'\n')
+                            yield line.decode('utf-8', errors='replace')
+                    if pending: yield pending.decode('utf-8', errors='replace')
+                    return
+            while process.poll() is None:
+                self.sample(); time.sleep(.025)
+
+
+def managed_run(args, cwd, env, timeout, input, text=True):
+    with ManagedChild(args, cwd, env, stdin=input is not None, text=text) as child:
+        deadline = time.monotonic() + timeout
+        while True:
+            child.sample()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0: raise subprocess.TimeoutExpired(args, timeout)
+            try:
+                stdout, stderr = child.process.communicate(input=input, timeout=min(PROCESS_SAMPLE_SECONDS, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                input = None  # communicate retains its buffered input and offset across retries.
+                if child.process.poll() is not None:
+                    terminate_registered(child.registry.parent)
+                    stdout, stderr = child.process.communicate(timeout=5)
+                    break
+        return subprocess.CompletedProcess(args, child.process.returncode, stdout, stderr)
 
 
 class VerificationError(CandidateError):
@@ -307,7 +397,7 @@ class Worker:
                     expected = stat.S_ISREG(info.st_mode) if leaf else stat.S_ISDIR(info.st_mode)
                     if not expected:
                         quarantine.mkdir(parents=True, exist_ok=True, mode=0o700)
-                        destination = quarantine / (str(uuid.uuid4()) + '-' + part)
+                        destination = quarantine / str(uuid.uuid4())
                         try: os.rename(part, destination, src_dir_fd=fd)
                         except OSError as error:
                             raise OperationalError('Cannot quarantine owned obstruction ' + name + '; files retained: ' + str(error)) from error
@@ -715,19 +805,16 @@ class Worker:
             args.extend(["--image", str(image)])
         args.extend(["--", "-"])
         with (self.directory / f"{label}-stderr.log").open("a") as stderr:
-            process = subprocess.Popen(args, cwd=self.root, env=self.env, stdin=subprocess.PIPE,
-                                       stdout=subprocess.PIPE, stderr=stderr, text=True)
-            process.stdin.write(prompt)
-            process.stdin.close()
-            for line in process.stdout:
-                try:
-                    event = json.loads(line)
-                    if label == "implementation" and event.get("type") == "thread.started":
-                        self.save(threadID=event["thread_id"])
-                    emit("codex", data=event)
-                except ValueError:
-                    emit("log", text=line[:32000])
-            code = process.wait()
+            with ManagedChild(args, self.root, self.env, stdin=True, stderr=stderr, text=False) as child:
+                for line in child.lines(prompt):
+                    try:
+                        event = json.loads(line)
+                        if label == "implementation" and event.get("type") == "thread.started":
+                            self.save(threadID=event["thread_id"])
+                        emit("codex", data=event)
+                    except ValueError:
+                        emit("log", text=line[:32000])
+                code = child.process.returncode
         if code or not output.exists():
             tail = (self.directory / f"{label}-stderr.log").read_text()[-4000:]
             raise OperationalError(f"Codex {label} failed ({code}): {tail}")

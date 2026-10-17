@@ -25,13 +25,8 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
         return pids.prefix(Int(bytes) / MemoryLayout<Int32>.size).compactMap { Self(pid: $0) }
     }
     struct Observation { var identities: [RequestProcessIdentity]; var uncertainty: String? }
-    static func registered(in directory: URL) throws -> [Self] {
-        let observation = try observe(in: directory)
-        if let uncertainty = observation.uncertainty { throw RequestWorkerTeardownError(cause: uncertainty) }
-        return observation.identities
-    }
     static func observe(in directory: URL, known additional: [Self] = []) throws -> Observation {
-        struct Entry: Decodable { let leader: RequestProcessIdentity; let members: [RequestProcessIdentity]; let unverified: Bool? }
+        struct Entry: Decodable { let leader: RequestProcessIdentity; let members: [RequestProcessIdentity] }
         let marker = directory.appendingPathComponent("children.json")
         guard FileManager.default.fileExists(atPath: marker.path) else { return Observation(identities: []) }
         let entries: [Entry]
@@ -154,14 +149,20 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         }
     }
     private func refreshOwnedLocked() {
+        owned = owned.filter { groups.identity($0.key) == $0.value }
+        termSent.formIntersection(Set(owned.values)); killSent.formIntersection(Set(owned.values))
+        var rootUncertainty: Error?
         if let leader, groups.identity(leader.pid) == leader {
             for identity in RequestProcessIdentity.group(leader.pid) { owned[identity.pid] = identity }
+        } else if let leader, groups.identity(leader.pid) == nil,
+                  RequestProcessIdentity.group(leader.pid).contains(where: { owned[$0.pid] != $0 }) {
+            rootUncertainty = RequestWorkerTeardownError(cause: "Unverified worker descendants remain.")
         }
         if let journal {
             do {
                 let observation = try RequestProcessIdentity.observe(in: journal, known: Array(owned.values))
                 for identity in observation.identities { owned[identity.pid] = identity }
-                registryError = observation.uncertainty.map { RequestWorkerTeardownError(cause: $0) }
+                registryError = observation.uncertainty.map { RequestWorkerTeardownError(cause: $0) } ?? rootUncertainty
             } catch { registryError = error }
         }
     }
@@ -319,7 +320,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         var termSent: Set<RequestProcessIdentity> = [], killSent: Set<RequestProcessIdentity> = []
         while true {
             let observation = try RequestProcessIdentity.observe(in: directory, known: targets)
-            targets = Array(Set(targets + observation.identities))
+            targets = Array(Set((targets + observation.identities).filter(\.isCurrent)))
             let signal = ProcessInfo.processInfo.systemUptime >= deadline - 5 ? SIGKILL : SIGTERM
             let pending = targets.filter { identity in
                 signal == SIGTERM ? termSent.insert(identity).inserted : killSent.insert(identity).inserted

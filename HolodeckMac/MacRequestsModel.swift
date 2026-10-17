@@ -155,12 +155,12 @@ final class MacRequestsModel {
             catch { self.error = error.localizedDescription }
         }
     }
-    func detach(_ id: UUID?) {
+    func detach(_ target: ShaderCheckoutDetachTarget) {
         checking = true; error = nil
         Task {
             defer { checking = false }
             do {
-                try await service.detachCheckout(id)
+                try await service.detachCheckout(target)
                 configuration = await service.configurationValue(); save()
                 message = "Checkout detached; files and evidence retained. Verify setup to enable requests."
             } catch { self.error = error.localizedDescription }

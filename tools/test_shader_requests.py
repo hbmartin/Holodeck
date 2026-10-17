@@ -859,6 +859,45 @@ worker.main()
         self.assertEqual(calls[-1][2],'ALPHA\n')
         self.assertEqual((self.root/'shaders/alpha/body.metal').read_text(),'EDIT\n')
 
+    def test_managed_communicate_preserves_large_input_across_timeouts(self):
+        env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job));payload='x'*2000000
+        result=worker_module.managed_run([sys.executable,'-c','import sys,time;time.sleep(.7);print(len(sys.stdin.read()))'],self.root,env,5,payload)
+        self.assertEqual(result.stdout.strip(),str(len(payload)))
+
+    def test_registry_prunes_more_than_700_retired_identities(self):
+        env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job))
+        with worker_module.ManagedChild([sys.executable,'-c','import time;time.sleep(.4)'],self.root,env) as child:
+            child.members += [{'pid':10000000+i,'seconds':1,'microseconds':0} for i in range(750)]
+            child.sample()
+            value=json.loads(child.registry.read_bytes())
+            self.assertEqual(value[0]['members'],[child.identity])
+            self.assertLess(child.registry.stat().st_size,1024)
+            child.process.communicate(timeout=2)
+        self.assertFalse((self.job/'children.json').exists())
+
+    def test_group_observation_timeout_is_operational_not_candidate_timeout(self):
+        with patch.object(worker_module.subprocess,'run',side_effect=subprocess.TimeoutExpired('ps',2)):
+            with self.assertRaises(worker_module.ProcessObservationError):worker_module.group_members(99999)
+
+    def test_quarantine_uses_bounded_names_for_long_components(self):
+        worker=worker_module.Worker(self.config,self.job);name='x'*240
+        target=self.base/'preserved';target.write_text('outside')
+        (self.root/name).symlink_to(target)
+        worker.quarantine_obstructions([name])
+        directory=worker.gitdir/'holodeck-recovery'/self.job.name
+        record=next(directory.glob('*.json'))
+        self.assertEqual(json.loads(record.read_text())['originalPath'],name)
+        self.assertLess(len(record.name),64);self.assertEqual(target.read_text(),'outside')
+
+    def test_streaming_child_is_registered_and_sampled_while_output_is_idle(self):
+        env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job));marker=self.base/'descendant'
+        code="import subprocess,sys,time;from pathlib import Path;sys.stdin.read();p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);Path(sys.argv[1]).write_text(str(p.pid));time.sleep(.6);print('done',flush=True)"
+        with worker_module.ManagedChild([sys.executable,'-c',code,str(marker)],self.root,env,stdin=True,text=False) as child:
+            self.assertTrue(child.registry.exists())
+            self.assertEqual(list(child.lines('prompt')),['done'])
+        self.assertIsNone(worker_module.process_identity(int(marker.read_text())))
+        self.assertFalse((self.job/'children.json').exists())
+
     def test_validation_timeout_terminates_descendants_and_removes_registry(self):
         worker=worker_module.Worker(self.config,self.job)
         child_pid=self.base/'probe-pid'
