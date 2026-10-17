@@ -1,6 +1,5 @@
 #if os(macOS)
 import Foundation
-import CryptoKit
 import Darwin
 
 /// Preserve checker status codes across the native CLI process boundary.
@@ -73,8 +72,6 @@ public enum ShaderLibraryTool {
             defer { argv.forEach { free($0) } }
             argv.withUnsafeBufferPointer { _ = execv(python, $0.baseAddress!) }
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        } catch let error as ShaderCheckerExit {
-            throw error
         } catch {
             FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
             throw ShaderCheckerExit(status: 2)

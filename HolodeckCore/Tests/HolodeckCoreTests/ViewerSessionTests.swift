@@ -70,7 +70,10 @@ final class ViewerSessionTests: XCTestCase {
         renderer.failure = ShaderCompilationError.missingFunction("fragmentShader")
         let sourceFailure = await session.selectForDelivery(TestCatalog.shaders[1])
         guard case .failed = sourceFailure else { return XCTFail("Known shader contract defect did not request repair") }
-        renderer.failure = NSError(domain: "MTLLibraryErrorDomain", code: 2)
+        renderer.failure = ShaderCompilationError.pipelineError(NSError(domain: "AGXMetalTest", code: 3, userInfo: [NSLocalizedDescriptionKey:"Fragment inputs mismatching vertex shader output types"]))
+        let linkFailure = await session.selectForDelivery(TestCatalog.shaders[1])
+        guard case .failed = linkFailure else { return XCTFail("Pipeline interface defect did not request repair") }
+        renderer.failure = NSError(domain: "AGXMetalTest", code: 3, userInfo:[NSLocalizedDescriptionKey:"Out of memory"])
         let transient = await session.selectForDelivery(TestCatalog.shaders[1])
         guard case .temporarilyUnavailable = transient else { return XCTFail("Internal renderer failure requested repair") }
     }

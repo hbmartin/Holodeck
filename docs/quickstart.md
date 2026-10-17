@@ -84,4 +84,6 @@ Manual requests show progress over playback and finish after the TV plays the re
 
 Open **HolodeckMac → Shader Requests** to inspect queued/running jobs, logs, commits and visual evidence. You can cancel queued work there. There is no TV cancellation or history browser. Finished records remain until you delete them.
 
+If **Checkout Recovery** appears, repair the named problem and choose **Retry Recovery**. Preserved work resumes when requests are enabled and the Mac is awake. A pending detachment finishes detaching instead. Detachment keeps files and evidence, and stays pending if processes cannot be stopped. Recovery must finish before deleting its records or reusing that checkout. **Rebuild Library** uses the last successfully selected folder; a failed folder selection retains the previous library.
+
 The TV also requests performance improvements for sustained slow playback. Those requests allow browsing. If the resulting scene is still slow, Retry schedules another improvement with manual priority; Dismiss suppresses automatic requests for that scene until the next TV launch.

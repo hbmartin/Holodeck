@@ -88,22 +88,33 @@ def terminate_registered(directory):
         if process_identity(leader['pid']) == leader:
             entry['members'] = merge_members(entry['members'], group_members(leader['pid']))
     write(file, entries)
-    for sig in (signal.SIGTERM, signal.SIGKILL):
+    deadline = time.monotonic() + 10
+    term_sent, kill_sent = set(), set()
+    next_sample = 0
+    while True:
+        if time.monotonic() >= next_sample:
+            for entry in entries:
+                if process_identity(entry['leader']['pid']) == entry['leader']:
+                    entry['members'] = merge_members(entry['members'], group_members(entry['leader']['pid']))
+            write(file, entries)
+            next_sample = time.monotonic() + .1
+        sig = signal.SIGKILL if time.monotonic() >= deadline - 5 else signal.SIGTERM
+        sent = kill_sent if sig == signal.SIGKILL else term_sent
         for entry in entries:
-            for identity in entry.get('members', [entry['leader']]):
-                if process_identity(identity['pid']) == identity:
+            for identity in entry['members']:
+                key = (identity['pid'], identity['seconds'], identity['microseconds'])
+                if key not in sent and process_identity(identity['pid']) == identity:
+                    sent.add(key)
                     with contextlib.suppress(ProcessLookupError): os.kill(identity['pid'], sig)
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            if not any(process_identity(i['pid']) == i for e in entries for i in e.get('members', [e['leader']])):
-                for entry in entries:
-                    if group_members(entry['leader']['pid']):
-                        entry['unverified'] = True
-                        write(file, entries)
-                        raise ProcessRecoveryError('Unverified validation descendants remain; retain the journal and recover or detach the checkout')
-                file.unlink(missing_ok=True); return
-            time.sleep(.02)
-    raise ProcessRecoveryError('Validation processes did not exit; checkout recovery is required')
+        live = any(process_identity(i['pid']) == i for e in entries for i in e['members'])
+        unknown = any(process_identity(e['leader']['pid']) is None and group_members(e['leader']['pid']) for e in entries)
+        if not live and not unknown:
+            file.unlink(missing_ok=True); return
+        if time.monotonic() >= deadline:
+            for entry in entries: entry['unverified'] = True
+            write(file, entries)
+            raise ProcessRecoveryError('Validation descendants did not settle; retain the journal and recover or detach the checkout')
+        time.sleep(.025)
 
 
 def managed_run(args, cwd, env, timeout, input, text=True):
@@ -1089,6 +1100,8 @@ def main():
         os.setsid()
     config = json.loads(Path(sys.argv[2]).read_text())
     def interrupted(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         raise WorkerInterrupted(signum)
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)

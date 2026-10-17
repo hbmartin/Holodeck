@@ -91,7 +91,7 @@ final class MacModel {
         if !usesDirectory { session.refresh() }
         let previewService = service
         let pressure = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .global())
-        pressure.setEventHandler { Task { await previewService.trimPreviewCaches() } }
+        pressure.setEventHandler { @Sendable in Task { await previewService.trimPreviewCaches() } }
         memoryPressure = pressure
         pressure.resume()
     }

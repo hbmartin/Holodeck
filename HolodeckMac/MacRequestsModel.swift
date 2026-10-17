@@ -19,6 +19,8 @@ final class MacRequestsModel {
     @ObservationIgnored private var observation: Task<Void, Never>?
     @ObservationIgnored private var publicationObservation: Task<Void, Never>?
     @ObservationIgnored private var pendingRepository: URL?
+    @ObservationIgnored private var selectionTask: Task<ShaderRepositorySelection, Error>?
+    @ObservationIgnored private var selectionID: UUID?
     @ObservationIgnored private var didInitialize = false
     @ObservationIgnored private var publicationSequence: UInt64?
     @ObservationIgnored private var initialization: Task<Void, Error>?
@@ -82,16 +84,36 @@ final class MacRequestsModel {
     isolated deinit { observation?.cancel(); publicationObservation?.cancel() }
     func initialized() async throws {
         try await initialization?.value
-        guard !didInitialize else { return }
-        if let pendingRepository { try await service.selectRepository(pendingRepository); self.pendingRepository = nil }
-        configuration = await service.configurationValue()
-        didInitialize = true
+        if !didInitialize { configuration = await service.configurationValue(); didInitialize = true }
+        if let task = selectionTask {
+            let id = selectionID, result = try await task.value
+            if id == selectionID { acceptSelection(result.configuration); selectionTask = nil; selectionID = nil; pendingRepository = nil }
+        }
+        if let pendingRepository {
+            let accepted = try await service.selectRepository(pendingRepository)
+            acceptSelection(accepted); self.pendingRepository = nil
+        }
     }
-    var hasUnfinishedJobs: Bool { pendingCleanup || jobs.contains { !$0.stage.terminal } }
-    func setRepository(_ url: URL) {
+    var hasUnfinishedJobs: Bool { pendingCleanup || !recoveries.isEmpty || jobs.contains { !$0.stage.terminal } }
+    /// A startup bookmark is a proposal until the service accepts it.
+    func proposeRepository(_ url: URL) {
         guard !configuration.enabled, !hasUnfinishedJobs else { return }
-        configuration.repository = url.path; configuration.checkoutID = nil; save()
         pendingRepository = url
+    }
+    private func acceptSelection(_ accepted: ShaderRequestConfiguration) {
+        configuration.repository = accepted.repository; configuration.checkoutID = accepted.checkoutID; configuration.enabled = accepted.enabled
+        save()
+    }
+    func reloadRepository(_ url: URL) async throws -> CatalogReloadResult {
+        try await initialization?.value
+        let id = UUID(), service = service
+        pendingRepository = url; selectionID = id
+        let task = Task { try await service.reloadRepository(url) }; selectionTask = task
+        let result = try await task.value
+        if selectionID == id {
+            acceptSelection(result.configuration); pendingRepository = nil; selectionTask = nil; selectionID = nil
+        }
+        return result.publication
     }
     private func save() { defaults?.set(try? JSONEncoder().encode(configuration), forKey: "holodeck.requestConfiguration") }
     func verify() {
@@ -101,7 +123,6 @@ final class MacRequestsModel {
             defer { checking = false }
             do {
                 try await initialized()
-                if let pendingRepository { try await service.selectRepository(pendingRepository); self.pendingRepository = nil }
                 let candidate = configuration
                 try await service.verify(configuration: candidate)
                 configuration = await service.configurationValue()

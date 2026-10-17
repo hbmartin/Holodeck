@@ -23,7 +23,20 @@ import XCTest
             try handle.seekToEnd(); try handle.write(contentsOf: Data(repeating: 2, count: 100_000)); try handle.close()
         })) { XCTAssertTrue($0.localizedDescription.contains("33 bytes; limit is 32")) }
     }
-    func testRejectsRootIntermediateFinalLinksAndSpecialFiles() async throws {
+    func testRootAliasRetargetingDoesNotChangeAnOpenedReader() throws {
+        let first = try folder(), second = try folder(), container = try folder()
+        try Data("first".utf8).write(to:first.appendingPathComponent("body"))
+        try Data("second".utf8).write(to:second.appendingPathComponent("body"))
+        let alias=container.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(at:alias,withDestinationURL:first)
+        let pinned=try BoundedCatalogReader(root:alias)
+        try FileManager.default.removeItem(at:alias)
+        try FileManager.default.createSymbolicLink(at:alias,withDestinationURL:second)
+        XCTAssertEqual(try pinned.read("body",limit:32).bytes,Data("first".utf8))
+        XCTAssertEqual(try BoundedCatalogReader(root:alias).read("body",limit:32).bytes,Data("second".utf8))
+    }
+
+    func testAcceptsRootAliasesButRejectsInteriorLinksAndSpecialFiles() async throws {
         let root = try folder(), outside = try folder()
         try Data("outside".utf8).write(to: outside.appendingPathComponent("body"))
         try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("linked"), withDestinationURL: outside)
