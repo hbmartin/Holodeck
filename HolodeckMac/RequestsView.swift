@@ -123,8 +123,11 @@ private struct CheckoutRecoveryView: View {
                     else { model.retryReconciliation() }
                 }
                     .disabled(model.checking || recovery.isRunning).accessibilityIdentifier("retry-checkout-cleanup")
+                if recovery.checkout == nil, let journal = recovery.journal {
+                    Button("Open Recovery Journal") { NSWorkspace.shared.open(journal) }
+                }
                 Button("Detach Checkout…", role: .destructive) { confirmsDetach = true }
-                    .disabled(model.checking).accessibilityIdentifier("detach-checkout")
+                    .disabled(model.checking || (recovery.kind == .reconciliation && recovery.checkout == nil)).accessibilityIdentifier("detach-checkout")
             }
         }.confirmationDialog("Detach this checkout and disable shader requests?", isPresented: $confirmsDetach) {
             Button("Detach and Keep Files", role: .destructive) { model.detach(recovery.kind == .cleanup ? recovery.id : recovery.requestID) }

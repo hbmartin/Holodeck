@@ -16,6 +16,12 @@ final class MacLibraryModel {
     private var publicationResolvedSequence: UInt64 = 0
     private enum ErrorOrigin: Hashable { case folder, publication, manualReload, server, approval, revocation }
     private var errors: [ErrorOrigin: String] = [:]
+    private var representedCatalogFailure: (origin: ErrorOrigin, id: UUID)?
+    var representedCatalogFailureID: UUID? { representedCatalogFailure?.id }
+    func representsCatalogFailure(_ failure: ViewerSession.Failure) -> Bool {
+        if case .catalog = failure.operation { return representedCatalogFailure?.id == failure.id }
+        return false
+    }
     var error: String? { errors[.folder] ?? errors[.server] ?? errors[.manualReload] ?? errors[.publication] ?? errors[.approval] ?? errors[.revocation] }
     var previewWarnings: [ShaderPreviewWarning] = []
     var serverState = LocalServerState()
@@ -29,6 +35,14 @@ final class MacLibraryModel {
     @ObservationIgnored private var sleeping = false
     @ObservationIgnored private var sleepObservers: [NSObjectProtocol] = []
     #if DEBUG
+    var exposesFailureAssociationTests = false
+    func injectUnrelatedCatalogFailureForTesting(revocation: Bool) {
+        guard exposesFailureAssociationTests else { return }
+        clearError(from: .folder); clearError(from: .manualReload); clearError(from: .publication)
+        folder = folder ?? FileManager.default.temporaryDirectory
+        setError(revocation ? "Previous revocation failed" : "Previous approval failed", from: revocation ? .revocation : .approval)
+        session.failure = .init(message: "Independent catalog failure", operation: .catalog)
+    }
     var isTestingReloadHeld = false
     @ObservationIgnored private var testingReloadContinuation: CheckedContinuation<Void, Never>?
     @ObservationIgnored private var holdsNextReloadForTesting = false
@@ -41,6 +55,7 @@ final class MacLibraryModel {
         #if DEBUG
         MacInspectionLifecycle.snapshot.libraryCreations += 1
         server = testingNamespace.map { LocalCatalogServer.testing(catalog: catalog, namespace: $0, advertise: testingAdvertises) } ?? LocalCatalogServer(catalog: catalog)
+        exposesFailureAssociationTests = testingNamespace != nil && UITestConfiguration(applicationID: "me.haroldmartin.HolodeckMac").hasExplicitStorageSuite && ProcessInfo.processInfo.environment["HOLODECK_UI_TEST_ERROR_ASSOCIATION"] == "1"
         holdsNextReloadForTesting = testingNamespace != nil && UITestConfiguration(applicationID: "me.haroldmartin.HolodeckMac").contains("--ui-test-hold-library-reload")
         #else
         server = LocalCatalogServer(catalog: catalog)
@@ -80,7 +95,7 @@ final class MacLibraryModel {
                 var stale = false
                 let url = try URL(resolvingBookmarkData: bookmark, options: [], relativeTo: nil, bookmarkDataIsStale: &stale)
                 if url.startAccessingSecurityScopedResource() { scopedURL = url }
-                folder = url; requests.setRepository(url); refreshBookmark = stale
+                folder = url; requests.proposeRepository(url); refreshBookmark = stale
             } catch { self.setError("Choose your shader folder again: \(error.localizedDescription)", from: .folder) }
         }
         let shouldRefreshBookmark = refreshBookmark
@@ -138,6 +153,7 @@ final class MacLibraryModel {
         Task {
             defer { localReloading = false }
             do {
+                try await requests.initialized()
                 try await requests.service.ensurePublication(force: true)
                 if let status = await requests.service.publicationStatus() { previewWarnings = status.warnings }
                 ready = true
@@ -177,14 +193,14 @@ final class MacLibraryModel {
                 do { bookmark = saveBookmark ? try url.bookmarkData(options: [],
                     includingResourceValuesForKeys: nil, relativeTo: nil) : nil }
                 catch { setError(error.localizedDescription, from: .folder); throw error }
-                let result = try await catalog.reload(from: url)
+                let result = try await requests.reloadRepository(url)
                 previewWarnings = result.previewWarnings; clearError(from: .publication)
                 if let bookmark { defaults?.set(bookmark, forKey: "holodeck.shaderFolderBookmark") }
                 if folder != url {
                     scopedURL?.stopAccessingSecurityScopedResource(); scopedURL = nil
                     if url.startAccessingSecurityScopedResource() { scopedURL = url }
                 }
-                folder = url; requests.setRepository(url); ready = true
+                folder = URL(fileURLWithPath: requests.configuration.repository); ready = true
                 await session.refresh(force: true).value
                 #if DEBUG
                 if holdsNextReloadForTesting {
@@ -225,9 +241,15 @@ final class MacLibraryModel {
         } else { publicationFailureSequence = nil }
         setError(prefix + error.localizedDescription, from: .publication)
     }
-    private func setError(_ message: String, from origin: ErrorOrigin) { errors[origin] = message }
+    private func setError(_ message: String, from origin: ErrorOrigin) {
+        errors[origin] = message
+        if origin == .publication || origin == .manualReload || origin == .folder, let failure = session.catalogFailure {
+            representedCatalogFailure = (origin, failure.id)
+        }
+    }
     private func clearError(from origin: ErrorOrigin) {
         errors[origin] = nil
+        if representedCatalogFailure?.origin == origin { representedCatalogFailure = nil }
         if origin == .publication { publicationFailureSequence = nil }
     }
     private func startServer() async throws {
@@ -271,7 +293,7 @@ struct ShaderLibrarySettings: View {
                         .accessibilityIdentifier("reload-shaders")
                     if library.isReloading { ProgressView().controlSize(.small).accessibilityIdentifier("shader-library-reloading") }
                 }.disabled(library.isReloading || library.requests.configuration.enabled || library.requests.hasUnfinishedJobs)
-                if library.requests.configuration.enabled {
+                if library.folder != nil {
                     Button("Rebuild Library", action: library.rebuildPublication)
                         .disabled(library.isReloading || library.requests.hasUnfinishedJobs)
                         .accessibilityIdentifier("rebuild-shader-library")
@@ -295,6 +317,10 @@ struct ShaderLibrarySettings: View {
                 Text("Changes are shared after Reload Shaders. Previews are generated and cached on this Mac.")
                     .font(.caption).foregroundStyle(.secondary)
                 #if DEBUG
+                if library.exposesFailureAssociationTests {
+                    Button("Inject Approval Catalog Failure") { library.injectUnrelatedCatalogFailureForTesting(revocation: false) }.accessibilityIdentifier("test-approval-catalog-failure")
+                    Button("Inject Revocation Catalog Failure") { library.injectUnrelatedCatalogFailureForTesting(revocation: true) }.accessibilityIdentifier("test-revocation-catalog-failure")
+                }
                 if library.isTestingReloadHeld {
                     if let failure = library.testingSelectionFailure {
                         Text(failure).accessibilityIdentifier("test-reload-selection-failure")

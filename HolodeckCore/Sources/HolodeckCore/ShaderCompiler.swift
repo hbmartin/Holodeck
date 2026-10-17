@@ -3,6 +3,7 @@ import Metal
 nonisolated public enum ShaderCompilationError: LocalizedError {
     case missingFunction(String)
     case invalidUniformLayout
+    case pipelineInterface(NSError)
 
     public static func isSourceDefect(_ error: Error) -> Bool {
         if error is ShaderCompilationError { return true }
@@ -10,8 +11,20 @@ nonisolated public enum ShaderCompilationError: LocalizedError {
         return native.domain == MTLLibraryErrorDomain && native.code == MTLLibraryError.compileFailure.rawValue
     }
 
+    /// Driver error domains/codes vary by GPU. Only known interface diagnostics are source defects.
+    static func pipelineError(_ error: Error) -> Error {
+        let native = error as NSError, diagnostic = native.localizedDescription.lowercased()
+        if diagnostic.contains("fragment input"),
+           diagnostic.contains("mismatching vertex shader output") || diagnostic.contains("not written by vertex shader") ||
+           diagnostic.contains("not found in vertex shader output") {
+            return ShaderCompilationError.pipelineInterface(native)
+        }
+        return error
+    }
+
     public var errorDescription: String? {
         switch self {
+        case .pipelineInterface(let error): return error.localizedDescription
         case .invalidUniformLayout: return "Uniforms must match the 16-byte buffer-0 contract"
         case .missingFunction(let name): return "The shader is missing its \(name) entry point."
         }
@@ -57,5 +70,6 @@ nonisolated func makeShaderPipeline(device: any MTLDevice, library: any MTLLibra
     descriptor.fragmentFunction = fragment
     descriptor.colorAttachments[0].pixelFormat = pixelFormat
     descriptor.rasterSampleCount = 1
-    return try device.makeRenderPipelineState(descriptor: descriptor)
+    do { return try device.makeRenderPipelineState(descriptor: descriptor) }
+    catch { throw ShaderCompilationError.pipelineError(error) }
 }

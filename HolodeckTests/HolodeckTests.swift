@@ -10,7 +10,7 @@ import ConcurrencyExtras
 @MainActor
 final class HolodeckTests: XCTestCase {
     func testDeliveryReportsOnlyOutputDefectsAndRetriesTransientFailures() async throws {
-        for scenario in ["capture", "refresh", "control", "activation", "missing", "superseded", "success"] {
+        for scenario in ["capture", "refresh", "control", "activation", "pipeline", "resource", "missing", "superseded", "success"] {
             let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
             let renderer = try makeRenderer(view: MTKView(frame: .zero, device: device))
             let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource(kind: .standard) { request, _ in
@@ -22,7 +22,7 @@ final class HolodeckTests: XCTestCase {
             let scenes = DeliverySceneRenderer(); session.attach(scenes)
             await session.refreshTask?.value; await session.selectionTask?.value
             scenes.mode = scenario
-            let shader = scenario == "activation" || scenario == "superseded" ? TestCatalog.shaders[1] : TestCatalog.initialShader
+            let shader = ["activation", "pipeline", "resource", "superseded"].contains(scenario) ? TestCatalog.shaders[1] : TestCatalog.initialShader
             let png = try RequestScreenshot.encode(pixels: Data([128,64,32,255]), width: 1, height: 1, bytesPerRow: 4)
             let context = ShaderRequestContext(shader: shader, screenshot: png, animationTime: 0, width: 1280, height: 720)
             var diagnostics: [String] = [], acknowledgements = 0
@@ -48,7 +48,7 @@ final class HolodeckTests: XCTestCase {
             await controller.deliver(job) // Delivery nonce handshake.
             await controller.deliver(job)
             controller.setForeground(false)
-            XCTAssertEqual(diagnostics.count, scenario == "missing" || scenario == "activation" ? 1 : 0, scenario)
+            XCTAssertEqual(diagnostics.count, ["missing", "activation", "pipeline"].contains(scenario) ? 1 : 0, scenario)
             XCTAssertEqual(acknowledgements, scenario == "success" ? 1 : 0, scenario)
         }
     }
@@ -1274,6 +1274,11 @@ private nonisolated final class TVRecoveryChannel: LocalRequestConnection, @unch
     var mode = "success"
     func select(_ shader: ShaderDefinition) async throws -> Bool {
         if mode == "activation" { throw ShaderCompilationError.missingFunction("fragmentShader") }
+        if mode == "pipeline" {
+            throw ShaderCompilationError.pipelineInterface(NSError(domain: "AGXMetalTest", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Fragment input(s) mismatching vertex shader output type(s)"]))
+        }
+        if mode == "resource" { throw NSError(domain: "AGXMetalTest", code: 3, userInfo: [NSLocalizedDescriptionKey: "Out of memory"]) }
         if mode == "superseded" { return false }
         activeShader = shader; return true
     }
