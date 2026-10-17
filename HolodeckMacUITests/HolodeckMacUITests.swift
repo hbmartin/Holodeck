@@ -171,6 +171,7 @@ final class HolodeckMacUITests: XCTestCase {
         let config: [String: Any] = ["repository": authoring.path, "codex": "/unavailable/codex", "python": "/usr/bin/python3", "git": "/usr/bin/git",
             "shaderTool": "", "model": "fixture", "reasoning": "high", "enabled": true]
         try JSONSerialization.data(withJSONObject: config).write(to: directory.appendingPathComponent("preferences.json"))
+        try JSONSerialization.data(withJSONObject: config).write(to: setup.appendingPathComponent("configuration.json"))
         let app = try app(suite: suite, arguments: ["--ui-test-local-library"])
         let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: authoring.appendingPathComponent("shaders/plasma/metadata.json"))) as? [String: Any])
         return (app, authoring, marker, metadata["name"] as! String, source)
@@ -222,6 +223,50 @@ final class HolodeckMacUITests: XCTestCase {
         rebuild.click()
         waitForTitle(f.name, in: app); waitForLibraryIdle(in: app)
         XCTAssertFalse(element("shader-library-error", in: app).exists)
+    }
+
+    func testPostStartupFolderSelectionThenImmediateRebuildUsesSelectedCheckout() throws {
+        let f = try managedRecoveryFixture(), app = f.app
+        try FileManager.default.removeItem(at: f.marker)
+        let directory = f.marker.deletingLastPathComponent().deletingLastPathComponent(), preferences = directory.appendingPathComponent("preferences.json")
+        var config = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: preferences)) as? [String: Any]); config["enabled"] = false
+        try JSONSerialization.data(withJSONObject: config).write(to: preferences)
+        app.launchEnvironment["HOLODECK_UI_TEST_SHADER_BOOKMARK"] = try f.authoring.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil).base64EncodedString()
+        let selected = FileManager.default.temporaryDirectory.appendingPathComponent("SelectedCheckout-"+UUID().uuidString)
+        try FileManager.default.copyItem(at: f.authoring, to: selected); addTeardownBlock { try? FileManager.default.removeItem(at: selected) }
+        app.launch(); app.activate(); waitForTitle(f.name,in: app)
+        element("shader-library-settings",in: app).click(); waitForLibraryIdle(in: app)
+        element("choose-shader-folder",in: app).click()
+        app.typeKey("g",modifierFlags:[.command,.shift]); app.typeText(selected.path); app.typeKey(.return,modifierFlags:[])
+        let confirm = app.windows["open-panel"].buttons["OKButton"].firstMatch
+        XCTAssertTrue(confirm.waitForExistence(timeout:10)); confirm.click()
+        waitForLibraryIdle(in: app)
+        let rebuild=element("rebuild-shader-library",in:app)
+        let enabled=XCTNSPredicateExpectation(predicate:NSPredicate(format:"enabled == true"),object:rebuild)
+        XCTAssertEqual(XCTWaiter.wait(for:[enabled],timeout:15),.completed); rebuild.click()
+        waitForLibraryIdle(in:app)
+        let configURL=directory.appendingPathComponent("publication/configuration.json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath:configURL.path))
+        let used=try XCTUnwrap(JSONSerialization.jsonObject(with:Data(contentsOf:configURL)) as? [String:Any])
+        XCTAssertEqual(URL(fileURLWithPath:try XCTUnwrap(used["repository"] as? String)).resolvingSymlinksInPath(),selected.resolvingSymlinksInPath())
+        let saved=try XCTUnwrap(JSONSerialization.jsonObject(with:Data(contentsOf:preferences)) as? [String:Any])
+        XCTAssertEqual(saved["repository"] as? String,used["repository"] as? String)
+    }
+
+    func testUnrelatedApprovalAndRevocationErrorsDoNotSuppressCatalogAlerts() throws {
+        for origin in ["approval","revocation"] {
+            let app = try app(arguments:["--ui-test-local-library"])
+            app.launchEnvironment["HOLODECK_UI_TEST_ERROR_ASSOCIATION"]="1"
+            app.launch();app.activate()
+            let settings=element("shader-library-settings",in:app)
+            XCTAssertTrue(settings.waitForExistence(timeout:15));settings.click();waitForLibraryIdle(in:app)
+            element("test-"+origin+"-catalog-failure",in:app).click()
+            XCTAssertTrue(app.staticTexts["Unable to Load Scenes"].waitForExistence(timeout:10))
+            XCTAssertTrue(app.staticTexts["Independent catalog failure"].exists)
+            app.windows["holodeck-viewer-window"].buttons["OK"].firstMatch.click()
+            waitForLibraryError("Previous "+origin+" failed",in:app)
+            app.terminate()
+        }
     }
 
     func testUnmanagedBookmarkSelectionSurvivesRequestInitialization() throws {

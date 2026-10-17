@@ -1316,6 +1316,73 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertEqual(jobs.first { $0.deviceID == "TV-B" }?.stage, .queued)
     }
 
+    func testSelectionRollbackFailureIsDurableAndRecoveryRestoresPreferences() async throws {
+        let (root, script) = try recoveryFixture(), old = try requestAuthoringFixture(root.appendingPathComponent("old")), new = try requestAuthoringFixture(root.appendingPathComponent("new"))
+        let catalogDirectory = root.appendingPathComponent("catalog"), preferences = root.appendingPathComponent("preferences.json")
+        let originalCatalog = DirectoryCatalog(directory: catalogDirectory), previous = try await originalCatalog.reload(from: old)
+        var files = DirectoryCatalogFileOperations()
+        files.writeMarker = { _, _ in
+            try FileManager.default.removeItem(at: preferences)
+            try FileManager.default.createDirectory(at: preferences, withIntermediateDirectories: false)
+            throw POSIXError(.EIO)
+        }
+        let catalog = DirectoryCatalog(directory: catalogDirectory, files: files)
+        _ = try await catalog.cached()
+        let service = ShaderRequestService(catalog: catalog, directory: root, workerScript: script)
+        await service.suspend(); try await service.initialize(configuration: .init(repository: old.path))
+        do { _ = try await service.reloadRepository(new); XCTFail("Failed publication installed") } catch {}
+        let store = try JSONDecoder().decode(RequestRecoveryStore.self, from: Data(contentsOf: root.appendingPathComponent("recovery.json")))
+        XCTAssertEqual(store.entries.values.first?.preferencesRollback?.repository,old.path)
+        let head = try JSONDecoder().decode(CatalogHead.self, from: await catalog.get(.head, limit: CatalogLimits.headBytes))
+        XCTAssertEqual(head.revision,previous.catalog.publicationRevision)
+        try FileManager.default.removeItem(at: preferences)
+        try await service.retryReconciliation()
+        let saved = try JSONDecoder().decode(ShaderRequestConfiguration.self,from:Data(contentsOf:preferences))
+        XCTAssertEqual(saved.repository,old.path)
+    }
+
+    func testPostStartupRepositorySelectionDrivesNextForcedPublication() async throws {
+        let f = try await publicationRecoveryFixture()
+        let previous = try await f.catalog.reload(from: f.authoring)
+        try await f.service.disable()
+        let selected = try requestAuthoringFixture(f.root.appendingPathComponent("selected"))
+        try Data("SELECTED\n".utf8).write(to: selected.appendingPathComponent("shaders/plasma/body.metal"))
+        let accepted = try await f.service.reloadRepository(selected)
+        XCTAssertEqual(accepted.configuration.repository, RequestPaths.canonical(selected))
+        XCTAssertNotEqual(accepted.publication.catalog.publicationRevision, previous.catalog.publicationRevision)
+        await f.service.resume(); try await f.service.ensurePublication(force: true)
+        let cfg = try JSONDecoder().decode(ShaderRequestConfiguration.self, from: Data(contentsOf: f.root.appendingPathComponent("publication/configuration.json")))
+        XCTAssertEqual(cfg.repository, RequestPaths.canonical(selected))
+        let status = await f.service.publicationStatus(); XCTAssertEqual(status?.revision, accepted.publication.catalog.publicationRevision)
+    }
+
+    func testRejectedAndFailedRepositorySelectionPreservePreviousState() async throws {
+        let f = try await publicationRecoveryFixture(), previous = try await f.catalog.reload(from: f.authoring)
+        do { _ = try await f.service.selectRepository(f.root); XCTFail("Enabled checkout changed") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("Disable shader requests")) }
+        try await f.service.disable()
+        let before = try Data(contentsOf: f.root.appendingPathComponent("preferences.json"))
+        do { _ = try await f.service.reloadRepository(f.root.appendingPathComponent("missing")); XCTFail("Invalid folder loaded") } catch {}
+        XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent("preferences.json")),before)
+        let cfg = await f.service.configurationValue(); XCTAssertEqual(cfg.repository,f.authoring.path)
+        let head = try JSONDecoder().decode(CatalogHead.self, from: await f.catalog.get(.head, limit: CatalogLimits.headBytes))
+        XCTAssertEqual(head.revision,previous.catalog.publicationRevision)
+    }
+
+    func testRepositorySelectionOwnsLeaseUntilPublicationCompletes() async throws {
+        for _ in 0..<10 {
+            let gate = RequestPreparationGate(), f = try await publicationRecoveryFixture(gate: gate)
+            try await f.service.disable()
+            let selecting = Task { try await f.service.reloadRepository(f.authoring) }
+            try await waitFor { await gate.entered }
+            do { _ = try await f.service.selectRepository(f.root); XCTFail("Changed repository during preparation") }
+            catch { XCTAssertTrue(error.localizedDescription.contains("Wait for active")) }
+            do { try await f.service.detachCheckout(); XCTFail("Detached during selection") }
+            catch { XCTAssertTrue(error.localizedDescription.contains("finish loading")) }
+            await gate.release(); _ = try await selecting.value
+        }
+    }
+
     func testUnsupportedInterpreterIsRejectedBeforeWorkerParsing() async throws {
         let (root, _) = try recoveryFixture(), interpreter = root.appendingPathComponent("old-python"), script = root.appendingPathComponent("invalid.py")
         try "this worker deliberately cannot parse!".write(to: script, atomically: true, encoding: .utf8)

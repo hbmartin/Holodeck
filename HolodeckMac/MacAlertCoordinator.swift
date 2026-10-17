@@ -13,7 +13,7 @@ final class MacAlertCoordinator {
             case .renderer(let failure):
                 return model.startupError?.id == failure.id
             case .session(let failure):
-                if case .catalog = failure.operation, model.library?.error != nil { return false }
+                if case .catalog = failure.operation, model.library?.representsCatalogFailure(failure) == true { return false }
                 return model.session.failure?.id == failure.id
             }
         }
@@ -50,7 +50,7 @@ final class MacAlertCoordinator {
         else if let failure = model.session.failure {
             if let library = model.library {
                 guard !library.isReloading else { return }
-                if case .catalog = failure.operation, library.folder == nil || library.error != nil { return }
+                if case .catalog = failure.operation, library.folder == nil || library.representsCatalogFailure(failure) { return }
             }
             payload = .session(failure)
         }

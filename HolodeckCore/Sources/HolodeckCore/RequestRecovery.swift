@@ -14,6 +14,7 @@ nonisolated struct RequestRecoveryStore: Codable, Sendable {
         var configuration: ShaderRequestConfiguration?
         var disposition: ShaderRequestRecoveryDisposition
         var message: String
+        var preferencesRollback: ShaderRequestConfiguration?
     }
     var formatVersion = 1
     var legacyMigrationComplete = false

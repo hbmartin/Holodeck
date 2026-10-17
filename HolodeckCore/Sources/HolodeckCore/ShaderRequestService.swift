@@ -98,6 +98,11 @@ public struct ShaderRequestPublicationEvent: Sendable {
     public let unresolvedFailure: ShaderRequestPublicationFailure?
 }
 
+public struct ShaderRepositorySelection: Sendable {
+    public let configuration: ShaderRequestConfiguration
+    public let publication: CatalogReloadResult
+}
+
 public actor ShaderRequestService {
     private struct Record: Codable, Sendable {
         var status: ShaderRequestStatus
@@ -126,6 +131,7 @@ public actor ShaderRequestService {
     private var preparedID: UUID?
     private struct Execution { let id = UUID(); var interrupted = false }
     private var execution: Execution?
+    private var selectingRepository = false
     private var maintenanceLease: UUID?
     private var maintenanceBusy: Bool { maintenanceLease != nil }
     private struct ReconciliationResult: Sendable { var owner: UUID?; var acknowledgements: [DetachedCheckoutAcknowledgement] }
@@ -188,6 +194,7 @@ public actor ShaderRequestService {
     }
     public func initialize(configuration: ShaderRequestConfiguration) throws {
         try load()
+        guard !selectingRepository else { throw ShaderRequestError.unavailable("Wait for the selected folder to finish loading.") }
         let previous = self.configuration
         let preferences = directory.appendingPathComponent("preferences.json")
         self.configuration = (try? Data(contentsOf: preferences)).flatMap { try? JSONDecoder().decode(ShaderRequestConfiguration.self, from: $0) } ?? configuration
@@ -262,14 +269,61 @@ public actor ShaderRequestService {
     private func folder(_ id: UUID) -> URL { directory.appendingPathComponent(id.uuidString) }
     public func artifacts(for id: UUID) -> URL { folder(id) }
     public func configurationValue() -> ShaderRequestConfiguration { configuration }
-    public func selectRepository(_ repository: URL) throws {
-        guard !configuration.enabled, activeID == nil, !maintenanceBusy,
-              !records.values.contains(where: { !$0.status.stage.terminal || $0.cleanupPending == true }) else { return }
-        guard configuration.repository.isEmpty || RequestPaths.canonical(repository) != RequestPaths.canonical(URL(fileURLWithPath: configuration.repository)) else { return }
-        configuration.repository = repository.path; configuration.checkoutID = nil
+    private func requireRepositorySelection() throws {
+        guard !configuration.enabled else { throw ShaderRequestError.unavailable("Disable shader requests before selecting another checkout.") }
+        guard activeID == nil, !maintenanceBusy, workerTask == nil else { throw ShaderRequestError.unavailable("Wait for active library preparation or checkout work before selecting another folder.") }
+        guard recovery.entries.isEmpty, reconciliationFailure == nil else { throw ShaderRequestError.unavailable(recoveryBlocker ?? "Retry checkout recovery before selecting another folder.") }
+        guard !records.values.contains(where: { !$0.status.stage.terminal || $0.cleanupPending == true }) else {
+            throw ShaderRequestError.unavailable("Finish or cancel queued requests before selecting another folder.")
+        }
+    }
+    private func selectedConfiguration(_ repository: URL) -> ShaderRequestConfiguration {
+        var selected = configuration
+        selected.repository = RequestPaths.canonical(repository); selected.checkoutID = nil
+        return selected
+    }
+    private func acceptRepository(_ accepted: ShaderRequestConfiguration) {
+        cancelPublicationRequests()
+        configuration = accepted
         publicationGeneration = UUID(); latestPublication = nil; unresolvedPublicationFailure = nil
-        try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
         _ = publicationState(.idle)
+    }
+    @discardableResult public func selectRepository(_ repository: URL) async throws -> ShaderRequestConfiguration {
+        try load(); try requireRepositorySelection()
+        try await reconcileWorkers(); try requireRepositorySelection()
+        let lease = beginMaintenance(); defer { endMaintenance(lease) }
+        let accepted = selectedConfiguration(repository)
+        try JSONEncoder().encode(accepted).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
+        acceptRepository(accepted)
+        return accepted
+    }
+    /// Folder selection, publication and persisted management configuration share one lease.
+    public func reloadRepository(_ repository: URL) async throws -> ShaderRepositorySelection {
+        try load(); try requireRepositorySelection()
+        try await reconcileWorkers(); try requireRepositorySelection()
+        let lease = beginMaintenance(); selectingRepository = true
+        defer { selectingRepository = false; endMaintenance(lease) }
+        let previous = configuration, accepted = selectedConfiguration(repository)
+        let prepared = try await catalog.prepare(from: repository)
+        do {
+            try Task.checkCancellation()
+            try JSONEncoder().encode(accepted).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
+            let publication: CatalogReloadResult
+            do { publication = try await catalog.install(prepared.id) }
+            catch {
+                do { try JSONEncoder().encode(previous).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic) }
+                catch {
+                    let journal = directory.appendingPathComponent("selection")
+                    holdForRecovery(journal: journal, configuration: previous, error: error)
+                    let key = RequestPaths.canonical(journal)
+                    recovery.entries[key]?.preferencesRollback = previous
+                    try? persistRecovery()
+                }
+                throw error
+            }
+            acceptRepository(accepted); published(publication)
+            return ShaderRepositorySelection(configuration: configuration, publication: publication)
+        } catch { await catalog.discard(prepared.id); throw error }
     }
     public func hasPendingCleanup() -> Bool { records.values.contains { $0.cleanupPending == true } }
     private var recoveryBlocker: String? {
@@ -430,6 +484,10 @@ public actor ShaderRequestService {
             // Finalization is idempotent; entries remain durable until record/ack writes finish.
             for entry in recovery.entries.values where entry.disposition == .detach { try finalizeDetachment(entry) }
             for entry in recovery.entries.values {
+                if let rollback = entry.preferencesRollback {
+                    try JSONEncoder().encode(rollback).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
+                    configuration = rollback
+                }
                 guard let id = entry.requestID, records[id]?.detached != true else { continue }
                 switch entry.disposition {
                 case .resume:
@@ -542,6 +600,7 @@ public actor ShaderRequestService {
     }
 
     public func detachCheckout(_ id: UUID? = nil) async throws {
+        guard !selectingRepository else { throw ShaderRequestError.unavailable("Wait for the selected folder to finish loading before detaching.") }
         let targetID = id ?? records.keys.first { folder($0) == reconciliationJournal }
         let selected = targetID.flatMap { records[$0]?.configuration } ?? (id == nil ? reconciliationConfiguration : nil) ?? (reconciliationFailure == nil ? configuration : nil)
         guard let selected else { throw ShaderRequestError.unavailable("This recovery journal has no verified checkout target. Repair its configuration; no selected checkout has been detached.") }
@@ -549,6 +608,7 @@ public actor ShaderRequestService {
         let ids = records.keys.filter { Self.samePublicationCheckout(records[$0]!.configuration, selected, paths: paths) }
         guard activeID == nil || ids.contains(activeID!) else { throw ShaderRequestError.unavailable("Wait for the other checkout’s active request before detaching this checkout.") }
         let lease = beginMaintenance(); defer { endMaintenance(lease) }
+        reconciliationTask = nil; reconciliationKickID = nil
         var targets = ids.map { (folder($0), Optional($0), records[$0]!.configuration) }
         for name in ["setup", "publication"] {
             let journal = directory.appendingPathComponent(name)
