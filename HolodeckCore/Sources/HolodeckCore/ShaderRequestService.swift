@@ -62,6 +62,9 @@ public struct ShaderRequestRecoveryStatus: Sendable, Identifiable {
     public let message: String
     public let isRunning: Bool
     public var requestID: UUID? = nil
+    public var journal: URL? = nil
+    public var checkout: ShaderRequestConfiguration? = nil
+    public var disposition: ShaderRequestRecoveryDisposition? = nil
 }
 
 public struct ShaderRequestPublicationStatus: Sendable {
@@ -111,6 +114,8 @@ public actor ShaderRequestService {
     private let directory: URL
     private let catalog: DirectoryCatalog
     private let workerScript: URL?
+    private var recovery = RequestRecoveryStore()
+    private let waitForWorker: @Sendable (RequestWorkerProcess) async throws -> Void
     private let reconcileWorker: @Sendable (URL) async throws -> Void
     private var configuration = ShaderRequestConfiguration()
     private var records: [UUID: Record] = [:]
@@ -123,14 +128,18 @@ public actor ShaderRequestService {
     private var execution: Execution?
     private var maintenanceLease: UUID?
     private var maintenanceBusy: Bool { maintenanceLease != nil }
-    private struct ReconciliationAttempt { let id = UUID(); let task: Task<UUID?, Error> }
+    private struct ReconciliationResult: Sendable { var owner: UUID?; var acknowledgements: [DetachedCheckoutAcknowledgement] }
+    private struct ReconciliationAttempt { let id = UUID(); let task: Task<ReconciliationResult, Error> }
     private var reconciliationTask: ReconciliationAttempt?
     private var reconciled = false
     private var reconciliationKickID: UUID?
     private var reconciliationFailure: String?
     private var reconciliationJournal: URL?
     private var reconciliationConfiguration: ShaderRequestConfiguration?
-    private struct ReconciliationError: Error { let journal: URL; let configuration: ShaderRequestConfiguration; let underlying: Error }
+    private struct ReconciliationError: LocalizedError {
+        let journal: URL; let configuration: ShaderRequestConfiguration?; let underlying: Error
+        var errorDescription: String? { underlying.localizedDescription }
+    }
     private static let reconciliationStatusID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     private var latestPublication: ShaderRequestPublicationStatus?
     private var publicationSequence: UInt64 = 0
@@ -159,12 +168,14 @@ public actor ShaderRequestService {
 
     public init(catalog: DirectoryCatalog, directory: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Holodeck/Requests")) {
         self.catalog = catalog; self.directory = directory; self.workerScript = nil
+        self.waitForWorker = { try await $0.waitForExit() }
         self.reconcileWorker = { try RequestWorkerProcess.reconcileOrphan(in: $0) }
     }
     init(catalog: DirectoryCatalog, directory: URL, workerScript: URL,
-         reconcileWorker: @escaping @Sendable (URL) async throws -> Void = { try RequestWorkerProcess.reconcileOrphan(in: $0) }) {
+         reconcileWorker: @escaping @Sendable (URL) async throws -> Void = { try RequestWorkerProcess.reconcileOrphan(in: $0) },
+         waitForWorker: @escaping @Sendable (RequestWorkerProcess) async throws -> Void = { try await $0.waitForExit() }) {
         self.catalog = catalog; self.directory = directory; self.workerScript = workerScript
-        self.reconcileWorker = reconcileWorker
+        self.reconcileWorker = reconcileWorker; self.waitForWorker = waitForWorker
     }
     private func workerProcess() -> RequestWorkerProcess { RequestWorkerProcess(script: workerScript) }
 
@@ -217,17 +228,6 @@ public actor ShaderRequestService {
             }
         }
         for id in records.keys {
-            if !hasAcknowledgements, records[id]?.detached == true, let record = records[id] {
-                do {
-                    if let owner = try Self.ownerMarker(record.configuration), owner.id == id,
-                       owner.directory == RequestPaths.canonical(folder(id)) {
-                        detachedOwners.append(Self.acknowledgement(id: id, job: folder(id), configuration: record.configuration))
-                    }
-                } catch {
-                    reconciliationFailure = "Worker recovery failed: " + error.localizedDescription
-                    reconciliationJournal = folder(id)
-                }
-            }
             if detachedOwners.contains(where: { $0.requestID == id }) {
                 records[id]?.detached = true; records[id]?.cleanupPending = false
                 if records[id]?.status.stage.terminal == false {
@@ -243,6 +243,18 @@ public actor ShaderRequestService {
             }
             // A restart makes one new recovery attempt after the operator can repair the host.
             records[id]?.cleanupFailure = nil
+        }
+        let sidecar = directory.appendingPathComponent("recovery.json")
+        if FileManager.default.fileExists(atPath: sidecar.path) {
+            recovery = try JSONDecoder().decode(RequestRecoveryStore.self,
+                from: BoundedCatalogReader(root: directory).read("recovery.json", limit: CatalogLimits.manifestBytes).bytes)
+            guard recovery.formatVersion == 1, recovery.entries.allSatisfy({ key, value in
+                key == value.journal && URL(fileURLWithPath: key).deletingLastPathComponent().path == RequestPaths.canonical(directory)
+            }) else { throw ShaderRequestError.unavailable("Recovery journal is invalid. Retain recovery.json and repair it before reusing this checkout.") }
+        }
+        if let entry = recovery.entries.values.first {
+            reconciliationFailure = entry.message; reconciliationJournal = URL(fileURLWithPath: entry.journal)
+            reconciliationConfiguration = entry.configuration
         }
         loaded = true
         try persist()
@@ -261,6 +273,7 @@ public actor ShaderRequestService {
     }
     public func hasPendingCleanup() -> Bool { records.values.contains { $0.cleanupPending == true } }
     private var recoveryBlocker: String? {
+        if let entry = recovery.entries.values.first { return "Mac checkout recovery required: " + entry.message }
         if let reconciliationFailure { return "Mac checkout recovery required: " + reconciliationFailure }
         if let record = records.values.first(where: { $0.cleanupPending == true }) {
             return "Mac checkout recovery required: " + (record.cleanupFailure ?? record.cleanupMessage ?? "Checkout cleanup is pending.")
@@ -330,12 +343,17 @@ public actor ShaderRequestService {
                 message: $0.cleanupFailure ?? $0.cleanupMessage ?? "Checkout cleanup is pending",
                 isRunning: activeID == $0.status.id)
         }.sorted { $0.id.uuidString < $1.id.uuidString }
-        if let reconciliationFailure {
-            let requestID = records.keys.first { folder($0) == reconciliationJournal }
-            let target = requestID.flatMap { records[$0]?.configuration } ?? reconciliationConfiguration ?? configuration
+        for entry in recovery.entries.values.sorted(by: { $0.journal < $1.journal }) {
+            statuses.append(ShaderRequestRecoveryStatus(id: entry.id, kind: .reconciliation,
+                repository: entry.configuration?.repository ?? "", python: entry.configuration?.python ?? "", git: entry.configuration?.git ?? "",
+                message: entry.message, isRunning: reconciliationTask != nil, requestID: entry.requestID,
+                journal: URL(fileURLWithPath: entry.journal), checkout: entry.configuration, disposition: entry.disposition))
+        }
+        if recovery.entries.isEmpty, let reconciliationFailure {
             statuses.append(ShaderRequestRecoveryStatus(id: Self.reconciliationStatusID, kind: .reconciliation,
-                repository: target.repository, python: target.python, git: target.git,
-                message: reconciliationFailure, isRunning: reconciliationTask != nil, requestID: requestID))
+                repository: reconciliationConfiguration?.repository ?? "", python: reconciliationConfiguration?.python ?? "", git: reconciliationConfiguration?.git ?? "",
+                message: reconciliationFailure, isRunning: reconciliationTask != nil,
+                requestID: records.keys.first { folder($0) == reconciliationJournal }, journal: reconciliationJournal, checkout: reconciliationConfiguration))
         }
         return statuses
     }
@@ -343,64 +361,141 @@ public actor ShaderRequestService {
     private func reconcileWorkers() async throws {
         guard !reconciled else { return }
         if reconciliationTask == nil {
-            let known = records.values.filter { $0.detached != true }.map { ($0.status.id, $0.configuration, folder($0.status.id)) }
-            let folders = known.map { ($0.2, $0.1) }
-                + [directory.appendingPathComponent("setup"), directory.appendingPathComponent("publication")].map { ($0, configuration) }
+            let all = records.values.map { ($0.status.id, $0.configuration, folder($0.status.id), $0.detached == true) }
+            let known = all.filter { !$0.3 }
+            let retained = recovery.entries
+            let legacyRecords = recovery.legacyMigrationComplete ? [] : all.filter { item in
+                item.3 && !detachedOwners.contains { $0.requestID == item.0 }
+            }
+            var folders = Set(known.map { $0.2 })
+            folders.formUnion([directory.appendingPathComponent("setup"), directory.appendingPathComponent("publication")])
+            folders.formUnion(retained.keys.map { URL(fileURLWithPath: $0) })
+            if let children = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) {
+                for child in children where UUID(uuidString: child.lastPathComponent) != nil {
+                    if Self.hasProcessEvidence(child) { folders.insert(child) }
+                }
+            }
             let reconcile = reconcileWorker
             reconciliationTask = ReconciliationAttempt(task: Task.detached {
-                for (folder, fallback) in folders {
-                    var target = fallback
+                for folder in folders.sorted(by: { $0.path < $1.path }) {
+                    do { try await reconcile(folder) }
+                    catch {
+                        let key = RequestPaths.canonical(folder)
+                        let target = all.first { RequestPaths.canonical($0.2) == key }?.1 ?? retained[key]?.configuration
+                            ?? (try? Self.savedConfiguration(in: folder))
+                        throw ReconciliationError(journal: folder, configuration: target, underlying: error)
+                    }
+                }
+                var result = ReconciliationResult(owner: nil, acknowledgements: [])
+                // Migration is retryable and never marks completion after an unreadable proof.
+                for (id, configuration, job, _) in legacyRecords {
                     do {
-                        target = try Self.savedConfiguration(in: folder, fallback: fallback)
-                        try await reconcile(folder)
-                    } catch { throw ReconciliationError(journal: folder, configuration: target, underlying: error) }
+                        if let owner = try Self.ownerMarker(configuration), owner.id == id, owner.directory == RequestPaths.canonical(job) {
+                            result.acknowledgements.append(Self.acknowledgement(id: id, job: job, configuration: configuration))
+                        }
+                    } catch { throw ReconciliationError(journal: job, configuration: configuration, underlying: error) }
                 }
                 var inspected: Set<String> = []
                 let paths = Self.canonicalRepositories(known.map { $0.1.repository })
-                for (_, configuration, job) in known {
+                for (_, configuration, job, _) in known {
                     let key = RequestPaths.canonical(URL(fileURLWithPath: configuration.repository)) + "\0" + configuration.git
                     guard inspected.insert(key).inserted, let gitdir = try? Self.gitDirectory(configuration) else { continue }
-                    let savedOwner: OwnerMarker?
-                    do { savedOwner = try Self.readOwner(in: gitdir) }
+                    let owner: OwnerMarker?
+                    do { owner = try Self.readOwner(in: gitdir) }
                     catch { throw ReconciliationError(journal: job, configuration: configuration, underlying: error) }
-                    guard let owner = savedOwner else { continue }
+                    guard let owner else { continue }
                     if let match = known.first(where: {
                         $0.0 == owner.id && owner.directory == RequestPaths.canonical($0.2) &&
                         Self.samePublicationCheckout($0.1, configuration, paths: paths)
-                    }) { return match.0 }
-                    throw ReconciliationError(journal: job, configuration: configuration, underlying:
-                        ShaderRequestError.unavailable("Checkout ownership does not match its original path. Restore the original checkout or detach it and select a fresh clean checkout."))
+                    }) { result.owner = result.owner ?? match.0 }
+                    else if !result.acknowledgements.contains(where: { $0.requestID == owner.id }) {
+                        throw ReconciliationError(journal: job, configuration: configuration, underlying:
+                            ShaderRequestError.unavailable("Checkout ownership does not match its original path. Restore the original checkout or detach it and select a fresh clean checkout."))
+                    }
                 }
-                return nil
+                return result
             })
         }
         guard let attempt = reconciliationTask else { return }
         do {
-            let discoveredOwner = try await attempt.task.value
+            let result = try await attempt.task.value
             guard reconciliationTask?.id == attempt.id else { return }
-            if let owner = discoveredOwner, records[owner]?.detached != true {
+            for acknowledgement in result.acknowledgements {
+                detachedOwners.removeAll { $0.requestID == acknowledgement.requestID }; detachedOwners.append(acknowledgement)
+                if Self.matchesDetachedCheckout(configuration, acknowledgement: acknowledgement) {
+                    configuration.enabled = false
+                    try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
+                }
+            }
+            // Finalization is idempotent; entries remain durable until record/ack writes finish.
+            for entry in recovery.entries.values where entry.disposition == .detach { try finalizeDetachment(entry) }
+            for entry in recovery.entries.values {
+                guard let id = entry.requestID, records[id]?.detached != true else { continue }
+                switch entry.disposition {
+                case .resume:
+                    if records[id]?.cleanupPending != true, records[id]?.status.stage != .awaitingClarification,
+                       records[id]?.status.stage != .awaitingActivation, records[id]?.status.stage.terminal == false {
+                        recoveryID = id; try update(id, stage: .repairing, message: "Resuming preserved work after process recovery")
+                    }
+                case .cleanup: records[id]?.cleanupFailure = nil
+                case .retainResult, .detach: break
+                }
+            }
+            if let owner = result.owner, records[owner]?.detached != true {
                 recoveryID = owner
                 if let stage = records[owner]?.status.stage, stage.terminal || stage == .awaitingActivation || stage == .awaitingClarification {
                     records[owner]?.cleanupPending = true
                     records[owner]?.cleanupMessage = "Cleaning interrupted owned work; pushed commits are retained"
-                    if !stage.terminal { try update(owner, stage: .failed, message: "Interrupted checkout cleanup is required") }
-                    else { try persist() }
-                } else if records[owner]?.status.stage != .repairing {
-                    try update(owner, stage: .repairing, message: "Recovering interrupted owned work")
-                }
+                    if !stage.terminal && stage != .awaitingActivation { try update(owner, stage: .failed, message: "Interrupted checkout cleanup is required") }
+                } else if records[owner]?.status.stage != .repairing { try update(owner, stage: .repairing, message: "Recovering interrupted owned work") }
             }
+            recovery.legacyMigrationComplete = true
+            try persist()
+            recovery.entries.removeAll(); try persist()
             reconciled = true; reconciliationTask = nil; reconciliationFailure = nil; reconciliationJournal = nil; reconciliationConfiguration = nil
+            emitUpdates()
         } catch {
             if reconciliationTask?.id == attempt.id {
                 let detail = error as? ReconciliationError
-                reconciliationJournal = detail?.journal
-                reconciliationConfiguration = detail?.configuration
-                reconciliationTask = nil; reconciliationFailure = "Worker recovery failed: " + (detail?.underlying ?? error).localizedDescription
-                setupMessage = reconciliationFailure!
-                try? persist()
-                failPendingPublicationForRecovery(reconciliationFailure!)
+                reconciliationTask = nil
+                holdForRecovery(journal: detail?.journal ?? reconciliationJournal ?? directory.appendingPathComponent("setup"),
+                    configuration: detail?.configuration ?? reconciliationConfiguration, error: detail?.underlying ?? error)
+                failPendingPublicationForRecovery(reconciliationFailure ?? error.localizedDescription)
             }
             throw error
+        }
+    }
+
+    nonisolated private static func hasProcessEvidence(_ journal: URL) -> Bool {
+        ["process.json", "children.json"].contains { FileManager.default.fileExists(atPath: journal.appendingPathComponent($0).path) }
+    }
+    private func persistRecovery() throws {
+        try JSONEncoder().encode(recovery).write(to: directory.appendingPathComponent("recovery.json"), options: .atomic)
+    }
+    private func holdForRecovery(journal: URL, configuration target: ShaderRequestConfiguration?, error: Error) {
+        let key = RequestPaths.canonical(journal), id = records.keys.first { RequestPaths.canonical(folder($0)) == key }
+        let disposition: ShaderRequestRecoveryDisposition
+        if let id, records[id]?.cleanupPending == true || records[id]?.revoked == true { disposition = .cleanup }
+        else if let id, records[id]?.status.stage == .awaitingActivation || records[id]?.status.stage == .completed { disposition = .retainResult }
+        else { disposition = .resume }
+        var entry = recovery.entries[key] ?? .init(journal: key, requestID: id, configuration: target, disposition: disposition, message: error.localizedDescription)
+        entry.configuration = entry.configuration ?? target; entry.message = error.localizedDescription
+        recovery.entries[key] = entry
+        reconciliationFailure = entry.message; reconciliationJournal = URL(fileURLWithPath: key); reconciliationConfiguration = entry.configuration; reconciled = false
+        do { try persistRecovery(); try persist() }
+        catch { reconciliationFailure = entry.message + " Recovery state could not be saved: " + error.localizedDescription }
+    }
+    private func finalizeDetachment(_ entry: RequestRecoveryStore.Entry) throws {
+        guard let id = entry.requestID, let target = entry.configuration else { return }
+        let acknowledgement = Self.acknowledgement(id: id, job: URL(fileURLWithPath: entry.journal), configuration: target)
+        detachedOwners.removeAll { $0.requestID == id }; detachedOwners.append(acknowledgement)
+        if records[id] != nil {
+            let wasDetached = records[id]?.detached == true
+            records[id]?.detached = true; records[id]?.interrupted = true
+            records[id]?.cleanupPending = false; records[id]?.cleanupFailure = nil
+            if !wasDetached, records[id]?.status.stage.terminal == false {
+                try update(id, stage: .failed, message: "Checkout detached; unpublished files and evidence were retained")
+            }
         }
     }
 
@@ -448,56 +543,52 @@ public actor ShaderRequestService {
 
     public func detachCheckout(_ id: UUID? = nil) async throws {
         let targetID = id ?? records.keys.first { folder($0) == reconciliationJournal }
-        let selected = targetID.flatMap { records[$0]?.configuration } ?? (id == nil ? reconciliationConfiguration : nil) ?? configuration
+        let selected = targetID.flatMap { records[$0]?.configuration } ?? (id == nil ? reconciliationConfiguration : nil) ?? (reconciliationFailure == nil ? configuration : nil)
+        guard let selected else { throw ShaderRequestError.unavailable("This recovery journal has no verified checkout target. Repair its configuration; no selected checkout has been detached.") }
         let paths = Self.canonicalRepositories([selected.repository] + records.values.map { $0.configuration.repository })
-        let ids = records.keys.filter { key in
-            guard let candidate = records[key]?.configuration else { return false }
-            return Self.sameCheckout(candidate, repository: selected.repository, checkoutID: selected.checkoutID, paths: paths)
-        }
-        guard activeID == nil || ids.contains(activeID!) else {
-            throw ShaderRequestError.unavailable("Wait for the other checkout’s active request before detaching this checkout.")
-        }
-        let lease = beginMaintenance()
-        defer { endMaintenance(lease) }
-        configuration.enabled = false
-        execution?.interrupted = true
-        for key in ids {
-            guard let record = records[key] else { continue }
-            let acknowledgement = Self.acknowledgement(id: key, job: folder(key), configuration: record.configuration)
-            detachedOwners.removeAll { $0.requestID == key }; detachedOwners.append(acknowledgement)
-            records[key]?.detached = true; records[key]?.interrupted = true
-            records[key]?.cleanupPending = false; records[key]?.cleanupFailure = nil
-            if !record.status.stage.terminal {
-                try update(key, stage: .failed, message: "Checkout detached; unpublished files and evidence were retained")
+        let ids = records.keys.filter { Self.samePublicationCheckout(records[$0]!.configuration, selected, paths: paths) }
+        guard activeID == nil || ids.contains(activeID!) else { throw ShaderRequestError.unavailable("Wait for the other checkout’s active request before detaching this checkout.") }
+        let lease = beginMaintenance(); defer { endMaintenance(lease) }
+        var targets = ids.map { (folder($0), Optional($0), records[$0]!.configuration) }
+        for name in ["setup", "publication"] {
+            let journal = directory.appendingPathComponent(name)
+            let target = recovery.entries[RequestPaths.canonical(journal)]?.configuration ?? (try? Self.savedConfiguration(in: journal))
+            if journal == reconciliationJournal || target.map({ Self.samePublicationCheckout($0, selected) }) == true {
+                targets.append((journal, nil, target ?? selected))
             }
         }
-        // Durable intent precedes all asynchronous teardown, including for terminal records.
-        try persist()
+        if targets.isEmpty { targets.append((directory.appendingPathComponent("setup"), nil, selected)) }
+        for (journal, requestID, target) in targets {
+            let key = RequestPaths.canonical(journal)
+            recovery.entries[key] = .init(journal: key, requestID: requestID, configuration: target, disposition: .detach,
+                message: "Detachment is pending until worker processes are confirmed stopped.")
+        }
+        configuration.enabled = false; execution?.interrupted = true
+        try persistRecovery(); try persist()
         try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
-        cancelPublicationRequests()
-        activeProcess?.stop()
+        cancelPublicationRequests(); activeProcess?.stop()
         if let activeProcess { try await settleProcess(activeProcess) }
         if let workerTask { await workerTask.value }
-        let maintenanceFolders = [directory.appendingPathComponent("setup"), directory.appendingPathComponent("publication")].filter { folder in
-            if folder == reconciliationJournal { return true }
-            let target = (try? Self.savedConfiguration(in: folder, fallback: configuration)) ?? configuration
-            return Self.samePublicationCheckout(selected, target)
-        }
-        let folders = ids.map { folder($0) } + maintenanceFolders
-        let reconcile = reconcileWorker
-        for folder in folders {
-            do { try await reconcile(folder) }
+        for (journal, _, _) in targets {
+            do { try await reconcileWorker(journal) }
             catch {
-                if error is RequestWorkerTeardownError { throw error }
-                // Quarantine an unverifiable app-owned marker as evidence; never signal its PID.
+                if error is RequestWorkerTeardownError {
+                    holdForRecovery(journal: journal, configuration: selected, error: error); throw error
+                }
+                // Explicit detachment retains unverifiable markers without signalling them.
                 for name in ["process", "children"] {
-                    let marker = folder.appendingPathComponent(name + ".json")
+                    let marker = journal.appendingPathComponent(name + ".json")
                     if FileManager.default.fileExists(atPath: marker.path) {
-                        try FileManager.default.moveItem(at: marker, to: folder.appendingPathComponent(name + "-detached-" + UUID().uuidString + ".json"))
+                        try FileManager.default.moveItem(at: marker, to: journal.appendingPathComponent(name + "-detached-" + UUID().uuidString + ".json"))
                     }
                 }
             }
         }
+        for (journal, _, _) in targets {
+            if let entry = recovery.entries[RequestPaths.canonical(journal)] { try finalizeDetachment(entry) }
+        }
+        try persist()
+        for (journal, _, _) in targets { recovery.entries[RequestPaths.canonical(journal)] = nil }
         reconciled = false; reconciliationTask = nil; reconciliationKickID = nil; reconciliationFailure = nil
         reconciliationJournal = nil; reconciliationConfiguration = nil
         resolvePublicationFailure()
@@ -600,12 +691,10 @@ public actor ShaderRequestService {
     }
 
     private func settleProcess(_ process: RequestWorkerProcess) async throws {
-        do { try await process.waitForExit() }
+        do { try await waitForWorker(process) }
         catch {
-            reconciliationFailure = error.localizedDescription; reconciled = false
-            reconciliationJournal = process.recoveryTarget?.directory ?? activeID.map(folder) ?? directory.appendingPathComponent("publication")
-            reconciliationConfiguration = process.recoveryTarget?.configuration ?? configurationForActiveWorker
-            try? persist()
+            holdForRecovery(journal: process.recoveryTarget?.directory ?? activeID.map(folder) ?? directory.appendingPathComponent("publication"),
+                configuration: process.recoveryTarget?.configuration ?? configurationForActiveWorker, error: error)
             throw error
         }
     }
@@ -658,6 +747,7 @@ public actor ShaderRequestService {
     private func persist() throws {
         try JSONEncoder().encode(detachedOwners).write(to: directory.appendingPathComponent("detached-checkouts.json"), options: .atomic)
         try JSONEncoder().encode(Array(records.values)).write(to: directory.appendingPathComponent("journal.json"), options: .atomic)
+        try persistRecovery()
         emitUpdates()
     }
     private func emitUpdates() { for observer in observers.values { observer.yield(allJobs()) } }
@@ -676,6 +766,7 @@ public actor ShaderRequestService {
         let lease = beginMaintenance()
         defer { endMaintenance(lease) }
         try await reconcileWorkers()
+        guard recovery.entries.isEmpty else { throw ShaderRequestError.unavailable("Retry checkout recovery before changing setup.") }
         let acknowledgements = detachedOwners
         let checkout = candidate
         candidate.detachedOwner = try await Task.detached { try Self.detachedOwner(for: checkout, acknowledgements: acknowledgements) }.value
@@ -726,7 +817,7 @@ public actor ShaderRequestService {
         kick()
     }
     public func deleteFinished(_ id: UUID) throws {
-        guard records[id]?.status.stage.terminal == true, records[id]?.cleanupPending != true, activeID != id else { throw ShaderRequestError.invalidRequest }
+        guard !recovery.entries.values.contains(where: { $0.requestID == id }), !Self.hasProcessEvidence(folder(id)), records[id]?.status.stage.terminal == true, records[id]?.cleanupPending != true, activeID != id else { throw ShaderRequestError.invalidRequest }
         try FileManager.default.removeItem(at: folder(id)); records[id] = nil; try persist()
     }
     public func revoke(_ deviceID: String) throws {
@@ -838,6 +929,7 @@ public actor ShaderRequestService {
             }
             return
         }
+        if let entry = recovery.entries.values.first { failPendingPublicationForRecovery(entry.message); return }
         let eligible = records.values.filter { !$0.revoked && $0.detached != true }.map(\.status)
         if let recoveryID, let failure = records[recoveryID]?.cleanupFailure {
             failPendingPublicationForRecovery(failure); return
@@ -907,7 +999,9 @@ public actor ShaderRequestService {
             try checkExecution(operation)
             guard discarded else { throw ShaderRequestError.unavailable("Cleanup did not complete.") }
             records[id]?.cleanupPending = false; records[id]?.cleanupFailure = nil
-            try update(id, stage: .failed, message: record.cleanupMessage ?? "TV access was revoked; any pushed commit remains")
+            if record.status.result != nil, record.status.stage == .awaitingActivation || record.status.stage == .completed {
+                try update(id, stage: record.status.stage, message: record.status.message)
+            } else { try update(id, stage: .failed, message: record.cleanupMessage ?? "Owned checkout cleanup completed; see the retained request diagnostic") }
         } catch {
             let stoppedError = await stopAndDrain(process)
             if execution?.interrupted == false, records[id]?.detached != true {
@@ -990,7 +1084,9 @@ public actor ShaderRequestService {
             if !outcomeSeen { throw ShaderRequestError.unavailable("Worker ended without a verified result.") }
         } catch {
             process.stop()
-            if execution?.interrupted == false, records[id]?.detached != true {
+            if error is RequestWorkerTeardownError {
+                holdForRecovery(journal: folder(id), configuration: record.configuration, error: error)
+            } else if execution?.interrupted == false, records[id]?.detached != true {
                 records[id]?.cleanupPending = true
                 records[id]?.cleanupMessage = error.localizedDescription
                 try? update(id, stage: .failed, message: error.localizedDescription)
@@ -999,7 +1095,7 @@ public actor ShaderRequestService {
         // A suspended/revoked process must release its lease before recovery or cleanup starts.
         if execution?.interrupted == true { process.stop() }
         do { try await settleProcess(process) }
-        catch { records[id]?.cleanupPending = true; records[id]?.cleanupFailure = error.localizedDescription }
+        catch { /* settleProcess persisted recovery without introducing discard intent. */ }
         if records[id]?.revoked == true, records[id]?.status.stage.terminal == false, records[id]?.detached != true {
             records[id]?.cleanupPending = true
             records[id]?.cleanupMessage = "TV access was revoked; any pushed commit remains"
@@ -1023,8 +1119,8 @@ public actor ShaderRequestService {
     nonisolated private static func canonicalRepositories(_ repositories: [String]) -> [String: String] {
         Dictionary(uniqueKeysWithValues: Set(repositories).map { ($0, $0.isEmpty ? "" : RequestPaths.canonical(URL(fileURLWithPath: $0))) })
     }
-    nonisolated private static func savedConfiguration(in journal: URL, fallback: ShaderRequestConfiguration) throws -> ShaderRequestConfiguration {
-        guard FileManager.default.fileExists(atPath: journal.appendingPathComponent("configuration.json").path) else { return fallback }
+    nonisolated private static func savedConfiguration(in journal: URL) throws -> ShaderRequestConfiguration? {
+        guard FileManager.default.fileExists(atPath: journal.appendingPathComponent("configuration.json").path) else { return nil }
         return try JSONDecoder().decode(ShaderRequestConfiguration.self,
             from: BoundedCatalogReader(root: journal).read("configuration.json", limit: CatalogLimits.headBytes).bytes)
     }
