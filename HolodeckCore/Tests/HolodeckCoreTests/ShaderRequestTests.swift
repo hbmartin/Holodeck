@@ -940,10 +940,9 @@ final class ShaderRequestTests: XCTestCase {
         let (root, _) = try recoveryFixture(), script = root.appendingPathComponent("completed.py")
         try "import json; print(json.dumps({'event':'done'}),flush=True)".write(to: script, atomically: true, encoding: .utf8)
         let probe = RequestSignalProbe()
-        let worker = RequestWorkerProcess(script: script, groups: .init(isAlive: { probe.alive($0) }, signal: { probe.signal($0, $1) }, schedule: { probe.schedule($0) }))
+        let worker = RequestWorkerProcess(script: script, groups: .init(signal: { probe.signal($0, $1) }, schedule: { probe.schedule($0) }))
         for try await _ in worker.run(mode: "run", configuration: .init(repository: root.path), directory: root.appendingPathComponent("completed")) {}
         try await worker.waitForExit()
-        probe.reuseGroup()
         worker.stop(); worker.stop()
         probe.fireTimers()
         XCTAssertEqual(probe.signalCount, 0)
@@ -1317,6 +1316,93 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertEqual(jobs.first { $0.deviceID == "TV-B" }?.stage, .queued)
     }
 
+    func testUnsupportedInterpreterIsRejectedBeforeWorkerParsing() async throws {
+        let (root, _) = try recoveryFixture(), interpreter = root.appendingPathComponent("old-python"), script = root.appendingPathComponent("invalid.py")
+        try "this worker deliberately cannot parse!".write(to: script, atomically: true, encoding: .utf8)
+        try """
+        #!/usr/bin/python3
+        import sys
+        args=sys.argv[1:];index=args.index('-c');source=args[index+1]
+        sys.argv=['-c']+args[index+2:];sys.version_info=(3,7,0)
+        exec(compile(source,'bootstrap','exec'))
+        """.write(to: interpreter, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions:0o755], ofItemAtPath: interpreter.path)
+        var config = ShaderRequestConfiguration(repository: root.path); config.python = interpreter.path
+        let worker = RequestWorkerProcess(script: script); var diagnostic: String?
+        do { for try await event in worker.run(mode: "run", configuration: config, directory: root.appendingPathComponent("unsupported")) { diagnostic = event.message } }
+        catch { XCTAssertTrue(error.localizedDescription.contains("Worker exited 2")) }
+        try await worker.waitForExit(); XCTAssertTrue(diagnostic?.contains("Python 3.9 or later") == true)
+        XCTAssertFalse(try String(contentsOf: root.appendingPathComponent("unsupported/worker-stderr.log"), encoding: .utf8).contains("SyntaxError"))
+    }
+
+    func testRepeatedStopSignalsEachBirthIdentityOnceAndRetiresIt() async throws {
+        let (root, _) = try recoveryFixture(), script = root.appendingPathComponent("stop-once.py"), probe = RequestSignalProbe()
+        try """
+        import signal,time
+        def stop(*args):
+            signal.signal(signal.SIGTERM,signal.SIG_IGN)
+            time.sleep(.1)
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM,stop)
+        print('{"event":"ready"}',flush=True)
+        time.sleep(60)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let worker = RequestWorkerProcess(script: script, groups: .init(signal: { pid, value in _ = probe.signal(pid,value); return kill(pid,value) }))
+        do {
+            for try await event in worker.run(mode: "run", configuration: .init(repository: root.path), directory: root.appendingPathComponent("stop-once")) {
+                if event.event == "ready" { worker.stop(); worker.stop(); worker.stop() }
+            }
+            XCTFail("Cancellation succeeded")
+        } catch is CancellationError {}
+        try await worker.waitForExit()
+        XCTAssertEqual(probe.signalCount,1)
+        worker.stop(); worker.stop(); XCTAssertEqual(probe.signalCount,1)
+    }
+
+    func testTransientRegistryGapSettlesBeforeSuccessfulWorkerCompletion() async throws {
+        for _ in 0..<10 {
+            let (root, _) = try recoveryFixture(), script = root.appendingPathComponent("registry-gap.py")
+            let bundled = try XCTUnwrap(RequestWorkerProcess.bundledScript)
+            try """
+            import importlib.util,subprocess,sys,time
+            from pathlib import Path
+            spec=importlib.util.spec_from_file_location('worker',\(String(reflecting: bundled.path)));w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
+            job=Path(sys.argv[3]);gate=job/'go'
+            code="import subprocess,sys,time;from pathlib import Path;gate=Path(sys.argv[1]);exec('while not gate.exists(): time.sleep(.005)');subprocess.Popen([sys.executable,'-c','import time;time.sleep(.2)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)"
+            parent=subprocess.Popen([sys.executable,'-c',code,str(gate)],start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            birth=w.process_identity(parent.pid);w.write(job/'children.json',[{'leader':birth,'members':[birth]}])
+            gate.touch();parent.wait();time.sleep(.35)
+            assert not w.group_members(parent.pid)
+            (job/'children.json').unlink();print('{"event":"done"}',flush=True)
+            """.write(to: script, atomically: true, encoding: .utf8)
+            let worker = RequestWorkerProcess(script: script)
+            var done = false
+            for try await event in worker.run(mode: "run", configuration: .init(repository: root.path), directory: root.appendingPathComponent("gap")) { done = done || event.event == "done" }
+            try await worker.waitForExit(); XCTAssertTrue(done)
+        }
+    }
+
+    func testPostExitSupervisorIdleCPUAndPollBudget() async throws {
+        guard ProcessInfo.processInfo.environment["HOLODECK_PROFILE_WORKER"] == "1" else { throw XCTSkip("Set HOLODECK_PROFILE_WORKER=1 with an optimized build") }
+        let (root, _) = try recoveryFixture(), script = root.appendingPathComponent("idle.py"), bundled = try XCTUnwrap(RequestWorkerProcess.bundledScript)
+        try """
+        import importlib.util,subprocess,sys
+        from pathlib import Path
+        spec=importlib.util.spec_from_file_location('worker',\(String(reflecting: bundled.path)));w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
+        child=subprocess.Popen([sys.executable,'-u','-c',"import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);print('ready',flush=True);time.sleep(60)"],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,start_new_session=True)
+        child.stdout.readline();birth=w.process_identity(child.pid)
+        w.write(Path(sys.argv[3])/'children.json',[{'leader':birth,'members':[birth]}])
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let waits = WorkerWaitCounter()
+        let worker = RequestWorkerProcess(script: script, groups: .init(wait: { duration in waits.record(); Thread.sleep(forTimeInterval: duration) }))
+        let start = Date(), cpu = clock()
+        for try await _ in worker.run(mode: "run", configuration: .init(repository: root.path), directory: root.appendingPathComponent("idle")) {}
+        try await worker.waitForExit()
+        let elapsed = Date().timeIntervalSince(start), used = Double(clock()-cpu)/Double(CLOCKS_PER_SEC)
+        XCTAssertLessThan(Double(waits.count)/elapsed,50); XCTAssertLessThan(used/elapsed,0.2)
+        print("Supervisor idle: \(Double(waits.count)/elapsed) polls/s, \(used/elapsed*100)% CPU")
+    }
+
     func testTeardownRecoveryPersistsResumeIntentWithoutDiscardingCheckpoint() async throws {
         for _ in 0..<10 {
             let (root, script) = try recoveryFixture(), gate = WorkerExitFailureGate()
@@ -1638,13 +1724,10 @@ private actor RequestPreparationGate {
 #if os(macOS)
 private final class RequestSignalProbe: @unchecked Sendable {
     private let lock = NSLock()
-    private var reused = false
     private var signals = 0
     private var timers: [DispatchWorkItem] = []
-    func alive(_ pid: Int32) -> Bool { lock.withLock { reused || (pid > 1 && kill(-pid, 0) == 0) } }
     func signal(_ pid: Int32, _ signal: Int32) -> Int32 { lock.withLock { signals += 1 }; return 0 }
     func schedule(_ item: DispatchWorkItem) { lock.withLock { timers.append(item) } }
-    func reuseGroup() { lock.withLock { reused = true } }
     func fireTimers() { let items = lock.withLock { timers }; items.forEach { $0.perform() } }
     var signalCount: Int { lock.withLock { signals } }
     var timerCount: Int { lock.withLock { timers.count } }
@@ -1672,5 +1755,13 @@ private actor WorkerExitFailureGate {
 }
 private actor DetachRecoveryFailureGate {
     func reconcile(_ journal: URL) throws { throw RequestWorkerTeardownError(cause: "Injected live descendants") }
+}
+#endif
+
+#if os(macOS)
+private final class WorkerWaitCounter: @unchecked Sendable {
+    private let lock = NSLock(); private var value = 0
+    func record() { lock.withLock { value += 1 } }
+    var count: Int { lock.withLock { value } }
 }
 #endif

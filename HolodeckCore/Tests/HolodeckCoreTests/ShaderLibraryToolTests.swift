@@ -5,8 +5,10 @@ import CryptoKit
 
 final class ShaderLibraryToolTests: XCTestCase {
     private var nativeTool: URL {
-        URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent(".build/debug/holodeck-shader-tool").resolvingSymlinksInPath()
+        let executableDirectory = Bundle(for: ShaderLibraryToolTests.self).bundleURL.deletingLastPathComponent()
+        let candidates = [executableDirectory.appendingPathComponent("holodeck-shader-tool"),
+            executableDirectory.deletingLastPathComponent().appendingPathComponent("holodeck-shader-tool")]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) } ?? candidates[0]
     }
 
     func testNativeWrapperPreservesInterpreterSignalAndProcessIdentity() throws {

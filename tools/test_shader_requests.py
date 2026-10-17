@@ -10,6 +10,7 @@ import socket
 from unittest.mock import patch
 from pathlib import Path
 import select
+import signal
 import shutil
 import struct
 import subprocess
@@ -866,6 +867,58 @@ worker.main()
             worker_module.run([sys.executable,'-c',script,str(child_pid)],self.root,worker.env,timeout=.5)
         self.assertIsNone(worker_module.process_identity(int(child_pid.read_text())))
         self.assertFalse((self.job/'children.json').exists())
+
+    def test_unrecorded_descendant_can_settle_without_permanent_recovery_failure(self):
+        gate=self.base/'leader-exit';pid_file=self.base/'settling-child'
+        code="import subprocess,sys,time;from pathlib import Path;p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(.4)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);Path(sys.argv[2]).write_text(str(p.pid));exec('while not Path(sys.argv[1]).exists(): time.sleep(.005)')"
+        parent=subprocess.Popen([sys.executable,'-c',code,str(gate),str(pid_file)],start_new_session=True)
+        try:
+            deadline=time.monotonic()+3
+            while not pid_file.exists():
+                self.assertLess(time.monotonic(),deadline);time.sleep(.005)
+            birth=worker_module.process_identity(parent.pid)
+            worker_module.write(self.job/'children.json',[{'leader':birth,'members':[birth]}])
+            gate.touch();parent.wait(timeout=2)
+            started=time.monotonic();worker_module.terminate_registered(self.job)
+            self.assertLess(time.monotonic()-started,2)
+            self.assertIsNone(worker_module.process_identity(int(pid_file.read_text())))
+            self.assertFalse((self.job/'children.json').exists())
+        finally:
+            if parent.poll() is None:parent.kill();parent.wait(timeout=2)
+
+    def test_repeated_signals_do_not_interrupt_registered_cleanup(self):
+        bootstrap="""import importlib.util,subprocess,sys,time
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('worker',sys.argv[1]);w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
+class ProbeWorker:
+ request=None
+ def __init__(self,config,directory):
+  child=subprocess.Popen([sys.executable,'-u','-c',"import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);print('ready',flush=True);time.sleep(60)"],start_new_session=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+  child.stdout.readline();birth=w.process_identity(child.pid);job=Path(directory);w.write(job/'children.json',[{'leader':birth,'members':[birth]}]);(job/'ready').touch()
+ def perform(self):time.sleep(60)
+w.Worker=ProbeWorker
+sys.argv=[sys.argv[1],'run',sys.argv[2],sys.argv[3]]
+w.main()
+"""
+        process=subprocess.Popen([sys.executable,'-I','-c',bootstrap,str(SCRIPT),str(self.config_path),str(self.job)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        birth=None
+        try:
+            deadline=time.monotonic()+3
+            while not (self.job/'ready').exists():
+                self.assertLess(time.monotonic(),deadline);time.sleep(.005)
+            registry=self.job/'children.json';birth=json.loads(registry.read_text())[0]['leader'];stamp=registry.stat().st_mtime_ns
+            process.send_signal(signal.SIGTERM)
+            while registry.stat().st_mtime_ns==stamp:
+                self.assertLess(time.monotonic(),deadline);time.sleep(.001)
+            process.send_signal(signal.SIGTERM);process.send_signal(signal.SIGINT)
+            out,err=process.communicate(timeout=11)
+            self.assertEqual(process.returncode,130,err)
+            self.assertNotIn('Traceback',err)
+            self.assertIsNone(worker_module.process_identity(birth['pid']))
+            self.assertFalse(registry.exists())
+        finally:
+            if process.poll() is None:process.kill();process.wait(timeout=2)
+            if birth and worker_module.process_identity(birth['pid'])==birth:os.kill(birth['pid'],signal.SIGKILL)
 
     def test_process_registry_rejects_special_files_and_malformed_identities(self):
         registry=self.job/'children.json'
