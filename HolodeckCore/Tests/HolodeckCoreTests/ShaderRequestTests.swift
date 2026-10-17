@@ -1331,11 +1331,14 @@ final class ShaderRequestTests: XCTestCase {
         }
         let catalog = DirectoryCatalog(directory: catalogDirectory, files: files)
         _ = try await catalog.cached()
-        let service = ShaderRequestService(catalog: catalog, directory: root, workerScript: script)
+        let writes = RecoveryWriteProbe()
+        let service = ShaderRequestService(catalog: catalog, directory: root, workerScript: script,
+            recoveryWriter: { data, url in writes.record(data); try data.write(to: url, options: .atomic) })
         await service.suspend(); try await service.initialize(configuration: .init(repository: old.path))
         do { _ = try await service.reloadRepository(new); XCTFail("Failed publication installed") } catch {}
         let store = try JSONDecoder().decode(RequestRecoveryStore.self, from: Data(contentsOf: root.appendingPathComponent("recovery.json")))
         XCTAssertEqual(store.entries.values.first?.preferencesRollback?.repository,old.path)
+        XCTAssertEqual(writes.firstSelection?.preferencesRollback?.repository,old.path)
         let head = try JSONDecoder().decode(CatalogHead.self, from: await catalog.get(.head, limit: CatalogLimits.headBytes))
         XCTAssertEqual(head.revision,previous.catalog.publicationRevision)
         try FileManager.default.removeItem(at: preferences)
@@ -1778,6 +1781,56 @@ final class ShaderRequestTests: XCTestCase {
         }
     }
 
+    func testUnchangedSelectionPreservesCheckoutIdentityAndPublicationGeneration() async throws {
+        let (root, script) = try recoveryFixture(), authoring = try requestAuthoringFixture(root.appendingPathComponent("authoring"))
+        let catalog = DirectoryCatalog(directory:root.appendingPathComponent("catalog"))
+        let service = ShaderRequestService(catalog:catalog,directory:root,workerScript:script)
+        var config = ShaderRequestConfiguration(repository:authoring.path); config.checkoutID = "stable-checkout"
+        try await service.initialize(configuration:config)
+        _ = try await service.reloadRepository(authoring)
+        var beforeEvents = await service.publicationUpdates().makeAsyncIterator()
+        let beforeValue = await beforeEvents.next(), before = try XCTUnwrap(beforeValue)
+        let preferences = try Data(contentsOf:root.appendingPathComponent("preferences.json"))
+        let alias = root.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(at:alias,withDestinationURL:authoring)
+        let accepted = try await service.selectRepository(alias)
+        var afterEvents = await service.publicationUpdates().makeAsyncIterator()
+        let afterValue = await afterEvents.next(), after = try XCTUnwrap(afterValue)
+        XCTAssertEqual(accepted.checkoutID,"stable-checkout");XCTAssertEqual(before.generation,after.generation)
+        XCTAssertEqual(before.publication?.sequence,after.publication?.sequence)
+        XCTAssertEqual(try Data(contentsOf:root.appendingPathComponent("preferences.json")),preferences)
+        let reloaded = try await service.reloadRepository(alias)
+        XCTAssertEqual(reloaded.configuration.checkoutID,"stable-checkout")
+    }
+
+    func testPublicationCallbackEligibilityRequiresInstalledRevisionAndGeneration() async throws {
+        let (root, script) = try recoveryFixture(), authoring = try requestAuthoringFixture(root.appendingPathComponent("authoring"))
+        let catalog = DirectoryCatalog(directory:root.appendingPathComponent("catalog"))
+        let service = ShaderRequestService(catalog:catalog,directory:root,workerScript:script)
+        try await service.initialize(configuration:.init(repository:authoring.path))
+        _ = try await service.reloadRepository(authoring)
+        var events = await service.publicationUpdates().makeAsyncIterator()
+        let eventValue = await events.next(), event = try XCTUnwrap(eventValue), status = try XCTUnwrap(event.publication)
+        let valid = await service.isCurrentPublication(status,generation:event.generation); XCTAssertTrue(valid)
+        try Data("// different source\n".utf8).write(to:authoring.appendingPathComponent("shaders/plasma/body.metal"))
+        _ = try await catalog.reload(from:authoring)
+        let stale = await service.isCurrentPublication(status,generation:event.generation); XCTAssertFalse(stale)
+        let wrongGeneration = await service.isCurrentPublication(status,generation:UUID()); XCTAssertFalse(wrongGeneration)
+    }
+
+    func testRecoveryOnlyStateAllowsDisablingRequests() async throws {
+        let (root, script) = try recoveryFixture()
+        let journal = root.appendingPathComponent("setup")
+        let entry = RequestRecoveryStore.Entry(journal:RequestPaths.canonical(journal),requestID:nil,configuration:nil,disposition:.resume,message:"Needs recovery")
+        var store = RequestRecoveryStore();store.entries[entry.journal] = entry
+        try JSONEncoder().encode(store).write(to:root.appendingPathComponent("recovery.json"))
+        let service = ShaderRequestService(catalog:DirectoryCatalog(directory:root.appendingPathComponent("catalog")),directory:root,workerScript:script)
+        try await service.initialize(configuration:.init(repository:root.path,enabled:true))
+        let allowed = await service.canDisableRequests();XCTAssertTrue(allowed)
+        try await service.disable()
+        let config = await service.configurationValue();XCTAssertFalse(config.enabled)
+    }
+
     func testDetachCancelsVerificationBeforeWorkerLaunchAndWaitsForLease() async throws {
         for _ in 0..<10 {
             let (root, script) = try recoveryFixture(), gate = RequestPreparationGate()
@@ -1893,5 +1946,18 @@ private final class WorkerWaitCounter: @unchecked Sendable {
     private let lock = NSLock(); private var value = 0
     func record() { lock.withLock { value += 1 } }
     var count: Int { lock.withLock { value } }
+}
+#endif
+
+#if os(macOS)
+private final class RecoveryWriteProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var first: RequestRecoveryStore.Entry?
+    func record(_ data: Data) {
+        guard let store = try? JSONDecoder().decode(RequestRecoveryStore.self,from:data),
+              let entry = store.entries.values.first(where: { $0.journal.hasSuffix("/selection") }) else { return }
+        lock.withLock { if first == nil { first = entry } }
+    }
+    var firstSelection: RequestRecoveryStore.Entry? { lock.withLock { first } }
 }
 #endif

@@ -53,9 +53,11 @@ public final class ViewerSession {
         public let id = UUID()
         public let message: String
         public let operation: Operation
-        public init(message: String, operation: Operation) {
+        public let correlationID: UUID?
+        public init(message: String, operation: Operation, correlationID: UUID? = nil) {
             self.message = message
             self.operation = operation
+            self.correlationID = correlationID
         }
     }
 
@@ -97,6 +99,7 @@ public final class ViewerSession {
     @ObservationIgnored private var hasBeenActive = false
     @ObservationIgnored private var savedID: String?
     @ObservationIgnored private var forcedRefreshPending = false
+    @ObservationIgnored private var pendingRefreshCorrelationID: UUID?
 
     public init(catalogService: CatalogService, preferences: ShaderPreferences, policy: ViewerPolicy) {
         self.catalogService = catalogService
@@ -132,9 +135,9 @@ public final class ViewerSession {
     }
 
     @discardableResult
-    public func refresh(force: Bool = false) -> Task<Void, Never> {
+    public func refresh(force: Bool = false, correlationID: UUID? = nil) -> Task<Void, Never> {
         if let refreshTask {
-            if force { forcedRefreshPending = true }
+            if force { forcedRefreshPending = true; pendingRefreshCorrelationID = correlationID }
             return refreshTask
         }
         isRefreshing = true
@@ -148,6 +151,7 @@ public final class ViewerSession {
                 self?.onEvent?(.catalogFinished)
             }
             var forcePass = force
+            var passCorrelationID = correlationID
             repeat {
                 let cached = await service.current()
                 guard !Task.isCancelled else { return }
@@ -176,12 +180,14 @@ public final class ViewerSession {
                     if let current { self.applyCatalog(current) }
                     self.refreshResult = error is CancellationError ? .cancelled : .failed(error.localizedDescription)
                     let message = self.catalogErrorMessage(error)
-                    if self.catalogFailure?.message != message {
-                        self.catalogFailure = Failure(message: message, operation: .catalog)
+                    if self.catalogFailure?.message != message || self.catalogFailure?.correlationID != passCorrelationID {
+                        self.catalogFailure = Failure(message: message, operation: .catalog, correlationID: passCorrelationID)
                     }
                     self.onEvent?(.catalogFailed)
                 }
                 forcePass = self?.forcedRefreshPending == true
+                passCorrelationID = self?.pendingRefreshCorrelationID
+                self?.pendingRefreshCorrelationID = nil
                 self?.forcedRefreshPending = false
             } while forcePass && !Task.isCancelled
         }
@@ -330,7 +336,7 @@ public final class ViewerSession {
     }
 
     public func shutdown() {
-        forcedRefreshPending = false
+        forcedRefreshPending = false; pendingRefreshCorrelationID = nil
         cancelPendingSelection()
         selectionTask?.cancel()
         refreshTask?.cancel()

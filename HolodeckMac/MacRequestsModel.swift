@@ -8,6 +8,7 @@ final class MacRequestsModel {
     var jobs: [ShaderRequestStatus] = []
     var recoveries: [ShaderRequestRecoveryStatus] = []
     private var pendingCleanup = false
+    var canDisableRequests = false
     var checking = false
     var message = "Configure Codex and enable requests."
     var error: String?
@@ -66,6 +67,7 @@ final class MacRequestsModel {
                 self.jobs = jobs
                 self.pendingCleanup = await service.hasPendingCleanup()
                 self.recoveries = await service.recoveryStatuses()
+                self.canDisableRequests = await service.canDisableRequests()
             }
         }
         publicationObservation = Task { [weak self] in
@@ -75,7 +77,8 @@ final class MacRequestsModel {
                 guard let self else { break }
                 if generation != event.generation { generation = event.generation; self.publicationSequence = nil }
                 self.onPublicationEvent?(event)
-                if let status = event.publication, status.sequence != self.publicationSequence {
+                if let status = event.publication, status.sequence != self.publicationSequence,
+                   await service.isCurrentPublication(status, generation: event.generation) {
                     self.publicationSequence = status.sequence; self.onPublication?(status)
                 }
             }
@@ -85,13 +88,27 @@ final class MacRequestsModel {
     func initialized() async throws {
         try await initialization?.value
         if !didInitialize { configuration = await service.configurationValue(); didInitialize = true }
-        if let task = selectionTask {
-            let id = selectionID, result = try await task.value
-            if id == selectionID { acceptSelection(result.configuration); selectionTask = nil; selectionID = nil; pendingRepository = nil }
+        if let task = selectionTask, let id = selectionID { _ = try await finishSelection(task, id: id) }
+        if let proposal = pendingRepository {
+            pendingRepository = nil
+            do { acceptSelection(try await service.selectRepository(proposal)) }
+            catch {
+                self.error = "The proposed shader folder was not accepted: " + error.localizedDescription
+                acceptSelection(await service.configurationValue())
+            }
         }
-        if let pendingRepository {
-            let accepted = try await service.selectRepository(pendingRepository)
-            acceptSelection(accepted); self.pendingRepository = nil
+    }
+    private func finishSelection(_ task: Task<ShaderRepositorySelection, Error>, id: UUID) async throws -> ShaderRepositorySelection {
+        defer {
+            if selectionID == id { selectionTask = nil; selectionID = nil; pendingRepository = nil }
+        }
+        do {
+            let result = try await task.value
+            if selectionID == id { acceptSelection(result.configuration) }
+            return result
+        } catch {
+            if selectionID == id { acceptSelection(await service.configurationValue()) }
+            throw error
         }
     }
     var hasUnfinishedJobs: Bool { pendingCleanup || !recoveries.isEmpty || jobs.contains { !$0.stage.terminal } }
@@ -106,14 +123,11 @@ final class MacRequestsModel {
     }
     func reloadRepository(_ url: URL) async throws -> CatalogReloadResult {
         try await initialization?.value
+        if let task = selectionTask, let id = selectionID { _ = try? await finishSelection(task, id: id) }
         let id = UUID(), service = service
         pendingRepository = url; selectionID = id
         let task = Task { try await service.reloadRepository(url) }; selectionTask = task
-        let result = try await task.value
-        if selectionID == id {
-            acceptSelection(result.configuration); pendingRepository = nil; selectionTask = nil; selectionID = nil
-        }
-        return result.publication
+        return try await finishSelection(task, id: id).publication
     }
     private func save() { defaults?.set(try? JSONEncoder().encode(configuration), forKey: "holodeck.requestConfiguration") }
     func verify() {

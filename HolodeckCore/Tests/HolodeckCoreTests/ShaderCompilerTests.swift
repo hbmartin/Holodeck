@@ -21,6 +21,19 @@ final class ShaderCompilerTests: XCTestCase {
             XCTAssertTrue(underlying.localizedDescription.lowercased().contains("fragment input"))
         }
     }
+    func testActualFragmentOutputMismatchIsASourceDefect() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let source = """
+        #include <metal_stdlib>
+        using namespace metal;
+        vertex float4 vertexShader(uint id [[vertex_id]]) { return float4(0,0,0,1); }
+        fragment uint4 fragmentShader() { return uint4(1); }
+        """
+        let library = try device.makeLibrary(source:source,options:nil)
+        XCTAssertThrowsError(try makeShaderPipeline(device:device,library:library,pixelFormat:.bgra8Unorm_srgb)) {
+            XCTAssertTrue(ShaderCompilationError.isSourceDefect($0));XCTAssertTrue($0.localizedDescription.contains("color attachment"))
+        }
+    }
     func testPipelineClassifierPreservesDiagnosticsAndDoesNotClassifyVendorCodesAlone() {
         for diagnostic in ["Fragment input(s) `user(color)` mismatching vertex shader output type(s) or not written by vertex shader",
                            "Link failed: fragment input vPos was not found in vertex shader outputs"] {

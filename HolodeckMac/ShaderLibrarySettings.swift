@@ -15,14 +15,17 @@ final class MacLibraryModel {
     private var publicationGeneration: UUID?
     private var publicationResolvedSequence: UInt64 = 0
     private enum ErrorOrigin: Hashable { case folder, publication, manualReload, server, approval, revocation }
-    private var errors: [ErrorOrigin: String] = [:]
-    private var representedCatalogFailure: (origin: ErrorOrigin, id: UUID)?
-    var representedCatalogFailureID: UUID? { representedCatalogFailure?.id }
-    func representsCatalogFailure(_ failure: ViewerSession.Failure) -> Bool {
-        if case .catalog = failure.operation { return representedCatalogFailure?.id == failure.id }
-        return false
+    private struct ErrorRecord { let message: String; let correlationID: UUID? }
+    private var errors: [ErrorOrigin: ErrorRecord] = [:]
+    var representedCatalogFailureID: UUID? {
+        guard let failure = session.catalogFailure, representsCatalogFailure(failure) else { return nil }
+        return failure.id
     }
-    var error: String? { errors[.folder] ?? errors[.server] ?? errors[.manualReload] ?? errors[.publication] ?? errors[.approval] ?? errors[.revocation] }
+    func representsCatalogFailure(_ failure: ViewerSession.Failure) -> Bool {
+        guard case .catalog = failure.operation, let correlationID = failure.correlationID else { return false }
+        return errors.values.contains { $0.correlationID == correlationID }
+    }
+    var error: String? { (errors[.folder] ?? errors[.server] ?? errors[.manualReload] ?? errors[.publication] ?? errors[.approval] ?? errors[.revocation])?.message }
     var previewWarnings: [ShaderPreviewWarning] = []
     var serverState = LocalServerState()
     @ObservationIgnored private let catalog: DirectoryCatalog
@@ -42,6 +45,12 @@ final class MacLibraryModel {
         folder = folder ?? FileManager.default.temporaryDirectory
         setError(revocation ? "Previous revocation failed" : "Previous approval failed", from: revocation ? .revocation : .approval)
         session.failure = .init(message: "Independent catalog failure", operation: .catalog)
+    }
+    func injectCorrelatedCatalogFailureForTesting() {
+        guard exposesFailureAssociationTests else { return }
+        let correlationID = UUID()
+        setError("Correlated catalog failure", from: .manualReload, correlationID: correlationID)
+        session.failure = .init(message: "Correlated catalog failure", operation: .catalog, correlationID: correlationID)
     }
     var isTestingReloadHeld = false
     @ObservationIgnored private var testingReloadContinuation: CheckedContinuation<Void, Never>?
@@ -154,8 +163,15 @@ final class MacLibraryModel {
             defer { localReloading = false }
             do {
                 try await requests.initialized()
-                try await requests.service.ensurePublication(force: true)
-                if let status = await requests.service.publicationStatus() { previewWarnings = status.warnings }
+                if requests.configuration.enabled {
+                    try await requests.service.ensurePublication(force: true)
+                    if let status = await requests.service.publicationStatus() { previewWarnings = status.warnings }
+                } else {
+                    guard !requests.configuration.repository.isEmpty else { throw ShaderRequestError.unavailable("Choose a shader folder before rebuilding.") }
+                    let result = try await requests.reloadRepository(URL(fileURLWithPath: requests.configuration.repository))
+                    previewWarnings = result.previewWarnings
+                }
+                clearError(from: .manualReload); clearError(from: .publication)
                 ready = true
                 await session.refresh(force: true).value
                 if !sleeping { try await startServer() }
@@ -174,7 +190,7 @@ final class MacLibraryModel {
         servicePublishing = event.operation.phase == .preparing
         if let failure = event.unresolvedFailure {
             publicationFailureSequence = failure.operationSequence
-            setError(failure.message, from: .publication)
+            setError(failure.message, from: .publication, correlationID: failure.correlationID)
         } else {
             publicationResolvedSequence = event.operation.sequence
             clearError(from: .publication)
@@ -184,6 +200,7 @@ final class MacLibraryModel {
     private func load(_ url: URL, saveBookmark: Bool) {
         guard !isReloading, !requests.configuration.enabled, !requests.hasUnfinishedJobs else { return }
         localReloading = true; clearError(from: .folder); clearError(from: .manualReload)
+        let correlationID = UUID()
         let accessed = url.startAccessingSecurityScopedResource()
         Task {
             defer { localReloading = false; if accessed { url.stopAccessingSecurityScopedResource() } }
@@ -201,7 +218,7 @@ final class MacLibraryModel {
                     if url.startAccessingSecurityScopedResource() { scopedURL = url }
                 }
                 folder = URL(fileURLWithPath: requests.configuration.repository); ready = true
-                await session.refresh(force: true).value
+                await session.refresh(force: true, correlationID: correlationID).value
                 #if DEBUG
                 if holdsNextReloadForTesting {
                     holdsNextReloadForTesting = false
@@ -211,7 +228,7 @@ final class MacLibraryModel {
                 }
                 #endif
                 if !sleeping { try await startServer() }
-            } catch { setError(error.localizedDescription, from: .manualReload) }
+            } catch { setError(error.localizedDescription, from: .manualReload, correlationID: correlationID) }
         }
     }
     private func applyPublicationOperation(_ status: ShaderRequestPublicationOperationStatus) {
@@ -226,7 +243,7 @@ final class MacLibraryModel {
             clearError(from: .publication)
             if !ready {
                 ready = true
-                await session.refresh(force: true).value
+                await session.refresh(force: true, correlationID: status.correlationID).value
                 if !sleeping { try? await startServer() }
             }
         }
@@ -239,17 +256,13 @@ final class MacLibraryModel {
                   failure.operationSequence >= (publicationFailureSequence ?? 0) else { return }
             publicationFailureSequence = failure.operationSequence
         } else { publicationFailureSequence = nil }
-        setError(prefix + error.localizedDescription, from: .publication)
+        setError(prefix + error.localizedDescription, from: .publication, correlationID: (error as? ShaderRequestPublicationFailure)?.correlationID)
     }
-    private func setError(_ message: String, from origin: ErrorOrigin) {
-        errors[origin] = message
-        if origin == .publication || origin == .manualReload || origin == .folder, let failure = session.catalogFailure {
-            representedCatalogFailure = (origin, failure.id)
-        }
+    private func setError(_ message: String, from origin: ErrorOrigin, correlationID: UUID? = nil) {
+        errors[origin] = ErrorRecord(message: message, correlationID: correlationID)
     }
     private func clearError(from origin: ErrorOrigin) {
         errors[origin] = nil
-        if representedCatalogFailure?.origin == origin { representedCatalogFailure = nil }
         if origin == .publication { publicationFailureSequence = nil }
     }
     private func startServer() async throws {
@@ -318,6 +331,7 @@ struct ShaderLibrarySettings: View {
                     .font(.caption).foregroundStyle(.secondary)
                 #if DEBUG
                 if library.exposesFailureAssociationTests {
+                    Button("Inject Correlated Catalog Failure") { library.injectCorrelatedCatalogFailureForTesting() }.accessibilityIdentifier("test-correlated-catalog-failure")
                     Button("Inject Approval Catalog Failure") { library.injectUnrelatedCatalogFailureForTesting(revocation: false) }.accessibilityIdentifier("test-approval-catalog-failure")
                     Button("Inject Revocation Catalog Failure") { library.injectUnrelatedCatalogFailureForTesting(revocation: true) }.accessibilityIdentifier("test-revocation-catalog-failure")
                 }

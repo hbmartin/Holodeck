@@ -80,7 +80,7 @@ struct RequestSettingsView: View {
             HStack {
                 Button("Verify Setup and Enable") { model.verify() }.disabled(model.checking || model.hasUnfinishedJobs || model.configuration.repository.isEmpty || model.configuration.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     .accessibilityIdentifier("enable-shader-requests")
-                if model.configuration.enabled { Button("Disable Requests") { model.disable() }.disabled(model.hasUnfinishedJobs) }
+                if model.configuration.enabled { Button("Disable Requests") { model.disable() }.disabled(model.checking || !model.canDisableRequests) }
                 Button("Open Requests") { openWindow(id: "requests") }
                 if model.checking { ProgressView().controlSize(.small) }
             }

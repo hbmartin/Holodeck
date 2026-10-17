@@ -15,7 +15,7 @@ nonisolated final class BoundedCatalogReader {
     private let root: Int32
     init(root url: URL) throws {
         root = open(url.resolvingSymlinksInPath().path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard root >= 0 else { throw LocalCatalogError.invalidFile(url.lastPathComponent, "Cannot open folder without following symbolic links: \(String(cString: strerror(errno)))") }
+        guard root >= 0 else { throw LocalCatalogError.invalidFile(url.lastPathComponent, "Cannot open the resolved root folder (root aliases are supported): \(String(cString: strerror(errno)))") }
     }
     deinit { close(root) }
 

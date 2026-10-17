@@ -85,6 +85,7 @@ public struct ShaderRequestPublicationFailure: LocalizedError, Sendable, Equatab
     public let operationSequence: UInt64
     public let message: String
     public let recoveryRequired: Bool
+    public var correlationID: UUID? = nil
     public var errorDescription: String? { message }
 }
 
@@ -95,6 +96,7 @@ public struct ShaderRequestPublicationOperationStatus: Sendable, Equatable {
     public let failure: ShaderRequestPublicationFailure?
     /// Set only when this operation successfully restores or installs this revision.
     public let revision: String?
+    public var correlationID: UUID? = nil
 }
 
 public struct ShaderRequestPublicationEvent: Sendable {
@@ -128,6 +130,7 @@ public actor ShaderRequestService {
     private var recovery = RequestRecoveryStore()
     private let waitForWorker: @Sendable (RequestWorkerProcess) async throws -> Void
     private let reconcileWorker: @Sendable (URL) async throws -> Void
+    private let recoveryWriter: @Sendable (Data, URL) throws -> Void
     private var configuration = ShaderRequestConfiguration()
     private var records: [UUID: Record] = [:]
     private var observers: [UUID: AsyncStream<[ShaderRequestStatus]>.Continuation] = [:]
@@ -184,12 +187,14 @@ public actor ShaderRequestService {
         self.catalog = catalog; self.directory = directory; self.workerScript = nil
         self.waitForWorker = { try await $0.waitForExit() }
         self.reconcileWorker = { try RequestWorkerProcess.reconcileOrphan(in: $0) }
+        self.recoveryWriter = { try $0.write(to: $1, options: .atomic) }
     }
     init(catalog: DirectoryCatalog, directory: URL, workerScript: URL,
          reconcileWorker: @escaping @Sendable (URL) async throws -> Void = { try RequestWorkerProcess.reconcileOrphan(in: $0) },
-         waitForWorker: @escaping @Sendable (RequestWorkerProcess) async throws -> Void = { try await $0.waitForExit() }) {
+         waitForWorker: @escaping @Sendable (RequestWorkerProcess) async throws -> Void = { try await $0.waitForExit() },
+         recoveryWriter: @escaping @Sendable (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) }) {
         self.catalog = catalog; self.directory = directory; self.workerScript = workerScript
-        self.reconcileWorker = reconcileWorker; self.waitForWorker = waitForWorker
+        self.reconcileWorker = reconcileWorker; self.waitForWorker = waitForWorker; self.recoveryWriter = recoveryWriter
     }
     private func workerProcess() -> RequestWorkerProcess { RequestWorkerProcess(script: workerScript) }
 
@@ -198,6 +203,7 @@ public actor ShaderRequestService {
             throw ShaderRequestError.unavailable("Wait for active checkout maintenance to finish.")
         }
         maintenanceLease = id
+        emitUpdates()
         return id
     }
     private func checkMaintenance(_ lease: UUID) throws {
@@ -210,6 +216,7 @@ public actor ShaderRequestService {
             let waiters = maintenanceWaiters; maintenanceWaiters.removeAll()
             for waiter in waiters { waiter.resume() }
         }
+        emitUpdates()
         if schedule { kick() }
     }
     private func waitForMaintenance() async {
@@ -309,17 +316,21 @@ public actor ShaderRequestService {
     }
     private func selectedConfiguration(_ repository: URL) -> ShaderRequestConfiguration {
         var selected = configuration
-        selected.repository = RequestPaths.canonical(repository); selected.checkoutID = nil
+        selected.repository = RequestPaths.canonical(repository)
+        if selected.repository != RequestPaths.canonical(URL(fileURLWithPath: configuration.repository)) { selected.checkoutID = nil }
         return selected
     }
     private func acceptRepository(_ accepted: ShaderRequestConfiguration) {
+        if Self.samePublicationCheckout(configuration, accepted) { configuration = accepted; return }
         cancelPublicationRequests()
         configuration = accepted
         publicationGeneration = UUID(); latestPublication = nil; unresolvedPublicationFailure = nil
         _ = publicationState(.idle)
     }
     @discardableResult public func selectRepository(_ repository: URL) async throws -> ShaderRequestConfiguration {
-        try load(); try requireRepositorySelection()
+        try load()
+        if RequestPaths.canonical(repository) == RequestPaths.canonical(URL(fileURLWithPath: configuration.repository)) { return configuration }
+        try requireRepositorySelection()
         try await reconcileWorkers(); try requireRepositorySelection()
         let lease = try beginMaintenance(); defer { endMaintenance(lease) }
         let accepted = selectedConfiguration(repository)
@@ -366,6 +377,11 @@ public actor ShaderRequestService {
         guard let latestPublication, latestPublication.revision == revision else { return nil }
         return latestPublication
     }
+    public func isCurrentPublication(_ status: ShaderRequestPublicationStatus, generation: UUID) async -> Bool {
+        let revision = await catalog.publicationRevisionValue()
+        return publicationGeneration == generation && latestPublication?.sequence == status.sequence &&
+            latestPublication?.revision == status.revision && revision == status.revision
+    }
     public func publicationOperationStatus() -> ShaderRequestPublicationOperationStatus { publicationOperation }
     public func publicationUpdates() -> AsyncStream<ShaderRequestPublicationEvent> {
         let id = UUID()
@@ -381,12 +397,15 @@ public actor ShaderRequestService {
     private func emitPublication() { for observer in publicationObservers.values { observer.yield(publicationEvent()) } }
     private func resolvePublicationFailure() { unresolvedPublicationFailure = nil; _ = publicationState(.idle) }
     private func publicationState(_ phase: ShaderRequestPublicationOperationStatus.Phase, message: String? = nil,
-                                  recoveryRequired: Bool = false, revision: String? = nil) -> ShaderRequestPublicationFailure? {
+                                  recoveryRequired: Bool = false, revision: String? = nil,
+                                  correlationID: UUID? = nil) -> ShaderRequestPublicationFailure? {
         let sequence = publicationOperation.sequence &+ 1
-        let failure = message.map { ShaderRequestPublicationFailure(generation: publicationGeneration, operationSequence: sequence, message: $0, recoveryRequired: recoveryRequired) }
+        let correlationID = correlationID ?? execution?.id
+        let failure = message.map { ShaderRequestPublicationFailure(generation: publicationGeneration, operationSequence: sequence,
+            message: $0, recoveryRequired: recoveryRequired, correlationID: correlationID) }
         if let failure { unresolvedPublicationFailure = failure }
         if revision != nil { unresolvedPublicationFailure = nil }
-        publicationOperation = .init(sequence: sequence, phase: phase, failure: failure, revision: revision)
+        publicationOperation = .init(sequence: sequence, phase: phase, failure: failure, revision: revision, correlationID: correlationID)
         emitPublication()
         return failure
     }
@@ -561,7 +580,7 @@ public actor ShaderRequestService {
         ["process.json", "children.json"].contains { FileManager.default.fileExists(atPath: journal.appendingPathComponent($0).path) }
     }
     private func persistRecovery() throws {
-        try JSONEncoder().encode(recovery).write(to: directory.appendingPathComponent("recovery.json"), options: .atomic)
+        try recoveryWriter(JSONEncoder().encode(recovery), directory.appendingPathComponent("recovery.json"))
     }
     private func holdForRecovery(journal: URL, configuration target: ShaderRequestConfiguration?, error: Error,
                                  preferencesRollback: ShaderRequestConfiguration? = nil) {
@@ -675,7 +694,7 @@ public actor ShaderRequestService {
             if let checkout = try? Self.savedConfiguration(in: journal), Self.samePublicationCheckout(checkout, selected),
                !targets.contains(where: { $0.0 == journal }) { targets.append((journal, nil, checkout)) }
         }
-        if targets.isEmpty { targets.append((directory.appendingPathComponent("setup"), nil, selected)) }
+        if targets.isEmpty { targets.append((directory.appendingPathComponent("detachment"), nil, selected)) }
         for (journal, requestID, checkout) in targets {
             let key = RequestPaths.canonical(journal)
             var entry = recovery.entries[key] ?? .init(journal: key, requestID: requestID, configuration: checkout,
@@ -811,9 +830,9 @@ public actor ShaderRequestService {
         if let lease { endMaintenance(lease, schedule: false) }
         let reported: Error?
         if let error, !(error is CancellationError) {
-            reported = publicationState(.failed, message: error.localizedDescription)
+            reported = publicationState(.failed, message: error.localizedDescription, correlationID: lease)
         } else {
-            _ = publicationState(.idle, revision: revision)
+            _ = publicationState(.idle, revision: revision, correlationID: lease)
             reported = error
         }
         for waiter in waiters {
@@ -939,8 +958,11 @@ public actor ShaderRequestService {
         resolvePublicationFailure()
         try persist(); kick()
     }
+    public func canDisableRequests() -> Bool {
+        activeID == nil && !maintenanceBusy && !records.values.contains(where: { !$0.status.stage.terminal || $0.cleanupPending == true })
+    }
     public func disable() throws {
-        guard activeID == nil, !maintenanceBusy, !records.values.contains(where: { !$0.status.stage.terminal || $0.cleanupPending == true }) else {
+        guard canDisableRequests() else {
             throw ShaderRequestError.unavailable("Requests are still in progress.")
         }
         configuration.enabled = false; setupMessage = "Shader requests are disabled."
