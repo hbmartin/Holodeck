@@ -66,13 +66,21 @@ def process_identity(pid):
         return None
 
 
-def group_members(pid):
+def process_groups():
     try:
         listing = subprocess.run(['/bin/ps', '-axo', 'pid=,pgid='], capture_output=True, text=True, timeout=2, check=True)
-    except (OSError, subprocess.SubprocessError) as error:
-        raise ProcessObservationError('Cannot observe owned process group: ' + str(error)) from error
-    return [identity for line in listing.stdout.splitlines() if len(parts := line.split()) == 2
-            and int(parts[1]) == pid and (identity := process_identity(int(parts[0]))) is not None]
+        groups = {}
+        for line in listing.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 2: groups.setdefault(int(parts[1]), []).append(int(parts[0]))
+        return groups
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise ProcessObservationError('Cannot observe owned process groups: ' + str(error)) from error
+
+
+def group_members(pid, snapshot=None):
+    groups = process_groups() if snapshot is None else snapshot
+    return [identity for member in groups.get(pid, []) if (identity := process_identity(member)) is not None]
 
 
 def merge_members(known, observed):
@@ -101,11 +109,13 @@ def terminate_registered(directory):
     next_sample = 0
     unknown = False
     while True:
-        if time.monotonic() >= next_sample:
+        sampled = time.monotonic() >= next_sample
+        if sampled:
             unknown = False
+            snapshot = process_groups()
             for entry in entries:
                 leader = entry['leader']
-                observed = group_members(leader['pid'])
+                observed = group_members(leader['pid'], snapshot)
                 if process_identity(leader['pid']) == leader:
                     entry['members'] = merge_members(entry['members'], observed)
                 else:
@@ -123,7 +133,7 @@ def terminate_registered(directory):
                     sent.add(key)
                     with contextlib.suppress(ProcessLookupError): os.kill(identity['pid'], sig)
         live = any(process_identity(i['pid']) == i for e in entries for i in e['members'])
-        if not live and not unknown:
+        if not live and sampled and not unknown:
             file.unlink(missing_ok=True); return
         if time.monotonic() >= deadline:
             raise ProcessRecoveryError('Owned descendants did not settle; retain the journal and recover or detach the checkout')
@@ -836,6 +846,7 @@ Choose any ONE existing shader ID to EDIT, retaining its ID, or create ONE unuse
 Ask a concise clarification only if intent is ambiguous. Unsupported audio/textures/multipass/app capabilities must be approximated using this runtime and disclosed.
 New output: append to index.shaders and relevant EXISTING collections; preserve the default and existing ordering. Generate a name, metadata and discovery tags/moods/motion. If editing an unlisted existing shader, append its ID too so the TV can download it.
 Allowed changes: one primary shader body/metadata, index membership, canonical shared helpers, and DATA ONLY in sourceRequirements/upstreamRequirements of authoring.json. Preserve schemaVersion and regressionProfiles.
+Shared helper edits must preserve all shader, snippet and template interfaces. If a template breaks, repair or revert the helper; templates are not editable.
 No tooling, test logic, other shader bodies, originals, previews, or app changes. Do NOT commit, push, change branches, or alter Git configuration.
 For PERFORMANCE purpose: optimize the context ID (unless deleted), preserve composition/colors/motion/detail for all affected shaders; report no changes if latest already addresses the old evidence. Timings refer to the observed old source, not necessarily latest.
 For activation repair: repair the failed OUTPUT ID from the diagnostic, preserving the creative intent. Recreate it if deleted. Classification belongs to the logical request: retain "new" for an output this request already created and published. The changed flag describes only this candidate diff; the host records earlier changes too.
@@ -846,7 +857,36 @@ An unchanged existing shader may be successful if it already satisfies the promp
                           "capturedContext": context, "answer": answer, "activationRepair": repair,
                           "previousOutput": self.checkpoint.get("outcome"), "previousPublication": self.previous_publication(), "verificationFeedback": feedback}, indent=2)
 
+    def require_checker(self):
+        """Compare data-only library expectations with the native tool's verified bundled identity."""
+        try:
+            raw = self.read_workspace('shader_checker.lock.json', limit=65536)
+            executable = os.stat(self.config['shaderTool'])
+            key = (raw, executable.st_ino, executable.st_size, executable.st_mtime_ns)
+            if getattr(self, '_checker_identity_key', None) == key: return
+            pin = json.loads(raw)
+            fields = ('repository', 'version', 'interfaceVersion', 'sourceCommit', 'sha256')
+            if not isinstance(pin, dict) or pin.get('repository') != 'hbmartin/HolodeckShaderCheck':
+                raise ValueError('unapproved checker repository')
+            for name, pattern in [('version', r'1\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'), ('sourceCommit', r'[0-9a-f]{40}'), ('sha256', r'[0-9a-f]{64}')]:
+                if type(pin.get(name)) is not str or re.fullmatch(pattern, pin[name]) is None:
+                    raise ValueError('invalid checker lock ' + name)
+            if type(pin.get('interfaceVersion')) is not int or pin['interfaceVersion'] != 1:
+                raise ValueError('unsupported checker interface')
+            identity = json.loads(run([self.config['shaderTool'], 'library', 'artifact-info', '--json'], self.root, self.env, timeout=5).stdout)
+            if not isinstance(identity, dict) or any(type(identity.get(name)) is not type(pin[name]) or identity[name] != pin[name] for name in fields):
+                raise ValueError('bundled checker identity differs from the selected library lock')
+            info = json.loads(run([self.config['shaderTool'], 'library', 'info', '--json', '--python', self.config['python']], self.root, self.env, timeout=5).stdout)
+            if not isinstance(info, dict) or type(info.get('interfaceVersion')) is not int or info['interfaceVersion'] != pin['interfaceVersion'] or info.get('checkerVersion') != pin['version']:
+                raise ValueError('packaged checker reports a different version or interface')
+            self._checker_identity_key = key
+        except ProcessRecoveryError:
+            raise
+        except (ValueError, TypeError, KeyError, OSError, CandidateError, OperationalError, subprocess.TimeoutExpired) as error:
+            raise OperationalError('Update Holodeck and the shader library together: ' + str(error)) from error
+
     def technical(self, baseline=False, commands=None):
+        self.require_checker()
         self.stage("validating", "Compiling macOS and tvOS shaders and running authoring/GPU tests")
         commands = commands or [[self.config["shaderTool"], "library", "validate", str(self.root), phase, "--python", self.config["python"]]
                                 for phase in ('--compile', '--gpu-only')]
@@ -976,6 +1016,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
         return self.checkpoint.get("requiredPreviewShaderIDs")
 
     def prepare_publication(self, required=None):
+        self.require_checker()
         emit("preparePublication", requiredPreviewShaderIDs=required if required is not None else self.required_previews())
         response = sys.stdin.readline()
         reply = json.loads(response) if response else {}
@@ -1153,11 +1194,8 @@ An unchanged existing shader may be successful if it already satisfies the promp
         self.git("checkout", "-B", "main", "origin/main")
         self.check_checkout_inputs()
         self.git("push", "--dry-run", "origin", "HEAD:main")
-        info = run([self.config["shaderTool"], "library", "info", "--json", "--python", self.config["python"]], self.root, self.env)
+        self.require_checker()
         try:
-            checker = json.loads(info.stdout)
-            if not isinstance(checker, dict) or type(checker.get('interfaceVersion')) is not int or checker['interfaceVersion'] != 1 or not isinstance(checker.get('checkerVersion'), str) or not checker['checkerVersion'].startswith('1.'):
-                raise ValueError("incompatible interface")
             configuration = json.loads(self.read_workspace('authoring.json'))
             if not isinstance(configuration, dict) or type(configuration.get('schemaVersion')) is not int or configuration['schemaVersion'] != 1:
                 raise ValueError("missing authoring schema 1")

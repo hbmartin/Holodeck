@@ -555,6 +555,8 @@ final class ShaderRequestTests: XCTestCase {
 
     private func requestAuthoringFixture(_ root: URL, includesUnrelated: Bool = false) throws -> URL {
         try FileManager.default.createDirectory(at: root.appendingPathComponent("shared"), withIntermediateDirectories: true)
+        let checkerLock = try XCTUnwrap(NativeShaderToolFixture.lock)
+        try Data(contentsOf:checkerLock).write(to:root.appendingPathComponent("shader_checker.lock.json"))
         try Data("COMMON\n".utf8).write(to: root.appendingPathComponent("shared/common.metal"))
         try Data("FRAGMENT\n".utf8).write(to: root.appendingPathComponent("shared/fragment.metal"))
         let ids = includesUnrelated ? ["plasma", "unrelated"] : ["plasma"]
@@ -585,7 +587,7 @@ final class ShaderRequestTests: XCTestCase {
         let authoring = try requestAuthoringFixture(root.appendingPathComponent("authoring"))
         let catalog = DirectoryCatalog(directory: root.appendingPathComponent("catalog"), previewGenerator: generator)
         let service = ShaderRequestService(catalog: catalog, directory: root, workerScript: script)
-        await service.suspend(); try await service.start(configuration: .init(repository: authoring.path, enabled: true))
+        await service.suspend(); try await service.start(configuration: .init(repository: authoring.path, shaderTool: NativeShaderToolFixture.executable.path, enabled: true))
         let request = ShaderRequest(prompt: "Prepare", context: try context())
         _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
         await service.resume()
@@ -619,7 +621,7 @@ final class ShaderRequestTests: XCTestCase {
                 return try ShaderPNG.gradient(colors: [[0,0,0],[1,1,1]])
             }
             let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog"), previewGenerator: previews), directory: root, workerScript: script)
-            await service.suspend(); try await service.start(configuration: .init(repository: authoring.path, enabled: true))
+            await service.suspend(); try await service.start(configuration: .init(repository: authoring.path, shaderTool: NativeShaderToolFixture.executable.path, enabled: true))
             let request = ShaderRequest(prompt: "Preview", context: try context())
             _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
             await service.resume()
@@ -652,14 +654,14 @@ final class ShaderRequestTests: XCTestCase {
         let previews = ShaderPreviewGenerator(directory: root.appendingPathComponent("previews")) { _ in try ShaderPNG.gradient(colors: [[0,0,0],[1,1,1]]) }
         let catalog = DirectoryCatalog(directory: root.appendingPathComponent("catalog"), previewGenerator: previews)
         let service = ShaderRequestService(catalog: catalog, directory: root.appendingPathComponent("service"))
-        try await service.start(configuration: .init(repository: authoring.path, enabled: true))
+        try await service.start(configuration: .init(repository: authoring.path, shaderTool: NativeShaderToolFixture.executable.path, enabled: true))
         try await service.ensurePublication()
         let publication = try await catalog.cached()
         XCTAssertEqual(publication?.shaders.map(\.id), ["plasma"])
         try Data("dirty".utf8).write(to: authoring.appendingPathComponent("shaders/plasma/body.metal"))
         let cold = DirectoryCatalog(directory: root.appendingPathComponent("cold"), previewGenerator: previews)
         let other = ShaderRequestService(catalog: cold, directory: root.appendingPathComponent("other-service"))
-        try await other.start(configuration: .init(repository: authoring.path, enabled: true))
+        try await other.start(configuration: .init(repository: authoring.path, shaderTool: NativeShaderToolFixture.executable.path, enabled: true))
         do { try await other.ensurePublication(); XCTFail("Dirty checkout bootstrapped") } catch {}
         XCTAssertEqual(try String(contentsOf: authoring.appendingPathComponent("shaders/plasma/body.metal"), encoding: .utf8), "dirty")
     }
@@ -685,7 +687,7 @@ final class ShaderRequestTests: XCTestCase {
         let previews = ShaderPreviewGenerator(directory: root.appendingPathComponent("previews")) { _ in try ShaderPNG.gradient(colors: [[0,0,0],[1,1,1]]) }
         let catalog = DirectoryCatalog(directory: root.appendingPathComponent("catalog"), previewGenerator: previews)
         let service = ShaderRequestService(catalog: catalog, directory: root.appendingPathComponent("service"))
-        try await service.initialize(configuration: .init(repository: authoring.path, enabled: true))
+        try await service.initialize(configuration: .init(repository: authoring.path, shaderTool: NativeShaderToolFixture.executable.path, enabled: true))
         try await service.ensurePublication()
         let first = await service.publicationStatus()
         try Data("CHANGED BODY\n".utf8).write(to: authoring.appendingPathComponent("shaders/plasma/body.metal"))
@@ -726,7 +728,7 @@ final class ShaderRequestTests: XCTestCase {
             let previews = ShaderPreviewGenerator(directory: root.appendingPathComponent("previews")) { _ in try ShaderPNG.gradient(colors: [[0,0,0],[1,1,1]]) }
             let catalog = DirectoryCatalog(directory: root.appendingPathComponent("catalog"), previewGenerator: previews)
             let initial = ShaderRequestService(catalog: catalog, directory: root, workerScript: script)
-            await initial.suspend(); try await initial.start(configuration: .init(repository: authoring.path, enabled: true))
+            await initial.suspend(); try await initial.start(configuration: .init(repository: authoring.path, shaderTool: NativeShaderToolFixture.executable.path, enabled: true))
             let owner = ShaderRequest(prompt: "Interrupted", context: try context()), queued = ShaderRequest(prompt: "Queued", context: try context())
             if interrupted {
                 _ = try await initial.control(operation: "requestSubmit", payload: .init(request: owner), deviceID: "A")
@@ -747,7 +749,7 @@ final class ShaderRequestTests: XCTestCase {
             """)
             try scriptSource.write(to: script, atomically: true, encoding: .utf8)
             let service = ShaderRequestService(catalog: catalog, directory: root, workerScript: script)
-            try await service.initialize(configuration: .init(repository: authoring.path, enabled: true))
+            try await service.initialize(configuration: .init(repository: authoring.path, shaderTool: NativeShaderToolFixture.executable.path, enabled: true))
             try await service.ensurePublication()
             let order = try String(contentsOf: root.appendingPathComponent("operation-order"), encoding: .utf8).split(separator: "\n").map(String.init)
             XCTAssertEqual(order, interrupted ? ["run:" + owner.id.uuidString, "discard:" + owner.id.uuidString, "publication:publication"] : ["publication:publication"])
@@ -776,7 +778,7 @@ final class ShaderRequestTests: XCTestCase {
         }
         let catalog = DirectoryCatalog(directory: root.appendingPathComponent("catalog"), previewGenerator: previews)
         let service = ShaderRequestService(catalog: catalog, directory: root, workerScript: script)
-        try await service.initialize(configuration: .init(repository: authoring.path, enabled: true))
+        try await service.initialize(configuration: .init(repository: authoring.path, shaderTool: NativeShaderToolFixture.executable.path, enabled: true))
         let rebuild = Task { try await service.ensurePublication(force: true) }
         try await waitFor { await gate.entered }
         await service.suspend(); await service.resume(); await gate.release()
@@ -1051,7 +1053,7 @@ final class ShaderRequestTests: XCTestCase {
         let catalog = DirectoryCatalog(directory: root.appendingPathComponent("catalog"), previewGenerator: previews)
         let service = ShaderRequestService(catalog: catalog, directory: root, workerScript: script, reconcileWorker: reconcile)
         await service.suspend()
-        try await service.initialize(configuration: .init(repository: authoring.path, enabled: true))
+        try await service.initialize(configuration: .init(repository: authoring.path, shaderTool: NativeShaderToolFixture.executable.path, enabled: true))
         return (root, script, authoring, catalog, service)
     }
     private func brokenReconciliation(_ root: URL) throws -> URL {
@@ -1515,7 +1517,7 @@ final class ShaderRequestTests: XCTestCase {
         """.write(to: script, atomically: true, encoding: .utf8)
         let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root,
             workerScript: script, waitForWorker: { try await gate.wait($0) })
-        await service.suspend(); try await service.start(configuration: .init(repository: authoring.path, enabled: true))
+        await service.suspend(); try await service.start(configuration: .init(repository: authoring.path, shaderTool: NativeShaderToolFixture.executable.path, enabled: true))
         let request = ShaderRequest(prompt: "Published", context: try context())
         _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
         await service.resume(); try await waitFor { await service.recoveryStatuses().contains { $0.disposition == .retainResult } }
@@ -1843,7 +1845,7 @@ final class ShaderRequestTests: XCTestCase {
             try await waitFor { await gate.entered }
             let detach = Task { try await service.detachCheckout(.selectedCheckout) }
             try await waitFor { await service.recoveryStatuses().contains { $0.disposition == .detach } }
-            do { _ = try await service.selectRepository(root); XCTFail("Selection stole the reserved detach lease") } catch {}
+            do { _ = try await service.selectRepository(root.appendingPathComponent("other")); XCTFail("Selection stole the reserved detach lease") } catch {}
             await gate.release()
             do { try await verify.value; XCTFail("Cancelled verification succeeded") } catch is CancellationError {}
             try await detach.value
