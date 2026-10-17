@@ -1571,6 +1571,8 @@ final class ShaderRequestTests: XCTestCase {
         try Data("{}".utf8).write(to: journal.appendingPathComponent("process.json"))
         do { try await service.retryReconciliation(); XCTFail("Ignored invalid process evidence") }
         catch { XCTAssertTrue(error.localizedDescription.contains("identity is unreadable")) }
+        do { try await service.verify(configuration: .init(repository: root.path)); XCTFail("Verified an unreconciled journal") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("identity is unreadable")) }
         let status = await service.recoveryStatuses().first { $0.kind == .reconciliation }
         XCTAssertNil(status?.checkout); XCTAssertEqual(status?.journal?.resolvingSymlinksInPath(), journal.resolvingSymlinksInPath())
         do { try await service.detachCheckout(); XCTFail("Guessed current checkout") }
