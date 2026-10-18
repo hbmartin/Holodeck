@@ -85,12 +85,15 @@ else:
     output={'passed':not fail_once,'reason':'Fixture image and source review passed','evidenceDigest':schema['properties']['evidenceDigest']['enum'][0]}
 Path(value('--output-last-message')).write_text(json.dumps(output))
 '''
+CHECKER_PIN = {'repository':'hbmartin/HolodeckShaderCheck','version':'1.0.0','interfaceVersion':1,'sourceCommit':'a'*40,'sha256':'b'*64}
 TOOL = r'''#!/usr/bin/env python3
 import json, os, signal, sys, time
 from pathlib import Path
 args = sys.argv[1:]
 if args == ['--version']:
     print('holodeck-shader-tool 1.1.0'); raise SystemExit(0)
+if args[:2] == ['library', 'artifact-info']:
+    print(json.dumps(CHECKER_PIN)); raise SystemExit(0)
 if args[:2] == ['library', 'info']:
     print(json.dumps({'interfaceVersion':1,'checkerVersion':'1.0.0'})); raise SystemExit(0)
 if args[:2] == ['library', 'validate']:
@@ -104,6 +107,7 @@ if args[:2] == ['library', 'validate']:
     raise SystemExit(0)
 Path(sys.argv[3]).write_bytes((Path(__file__).parent/'frame.png').read_bytes())
 '''
+TOOL = TOOL.replace('CHECKER_PIN',repr(CHECKER_PIN))
 LIBRARY = '''import sys\nfrom pathlib import Path\nif any('BAD' in p.read_text() for p in Path('shaders').glob('*/body.metal')): sys.exit(1)\n'''
 
 
@@ -126,6 +130,7 @@ class ShaderRequestWorkerTests(unittest.TestCase):
             (self.root/f'shaders/{sid}/body.metal').write_text(sid.upper()+'\n')
             (self.root/f'shaders/{sid}/metadata.json').write_text(json.dumps({'id':sid,'shared':['common','fragment']}))
         (self.root/'index.json').write_text(json.dumps({'defaultShaderID':'alpha','shaders':['alpha','beta'],'collections':[]}))
+        (self.root/'shader_checker.lock.json').write_text(json.dumps(CHECKER_PIN))
         (self.root/'tools').mkdir()
         (self.root/'tools/library.py').write_text(LIBRARY)
         (self.root/'tools/test_authoring.py').write_text('import unittest\nclass Tests(unittest.TestCase):\n def test_authoring(self): self.assertTrue(True)\n')
@@ -544,10 +549,12 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         owner={'id':self.request['id'],'directory':str(self.job.resolve())};worker_module.write(worker.owner,owner)
         self.config['detachedOwner']={'requestID':self.request['id'],'directory':str(self.job),'repository':str(self.root),'checkoutID':'checkout-fixture'}
         worker.codex=lambda *args,**kwargs:{'imageDescription':'Fixture'}
+        worker.require_checker()
         return worker,owner
 
     def test_detached_owner_retires_only_after_successful_setup(self):
         worker,owner=self.detached_setup_worker()
+        worker.require_checker()
         with patch.object(worker_module,'run',return_value=subprocess.CompletedProcess([],0,json.dumps({'interfaceVersion':1,'checkerVersion':'1.0.0'}),'')):
             worker.preflight()
         self.assertFalse(worker.owner.exists())
@@ -592,6 +599,7 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         proof['repository']=str(alias);self.config['detachedOwner']=proof
         worker=worker_module.Worker(dict(self.config,repository=str(alias)),self.job)
         worker.codex=lambda *args,**kwargs:{'imageDescription':'Fixture'}
+        worker.require_checker()
         with patch.object(worker_module,'run',return_value=subprocess.CompletedProcess([],0,json.dumps({'interfaceVersion':1,'checkerVersion':'1.0.0'}),'')):
             worker.preflight()
         self.assertFalse(original.owner.exists())
@@ -653,6 +661,7 @@ class ShaderRequestWorkerTests(unittest.TestCase):
             text=(self.root/'shaders/alpha/body.metal').read_text();observed.append(text)
             if text=='EDIT\n':raise subprocess.TimeoutExpired(command,600)
             return subprocess.CompletedProcess(command,0,'','')
+        worker.require_checker()
         with patch.object(worker_module,'run',side_effect=operation):
             with self.assertRaises(worker_module.VerificationError) as failure:worker.technical()
             worker.classify_verification_failure(failure.exception)
@@ -852,12 +861,93 @@ worker.main()
             text=(self.root/'shaders/alpha/body.metal').read_text()
             calls.append((phase,kwargs['timeout'],text))
             return subprocess.CompletedProcess(command,2 if phase=='--gpu-only' and text=='EDIT\n' else 0,'candidate probe timed out','')
+        worker.require_checker()
         with patch.object(worker_module,'run',side_effect=validate):
             with self.assertRaises(worker_module.VerificationError) as failure:worker.technical()
             worker.classify_verification_failure(failure.exception)
         self.assertEqual([(c[0],c[1]) for c in calls],[('--compile',600),('--gpu-only',600),('--gpu-only',600)])
         self.assertEqual(calls[-1][2],'ALPHA\n')
         self.assertEqual((self.root/'shaders/alpha/body.metal').read_text(),'EDIT\n')
+
+    def test_checker_identity_mismatch_is_operational_before_validation(self):
+        worker=worker_module.Worker(self.config,self.job)
+        for field,value in [('version','1.99.0'),('sha256','c'*64),('sourceCommit','c'*40),('repository','someone/Other'),('interfaceVersion',True)]:
+            with self.subTest(field=field):
+                (self.root/'shader_checker.lock.json').write_text(json.dumps(dict(CHECKER_PIN,**{field:value})))
+                with self.assertRaisesRegex(worker_module.OperationalError,'Update Holodeck'):
+                    worker.technical()
+        (self.root/'shader_checker.lock.json').write_text(json.dumps(CHECKER_PIN))
+        worker.require_checker()
+
+    def test_managed_communicate_preserves_large_input_across_timeouts(self):
+        env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job));payload='x'*2000000
+        result=worker_module.managed_run([sys.executable,'-c','import sys,time;time.sleep(.7);print(len(sys.stdin.read()))'],self.root,env,5,payload)
+        self.assertEqual(result.stdout.strip(),str(len(payload)))
+
+    def test_registry_prunes_more_than_700_retired_identities(self):
+        env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job))
+        with worker_module.ManagedChild([sys.executable,'-c','import time;time.sleep(.4)'],self.root,env) as child:
+            child.members += [{'pid':10000000+i,'seconds':1,'microseconds':0} for i in range(750)]
+            child.sample()
+            value=json.loads(child.registry.read_bytes())
+            self.assertEqual(value[0]['members'],[child.identity])
+            self.assertLess(child.registry.stat().st_size,1024)
+            child.process.communicate(timeout=2)
+        self.assertFalse((self.job/'children.json').exists())
+
+    def test_group_observation_timeout_is_operational_not_candidate_timeout(self):
+        with patch.object(worker_module.subprocess,'run',side_effect=subprocess.TimeoutExpired('ps',2)):
+            with self.assertRaises(worker_module.ProcessObservationError):worker_module.group_members(99999)
+
+    def test_quarantine_uses_bounded_names_for_long_components(self):
+        worker=worker_module.Worker(self.config,self.job);name='x'*240
+        target=self.base/'preserved';target.write_text('outside')
+        (self.root/name).symlink_to(target)
+        worker.quarantine_obstructions([name])
+        directory=worker.gitdir/'holodeck-recovery'/self.job.name
+        record=next(directory.glob('*.json'))
+        self.assertEqual(json.loads(record.read_text())['originalPath'],name)
+        self.assertLess(len(record.name),64);self.assertEqual(target.read_text(),'outside')
+
+    def test_late_fork_during_termination_retains_evidence_and_blocks_handoff(self):
+        env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job));marker=self.base/'late-child'
+        code="""import signal,subprocess,sys,time
+from pathlib import Path
+def stop(*args):
+ child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+ Path(sys.argv[1]).write_text(str(child.pid))
+ raise SystemExit(0)
+signal.signal(signal.SIGTERM,stop)
+sys.stdin.read();print('ready',flush=True)
+time.sleep(60)
+"""
+        try:
+            with self.assertRaises(worker_module.ProcessRecoveryError):
+                with worker_module.ManagedChild([sys.executable,'-c',code,str(marker)],self.root,env,stdin=True,text=False) as child:
+                    lines=child.lines('prompt');self.assertEqual(next(lines),'ready')
+                    # Exit the streaming invocation; the leader forks only after the final observation's TERM.
+            self.assertTrue((self.job/'children.json').exists())
+            self.assertIsNotNone(worker_module.process_identity(int(marker.read_text())))
+        finally:
+            if marker.exists():
+                identity=worker_module.process_identity(int(marker.read_text()))
+                if identity and worker_module.process_identity(identity['pid'])==identity:os.kill(identity['pid'],signal.SIGKILL)
+
+    def test_live_registry_overflow_preserves_previous_evidence(self):
+        registry=self.job/'children.json';original=b'[]';registry.write_bytes(original)
+        identities=[{'pid':100000+i,'seconds':1792260000,'microseconds':123456} for i in range(1500)]
+        with self.assertRaisesRegex(worker_module.ProcessRecoveryError,'64 KiB'):
+            worker_module.save_registry(registry,[{'leader':identities[0],'members':identities}])
+        self.assertEqual(registry.read_bytes(),original)
+
+    def test_streaming_child_is_registered_and_sampled_while_output_is_idle(self):
+        env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job));marker=self.base/'descendant'
+        code="import subprocess,sys,time;from pathlib import Path;sys.stdin.read();p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);Path(sys.argv[1]).write_text(str(p.pid));time.sleep(.6);print('done',flush=True)"
+        with worker_module.ManagedChild([sys.executable,'-c',code,str(marker)],self.root,env,stdin=True,text=False) as child:
+            self.assertTrue(child.registry.exists())
+            self.assertEqual(list(child.lines('prompt')),['done'])
+        self.assertIsNone(worker_module.process_identity(int(marker.read_text())))
+        self.assertFalse((self.job/'children.json').exists())
 
     def test_validation_timeout_terminates_descendants_and_removes_registry(self):
         worker=worker_module.Worker(self.config,self.job)

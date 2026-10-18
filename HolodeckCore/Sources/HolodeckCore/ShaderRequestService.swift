@@ -52,6 +52,12 @@ nonisolated struct RequestWorkerEvent: Decodable, Sendable {
     var result: ShaderRequestResult?
 }
 
+public enum ShaderCheckoutDetachTarget: Sendable {
+    case request(UUID)
+    case recovery(UUID)
+    case selectedCheckout
+}
+
 public struct ShaderRequestRecoveryStatus: Sendable, Identifiable {
     public enum Kind: Sendable { case cleanup, reconciliation }
     public let id: UUID
@@ -79,6 +85,7 @@ public struct ShaderRequestPublicationFailure: LocalizedError, Sendable, Equatab
     public let operationSequence: UInt64
     public let message: String
     public let recoveryRequired: Bool
+    public var correlationID: UUID? = nil
     public var errorDescription: String? { message }
 }
 
@@ -89,6 +96,7 @@ public struct ShaderRequestPublicationOperationStatus: Sendable, Equatable {
     public let failure: ShaderRequestPublicationFailure?
     /// Set only when this operation successfully restores or installs this revision.
     public let revision: String?
+    public var correlationID: UUID? = nil
 }
 
 public struct ShaderRequestPublicationEvent: Sendable {
@@ -122,6 +130,7 @@ public actor ShaderRequestService {
     private var recovery = RequestRecoveryStore()
     private let waitForWorker: @Sendable (RequestWorkerProcess) async throws -> Void
     private let reconcileWorker: @Sendable (URL) async throws -> Void
+    private let recoveryWriter: @Sendable (Data, URL) throws -> Void
     private var configuration = ShaderRequestConfiguration()
     private var records: [UUID: Record] = [:]
     private var observers: [UUID: AsyncStream<[ShaderRequestStatus]>.Continuation] = [:]
@@ -133,7 +142,9 @@ public actor ShaderRequestService {
     private var execution: Execution?
     private var selectingRepository = false
     private var maintenanceLease: UUID?
-    private var maintenanceBusy: Bool { maintenanceLease != nil }
+    private var detaching = false
+    private var maintenanceWaiters: [CheckedContinuation<Void, Never>] = []
+    private var maintenanceBusy: Bool { maintenanceLease != nil || detaching }
     private struct ReconciliationResult: Sendable { var owner: UUID?; var acknowledgements: [DetachedCheckoutAcknowledgement] }
     private struct ReconciliationAttempt { let id = UUID(); let task: Task<ReconciliationResult, Error> }
     private var reconciliationTask: ReconciliationAttempt?
@@ -176,17 +187,43 @@ public actor ShaderRequestService {
         self.catalog = catalog; self.directory = directory; self.workerScript = nil
         self.waitForWorker = { try await $0.waitForExit() }
         self.reconcileWorker = { try RequestWorkerProcess.reconcileOrphan(in: $0) }
+        self.recoveryWriter = { try $0.write(to: $1, options: .atomic) }
     }
     init(catalog: DirectoryCatalog, directory: URL, workerScript: URL,
          reconcileWorker: @escaping @Sendable (URL) async throws -> Void = { try RequestWorkerProcess.reconcileOrphan(in: $0) },
-         waitForWorker: @escaping @Sendable (RequestWorkerProcess) async throws -> Void = { try await $0.waitForExit() }) {
+         waitForWorker: @escaping @Sendable (RequestWorkerProcess) async throws -> Void = { try await $0.waitForExit() },
+         recoveryWriter: @escaping @Sendable (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) }) {
         self.catalog = catalog; self.directory = directory; self.workerScript = workerScript
-        self.reconcileWorker = reconcileWorker; self.waitForWorker = waitForWorker
+        self.reconcileWorker = reconcileWorker; self.waitForWorker = waitForWorker; self.recoveryWriter = recoveryWriter
     }
     private func workerProcess() -> RequestWorkerProcess { RequestWorkerProcess(script: workerScript) }
 
-    private func beginMaintenance() -> UUID { let lease = UUID(); maintenanceLease = lease; return lease }
-    private func endMaintenance(_ lease: UUID) { if maintenanceLease == lease { maintenanceLease = nil }; kick() }
+    private func beginMaintenance(id: UUID = UUID(), forDetachment: Bool = false) throws -> UUID {
+        guard maintenanceLease == nil, !detaching || forDetachment else {
+            throw ShaderRequestError.unavailable("Wait for active checkout maintenance to finish.")
+        }
+        maintenanceLease = id
+        emitUpdates()
+        return id
+    }
+    private func checkMaintenance(_ lease: UUID) throws {
+        try Task.checkCancellation()
+        guard maintenanceLease == lease, !detaching else { throw CancellationError() }
+    }
+    private func endMaintenance(_ lease: UUID, schedule: Bool = true) {
+        if maintenanceLease == lease {
+            maintenanceLease = nil
+            let waiters = maintenanceWaiters; maintenanceWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+        }
+        emitUpdates()
+        if schedule { kick() }
+    }
+    private func waitForMaintenance() async {
+        while maintenanceLease != nil {
+            await withCheckedContinuation { maintenanceWaiters.append($0) }
+        }
+    }
 
     public func start(configuration: ShaderRequestConfiguration) throws {
         try initialize(configuration: configuration)
@@ -279,19 +316,23 @@ public actor ShaderRequestService {
     }
     private func selectedConfiguration(_ repository: URL) -> ShaderRequestConfiguration {
         var selected = configuration
-        selected.repository = RequestPaths.canonical(repository); selected.checkoutID = nil
+        selected.repository = RequestPaths.canonical(repository)
+        if selected.repository != RequestPaths.canonical(URL(fileURLWithPath: configuration.repository)) { selected.checkoutID = nil }
         return selected
     }
     private func acceptRepository(_ accepted: ShaderRequestConfiguration) {
+        if Self.samePublicationCheckout(configuration, accepted) { configuration = accepted; return }
         cancelPublicationRequests()
         configuration = accepted
         publicationGeneration = UUID(); latestPublication = nil; unresolvedPublicationFailure = nil
         _ = publicationState(.idle)
     }
     @discardableResult public func selectRepository(_ repository: URL) async throws -> ShaderRequestConfiguration {
-        try load(); try requireRepositorySelection()
+        try load()
+        if RequestPaths.canonical(repository) == RequestPaths.canonical(URL(fileURLWithPath: configuration.repository)) { return configuration }
+        try requireRepositorySelection()
         try await reconcileWorkers(); try requireRepositorySelection()
-        let lease = beginMaintenance(); defer { endMaintenance(lease) }
+        let lease = try beginMaintenance(); defer { endMaintenance(lease) }
         let accepted = selectedConfiguration(repository)
         try JSONEncoder().encode(accepted).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
         acceptRepository(accepted)
@@ -301,12 +342,12 @@ public actor ShaderRequestService {
     public func reloadRepository(_ repository: URL) async throws -> ShaderRepositorySelection {
         try load(); try requireRepositorySelection()
         try await reconcileWorkers(); try requireRepositorySelection()
-        let lease = beginMaintenance(); selectingRepository = true
+        let lease = try beginMaintenance(); selectingRepository = true
         defer { selectingRepository = false; endMaintenance(lease) }
         let previous = configuration, accepted = selectedConfiguration(repository)
         let prepared = try await catalog.prepare(from: repository)
         do {
-            try Task.checkCancellation()
+            try checkMaintenance(lease)
             try JSONEncoder().encode(accepted).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
             let publication: CatalogReloadResult
             do { publication = try await catalog.install(prepared.id) }
@@ -314,10 +355,7 @@ public actor ShaderRequestService {
                 do { try JSONEncoder().encode(previous).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic) }
                 catch {
                     let journal = directory.appendingPathComponent("selection")
-                    holdForRecovery(journal: journal, configuration: previous, error: error)
-                    let key = RequestPaths.canonical(journal)
-                    recovery.entries[key]?.preferencesRollback = previous
-                    try? persistRecovery()
+                    holdForRecovery(journal: journal, configuration: previous, error: error, preferencesRollback: previous)
                 }
                 throw error
             }
@@ -339,6 +377,11 @@ public actor ShaderRequestService {
         guard let latestPublication, latestPublication.revision == revision else { return nil }
         return latestPublication
     }
+    public func isCurrentPublication(_ status: ShaderRequestPublicationStatus, generation: UUID) async -> Bool {
+        let revision = await catalog.publicationRevisionValue()
+        return publicationGeneration == generation && latestPublication?.sequence == status.sequence &&
+            latestPublication?.revision == status.revision && revision == status.revision
+    }
     public func publicationOperationStatus() -> ShaderRequestPublicationOperationStatus { publicationOperation }
     public func publicationUpdates() -> AsyncStream<ShaderRequestPublicationEvent> {
         let id = UUID()
@@ -354,12 +397,15 @@ public actor ShaderRequestService {
     private func emitPublication() { for observer in publicationObservers.values { observer.yield(publicationEvent()) } }
     private func resolvePublicationFailure() { unresolvedPublicationFailure = nil; _ = publicationState(.idle) }
     private func publicationState(_ phase: ShaderRequestPublicationOperationStatus.Phase, message: String? = nil,
-                                  recoveryRequired: Bool = false, revision: String? = nil) -> ShaderRequestPublicationFailure? {
+                                  recoveryRequired: Bool = false, revision: String? = nil,
+                                  correlationID: UUID? = nil) -> ShaderRequestPublicationFailure? {
         let sequence = publicationOperation.sequence &+ 1
-        let failure = message.map { ShaderRequestPublicationFailure(generation: publicationGeneration, operationSequence: sequence, message: $0, recoveryRequired: recoveryRequired) }
+        let correlationID = correlationID ?? execution?.id
+        let failure = message.map { ShaderRequestPublicationFailure(generation: publicationGeneration, operationSequence: sequence,
+            message: $0, recoveryRequired: recoveryRequired, correlationID: correlationID) }
         if let failure { unresolvedPublicationFailure = failure }
         if revision != nil { unresolvedPublicationFailure = nil }
-        publicationOperation = .init(sequence: sequence, phase: phase, failure: failure, revision: revision)
+        publicationOperation = .init(sequence: sequence, phase: phase, failure: failure, revision: revision, correlationID: correlationID)
         emitPublication()
         return failure
     }
@@ -474,6 +520,7 @@ public actor ShaderRequestService {
         do {
             let result = try await attempt.task.value
             guard reconciliationTask?.id == attempt.id else { return }
+            guard !detaching else { reconciliationTask = nil; throw CancellationError() }
             for acknowledgement in result.acknowledgements {
                 detachedOwners.removeAll { $0.requestID == acknowledgement.requestID }; detachedOwners.append(acknowledgement)
                 if Self.matchesDetachedCheckout(configuration, acknowledgement: acknowledgement) {
@@ -513,11 +560,16 @@ public actor ShaderRequestService {
             reconciled = true; reconciliationTask = nil; reconciliationFailure = nil; reconciliationJournal = nil; reconciliationConfiguration = nil
             emitUpdates()
         } catch {
+            if detaching, error is CancellationError { throw error }
             if reconciliationTask?.id == attempt.id {
                 let detail = error as? ReconciliationError
                 reconciliationTask = nil
-                holdForRecovery(journal: detail?.journal ?? reconciliationJournal ?? directory.appendingPathComponent("setup"),
-                    configuration: detail?.configuration ?? reconciliationConfiguration, error: detail?.underlying ?? error)
+                if let detail {
+                    holdForRecovery(journal: detail.journal, configuration: detail.configuration, error: detail.underlying)
+                } else {
+                    holdForRecovery(journal: reconciliationJournal ?? directory.appendingPathComponent("setup"),
+                        configuration: reconciliationConfiguration, error: error)
+                }
                 failPendingPublicationForRecovery(reconciliationFailure ?? error.localizedDescription)
             }
             throw error
@@ -528,9 +580,10 @@ public actor ShaderRequestService {
         ["process.json", "children.json"].contains { FileManager.default.fileExists(atPath: journal.appendingPathComponent($0).path) }
     }
     private func persistRecovery() throws {
-        try JSONEncoder().encode(recovery).write(to: directory.appendingPathComponent("recovery.json"), options: .atomic)
+        try recoveryWriter(JSONEncoder().encode(recovery), directory.appendingPathComponent("recovery.json"))
     }
-    private func holdForRecovery(journal: URL, configuration target: ShaderRequestConfiguration?, error: Error) {
+    private func holdForRecovery(journal: URL, configuration target: ShaderRequestConfiguration?, error: Error,
+                                 preferencesRollback: ShaderRequestConfiguration? = nil) {
         let key = RequestPaths.canonical(journal), id = records.keys.first { RequestPaths.canonical(folder($0)) == key }
         let disposition: ShaderRequestRecoveryDisposition
         if let id, records[id]?.cleanupPending == true || records[id]?.revoked == true { disposition = .cleanup }
@@ -538,10 +591,14 @@ public actor ShaderRequestService {
         else { disposition = .resume }
         var entry = recovery.entries[key] ?? .init(journal: key, requestID: id, configuration: target, disposition: disposition, message: error.localizedDescription)
         entry.configuration = entry.configuration ?? target; entry.message = error.localizedDescription
+        if let preferencesRollback { entry.preferencesRollback = preferencesRollback }
         recovery.entries[key] = entry
         reconciliationFailure = entry.message; reconciliationJournal = URL(fileURLWithPath: key); reconciliationConfiguration = entry.configuration; reconciled = false
         do { try persistRecovery(); try persist() }
-        catch { reconciliationFailure = entry.message + " Recovery state could not be saved: " + error.localizedDescription }
+        catch {
+            entry.message += " Recovery state could not be saved: " + error.localizedDescription
+            recovery.entries[key] = entry; reconciliationFailure = entry.message; emitUpdates()
+        }
     }
     private func finalizeDetachment(_ entry: RequestRecoveryStore.Entry) throws {
         guard let id = entry.requestID, let target = entry.configuration else { return }
@@ -570,7 +627,7 @@ public actor ShaderRequestService {
         guard activeID == nil, !maintenanceBusy, let record = records[id], record.cleanupPending == true else {
             throw ShaderRequestError.unavailable("Wait for active checkout work to finish before retrying cleanup.")
         }
-        let lease = beginMaintenance()
+        let lease = try beginMaintenance()
         defer { endMaintenance(lease) }
         var corrected = record.configuration
         corrected.repository = repository; corrected.python = python; corrected.git = git
@@ -579,6 +636,7 @@ public actor ShaderRequestService {
         }
         let job = folder(id)
         try await Task.detached { try Self.validateRecoveryCheckout(corrected, id: id, job: job) }.value
+        try checkMaintenance(lease)
         guard records[id]?.detached != true else { throw CancellationError() }
         let previous = record.configuration
         let paths = Self.canonicalRepositories([configuration.repository, previous.repository] + records.values.map { $0.configuration.repository })
@@ -599,41 +657,72 @@ public actor ShaderRequestService {
         try await reconcileWorkers()
     }
 
-    public func detachCheckout(_ id: UUID? = nil) async throws {
+    public func detachCheckout(_ target: ShaderCheckoutDetachTarget) async throws {
         guard !selectingRepository else { throw ShaderRequestError.unavailable("Wait for the selected folder to finish loading before detaching.") }
-        let targetID = id ?? records.keys.first { folder($0) == reconciliationJournal }
-        let selected = targetID.flatMap { records[$0]?.configuration } ?? (id == nil ? reconciliationConfiguration : nil) ?? (reconciliationFailure == nil ? configuration : nil)
-        guard let selected else { throw ShaderRequestError.unavailable("This recovery journal has no verified checkout target. Repair its configuration; no selected checkout has been detached.") }
+        guard !detaching else { throw ShaderRequestError.unavailable("Checkout detachment is already in progress.") }
+        let selected: ShaderRequestConfiguration
+        switch target {
+        case .request(let id):
+            guard let record = records[id] else { throw ShaderRequestError.invalidRequest }
+            selected = record.configuration
+        case .recovery(let id):
+            guard let entry = recovery.entries.values.first(where: { $0.id == id }), let checkout = entry.configuration else {
+                throw ShaderRequestError.unavailable("This recovery journal has no verified checkout target. Repair its configuration; no selected checkout has been detached.")
+            }
+            selected = checkout
+        case .selectedCheckout:
+            guard recovery.entries.isEmpty, reconciliationFailure == nil else {
+                throw ShaderRequestError.unavailable("Select an exact recovery entry; there is no verified checkout target for a global detachment.")
+            }
+            selected = configuration
+        }
         let paths = Self.canonicalRepositories([selected.repository] + records.values.map { $0.configuration.repository })
         let ids = records.keys.filter { Self.samePublicationCheckout(records[$0]!.configuration, selected, paths: paths) }
         guard activeID == nil || ids.contains(activeID!) else { throw ShaderRequestError.unavailable("Wait for the other checkout’s active request before detaching this checkout.") }
-        let lease = beginMaintenance(); defer { endMaintenance(lease) }
-        reconciliationTask = nil; reconciliationKickID = nil
+        detaching = true
+        defer { detaching = false; kick() }
+        // Reserve detachment before yielding. Existing maintenance owns its lease until it retires.
         var targets = ids.map { (folder($0), Optional($0), records[$0]!.configuration) }
-        for name in ["setup", "publication"] {
-            let journal = directory.appendingPathComponent(name)
-            let target = recovery.entries[RequestPaths.canonical(journal)]?.configuration ?? (try? Self.savedConfiguration(in: journal))
-            if journal == reconciliationJournal || target.map({ Self.samePublicationCheckout($0, selected) }) == true {
-                targets.append((journal, nil, target ?? selected))
+        for entry in recovery.entries.values where entry.configuration.map({ Self.samePublicationCheckout($0, selected) }) == true {
+            let journal = URL(fileURLWithPath: entry.journal)
+            if !targets.contains(where: { RequestPaths.canonical($0.0) == entry.journal }) {
+                targets.append((journal, entry.requestID, entry.configuration!))
             }
         }
-        if targets.isEmpty { targets.append((directory.appendingPathComponent("setup"), nil, selected)) }
-        for (journal, requestID, target) in targets {
+        for name in ["setup", "publication"] {
+            let journal = directory.appendingPathComponent(name)
+            if let checkout = try? Self.savedConfiguration(in: journal), Self.samePublicationCheckout(checkout, selected),
+               !targets.contains(where: { $0.0 == journal }) { targets.append((journal, nil, checkout)) }
+        }
+        if targets.isEmpty { targets.append((directory.appendingPathComponent("detachment"), nil, selected)) }
+        for (journal, requestID, checkout) in targets {
             let key = RequestPaths.canonical(journal)
-            recovery.entries[key] = .init(journal: key, requestID: requestID, configuration: target, disposition: .detach,
-                message: "Detachment is pending until worker processes are confirmed stopped.")
+            var entry = recovery.entries[key] ?? .init(journal: key, requestID: requestID, configuration: checkout,
+                disposition: .detach, message: "")
+            entry.disposition = .detach
+            entry.message = "Detachment is pending until worker processes are confirmed stopped."
+            recovery.entries[key] = entry
         }
         configuration.enabled = false; execution?.interrupted = true
         try persistRecovery(); try persist()
         try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
         cancelPublicationRequests(); activeProcess?.stop()
-        if let activeProcess { try await settleProcess(activeProcess) }
-        if let workerTask { await workerTask.value }
-        for (journal, _, _) in targets {
+        if let process = activeProcess { try await settleProcess(process) }
+        if let task = workerTask { await task.value }
+        await waitForMaintenance()
+        let lease = try beginMaintenance(forDetachment: true)
+        defer { endMaintenance(lease) }
+        // Reconciliation may have been running before the reservation. It must finish before handoff.
+        if let attempt = reconciliationTask {
+            _ = try? await attempt.task.value
+            if reconciliationTask?.id == attempt.id { reconciliationTask = nil }
+        }
+        reconciliationKickID = nil
+        for (journal, _, checkout) in targets {
             do { try await reconcileWorker(journal) }
             catch {
                 if error is RequestWorkerTeardownError {
-                    holdForRecovery(journal: journal, configuration: selected, error: error); throw error
+                    holdForRecovery(journal: journal, configuration: checkout, error: error); throw error
                 }
                 // Explicit detachment retains unverifiable markers without signalling them.
                 for name in ["process", "children"] {
@@ -649,8 +738,11 @@ public actor ShaderRequestService {
         }
         try persist()
         for (journal, _, _) in targets { recovery.entries[RequestPaths.canonical(journal)] = nil }
-        reconciled = false; reconciliationTask = nil; reconciliationKickID = nil; reconciliationFailure = nil
-        reconciliationJournal = nil; reconciliationConfiguration = nil
+        reconciled = false; reconciliationTask = nil; reconciliationKickID = nil
+        if let entry = recovery.entries.values.first {
+            reconciliationFailure = entry.message; reconciliationJournal = URL(fileURLWithPath: entry.journal)
+            reconciliationConfiguration = entry.configuration
+        } else { reconciliationFailure = nil; reconciliationJournal = nil; reconciliationConfiguration = nil }
         resolvePublicationFailure()
         setupMessage = "Requests disabled. Select a checkout and verify setup before enabling requests again."
         try persist()
@@ -735,12 +827,12 @@ public actor ShaderRequestService {
         let waiters = activePublication?.waiters ?? []
         let lease = execution?.id
         activePublication = nil; activeProcess = nil; execution = nil; workerTask = nil
-        if maintenanceLease == lease { maintenanceLease = nil }
+        if let lease { endMaintenance(lease, schedule: false) }
         let reported: Error?
         if let error, !(error is CancellationError) {
-            reported = publicationState(.failed, message: error.localizedDescription)
+            reported = publicationState(.failed, message: error.localizedDescription, correlationID: lease)
         } else {
-            _ = publicationState(.idle, revision: revision)
+            _ = publicationState(.idle, revision: revision, correlationID: lease)
             reported = error
         }
         for waiter in waiters {
@@ -823,17 +915,23 @@ public actor ShaderRequestService {
         }
         var candidate = candidate
         candidate.repository = RequestPaths.canonical(URL(fileURLWithPath: candidate.repository))
-        let lease = beginMaintenance()
-        defer { endMaintenance(lease) }
+        let operation = Execution()
+        let lease = try beginMaintenance(id: operation.id)
+        execution = operation
+        defer {
+            if execution?.id == operation.id { activeProcess = nil; execution = nil }
+            endMaintenance(lease)
+        }
         try await reconcileWorkers()
+        try checkExecution(operation.id)
         guard recovery.entries.isEmpty else { throw ShaderRequestError.unavailable("Retry checkout recovery before changing setup.") }
         let acknowledgements = detachedOwners
         let checkout = candidate
         candidate.detachedOwner = try await Task.detached { try Self.detachedOwner(for: checkout, acknowledgements: acknowledgements) }.value
         candidate.checkoutID = nil
-        let process = workerProcess(), operation = Execution()
-        activeProcess = process; execution = operation
-        defer { if execution?.id == operation.id { activeProcess = nil; execution = nil } }
+        try checkExecution(operation.id)
+        let process = workerProcess()
+        activeProcess = process
         var verified = false
         do {
             for try await event in process.run(mode: "preflight", configuration: candidate, directory: directory.appendingPathComponent("setup")) {
@@ -860,8 +958,11 @@ public actor ShaderRequestService {
         resolvePublicationFailure()
         try persist(); kick()
     }
+    public func canDisableRequests() -> Bool {
+        activeID == nil && !maintenanceBusy && !records.values.contains(where: { !$0.status.stage.terminal || $0.cleanupPending == true })
+    }
     public func disable() throws {
-        guard activeID == nil, !maintenanceBusy, !records.values.contains(where: { !$0.status.stage.terminal || $0.cleanupPending == true }) else {
+        guard canDisableRequests() else {
             throw ShaderRequestError.unavailable("Requests are still in progress.")
         }
         configuration.enabled = false; setupMessage = "Shader requests are disabled."
@@ -1019,7 +1120,8 @@ public actor ShaderRequestService {
                 request.force = request.force || force; request.ownsRetry = true
                 pendingPublication = request; retryPublicationForce = nil
             }
-            activePublication = pendingPublication; pendingPublication = nil; maintenanceLease = operation.id
+            guard (try? beginMaintenance(id: operation.id)) != nil else { execution = nil; return }
+            activePublication = pendingPublication; pendingPublication = nil
             _ = publicationState(.preparing)
             workerTask = Task { [weak self] in await self?.runPublication(operation: operation.id) }
             return

@@ -38,7 +38,7 @@ public enum ShaderTool {
     }
 
     private static func usage() -> ShaderToolError {
-        ShaderToolError("Usage: holodeck-shader-tool --version | library info|validate|assemble|render ... [--python ABSOLUTE_PATH] | render SOURCE OUTPUT [--width N --height N --time SECONDS] | probe render|compute SOURCE SAMPLES_JSON RESULT_JSON")
+        ShaderToolError("Usage: holodeck-shader-tool --version | library info|artifact-info|validate|assemble|render ... [--python ABSOLUTE_PATH] | render SOURCE OUTPUT [--width N --height N --time SECONDS] | probe render|compute SOURCE SAMPLES_JSON RESULT_JSON")
     }
 }
 #endif

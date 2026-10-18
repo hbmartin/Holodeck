@@ -14,6 +14,9 @@ nonisolated public enum ShaderCompilationError: LocalizedError {
     /// Driver error domains/codes vary by GPU. Only known interface diagnostics are source defects.
     static func pipelineError(_ error: Error) -> Error {
         let native = error as NSError, diagnostic = native.localizedDescription.lowercased()
+        if diagnostic.contains("output of type"), diagnostic.contains("not compatible with"), diagnostic.contains("color attachment") {
+            return ShaderCompilationError.pipelineInterface(native)
+        }
         if diagnostic.contains("fragment input"),
            diagnostic.contains("mismatching vertex shader output") || diagnostic.contains("not written by vertex shader") ||
            diagnostic.contains("not found in vertex shader output") {

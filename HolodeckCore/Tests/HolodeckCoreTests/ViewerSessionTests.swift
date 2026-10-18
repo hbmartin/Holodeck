@@ -27,6 +27,17 @@ final class ViewerSessionTests: XCTestCase {
         return snapshot
     }
 
+    func testCatalogFailureCorrelationChangesWithTheRequestingOperation() async throws {
+        let service = CatalogService(initialCatalog:TestCatalog.catalog,source:CatalogSource(kind:.standard) { _, _ in throw LocalCatalogError.timeout },storage:.disabled)
+        let session = ViewerSession(catalogService:service,preferences:.inMemory(),policy:.mac)
+        let first = UUID(), second = UUID()
+        await session.refresh(force:true,correlationID:first).value
+        XCTAssertEqual(session.catalogFailure?.correlationID,first)
+        let oldFailureID = session.catalogFailure?.id
+        await session.refresh(force:true,correlationID:second).value
+        XCTAssertEqual(session.catalogFailure?.correlationID,second)
+        XCTAssertNotEqual(session.catalogFailure?.id,oldFailureID)
+    }
     func testDeliveryRequiresFreshSuccessEvenWithPlayableCachedCatalog() async throws {
         let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource(kind: .standard) { _, _ in throw LocalCatalogError.timeout }, storage: .disabled)
         let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .tv)

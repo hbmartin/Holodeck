@@ -4,11 +4,41 @@ import CryptoKit
 @testable import HolodeckCore
 
 final class ShaderLibraryToolTests: XCTestCase {
-    private var nativeTool: URL {
-        let executableDirectory = Bundle(for: ShaderLibraryToolTests.self).bundleURL.deletingLastPathComponent()
-        let candidates = [executableDirectory.appendingPathComponent("holodeck-shader-tool"),
-            executableDirectory.deletingLastPathComponent().appendingPathComponent("holodeck-shader-tool")]
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) } ?? candidates[0]
+    private var nativeTool: URL { NativeShaderToolFixture.executable }
+
+    private struct Output { let stdout: Data; let stderr: String }
+    /// File-backed capture cannot wait forever on a descendant's inherited pipe.
+    private func execute(_ process: Process, timeout: TimeInterval = 15) throws -> Output {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let stdout = directory.appendingPathComponent("stdout"), stderr = directory.appendingPathComponent("stderr")
+        for file in [stdout,stderr] { FileManager.default.createFile(atPath: file.path, contents: nil) }
+        let out = try FileHandle(forWritingTo: stdout), err = try FileHandle(forWritingTo: stderr)
+        defer { try? out.close(); try? err.close() }
+        let executable = try XCTUnwrap(process.executableURL)
+        process.arguments = ["-I", "-c", "import contextlib,os,sys; exec('with contextlib.suppress(PermissionError): os.setsid()'); os.execv(sys.argv[1],sys.argv[1:])", executable.path] + (process.arguments ?? [])
+        process.executableURL = URL(fileURLWithPath:"/usr/bin/python3")
+        process.standardInput = FileHandle.nullDevice; process.standardOutput = out; process.standardError = err
+        try process.run()
+        let leader = RequestProcessIdentity(pid: process.processIdentifier), deadline = Date().addingTimeInterval(timeout)
+        var owned: Set<RequestProcessIdentity> = []
+        if let leader { owned.insert(leader) }
+        defer { RequestProcessIdentity.signal(Array(owned),SIGKILL) }
+        while process.isRunning {
+            if leader?.isCurrent == true { owned.formUnion(RequestProcessIdentity.group(process.processIdentifier)) }
+            if Date() >= deadline {
+                RequestProcessIdentity.signal(Array(owned),SIGKILL); process.waitUntilExit()
+                throw ShaderToolError("Test subprocess timed out after \(timeout) seconds")
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        process.waitUntilExit()
+        return Output(stdout: try Data(contentsOf: stdout), stderr: String(decoding: try Data(contentsOf: stderr), as: UTF8.self))
+    }
+    private func native(_ arguments: [String], executable: URL? = nil) throws -> (Process, Output) {
+        let process = Process(); process.executableURL = executable ?? nativeTool; process.arguments = arguments
+        return (process, try execute(process))
     }
 
     func testNativeWrapperPreservesInterpreterSignalAndProcessIdentity() throws {
@@ -20,7 +50,7 @@ final class ShaderLibraryToolTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: interpreter.path)
         let process = Process(); process.executableURL = nativeTool
         process.arguments = ["library", "info", "--python", interpreter.path]
-        try process.run(); process.waitUntilExit()
+        _ = try execute(process)
         XCTAssertEqual(process.terminationReason, .uncaughtSignal); XCTAssertEqual(process.terminationStatus, SIGTERM)
         XCTAssertEqual(try String(contentsOf: pid, encoding: .utf8), String(process.processIdentifier))
     }
@@ -48,14 +78,14 @@ final class ShaderLibraryToolTests: XCTestCase {
         try canary.write(to: directory.appendingPathComponent("tools/library.py"), atomically: true, encoding: .utf8)
         let compile = Process(); compile.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         compile.arguments = ["-I", "-c", "import py_compile,sys;py_compile.compile(sys.argv[1],doraise=True)", directory.appendingPathComponent("tools/library.py").path]
-        try compile.run(); compile.waitUntilExit(); XCTAssertEqual(compile.terminationStatus, 0)
+        _ = try execute(compile); XCTAssertEqual(compile.terminationStatus, 0)
         let process = Process(); process.executableURL = nativeTool
         process.currentDirectoryURL = directory
         process.arguments = ["library", "validate", directory.path, "--json"]
         process.standardOutput = Pipe(); process.standardError = Pipe()
         var environment = ProcessInfo.processInfo.environment; environment["PYTHONPATH"] = directory.path
         process.environment = environment
-        try process.run(); process.waitUntilExit()
+        _ = try execute(process)
         XCTAssertEqual(process.terminationStatus, 0)
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
@@ -87,7 +117,7 @@ final class ShaderLibraryToolTests: XCTestCase {
         assert worker.process_identity(int(Path(sys.argv[5]).read_text())) is None,'Descendant survived timeout'
         assert not (Path(sys.argv[4])/'children.json').exists(),'Teardown did not release registry'
         """, worker.path, nativeTool.path, interpreter.path, directory.path, pid.path]
-        try process.run(); process.waitUntilExit()
+        _ = try execute(process)
         XCTAssertEqual(process.terminationStatus, 0)
     }
     func testMissingAndModifiedArtifactsFailBeforePythonExecution() throws {
@@ -100,7 +130,7 @@ final class ShaderLibraryToolTests: XCTestCase {
         let data = Data("checker fixture".utf8)
         try data.write(to: artifact)
         let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        var pin: [String: Any] = ["version": "1.1.0", "interfaceVersion": 1,
+        var pin: [String: Any] = ["repository": "hbmartin/HolodeckShaderCheck", "version": "1.1.0", "interfaceVersion": 1,
                                   "sourceCommit": String(repeating: "a", count: 40), "sha256": hash]
         try JSONSerialization.data(withJSONObject: pin).write(to: lock)
         XCTAssertEqual(try ShaderLibraryTool.checkedArtifact(artifact: artifact, lock: lock), artifact)
@@ -119,34 +149,52 @@ final class ShaderLibraryToolTests: XCTestCase {
     }
 
     func testReleasedCheckerReportsLockedVersionAndInterface() throws {
-        let resources = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-            .deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("Sources/HolodeckCore/Resources")
-        let lock = resources.appendingPathComponent("shader_checker.lock.json")
-        let artifact = try ShaderLibraryTool.checkedArtifact(
-            artifact: resources.appendingPathComponent("shader_checker.pyz"), lock: lock)
-        let pin = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: lock)) as? [String: Any])
-        let process = Process()
-        let output = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        process.arguments = ["-I", artifact.path, "info", "--json"]
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = output
-        try process.run()
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        XCTAssertEqual(process.terminationStatus, 0)
-        let info = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        XCTAssertEqual(info["checkerVersion"] as? String, pin["version"] as? String)
-        XCTAssertEqual(info["interfaceVersion"] as? Int, pin["interfaceVersion"] as? Int)
+        let expectedLock = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/HolodeckCore/Resources/shader_checker.lock.json")
+        let expected = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: expectedLock)) as? NSDictionary)
+        let (identityProcess, identityOutput) = try native(["library","artifact-info","--json"])
+        XCTAssertEqual(identityProcess.terminationStatus,0,identityOutput.stderr)
+        let actual = try XCTUnwrap(JSONSerialization.jsonObject(with: identityOutput.stdout) as? NSDictionary)
+        XCTAssertEqual(actual,expected,"Packaged resources differ from the intended release lock")
+        let (process, output) = try native(["library","info","--json"])
+        XCTAssertEqual(process.terminationStatus,0,output.stderr)
+        let info = try XCTUnwrap(JSONSerialization.jsonObject(with: output.stdout) as? [String:Any])
+        XCTAssertEqual(info["checkerVersion"] as? String,actual["version"] as? String)
+        XCTAssertEqual(info["interfaceVersion"] as? Int,actual["interfaceVersion"] as? Int)
     }
 
-    func testLibraryRejectsInvalidInterpreterAndBackendOverrides() {
-        for arguments in [["info", "--python", "relative"], ["info", "--python"],
-                          ["info", "--shader-tool", "/untrusted/backend"]] {
-            XCTAssertThrowsError(try ShaderLibraryTool.run(arguments: arguments)) {
-                XCTAssertEqual(($0 as? ShaderCheckerExit)?.status, 2)
-            }
+    func testIsolatedInstallationRejectsMissingModifiedAndIncompatibleResources() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories:true)
+        defer { try? FileManager.default.removeItem(at:directory) }
+        let executable = directory.appendingPathComponent("holodeck-shader-tool")
+        try FileManager.default.copyItem(at:nativeTool,to:executable)
+        let (missing,missingOutput) = try native(["library","artifact-info","--json"],executable:executable)
+        XCTAssertEqual(missing.terminationStatus,2);XCTAssertTrue(missingOutput.stderr.contains("missing"))
+        let bundleURL = nativeTool.deletingLastPathComponent().appendingPathComponent("HolodeckCore_HolodeckCore.bundle")
+        let copied = directory.appendingPathComponent(bundleURL.lastPathComponent)
+        try FileManager.default.copyItem(at:bundleURL,to:copied)
+        let bundle = try XCTUnwrap(Bundle(url:copied))
+        let artifact = try XCTUnwrap(bundle.url(forResource:"shader_checker",withExtension:"pyz"))
+        let lock = try XCTUnwrap(bundle.url(forResource:"shader_checker.lock",withExtension:"json"))
+        let original = try Data(contentsOf:artifact)
+        try Data("stale artifact".utf8).write(to:artifact)
+        let (modified,modifiedOutput) = try native(["library","artifact-info","--json"],executable:executable)
+        XCTAssertEqual(modified.terminationStatus,2);XCTAssertTrue(modifiedOutput.stderr.contains("checksum"))
+        try original.write(to:artifact)
+        var pin = try XCTUnwrap(JSONSerialization.jsonObject(with:Data(contentsOf:lock)) as? [String:Any])
+        pin["repository"] = "untrusted/Checker"
+        try JSONSerialization.data(withJSONObject:pin).write(to:lock)
+        let (incompatible,_) = try native(["library","artifact-info","--json"],executable:executable)
+        XCTAssertEqual(incompatible.terminationStatus,2)
+    }
+
+    func testLibraryRejectsInvalidInterpreterAndBackendOverrides() throws {
+        for (arguments, diagnostic) in [(["info","--python","relative"],"absolute executable path"),
+            (["info","--python"],"requires an absolute executable path"),
+            (["info","--shader-tool","/untrusted/backend"],"overridden native GPU backend")] {
+            let (process,output) = try native(["library"] + arguments)
+            XCTAssertEqual(process.terminationStatus,2);XCTAssertTrue(output.stderr.contains(diagnostic),output.stderr)
         }
     }
 }

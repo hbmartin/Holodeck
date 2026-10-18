@@ -132,7 +132,7 @@ final class HolodeckMacUITests: XCTestCase {
         app.launch(); app.activate()
         let settings = element("shader-library-settings", in: app)
         XCTAssertTrue(settings.waitForExistence(timeout: 15)); settings.click()
-        let retry = app.buttons["Retry Recovery"].firstMatch
+        let retry = element("retry-checkout-cleanup", in: app)
         XCTAssertTrue(retry.waitForExistence(timeout: 10))
         XCTAssertFalse(element("recovery-repository", in: app).exists)
         try FileManager.default.removeItem(at: marker)
@@ -148,6 +148,15 @@ final class HolodeckMacUITests: XCTestCase {
         let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: fixtureURL)) as? [String: Any])
         let sources = try XCTUnwrap(fixture["sources"] as? [String: String]), source = try XCTUnwrap(sources["plasma"]).data(using: .utf8)!
         try source.write(to: authoring.appendingPathComponent("shaders/plasma/body.metal"))
+        var ancestor = Bundle(for:Self.self).bundleURL
+        var candidates: [URL] = []
+        for _ in 0..<6 {
+            candidates.append(ancestor.appendingPathComponent("HolodeckCore_HolodeckCore.bundle/Contents/Resources/shader_checker.lock.json"))
+            candidates.append(ancestor.appendingPathComponent("HolodeckMac.app/Contents/Resources/Tools/HolodeckCore_HolodeckCore.bundle/Contents/Resources/shader_checker.lock.json"))
+            ancestor.deleteLastPathComponent()
+        }
+        let releaseLock = try XCTUnwrap(candidates.first { FileManager.default.fileExists(atPath:$0.path) },"Packaged checker lock is missing")
+        try Data(contentsOf:releaseLock).write(to:authoring.appendingPathComponent("shader_checker.lock.json"))
         for arguments in [["init", "--quiet", "-b", "main"], ["add", "--all"],
                           ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "UI fixture"]] {
             // /usr/bin/git invokes xcrun, which is unavailable in the sandboxed UI runner.
@@ -188,18 +197,31 @@ final class HolodeckMacUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [idle], timeout: 15), .completed)
     }
 
+    private func dismissInitialCatalogFailure(in app: XCUIApplication) {
+        // The empty initial catalog and checkout recovery have no shared operation ID.
+        // Keep the independent catalog alert visible until the user dismisses it.
+        XCTAssertTrue(app.staticTexts["Unable to Load Scenes"].waitForExistence(timeout: 15))
+        app.windows["holodeck-viewer-window"].buttons["OK"].firstMatch.click()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"),
+            object: app.staticTexts["Unable to Load Scenes"])], timeout: 10), .completed)
+    }
+
     func testPublicationRecoveryReportsLockContentionAndExplicitRebuildRecovers() throws {
         let f = try managedRecoveryFixture(), app = f.app
         let lease = open(f.authoring.appendingPathComponent(".git/holodeck-requests.lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
         XCTAssertGreaterThanOrEqual(lease, 0); XCTAssertEqual(flock(lease, LOCK_EX | LOCK_NB), 0)
         defer { flock(lease, LOCK_UN); close(lease) }
         app.launch(); app.activate()
+        dismissInitialCatalogFailure(in: app)
         let settings = element("shader-library-settings", in: app)
         XCTAssertTrue(settings.waitForExistence(timeout: 15)); settings.click()
         waitForLibraryError("needs checkout recovery", in: app); waitForLibraryIdle(in: app)
-        XCTAssertTrue(element("rebuild-shader-library", in: app).isEnabled)
+        XCTAssertFalse(element("rebuild-shader-library", in: app).isEnabled)
         try FileManager.default.removeItem(at: f.marker)
-        app.buttons["Retry Recovery"].firstMatch.click()
+        let recoveryButton = element("retry-checkout-cleanup", in: app)
+        XCTAssertTrue(recoveryButton.waitForExistence(timeout:10),app.debugDescription)
+        recoveryButton.click()
         waitForLibraryError("Checkout is busy in another process", in: app); waitForLibraryIdle(in: app)
         XCTAssertEqual(flock(lease, LOCK_UN), 0)
         element("rebuild-shader-library", in: app).click()
@@ -210,12 +232,15 @@ final class HolodeckMacUITests: XCTestCase {
     func testAutomaticPublicationFailureEndsSpinnerAndExplicitRetryRecovers() throws {
         let f = try managedRecoveryFixture(), app = f.app
         app.launch(); app.activate()
+        dismissInitialCatalogFailure(in: app)
         let settings = element("shader-library-settings", in: app)
         XCTAssertTrue(settings.waitForExistence(timeout: 15)); settings.click()
         waitForLibraryError("needs checkout recovery", in: app); waitForLibraryIdle(in: app)
         try Data("dirty checkout".utf8).write(to: f.authoring.appendingPathComponent("shaders/plasma/body.metal"))
         try FileManager.default.removeItem(at: f.marker)
-        app.buttons["Retry Recovery"].firstMatch.click()
+        let recoveryButton = element("retry-checkout-cleanup", in: app)
+        XCTAssertTrue(recoveryButton.waitForExistence(timeout:10),app.debugDescription)
+        recoveryButton.click()
         waitForLibraryError("clean main checkout", in: app); waitForLibraryIdle(in: app)
         let rebuild = element("rebuild-shader-library", in: app)
         XCTAssertTrue(rebuild.isEnabled)
@@ -245,12 +270,10 @@ final class HolodeckMacUITests: XCTestCase {
         let enabled=XCTNSPredicateExpectation(predicate:NSPredicate(format:"enabled == true"),object:rebuild)
         XCTAssertEqual(XCTWaiter.wait(for:[enabled],timeout:15),.completed); rebuild.click()
         waitForLibraryIdle(in:app)
-        let configURL=directory.appendingPathComponent("publication/configuration.json")
-        XCTAssertTrue(FileManager.default.fileExists(atPath:configURL.path))
-        let used=try XCTUnwrap(JSONSerialization.jsonObject(with:Data(contentsOf:configURL)) as? [String:Any])
-        XCTAssertEqual(URL(fileURLWithPath:try XCTUnwrap(used["repository"] as? String)).resolvingSymlinksInPath(),selected.resolvingSymlinksInPath())
+        XCTAssertFalse(FileManager.default.fileExists(atPath:directory.appendingPathComponent("publication/configuration.json").path),"Unmanaged rebuild must not launch a Git publication worker")
         let saved=try XCTUnwrap(JSONSerialization.jsonObject(with:Data(contentsOf:preferences)) as? [String:Any])
-        XCTAssertEqual(saved["repository"] as? String,used["repository"] as? String)
+        XCTAssertEqual(URL(fileURLWithPath:try XCTUnwrap(saved["repository"] as? String)).resolvingSymlinksInPath(),selected.resolvingSymlinksInPath())
+
     }
 
     func testUnrelatedApprovalAndRevocationErrorsDoNotSuppressCatalogAlerts() throws {
@@ -267,6 +290,39 @@ final class HolodeckMacUITests: XCTestCase {
             waitForLibraryError("Previous "+origin+" failed",in:app)
             app.terminate()
         }
+    }
+
+    func testCorrelatedCatalogFailureIsShownOnce() throws {
+        let app = try app(arguments:["--ui-test-local-library"])
+        app.launchEnvironment["HOLODECK_UI_TEST_ERROR_ASSOCIATION"] = "1"
+        app.launch(); app.activate()
+        let settings = element("shader-library-settings",in:app)
+        XCTAssertTrue(settings.waitForExistence(timeout:15));settings.click();waitForLibraryIdle(in:app)
+        element("test-correlated-catalog-failure",in:app).click()
+        waitForLibraryError("Correlated catalog failure",in:app)
+        XCTAssertFalse(app.staticTexts["Unable to Load Scenes"].exists)
+    }
+
+    func testRejectedStartupBookmarkStillRestoresCachedLibraryAndServer() throws {
+        let f = try managedRecoveryFixture(), app = f.app
+        try FileManager.default.removeItem(at:f.marker)
+        let directory = f.marker.deletingLastPathComponent().deletingLastPathComponent(), preferences = directory.appendingPathComponent("preferences.json")
+        var config = try XCTUnwrap(JSONSerialization.jsonObject(with:Data(contentsOf:preferences)) as? [String:Any])
+        config["enabled"] = false;try JSONSerialization.data(withJSONObject:config).write(to:preferences)
+        app.launchEnvironment["HOLODECK_UI_TEST_SHADER_BOOKMARK"] = try f.authoring.bookmarkData(options:[],includingResourceValuesForKeys:nil,relativeTo:nil).base64EncodedString()
+        app.launch();app.activate();waitForTitle(f.name,in:app);app.terminate()
+        let rejected = try authoringFolderWithInvalidShader(), journal = directory.appendingPathComponent("setup").resolvingSymlinksInPath().path
+        let entry: [String:Any] = ["id":UUID().uuidString,"journal":journal,"disposition":"resume","message":"Independent recovery"]
+        try JSONSerialization.data(withJSONObject:["formatVersion":1,"legacyMigrationComplete":true,"entries":[journal:entry]])
+            .write(to:directory.appendingPathComponent("recovery.json"))
+        app.launchEnvironment["HOLODECK_UI_TEST_SHADER_BOOKMARK"] = try rejected.bookmarkData(options:[],includingResourceValuesForKeys:nil,relativeTo:nil).base64EncodedString()
+        app.launch();app.activate();waitForTitle(f.name,in:app)
+        element("shader-library-settings",in:app).click();waitForLibraryIdle(in:app)
+        let serving = element("shader-serving-status",in:app)
+        let ready = XCTNSPredicateExpectation(predicate:NSPredicate(format:"label CONTAINS %@ OR value CONTAINS %@","Serving shaders","Serving shaders"),object:serving)
+        XCTAssertEqual(XCTWaiter.wait(for:[ready],timeout:15),.completed)
+        let saved = try XCTUnwrap(JSONSerialization.jsonObject(with:Data(contentsOf:preferences)) as? [String:Any])
+        XCTAssertEqual(saved["repository"] as? String,f.authoring.resolvingSymlinksInPath().path)
     }
 
     func testUnmanagedBookmarkSelectionSurvivesRequestInitialization() throws {
@@ -291,12 +347,15 @@ final class HolodeckMacUITests: XCTestCase {
         let f = try managedRecoveryFixture(), app = f.app
         app.launchEnvironment["HOLODECK_UI_TEST_SHADER_BOOKMARK"] = Data("invalid bookmark".utf8).base64EncodedString()
         app.launch(); app.activate()
+        dismissInitialCatalogFailure(in: app)
         let settings = element("shader-library-settings", in: app)
         XCTAssertTrue(settings.waitForExistence(timeout: 15)); settings.click()
-        XCTAssertTrue(app.buttons["Retry Recovery"].firstMatch.waitForExistence(timeout: 10))
+        XCTAssertTrue(element("retry-checkout-cleanup", in: app).waitForExistence(timeout: 10),app.debugDescription)
         waitForLibraryIdle(in: app); waitForLibraryError("Choose your shader folder again", in: app)
         try FileManager.default.removeItem(at: f.marker)
-        app.buttons["Retry Recovery"].firstMatch.click()
+        let recoveryButton = element("retry-checkout-cleanup", in: app)
+        XCTAssertTrue(recoveryButton.waitForExistence(timeout:10),app.debugDescription)
+        recoveryButton.click()
         waitForTitle(f.name, in: app); waitForLibraryIdle(in: app)
         waitForLibraryError("Choose your shader folder again", in: app)
     }
@@ -358,6 +417,11 @@ final class HolodeckMacUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [namedFile], timeout: 10), .completed)
         waitForTitle("Edited Plasma", in: app)
         try JSONSerialization.data(withJSONObject: metadata).write(to: metadataURL)
+        // Rebuild must recover from the failed selection task without restarting or requiring Git.
+        element("rebuild-shader-library", in: app).click()
+        let cleared = XCTNSPredicateExpectation(predicate:NSPredicate(format:"exists == false"),object:failure)
+        XCTAssertEqual(XCTWaiter.wait(for:[cleared],timeout:20),.completed)
+        waitForTitle("Edited Plasma",in:app)
         app.terminate(); app.launch()
         waitForTitle("Edited Plasma", in: app)
         XCTAssertFalse(app.windows["holodeck-viewer-window"].descendants(matching: .any)
