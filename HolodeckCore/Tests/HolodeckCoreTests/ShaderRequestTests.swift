@@ -1446,8 +1446,11 @@ final class ShaderRequestTests: XCTestCase {
             code="import subprocess,sys,time;from pathlib import Path;gate=Path(sys.argv[1]);exec('while not gate.exists(): time.sleep(.005)');subprocess.Popen([sys.executable,'-c','import time;time.sleep(.2)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)"
             parent=subprocess.Popen([sys.executable,'-c',code,str(gate)],start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             birth=w.process_identity(parent.pid);w.write(job/'children.json',[{'leader':birth,'members':[birth]}])
-            gate.touch();parent.wait();time.sleep(.35)
-            assert not w.group_members(parent.pid)
+            gate.touch();parent.wait()
+            deadline=w.process_clock()+5
+            while w.group_members(parent.pid):
+                assert w.process_clock()<deadline, 'Fixture descendant did not settle'
+                time.sleep(.005)
             (job/'children.json').unlink();print('{"event":"done"}',flush=True)
             """.write(to: script, atomically: true, encoding: .utf8)
             let worker = RequestWorkerProcess(script: script)
@@ -1863,20 +1866,186 @@ final class ShaderRequestTests: XCTestCase {
         try await waitFor { await observations.lastAllowed }
     }
 
-    func testNativeGroupObservationRetriesTransientFailuresAndNeverReturnsFalseEmptyGroup() throws {
-        let current = try XCTUnwrap(RequestProcessIdentity(pid: getpid()))
-        var attempts = 0, delays: [TimeInterval] = []
-        let recovered = try RequestProcessIdentity.retryGroupObservation({
-            attempts += 1
-            if attempts < 3 { throw POSIXError(.EINTR) }
-            return [current]
-        }, wait: { delays.append($0) })
-        XCTAssertEqual(recovered, [current]); XCTAssertEqual(attempts, 3); XCTAssertEqual(delays, [0.25, 0.25])
-        attempts = 0; delays = []
-        XCTAssertThrowsError(try RequestProcessIdentity.retryGroupObservation({
-            attempts += 1; throw POSIXError(.EIO)
-        }, wait: { delays.append($0) }))
-        XCTAssertEqual(attempts, 3); XCTAssertEqual(delays, [0.25, 0.25])
+    func testPersistentObservationFailureRetainsCauseAfterSettlementRecovers() async throws {
+        let (root, script) = try recoveryFixture()
+        try """
+        import time
+        print('{"event":"ready"}',flush=True)
+        time.sleep(60)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let probe = NativeObservationProbe(failures: 3)
+        let worker = RequestWorkerProcess(script: script, groups: .init(group: { try probe.observe($0) }))
+        do {
+            for try await _ in worker.run(mode: "run", configuration: .init(repository: root.path), directory: root.appendingPathComponent("job")) {}
+            XCTFail("Persistent observation failure was ignored")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("Repeated process observation failure")) }
+        try await worker.waitForExit()
+    }
+
+    func testRetiredWorkerRootDoesNotAuthorizeUnknownOrphanDescendants() throws {
+        let (root, _) = try recoveryFixture(), job = root.appendingPathComponent("retired-root")
+        try FileManager.default.createDirectory(at: job, withIntermediateDirectories: true)
+        let child = Process(), input = Pipe(), output = Pipe()
+        child.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        child.arguments = ["-u", "-c", "import subprocess,sys; p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);print(p.pid,flush=True);sys.stdin.read()"]
+        child.standardInput = input; child.standardOutput = output
+        try child.run()
+        let helperPID = try XCTUnwrap(Int32(String(decoding: output.fileHandleForReading.availableData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)))
+        let helper = try XCTUnwrap(RequestProcessIdentity(pid: helperPID))
+        defer { RequestProcessIdentity.signal([helper],SIGKILL); if child.isRunning { child.terminate(); child.waitUntilExit() } }
+        let birth = try XCTUnwrap(RequestProcessIdentity(pid: child.processIdentifier))
+        let marker: [String: Any] = ["pid":birth.pid,"birth":["pid":birth.pid,"seconds":birth.seconds,"microseconds":birth.microseconds],"script":"fixture.py","directory":job.path]
+        let file = job.appendingPathComponent("process.json")
+        try JSONSerialization.data(withJSONObject:marker).write(to:file)
+        try input.fileHandleForWriting.close(); child.waitUntilExit()
+        let probe = NativeObservationProbe()
+        XCTAssertThrowsError(try RequestWorkerProcess.reconcileOrphan(in:job,groups:.init(now:{probe.now},wait:{probe.advance($0)})))
+        XCTAssertTrue(helper.isCurrent); XCTAssertTrue(FileManager.default.fileExists(atPath:file.path))
+    }
+
+    func testNativeObservationRetriesOutsideOwnershipLock() async throws {
+        let (root, script) = try recoveryFixture()
+        try """
+        import contextlib,os,json,time
+        with contextlib.suppress(PermissionError):os.setsid()
+        print(json.dumps({'event':'preflight'}),flush=True)
+        time.sleep(1)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let probe = NativeObservationProbe(failures: 2)
+        let worker = RequestWorkerProcess(script: script, groups: .init(group: { try probe.observe($0) }))
+        for try await _ in worker.run(mode: "preflight", configuration: .init(repository: root.path), directory: root.appendingPathComponent("job")) {}
+        try await worker.waitForExit()
+        XCTAssertGreaterThanOrEqual(probe.calls, 3)
+    }
+
+    func testStopAndLogDrainingDoNotWaitForGroupEnumeration() async throws {
+        let (root, script) = try recoveryFixture()
+        try """
+        import contextlib,os,signal,sys,time
+        with contextlib.suppress(PermissionError):os.setsid()
+        def stop(*args):
+            print('stopped during observation',file=sys.stderr,flush=True)
+            sys.exit(0)
+        signal.signal(signal.SIGTERM,stop)
+        print('ready',file=sys.stderr,flush=True)
+        while True:
+            print('observation heartbeat',file=sys.stderr,flush=True)
+            time.sleep(.01)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let probe = NativeObservationProbe(held: true)
+        let job = root.appendingPathComponent("job")
+        let worker = RequestWorkerProcess(script: script, groups: .init(group: { try probe.observe($0) }))
+        let consuming = Task { do { for try await _ in worker.run(mode: "preflight", configuration: .init(repository: root.path), directory: job) {} } catch {} }
+        defer { probe.release(); consuming.cancel(); worker.stop() }
+        try await waitFor { probe.entered && ((try? String(contentsOf: job.appendingPathComponent("worker-stderr.log"), encoding: .utf8).contains("ready")) == true) }
+        let stopped = expectation(description: "Stop returns before observation is released")
+        DispatchQueue.global().async { worker.stop(); stopped.fulfill() }
+        await fulfillment(of: [stopped], timeout: 1)
+        XCTAssertThrowsError(try worker.reply(true))
+        let log = job.appendingPathComponent("worker-stderr.log")
+        let size = try Data(contentsOf: log).count
+        try await waitFor { (try? Data(contentsOf: log).count) ?? 0 > size }
+        probe.release(); await consuming.value
+        try await worker.waitForExit()
+    }
+
+    func testOrphanEnumerationFailureRetainsMarkerAndTerminatesVerifiedRoot() throws {
+        let (root, _) = try recoveryFixture(), job = root.appendingPathComponent("orphan")
+        try FileManager.default.createDirectory(at: job, withIntermediateDirectories: true)
+        let child = Process(), pipe = Pipe()
+        child.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        child.arguments = ["-u", "-c", "import contextlib,os,time\nwith contextlib.suppress(PermissionError):os.setsid()\nprint('ready',flush=True);time.sleep(60)"]
+        child.standardOutput = pipe; try child.run()
+        defer { if child.isRunning { child.terminate(); child.waitUntilExit() } }
+        _ = pipe.fileHandleForReading.availableData
+        let birth = try XCTUnwrap(RequestProcessIdentity(pid: child.processIdentifier))
+        let marker: [String: Any] = ["pid": birth.pid, "birth": ["pid":birth.pid,"seconds":birth.seconds,"microseconds":birth.microseconds], "script":"fixture.py", "directory":job.path]
+        let file = job.appendingPathComponent("process.json")
+        try JSONSerialization.data(withJSONObject: marker).write(to: file)
+        let probe = NativeObservationProbe(failures: Int.max)
+        XCTAssertThrowsError(try RequestWorkerProcess.reconcileOrphan(in: job, groups: .init(group: { try probe.observe($0) }, now: { probe.now }, wait: { probe.advance($0) })))
+        child.waitUntilExit()
+        XCTAssertFalse(birth.isCurrent); XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    func testLiveNativeTeardownUsesRemainingSupervisorBudget() async throws {
+        let (root, script) = try recoveryFixture(), bundled = try XCTUnwrap(RequestWorkerProcess.bundledScript)
+        try """
+        import contextlib,importlib.util,json,os,signal,sys,time,uuid
+        from pathlib import Path
+        with contextlib.suppress(PermissionError):os.setsid()
+        spec=importlib.util.spec_from_file_location('w',\(String(reflecting: bundled.path)))
+        w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
+        job=Path(sys.argv[3]);anchor=w.process_identity(os.getpid())
+        w.save_registry(job/'children.json',[{'leader':anchor,'members':[anchor]}])
+        status=w.new_status(anchor,str(uuid.uuid4()));status.update(state='draining',deadline=.5)
+        w.save_process_json(job/'supervision.json',status)
+        signal.signal(signal.SIGTERM,signal.SIG_IGN)
+        print(json.dumps({'event':'ready'}),flush=True)
+        while True:time.sleep(.01)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let probe = NativeObservationProbe()
+        let worker = RequestWorkerProcess(script: script, groups: .init(now: { probe.now }, wait: { probe.advance($0) }))
+        do {
+            for try await event in worker.run(mode: "run", configuration: .init(repository: root.path), directory: root.appendingPathComponent("job")) {
+                if event.event == "ready" { worker.stop() }
+            }
+            XCTFail("Unacknowledged pipe barrier was ignored")
+        } catch is RequestWorkerTeardownError {}
+        XCTAssertLessThanOrEqual(probe.now,0.55)
+        do { try await worker.waitForExit(); XCTFail("Unverified settlement was accepted") } catch is RequestWorkerTeardownError {}
+    }
+
+    func testNativeFallbackInheritsTaggedDeadlineWithoutRestartingBudget() throws {
+        let (root, _) = try recoveryFixture(), job = root.appendingPathComponent("deadline")
+        try FileManager.default.createDirectory(at: job, withIntermediateDirectories: true)
+        let child = Process(), pipe = Pipe()
+        child.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        child.arguments = ["-u", "-c", "import time;print('ready',flush=True);time.sleep(60)"]
+        child.standardOutput = pipe; try child.run(); _ = pipe.fileHandleForReading.availableData
+        defer { if child.isRunning { child.terminate(); child.waitUntilExit() } }
+        let anchor = try XCTUnwrap(RequestProcessIdentity(pid: child.processIdentifier))
+        let identity: [String: Any] = ["pid":anchor.pid,"seconds":anchor.seconds,"microseconds":anchor.microseconds]
+        try JSONSerialization.data(withJSONObject: [["leader":identity,"members":[identity]]]).write(to: job.appendingPathComponent("children.json"))
+        var status: [String: Any] = ["formatVersion":2,"sessionID":UUID().uuidString,"revision":1,"clock":"darwin-uptime-raw",
+            "supervisor":identity,"state":"draining","processesSettled":false,"pipeDrainComplete":false,"deadline":0.5]
+        let file = job.appendingPathComponent("supervision.json")
+        try JSONSerialization.data(withJSONObject: status).write(to: file)
+        XCTAssertEqual(try RequestProcessIdentity.observe(in: job).deadline,0.5)
+        status["formatVersion"] = 1
+        try JSONSerialization.data(withJSONObject: status).write(to: file)
+        XCTAssertNil(try RequestProcessIdentity.observe(in: job).deadline)
+        status["formatVersion"] = 2
+        try JSONSerialization.data(withJSONObject: status).write(to: file)
+        let probe = NativeObservationProbe()
+        XCTAssertThrowsError(try RequestWorkerProcess.reconcileOrphan(in: job, groups: .init(now: { probe.now }, wait: { probe.advance($0) })))
+        XCTAssertLessThanOrEqual(probe.now,0.5)
+        XCTAssertTrue(FileManager.default.fileExists(atPath:file.path))
+        child.waitUntilExit(); XCTAssertFalse(anchor.isCurrent)
+    }
+
+    func testSupervisorRetirementRequiresFreshQuiescentGroupObservation() throws {
+        let child = Process(), pipe = Pipe()
+        child.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        child.arguments = ["-u", "-c", "import time;print('ready',flush=True);time.sleep(60)"]
+        child.standardOutput = pipe; try child.run(); _ = pipe.fileHandleForReading.availableData
+        let work = try XCTUnwrap(RequestProcessIdentity(pid: child.processIdentifier))
+        child.terminate(); child.waitUntilExit()
+        let anchor = try XCTUnwrap(RequestProcessIdentity(pid: getpid()))
+        XCTAssertEqual(RequestProcessIdentity.shutdownTargets([anchor], sessions: [anchor:[anchor,work]], signal: SIGKILL), [])
+        XCTAssertEqual(RequestProcessIdentity.shutdownTargets([anchor], sessions: [anchor:[anchor]], signal: SIGKILL, allowOwnerRetirement: false), [])
+        XCTAssertEqual(RequestProcessIdentity.shutdownTargets([anchor], sessions: [anchor:[anchor]], signal: SIGKILL), [anchor])
+    }
+
+    func testDeadSupervisorCannotSuppressTermForKnownWork() throws {
+        let child = Process(), pipe = Pipe()
+        child.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        child.arguments = ["-u", "-c", "import time;print('ready',flush=True);time.sleep(60)"]
+        child.standardOutput = pipe; try child.run(); _ = pipe.fileHandleForReading.availableData
+        let anchor = try XCTUnwrap(RequestProcessIdentity(pid: child.processIdentifier))
+        child.terminate(); child.waitUntilExit()
+        let work = try XCTUnwrap(RequestProcessIdentity(pid: getpid()))
+        XCTAssertEqual(RequestProcessIdentity.shutdownTargets([work], sessions: [anchor:[anchor,work]], signal: SIGTERM), [work])
     }
 
     func testNativeWorkerAcceptsSuccessfulCommandWithLateHelperAndRetainedSupervisor() async throws {
@@ -2125,6 +2294,31 @@ private actor DisableEligibilityRecorder {
     func record(_ allowed: Bool, completed: Bool) {
         lastAllowed = allowed
         if completed && !allowed { completedWhileBlocked = true }
+    }
+}
+#endif
+
+#if os(macOS)
+private final class NativeObservationProbe: @unchecked Sendable {
+    private let lock = NSLock(), gate = DispatchSemaphore(value: 0)
+    private var remaining: Int, held: Bool, count = 0, clock: TimeInterval = 0
+    init(failures: Int = 0, held: Bool = false) { remaining = failures; self.held = held }
+    var calls: Int { lock.withLock { count } }
+    var entered: Bool { calls > 0 }
+    var now: TimeInterval { lock.withLock { clock } }
+    func advance(_ duration: TimeInterval) { lock.withLock { clock += duration } }
+    func release() { gate.signal() }
+    func observe(_ pid: Int32) throws -> [RequestProcessIdentity] {
+        let (wait, fail) = lock.withLock { () -> (Bool, Bool) in
+            count += 1
+            let wait = held; held = false
+            let fail = remaining > 0
+            if fail { remaining -= 1 }
+            return (wait, fail)
+        }
+        if wait { _ = gate.wait(timeout: .now() + 5) }
+        if fail { throw POSIXError(.EIO) }
+        return try RequestProcessIdentity.checkedGroup(pid)
     }
 }
 #endif
