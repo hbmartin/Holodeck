@@ -47,6 +47,10 @@ final class MacLibraryModel {
         setError(revocation ? "Previous revocation failed" : "Previous approval failed", from: revocation ? .revocation : .approval)
         session.failure = .init(message: "Independent catalog failure", operation: .catalog)
     }
+    func associateCatalogFailureForTesting(_ correlationID: UUID) {
+        guard exposesFailureAssociationTests else { return }
+        setError("Presented catalog failure is represented here", from: .manualReload, correlationID: correlationID)
+    }
     func injectCorrelatedCatalogFailureForTesting() {
         guard exposesFailureAssociationTests else { return }
         let correlationID = UUID()

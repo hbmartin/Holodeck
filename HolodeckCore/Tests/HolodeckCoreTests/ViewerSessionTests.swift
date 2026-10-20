@@ -52,6 +52,31 @@ final class ViewerSessionTests: XCTestCase {
         }
     }
 
+    func testPresentedFailureKeepsIdentityAndActionsWhenCoalescedOwnersGrow() async throws {
+        for retry in [false, true] {
+            let first = UUID(), second = UUID()
+            let service = CatalogService(source: CatalogSource(kind: .standard) { _, _ in
+                throw LocalCatalogError.timeout
+            }, storage: .disabled)
+            let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
+            var presented: ViewerSession.Failure?
+            session.onEvent = { event in
+                guard case .catalogFailed = event, presented == nil else { return }
+                presented = session.catalogFailure
+                session.refresh(force: true, correlationID: second)
+                session.refresh(force: true)
+            }
+            let task = session.refresh(force: true, correlationID: first)
+            await task.value
+            let captured = try XCTUnwrap(presented), current = try XCTUnwrap(session.catalogFailure)
+            XCTAssertEqual(current.id, captured.id)
+            XCTAssertEqual(current.correlationIDs, [first, second])
+            session.onEvent = nil
+            if retry { session.retry(captured); XCTAssertNil(session.catalogFailure); await session.refreshTask?.value }
+            else { session.dismissFailure(id: captured.id); XCTAssertNil(session.catalogFailure) }
+        }
+    }
+
     func testCatalogFailureCorrelationChangesWithTheRequestingOperation() async throws {
         let service = CatalogService(initialCatalog:TestCatalog.catalog,source:CatalogSource(kind:.standard) { _, _ in throw LocalCatalogError.timeout },storage:.disabled)
         let session = ViewerSession(catalogService:service,preferences:.inMemory(),policy:.mac)

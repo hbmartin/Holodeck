@@ -26,7 +26,7 @@ final class ShaderLibraryToolTests: XCTestCase {
         if let leader { owned.insert(leader) }
         defer { RequestProcessIdentity.signal(Array(owned),SIGKILL) }
         while process.isRunning {
-            if leader?.isCurrent == true { owned.formUnion(RequestProcessIdentity.group(process.processIdentifier)) }
+            if leader?.isCurrent == true { owned.formUnion(try RequestProcessIdentity.checkedGroup(process.processIdentifier)) }
             if Date() >= deadline {
                 RequestProcessIdentity.signal(Array(owned),SIGKILL); process.waitUntilExit()
                 throw ShaderToolError("Test subprocess timed out after \(timeout) seconds")

@@ -294,6 +294,39 @@ final class HolodeckMacUITests: XCTestCase {
         }
     }
 
+    func testPresentedCatalogAlertRetainsActionsWhenCorrelationMetadataChanges() throws {
+        let app = try app(arguments:["--ui-test-local-library", "--ui-test-extend-catalog-correlation"])
+        app.launchEnvironment["HOLODECK_UI_TEST_ERROR_ASSOCIATION"] = "1"
+        app.launch(); app.activate()
+        let settings = element("shader-library-settings",in:app)
+        XCTAssertTrue(settings.waitForExistence(timeout:15)); settings.click(); waitForLibraryIdle(in:app)
+        element("test-approval-catalog-failure",in:app).click()
+        let sheet = element("catalog-correlation-sheet",in:app)
+        XCTAssertTrue(sheet.waitForExistence(timeout:10))
+        let presentations = element("test-catalog-alert-count",in:app)
+        let replacement = XCTNSPredicateExpectation(predicate:NSPredicate(format:"value != %@", "1"),object:presentations)
+        replacement.isInverted = true
+        XCTAssertEqual(XCTWaiter.wait(for:[replacement],timeout:2),.completed)
+        sheet.buttons["OK"].click()
+        let dismissed = XCTNSPredicateExpectation(predicate:NSPredicate(format:"exists == false"),object:sheet)
+        XCTAssertEqual(XCTWaiter.wait(for:[dismissed],timeout:5),.completed)
+        waitForLibraryError("Previous approval failed",in:app)
+    }
+
+    func testPresentedCatalogAlertUsesNewCorrelationMetadataForSuppression() throws {
+        let app = try app(arguments:["--ui-test-local-library", "--ui-test-associate-presented-catalog"])
+        app.launchEnvironment["HOLODECK_UI_TEST_ERROR_ASSOCIATION"] = "1"
+        app.launch(); app.activate()
+        let settings = element("shader-library-settings",in:app)
+        XCTAssertTrue(settings.waitForExistence(timeout:15)); settings.click(); waitForLibraryIdle(in:app)
+        element("test-approval-catalog-failure",in:app).click()
+        waitForLibraryError("Presented catalog failure is represented here",in:app)
+        let alert = app.staticTexts["Unable to Load Scenes"]
+        let dismissed = XCTNSPredicateExpectation(predicate:NSPredicate(format:"exists == false"),object:alert)
+        XCTAssertEqual(XCTWaiter.wait(for:[dismissed],timeout:5),.completed)
+        XCTAssertEqual(element("test-catalog-alert-count",in:app).value as? String,"1")
+    }
+
     func testCorrelatedCatalogFailureIsShownOnce() throws {
         let app = try app(arguments:["--ui-test-local-library"])
         app.launchEnvironment["HOLODECK_UI_TEST_ERROR_ASSOCIATION"] = "1"

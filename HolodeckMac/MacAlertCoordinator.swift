@@ -12,9 +12,10 @@ final class MacAlertCoordinator {
             switch self {
             case .renderer(let failure):
                 return model.startupError?.id == failure.id
-            case .session(let failure):
-                if case .catalog = failure.operation, model.library?.representsCatalogFailure(failure) == true { return false }
-                return model.session.failure?.id == failure.id
+            case .session(let captured):
+                guard let current = model.session.failure, current.id == captured.id else { return false }
+                if case .catalog = current.operation, model.library?.representsCatalogFailure(current) == true { return false }
+                return true
             }
         }
     }
