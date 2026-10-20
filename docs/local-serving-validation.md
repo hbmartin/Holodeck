@@ -424,3 +424,41 @@ Evidence logs use `/tmp/holodeck-races-*`: `core-clock-final.log`, `worker39-fin
 No live request, physical-device installation, primary app replacement, enabling of requests, checker release, library-lock change, merge or deployment occurred. A later rollout must drain requests before installing the matching native host and bundled worker. Linux checker/library CI remains unchanged.
 
 PR automation: both Socket security checks passed. SonarCloud’s quality gate remains red on five S8707 CLI-path findings in registry persistence/removal. At the reviewed commit, the native host supplies journal arguments from its private Application Support request directory and UUID job IDs (`MacRequestsModel`, `ShaderRequestService.folder`, `RequestWorkerProcess.run`); TV request text and Codex output do not supply these arguments. Temporary names are generated UUIDs and registry basenames are fixed. These findings were triaged as false positives at this trust boundary, with target/HEAD evidence stored by the PR triage workflow. Scanner findings/rules were not dismissed or suppressed; reviewer disposition remains open.
+
+## Per-command supervision settlement follow-up (2026-10-20)
+
+This pass starts from PR #30's merged tree, `22dd0a8`, and retains one supervisor per command. The shared runtime is packaged as `shader_processes.py` beside `shader_requests.py`; isolated worker launches explicitly disable bytecode writes so imports do not add cache files to installed resources. Both files must come from the same app build. Checker bytes and both checker locks remain unchanged.
+
+One settlement engine handles ordinary exit, exceptional exit and Python orphan cleanup. It observes again after signalling/persistence before claiming group quiescence, then retires the owner last. Supervision format 2 adds a session UUID, increasing revisions, a tagged clock, independent process-settlement proof and a pipe-drain acknowledgment. Pending pipe evidence is durable before execution; a failed attempt to record a pipe failure cannot erase that barrier. Older disk status cannot replace newer channel status. Known-only owner crashes can finish cleanup without falsely requiring checkout recovery; a missing command exit status remains an operational failure.
+
+Darwin deadlines use `CLOCK_UPTIME_RAW`, excluding sleep and sharing native `systemUptime`'s domain. Python cross-process tests run under both supported interpreters; a direct Python/Swift probe also placed native uptime between the two Python readings. Simulated sleep and exhausted-budget tests cover the selected clock and inherited deadlines. Untagged version-1 deadlines are not compared against the new clock. Native live and orphan fallback inherit the remaining budget rather than starting another ten seconds.
+
+Native observations and retries run outside ownership locks. Cancellation returns while enumeration is gated, logging continues, retired roots retain uncertainty about unfamiliar descendants, and cached sessions cannot suppress TERM after their owner disappears. Owner retirement requires a fresh quiescent snapshot. Persistent observation failures retain their original diagnostic even if subsequent cleanup succeeds.
+
+Correlation-only updates preserve the presented failure's identity and actions. Repeated automatic checks also preserve an existing unresolved failure; changed explicit owners, dismissal, retry or recovery establish a new occurrence. Alert eligibility reads current correlation metadata. Well-formed unsupported checker versions/interfaces receive compatibility guidance, separately from malformed locks and launch faults.
+
+Validation completed in this pass:
+
+- **99 Python worker tests passed on Python 3.9.6 and 99 on Python 3.15.0**, with no skips, failures or errors. Three disjoint partitions per interpreter were checked against the complete manifest: 99 unique names, no omissions or duplicates. Added coverage includes the post-fsync fork window, channel/disk ordering, pre-launch EOF/stop, lost owners, failed pipe-evidence persistence, directory-sync gating, buffered streaming readiness, control resets, failed supervisor birth establishment and bounded durable writes.
+- **Full shared Swift suite: 295 executed, six opt-in skips, zero failures**, with real authoring and GPU integration enabled. Native regressions include paused enumeration, persistent failures followed by successful settlement, stale session maps, inherited live/orphan deadlines, unknown descendants of retired roots, and missing packaged runtime resources. A legacy fixture now waits for observed descendant exit with a bounded backstop instead of assuming a fixed sleep is sufficient.
+- **Seven selected Mac UI tests passed**, including both new presented-alert correlation cases, positive unrelated alerts, bounded duplicate-alert absence, startup Verify ordering, rejected bookmarks with cached serving and immediate rebuilding of an accepted folder.
+- **46 tvOS 27 simulator app unit tests passed**, with no skips or failures.
+- **Fourteen Release resource/native-supervision/profile tests passed**, followed by two packaged launch tests after the final startup guard. The native idle profile measured about **30.4 polls/s and 1.10% of one CPU core**.
+- **Both Release app builds passed**, with signing disabled. Both Mac resource-bundle copies of each worker file match source exactly, and the packaged native tool passed artifact-info, checker-info and a read-only selected-library identity comparison. No requests were enabled.
+- The unchanged packaged checker compiled **66 assets plus shader/snippet templates for macOS and tvOS**. The separate Mac GPU run passed **seven profile checks**.
+
+Startup measurements use `tools/profile_shader_supervision.py --baseline 22dd0a8 --worker PATH_TO_RELEASE_BUNDLED_WORKER`. Both artifact trees are copied unchanged onto the same temporary filesystem before comparison; recorded hashes match the final packaged files. Each comparison uses the same interpreter, 31 warm short-command samples and five 18-Git-command fixtures. Timings were collected during concurrent validation and are local observations, not CI timing assertions:
+
+| Measurement | Python 3.9.6: PR #30 → follow-up | Python 3.15.0: PR #30 → follow-up |
+| --- | --- | --- |
+| Short command median | 236.2 → 158.4 ms | 149.5 → 83.4 ms |
+| 18-command fixture median | 3397.5 → 2764.5 ms | 2195.3 → 1531.1 ms |
+| Atomic evidence replacements per command | 7 → 5 | 7 → 5 |
+| Fsync calls per command | 14 → 10 | 14 → 10 |
+| Interpreter launches per command | 2 → 2 | 2 → 2 |
+| Reaped-child CPU during a 15-second idle command | 1.39 → 1.02% | 0.94 → 0.83% |
+| Parent CPU during the same idle command | 0.09 → 0.04% | 0.10 → 0.05% |
+
+The per-command interpreter lifetime is intentionally retained. The optimization removes worker-only imports, replaces startup polling with readiness/SIGCHLD wakeups and batches compatible directory syncs without removing execution or completion barriers.
+
+Evidence uses `/tmp/holodeck-final-*`: `accepted{39,315}-{0,1,2}.log`, matching manifests/status logs, `process-regressions.log`, `core-accepted.log`, `ui-complete.log`, `tv-tests.log`, `tv-test-summary.json`, `gpu.log`, `benchmark{39,315}.json`, `release-audited.log`, `package.log`, `mac-package.log` and `tv-package.log`. Metal compilation is also recorded in `/tmp/holodeck-settlement-metal.log`. The full-core skips cover three unrelated catalog profiles, the separately run worker profile, live LAN/TLS and live Codex publication. Physical Apple TV execution, TV UI tests and live requests were not run. No live app replacement, enabling of requests, checker release, library-lock change, merge or deployment occurred; Linux checker/library CI is unchanged.

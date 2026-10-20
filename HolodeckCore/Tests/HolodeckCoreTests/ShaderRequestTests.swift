@@ -1866,6 +1866,22 @@ final class ShaderRequestTests: XCTestCase {
         try await waitFor { await observations.lastAllowed }
     }
 
+    func testMissingPackagedProcessRuntimeReportsSetupFailure() async throws {
+        let (root, _) = try recoveryFixture(), script = root.appendingPathComponent("copied-worker.py")
+        try FileManager.default.copyItem(at: XCTUnwrap(RequestWorkerProcess.bundledScript), to: script)
+        let worker = RequestWorkerProcess(script: script)
+        var failure: RequestWorkerEvent?
+        do {
+            for try await event in worker.run(mode: "preflight", configuration: .init(repository: root.path), directory: root.appendingPathComponent("job")) {
+                if event.event == "failure" { failure = event }
+            }
+            XCTFail("Missing runtime launched successfully")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("Worker exited 2")) }
+        try await worker.waitForExit()
+        XCTAssertTrue(failure?.message?.contains("process runtime is missing or unreadable") == true)
+        XCTAssertEqual(failure?.recoveryRequired, false)
+    }
+
     func testPersistentObservationFailureRetainsCauseAfterSettlementRecovers() async throws {
         let (root, script) = try recoveryFixture()
         try """
