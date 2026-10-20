@@ -879,6 +879,17 @@ worker.main()
         (self.root/'shader_checker.lock.json').write_text(json.dumps(CHECKER_PIN))
         worker.require_checker()
 
+    def test_well_formed_unsupported_locks_have_compatibility_diagnostics(self):
+        worker=worker_module.Worker(self.config,self.job)
+        for changes in ({'version':'2.0.0'},{'interfaceVersion':2}):
+            (self.root/'shader_checker.lock.json').write_text(json.dumps(dict(CHECKER_PIN,**changes)))
+            with self.assertRaisesRegex(worker_module.OperationalError,'Update Holodeck and the shader library together'):
+                worker.require_checker()
+        for changes in ({'version':'01.0.0'},{'interfaceVersion':True},{'version':'future'}):
+            (self.root/'shader_checker.lock.json').write_text(json.dumps(dict(CHECKER_PIN,**changes)))
+            with self.assertRaisesRegex(worker_module.OperationalError,'invalid or unreadable'):
+                worker.require_checker()
+
     def test_checker_probe_timeouts_and_malformed_responses_have_specific_diagnostics(self):
         for fault,expected in [(subprocess.TimeoutExpired('native',30),'timed out after 30 seconds'),
                                (OSError('cannot launch'),'could not run'),

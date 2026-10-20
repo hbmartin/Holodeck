@@ -50,7 +50,7 @@ public final class ViewerSession {
     }
     public struct Failure: Identifiable {
         public enum Operation { case catalog, selection(ShaderDefinition, SelectionOrigin) }
-        public let id = UUID()
+        public let id: UUID
         public let message: String
         public let operation: Operation
         public let correlationIDs: Set<UUID>
@@ -59,9 +59,16 @@ public final class ViewerSession {
             self.init(message: message, operation: operation, correlationIDs: correlationID.map { [$0] } ?? [])
         }
         public init(message: String, operation: Operation, correlationIDs: Set<UUID>) {
+            self.init(id: UUID(), message: message, operation: operation, correlationIDs: correlationIDs)
+        }
+        private init(id: UUID, message: String, operation: Operation, correlationIDs: Set<UUID>) {
+            self.id = id
             self.message = message
             self.operation = operation
             self.correlationIDs = correlationIDs
+        }
+        public func withCorrelationIDs(_ ids: Set<UUID>) -> Self {
+            Self(id: id, message: message, operation: operation, correlationIDs: ids)
         }
     }
 
@@ -146,7 +153,7 @@ public final class ViewerSession {
                 refreshCorrelationIDs.insert(correlationID)
                 if let failure = catalogFailure, failure.id == refreshFailureID,
                    failure.correlationIDs != refreshCorrelationIDs {
-                    catalogFailure = Failure(message: failure.message, operation: .catalog, correlationIDs: refreshCorrelationIDs)
+                    catalogFailure = failure.withCorrelationIDs(refreshCorrelationIDs)
                     refreshFailureID = catalogFailure?.id
                 }
             }
@@ -194,7 +201,12 @@ public final class ViewerSession {
                     if let current { self.applyCatalog(current) }
                     self.refreshResult = error is CancellationError ? .cancelled : .failed(error.localizedDescription)
                     let message = self.catalogErrorMessage(error)
-                    if self.catalogFailure?.message != message || self.catalogFailure?.correlationIDs != self.refreshCorrelationIDs {
+                    if let failure = self.catalogFailure, failure.message == message,
+                       failure.id == self.refreshFailureID || failure.correlationIDs == self.refreshCorrelationIDs {
+                        // Repeated automatic checks keep the same pending failure. A new
+                        // task with different explicit owners describes a different occurrence.
+                        self.catalogFailure = failure.withCorrelationIDs(self.refreshCorrelationIDs)
+                    } else {
                         self.catalogFailure = Failure(message: message, operation: .catalog, correlationIDs: self.refreshCorrelationIDs)
                     }
                     self.refreshFailureID = self.catalogFailure?.id

@@ -1214,11 +1214,13 @@ An unchanged existing shader may be successful if it already satisfies the promp
             pin = json.loads(raw)
             if not isinstance(pin, dict) or pin.get('repository') != 'hbmartin/HolodeckShaderCheck':
                 raise ValueError('unapproved checker repository')
-            for name, pattern in [('version', r'1\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'), ('sourceCommit', r'[0-9a-f]{40}'), ('sha256', r'[0-9a-f]{64}')]:
+            for name, pattern in [('version', r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'), ('sourceCommit', r'[0-9a-f]{40}'), ('sha256', r'[0-9a-f]{64}')]:
                 if type(pin.get(name)) is not str or re.fullmatch(pattern, pin[name]) is None: raise ValueError('invalid ' + name)
-            if type(pin.get('interfaceVersion')) is not int or pin['interfaceVersion'] != 1: raise ValueError('unsupported checker interface')
+            if type(pin.get('interfaceVersion')) is not int or pin['interfaceVersion'] < 1: raise ValueError('invalid checker interface')
         except (OSError, ValueError, TypeError, CandidateError) as error:
             raise OperationalError('Selected library checker lock is invalid or unreadable: ' + str(error)) from error
+        if pin['interfaceVersion'] != 1 or int(pin['version'].split('.')[0]) != 1:
+            raise OperationalError('Update Holodeck and the shader library together: selected library requires an unsupported checker version or interface')
         try: executable = os.stat(self.config['shaderTool'])
         except OSError as error: raise OperationalError('Cannot inspect the configured shader tool: ' + str(error)) from error
         key = (raw, executable.st_ino, executable.st_size, executable.st_mtime_ns)

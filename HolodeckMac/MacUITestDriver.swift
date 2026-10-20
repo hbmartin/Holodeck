@@ -7,10 +7,12 @@ import MetalKit
 final class MacUITestDriver {
     private let configuration: UITestConfiguration
     private var replacesPresentedFailure: Bool
+    private var extendsCatalogCorrelation: Bool
     private var repeatsRendererInstallation: Bool
 
     init(configuration: UITestConfiguration) {
         self.configuration = configuration
+        extendsCatalogCorrelation = configuration.contains("--ui-test-extend-catalog-correlation") || configuration.contains("--ui-test-associate-presented-catalog")
         replacesPresentedFailure = configuration.contains("--ui-test-replace-presented-failure")
         repeatsRendererInstallation = configuration.contains("--ui-test-repeat-renderer-installation")
     }
@@ -44,6 +46,15 @@ final class MacUITestDriver {
         if model.library?.exposesFailureAssociationTests == true,
            let failure = model.session.failure, case .catalog = failure.operation {
             model.library?.catalogAlertPresentationCount += 1
+        }
+        if extendsCatalogCorrelation, let failure = model.session.failure, case .catalog = failure.operation {
+            extendsCatalogCorrelation = false
+            let correlationID = UUID()
+            model.window?.attachedSheet?.setAccessibilityIdentifier("catalog-correlation-sheet")
+            model.session.failure = failure.withCorrelationIDs(failure.correlationIDs.union([correlationID]))
+            if configuration.contains("--ui-test-associate-presented-catalog") {
+                model.library?.associateCatalogFailureForTesting(correlationID)
+            }
         }
         if repeatsRendererInstallation, model.startupError != nil {
             repeatsRendererInstallation = false
