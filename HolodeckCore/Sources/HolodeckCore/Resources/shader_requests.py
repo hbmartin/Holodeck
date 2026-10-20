@@ -40,15 +40,17 @@ class WorkerInterrupted(BaseException):
     pass
 
 
+CLOCK_DOMAIN = 'darwin-uptime-raw' if sys.platform == 'darwin' else 'linux-monotonic'
 _libproc = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True) if sys.platform == 'darwin' else None
 REGISTRY_LIMIT = 65536
 PROCESS_SAMPLE_SECONDS = .25
+TERMINAL_STATES = ('settled', 'failed', 'cancelled')
 
 
 def process_clock():
-    # Python 3.9 on macOS gives time.monotonic() a process-local origin.
-    # Supervision deadlines must be comparable across the worker and its owner.
-    return time.clock_gettime(time.CLOCK_MONOTONIC)
+    # Shared across processes, and (like native systemUptime) excludes system sleep.
+    clock = time.CLOCK_UPTIME_RAW if sys.platform == 'darwin' else time.CLOCK_MONOTONIC
+    return time.clock_gettime(clock)
 
 
 class ProcessObservationError(ProcessRecoveryError):
@@ -80,7 +82,7 @@ def group_members(pid):
         while size <= 1048576:
             data = ctypes.create_string_buffer(size)
             ctypes.set_errno(0)
-            count = _libproc.proc_listpids(2, pid, data, size)  # PROC_PGRP_ONLY
+            count = _libproc.proc_listpids(2, pid, data, size)
             if count < 0 or (count == 0 and ctypes.get_errno()):
                 raise ProcessObservationError('Cannot enumerate owned process group: ' + os.strerror(ctypes.get_errno()))
             if count < size:
@@ -90,7 +92,6 @@ def group_members(pid):
             size *= 2
         else: raise ProcessObservationError('Owned process group enumeration exceeds its capacity')
     else:
-        # Linux test support. Darwin never launches ps to observe commands.
         try:
             listing = subprocess.run(['/bin/ps', '-axo', 'pid=,pgid='], capture_output=True, text=True, timeout=2, check=True)
             pids = [int(parts[0]) for line in listing.stdout.splitlines()
@@ -147,6 +148,13 @@ def save_process_json(file, value):
 def save_registry(file, entries): save_process_json(file, entries)
 
 
+def retire_evidence(directory):
+    for name in ('children.json', 'supervision.json'): (Path(directory) / name).unlink(missing_ok=True)
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+
 def valid_identity(identity):
     return isinstance(identity, dict) and all(type(identity.get(key)) is int for key in ('pid', 'seconds', 'microseconds')) and identity['pid'] > 1
 
@@ -161,109 +169,187 @@ def read_registry(directory):
 
 def read_supervision(directory):
     value = read_process_json(Path(directory) / 'supervision.json')
-    if value is not None and (not isinstance(value, dict) or type(value.get('formatVersion')) is not int or value.get('formatVersion') != 1
-            or not valid_identity(value.get('supervisor')) or value.get('state') not in ('starting', 'running', 'draining', 'settled', 'failed')
+    if value is None: return None
+    if (not isinstance(value, dict) or type(value.get('formatVersion')) is not int or value['formatVersion'] not in (1, 2)
+            or not valid_identity(value.get('supervisor')) or value.get('state') not in ('starting', 'running', 'draining', *TERMINAL_STATES)
             or (value.get('command') is not None and not valid_identity(value['command']))):
         raise ProcessRecoveryError('Invalid supervision evidence; retain the journal')
+    if value['formatVersion'] == 2:
+        try: uuid.UUID(value['sessionID'])
+        except (KeyError, ValueError, TypeError, AttributeError) as error: raise ProcessRecoveryError('Invalid supervision session') from error
+        if (type(value.get('revision')) is not int or value['revision'] < 0 or value.get('clock') != CLOCK_DOMAIN
+                or type(value.get('pipeDrainComplete')) is not bool or type(value.get('processesSettled')) is not bool):
+            raise ProcessRecoveryError('Invalid supervision revision, clock or completion evidence')
     return value
 
 
+def new_status(anchor, session):
+    return dict(formatVersion=2, sessionID=session, revision=0, clock=CLOCK_DOMAIN, supervisor=anchor,
+                command=None, state='starting', commandReturnCode=None, processesSettled=False, pipeDrainComplete=False)
+
+
 class Termination:
-    def __init__(self):
-        self.started = None; self.term_sent = set(); self.kill_sent = set()
-
-    def begin(self):
-        if self.started is None: self.started = process_clock()
-
-    def signal(self, identities, exclude=()):
-        self.begin()
-        sig = signal.SIGKILL if process_clock() - self.started >= 5 else signal.SIGTERM
-        sent = self.kill_sent if sig == signal.SIGKILL else self.term_sent
-        for identity in identities:
-            key = (identity['pid'], identity['seconds'], identity['microseconds'])
-            if identity not in exclude and key not in sent and process_identity(identity['pid']) == identity:
-                sent.add(key)
-                with contextlib.suppress(ProcessLookupError): os.kill(identity['pid'], sig)
+    def __init__(self, deadline=None):
+        self.deadline = deadline; self.term_sent = set(); self.kill_sent = set()
 
     @property
-    def expired(self): return self.started is not None and process_clock() - self.started >= 10
+    def started(self): return self.deadline - 10 if self.deadline is not None else None
+
+    def begin(self):
+        if self.deadline is None: self.deadline = process_clock() + 10
+
+    def signal(self, identities, exclude=()):
+        self.begin(); errors = []
+        for identity in identities:
+            if identity in exclude or process_identity(identity['pid']) != identity: continue
+            key = (identity['pid'], identity['seconds'], identity['microseconds'])
+            signals = [(signal.SIGTERM, self.term_sent)]
+            if process_clock() >= self.deadline - 5: signals.append((signal.SIGKILL, self.kill_sent))
+            for sig, sent in signals:
+                if key in sent: continue
+                sent.add(key)
+                try:
+                    if process_identity(identity['pid']) == identity: os.kill(identity['pid'], sig)
+                except ProcessLookupError: pass
+                except OSError as error: errors.append(error)
+        return errors
+
+    @property
+    def expired(self): return self.deadline is not None and process_clock() >= self.deadline
+
+
+def status_deadline(status):
+    # Version 1 used a different Darwin clock. Never compare its absolute deadline.
+    if status and status.get('formatVersion') == 2 and status.get('clock') == CLOCK_DOMAIN:
+        deadline = status.get('deadline')
+        if type(deadline) in (int, float): return deadline
+    return None
+
+
+class Settlement:
+    """One observation/termination engine for normal, exceptional and orphan cleanup."""
+    def __init__(self, directory, entries, anchor=None, termination=None):
+        self.directory = Path(directory); self.entries = entries; self.anchor = anchor
+        self.termination = termination or Termination()
+        self.next_sample = 0; self.observation_errors = 0; self.uncertain = True
+        self.errors = []; self.failure_kind = None
+
+    @property
+    def identities(self): return [i for entry in self.entries for i in entry['members']]
+
+    def fail(self, error, kind):
+        message = str(error)
+        if message not in self.errors: self.errors.append(message)
+        self.failure_kind = self.failure_kind or kind
+        self.termination.begin()
+
+    @property
+    def failure(self): return '; cleanup error: '.join(self.errors) if self.errors else None
+
+    def observe(self):
+        quiet = True; self.uncertain = False
+        for entry in self.entries:
+            leader = entry['leader']; current = process_identity(leader['pid'])
+            observed = group_members(leader['pid']) if current in (None, leader) else []
+            if current == leader:
+                entry['members'] = merge_members(entry['members'] + [leader], observed)
+                quiet &= not any(i != self.anchor for i in observed)
+            else:
+                entry['members'] = merge_members(entry['members'], [])
+                self.uncertain |= any(i not in entry['members'] for i in observed)
+                quiet &= not observed
+            quiet &= not any(i != self.anchor for i in entry['members'])
+        return quiet and not self.uncertain
+
+    def step(self, delegate=False):
+        # Signals are attempted even when evidence persistence or observation fails.
+        if self.termination.started is not None and (not delegate or process_clock() >= self.termination.deadline - 5):
+            for error in self.termination.signal(self.identities, exclude=[self.anchor]): self.fail(error, 'signal')
+        if process_clock() < self.next_sample: return False
+        self.next_sample = process_clock() + PROCESS_SAMPLE_SECONDS
+        try:
+            quiet = self.observe(); self.observation_errors = 0
+        except ProcessObservationError as error:
+            self.observation_errors += 1; self.uncertain = True
+            if self.observation_errors >= 3: self.fail(error, 'observation')
+            return False
+        try: save_registry(self.directory / 'children.json', self.entries)
+        except (OSError, ProcessRecoveryError) as error: self.fail(error, 'registry')
+        if self.termination.started is not None and (not delegate or process_clock() >= self.termination.deadline - 5):
+            for error in self.termination.signal(self.identities, exclude=[self.anchor]): self.fail(error, 'signal')
+        if quiet or not any(i != self.anchor and process_identity(i['pid']) == i for i in self.identities):
+            # Never use the snapshot preceding a signal or fsync as completion proof.
+            try: return self.observe()
+            except ProcessObservationError as error:
+                self.uncertain = True; self.observation_errors += 1
+                if self.observation_errors >= 3: self.fail(error, 'observation')
+        return False
+
+    def expired_error(self):
+        message = self.failure or ('Cannot observe owned processes' if self.uncertain else 'Owned descendants did not settle')
+        return ProcessRecoveryError(message + '; settlement budget exhausted before verification. Retain the journal and recover or detach the checkout.')
 
 
 def terminate_registered(directory, deadline=None):
-    directory = Path(directory); entries = read_registry(directory); supervision = read_supervision(directory)
-    if supervision and supervision.get('failureKind') == 'pipeDrain' and supervision.get('recoveryRequired'):
-        raise ProcessDrainError(supervision.get('failure', 'External pipe ownership is unresolved; detach or repair the checkout'))
-    if not entries and supervision is None: return
-    anchor = supervision['supervisor'] if supervision else None
+    directory = Path(directory); entries = read_registry(directory); status = read_supervision(directory)
+    if not entries and status is None: return
+    anchor = status['supervisor'] if status else None
     if anchor and not any(e['leader'] == anchor for e in entries):
         raise ProcessRecoveryError('Supervisor identity does not match its process registry')
-    termination = Termination(); termination.begin()
-    if deadline is not None: termination.started = deadline - 10
-    # The live supervisor owns normal termination; fallback kills work processes only after five seconds.
+    termination = Termination(status_deadline(status) if deadline is None else deadline); termination.begin()
+    engine = Settlement(directory, entries, anchor, termination)
     if anchor and process_identity(anchor['pid']) == anchor:
-        with contextlib.suppress(ProcessLookupError): os.kill(anchor['pid'], signal.SIGTERM)
-    next_sample = 0; observation_errors = 0; unknown = False; persistence_error = None
+        try: os.kill(anchor['pid'], signal.SIGTERM)
+        except ProcessLookupError: pass
+        except OSError as error: engine.fail(error, 'signal')
     while True:
-        sampled = False
-        if process_clock() >= next_sample:
-            unknown = False
-            try:
-                for entry in entries:
-                    leader = entry['leader']; observed = group_members(leader['pid'])
-                    if process_identity(leader['pid']) == leader:
-                        entry['members'] = merge_members(entry['members'], observed)
-                    else:
-                        entry['members'] = merge_members(entry['members'], [])
-                        unknown |= process_identity(leader['pid']) is None and any(i not in entry['members'] for i in observed)
-                sampled = True; observation_errors = 0
-            except ProcessObservationError:
-                observation_errors += 1; unknown = True
-            next_sample = process_clock() + PROCESS_SAMPLE_SECONDS
-        identities = [i for e in entries for i in e['members']]
         anchor_live = anchor is not None and process_identity(anchor['pid']) == anchor
-        if not anchor_live or process_clock() - termination.started >= 5:
-            termination.signal(identities, exclude=[anchor] if anchor_live else [])
-        work = [i for i in identities if i != anchor and process_identity(i['pid']) == i]
-        if sampled and not work and not unknown:
+        quiet = engine.step(delegate=anchor_live)
+        if quiet:
             if anchor_live:
-                # Only the trusted anchor remains and cannot create further work.
-                with contextlib.suppress(ProcessLookupError): os.kill(anchor['pid'], signal.SIGKILL)
-            elif not any(process_identity(i['pid']) == i for i in identities):
-                for name in ('children.json', 'supervision.json'): (directory / name).unlink(missing_ok=True)
-                if persistence_error: raise OperationalError(str(persistence_error))
+                # The fresh group contains only the trusted owner. Retire it last.
+                for error in termination.signal([anchor]): engine.fail(error, 'signal')
+            else:
+                final = read_supervision(directory) or status
+                pending = final and final.get('formatVersion') == 2 and not final['pipeDrainComplete']
+                if pending or (final and final.get('failureKind') == 'pipeDrain' and final.get('recoveryRequired')):
+                    raise ProcessDrainError((final or {}).get('failure') or 'Pipe completion is unverified; retain the journal and recover or detach the checkout')
+                retire_evidence(directory)
+                if engine.failure: raise OperationalError(engine.failure)
                 return
-        # Persisting additional evidence must never prevent verified termination.
-        if sampled:
-            try: save_registry(directory / 'children.json', entries)
-            except (ProcessRecoveryError, OSError) as error: persistence_error = persistence_error or error
-        if termination.expired:
-            reason = 'Cannot observe owned processes' if observation_errors >= 3 else 'Owned descendants did not settle'
-            raise ProcessRecoveryError(reason + '; retain the journal and recover or detach the checkout')
-        time.sleep(.025)
+        if termination.expired: raise engine.expired_error()
+        time.sleep(min(.025, max(0, termination.deadline - process_clock())))
 
 
 def supervise(control_fd):
-    """The retained session leader is the ownership anchor until all work settles."""
     control = socket.socket(fileno=control_fd); control.settimeout(30)
     directory = Path(os.environ['HOLODECK_REQUEST_DIRECTORY'])
-    anchor = process_identity(os.getpid()); command = None; members = [anchor]
-    status = {'formatVersion': 1, 'supervisor': anchor, 'command': None, 'state': 'starting', 'commandReturnCode': None}
-    stop = [False]; termination = Termination(); first_error = None; error_kind = None
+    anchor = process_identity(os.getpid()); command = None; launched = False; stop = [False]
+    status = new_status(anchor, os.environ.get('HOLODECK_SUPERVISION_SESSION', str(uuid.uuid4())))
+    engine = Settlement(directory, [{'leader': anchor, 'members': [anchor]}], anchor)
     signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__(0, True))
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__(0, True))
     def report(state, **fields):
-        status.update(state=state, **fields)
-        save_process_json(directory / 'supervision.json', status)
+        status.update(state=state, revision=status['revision'] + 1, **fields)
+        persisted = True
+        try: save_process_json(directory / 'supervision.json', status)
+        except (OSError, ProcessRecoveryError) as error:
+            engine.fail(error, 'persistence'); persisted = False
+            status.update(failure=engine.failure, failureKind=engine.failure_kind)
         with contextlib.suppress(OSError): control.sendall(json.dumps(status).encode() + b'\n')
+        return persisted
+    pending = bytearray(); control_open = True
     try:
-        launch = bytearray()
-        while b'\n' not in launch:
+        while b'\n' not in pending and not stop[0]:
             chunk = control.recv(4096)
-            if not chunk: return 125
-            launch.extend(chunk)
-            if len(launch) > REGISTRY_LIMIT: raise OperationalError('Managed startup message exceeds 64 KiB')
-        request = json.loads(launch.partition(b'\n')[0])
-        if stop[0]: return 130
+            if not chunk: control_open = False; stop[0] = True; break
+            pending.extend(chunk)
+            if len(pending) > REGISTRY_LIMIT: raise OperationalError('Managed startup message exceeds 64 KiB')
+        if stop[0]:
+            status.update(pipeDrainComplete=True, processesSettled=True)
+            report('cancelled', failure='Managed startup cancelled before command execution', failureKind='startup', recoveryRequired=False)
+            return 130
+        line, _, pending = pending.partition(b'\n'); request = json.loads(line)
         read_gate, write_gate = os.pipe()
         bootstrap = 'import os,sys;gate=int(sys.argv[1]);go=os.read(gate,1);os.close(gate);go or sys.exit(125);os.execv(sys.argv[2],sys.argv[2:])'
         try:
@@ -271,95 +357,87 @@ def supervise(control_fd):
                 cwd=request['cwd'], pass_fds=(read_gate,))
             identity = process_identity(command.pid)
             if identity is None: raise ProcessRecoveryError('Cannot establish command birth identity')
-            status['command'] = identity; members.append(identity)
-            save_registry(directory / 'children.json', [{'leader': anchor, 'members': members}])
-            report('running')
-            if not stop[0]: os.write(write_gate, b'1')
-        finally:
-            os.close(read_gate); os.close(write_gate)
-        # Only command processes retain the input/output pipes. Status has a dedicated channel.
+            status['command'] = identity; engine.entries[0]['members'].append(identity)
+            save_registry(directory / 'children.json', engine.entries)
+            if report('running') and not stop[0]: os.write(write_gate, b'1'); launched = True
+        finally: os.close(read_gate); os.close(write_gate)
+    except BaseException as error: engine.fail(error, 'startup'); stop[0] = True
+    finally:
         for fd in (0, 1, 2):
             with contextlib.suppress(OSError): os.close(fd)
-        control.setblocking(False); control_pending = bytearray(launch.partition(b'\n')[2]); next_sample = 0; observation_errors = 0
+    if not launched: status['pipeDrainComplete'] = True
+    control.setblocking(False); work_settled = False; drain_deadline = None
+    try:
         while True:
             try:
-                message = control.recv(4096)
-                if not message: stop[0] = True
-                control_pending.extend(message)
-            except BlockingIOError: pass
-            while b'\n' in control_pending:
-                line, _, control_pending = control_pending.partition(b'\n')
-                if json.loads(line).get('action') == 'stop': stop[0] = True
-            if len(control_pending) > REGISTRY_LIMIT: raise OperationalError('Managed control message exceeds 64 KiB')
-            rc = command.poll()
-            if rc is not None and status['commandReturnCode'] is None:
-                status['commandReturnCode'] = rc; termination.begin(); next_sample = 0
-                report('draining', deadline=termination.started + 10)
-            if stop[0]: termination.begin()
-            sampled = False
-            if process_clock() >= next_sample:
-                try:
-                    members = merge_members(members, group_members(anchor['pid']))
-                    sampled = True; observation_errors = 0
-                except ProcessObservationError as error:
-                    observation_errors += 1
-                    if observation_errors >= 3: first_error = first_error or error; error_kind = error_kind or 'observation'; termination.begin()
-                try: save_registry(directory / 'children.json', [{'leader': anchor, 'members': members}])
-                except (OSError, ProcessRecoveryError) as error:
-                    first_error = first_error or error; error_kind = error_kind or 'registry'; termination.begin()
-                next_sample = process_clock() + PROCESS_SAMPLE_SECONDS
-            if termination.started is not None:
-                termination.signal(members, exclude=[anchor])
-                if sampled and rc is not None and not any(i != anchor and process_identity(i['pid']) == i for i in members):
-                    report('settled', failure=str(first_error) if first_error else None, failureKind=error_kind, recoveryRequired=False)
-                    return 0
-                if termination.expired:
-                    report('failed', failure=str(first_error or 'Owned descendants did not settle'), failureKind=error_kind or 'settlement', recoveryRequired=True)
+                if control_open:
+                    try:
+                        message = control.recv(65536)
+                        if not message: control_open = False; stop[0] = True
+                        pending.extend(message)
+                    except BlockingIOError: pass
+                    while b'\n' in pending:
+                        line, _, pending = pending.partition(b'\n'); message = json.loads(line)
+                        if message.get('action') == 'stop':
+                            stop[0] = True
+                            inherited = message.get('deadline')
+                            if type(inherited) in (int, float):
+                                engine.termination.deadline = min(engine.termination.deadline or inherited, inherited)
+                        if message.get('sessionID') == status['sessionID']:
+                            if message.get('action') == 'drained': status['pipeDrainComplete'] = True
+                            if message.get('action') == 'pipeFailure': engine.fail(ProcessDrainError(message['message']), 'pipeDrain'); stop[0] = True
+                    if len(pending) > REGISTRY_LIMIT: raise OperationalError('Managed control message exceeds 64 KiB')
+                rc = command.poll() if command is not None else None
+                if rc is not None and status['commandReturnCode'] is None:
+                    status['commandReturnCode'] = rc; engine.termination.begin(); engine.next_sample = 0
+                if stop[0]: engine.termination.begin()
+                if engine.termination.started is not None and status.get('deadline') is None:
+                    report('draining', deadline=engine.termination.deadline)
+                quiet = engine.step()
+                if engine.termination.started is not None and quiet and (command is None or rc is not None):
+                    if not work_settled:
+                        work_settled = True; status['processesSettled'] = True
+                        drain_deadline = min(process_clock() + 5, engine.termination.deadline)
+                        report('draining')
+                    if status['pipeDrainComplete']:
+                        report('failed' if engine.failure else 'settled', failure=engine.failure, failureKind=engine.failure_kind, recoveryRequired=False)
+                        return 0 if not engine.failure else 2
+                    if engine.failure_kind == 'pipeDrain' or process_clock() >= drain_deadline:
+                        engine.fail(ProcessDrainError('Managed output pipes did not close; external pipe ownership is unresolved. Recover or detach the checkout.'), 'pipeDrain')
+                        report('failed', failure=engine.failure, failureKind='pipeDrain', recoveryRequired=True)
+                        return 2
+                if engine.termination.expired:
+                    report('failed', failure=str(engine.expired_error()), failureKind=engine.failure_kind or 'settlement', recoveryRequired=True)
                     return 2
+            except BaseException as error: engine.fail(error, 'supervision'); stop[0] = True
             time.sleep(.025)
-    except BaseException as error:
-        # Startup failures cannot skip termination, including a failed registration write.
-        termination.begin()
-        fresh = command is None
-        while command is not None and not termination.expired:
-            try: members = merge_members(members, group_members(anchor['pid'])); fresh = True
-            except ProcessObservationError: fresh = False
-            termination.signal(members, exclude=[anchor])
-            command.poll()
-            if fresh and not any(i != anchor and process_identity(i['pid']) == i for i in members): break
-            time.sleep(.025)
-        unresolved = not fresh or any(i != anchor and process_identity(i['pid']) == i for i in members)
-        status.update(state='failed', failure=str(error), failureKind='startup', recoveryRequired=unresolved)
-        with contextlib.suppress(OSError, ProcessRecoveryError): report('failed')
-        with contextlib.suppress(OSError): control.sendall(json.dumps(status).encode() + b'\n')
-        return 2
     finally: control.close()
 
 
 class ManagedChild:
-    """Captured and streaming invocations share one durable retained-session supervisor."""
     def __init__(self, args, cwd, env, *, stdin=False, stderr=subprocess.PIPE, text=True, supervisor_script=None):
         self.args, self.cwd, self.env = [str(a) for a in args], cwd, env
         self.supervisor_script = Path(supervisor_script or __file__).resolve()
         self.stdin, self.stderr, self.text = stdin, stderr, text
         self.registry = Path(env['HOLODECK_REQUEST_DIRECTORY']) / 'children.json'
         self.process = None; self.control = None; self.status = None; self.pending = bytearray()
+        self.local_failure = None; self.pipes_drained = False; self.acknowledged = False; self.fallback = None
+        self.stop_deadline = None
 
     def __enter__(self):
         terminate_registered(self.registry.parent)
-        self.control, child_control = socket.socketpair()
+        self.control, child_control = socket.socketpair(); session = str(uuid.uuid4())
         try:
             self.process = subprocess.Popen([sys.executable, '-I', str(self.supervisor_script), '_supervise', str(child_control.fileno())],
-                cwd=self.cwd, env=self.env, stdin=subprocess.PIPE if self.stdin else subprocess.DEVNULL,
+                cwd=self.cwd, env=dict(self.env, HOLODECK_SUPERVISION_SESSION=session), stdin=subprocess.PIPE if self.stdin else subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=self.stderr, text=self.text, start_new_session=True, pass_fds=(child_control.fileno(),))
             self.identity = process_identity(self.process.pid)
             if self.identity is None: raise ProcessRecoveryError('Cannot establish managed supervisor identity')
-            self.status = {'formatVersion': 1, 'supervisor': self.identity, 'command': None, 'state': 'starting', 'commandReturnCode': None}
+            self.status = new_status(self.identity, session)
             save_registry(self.registry, [{'leader': self.identity, 'members': [self.identity]}])
             save_process_json(self.registry.parent / 'supervision.json', self.status)
             self.control.sendall(json.dumps({'args': self.args, 'cwd': str(self.cwd)}).encode() + b'\n')
-            self.control.setblocking(False)
-            deadline = process_clock() + 30
+            self.control.setblocking(False); deadline = process_clock() + 30
             while self.status['state'] == 'starting':
                 self.sample()
                 if self.process.poll() is not None: break
@@ -370,13 +448,18 @@ class ManagedChild:
         except BaseException:
             if self.process is not None:
                 self.stop()
-                with contextlib.suppress(Exception): self.process.wait(timeout=11)
-                if self.process.poll() is None: self.process.kill(); self.process.wait(timeout=5)
-            self.close_pipes(); raise
+                self.__exit__(*sys.exc_info())
+            else: self.close_pipes()
+            raise
         finally: child_control.close()
 
     @property
     def command_returncode(self): return self.status.get('commandReturnCode') if self.status else None
+
+    def accept_status(self, value):
+        if self.status and (value.get('sessionID') != self.status.get('sessionID') or value.get('supervisor') != self.identity):
+            raise ProcessRecoveryError('Supervisor status does not belong to this command')
+        if self.status is None or value.get('revision', 0) > self.status.get('revision', 0): self.status = value
 
     def sample(self):
         while self.control is not None:
@@ -385,35 +468,35 @@ class ManagedChild:
             if not chunk: break
             self.pending.extend(chunk)
             while b'\n' in self.pending:
-                line, _, self.pending = self.pending.partition(b'\n')
-                self.status = json.loads(line)
+                line, _, self.pending = self.pending.partition(b'\n'); self.accept_status(json.loads(line))
             if len(self.pending) > REGISTRY_LIMIT: raise ProcessRecoveryError('Malformed supervisor status channel')
 
     def check_status(self):
         self.sample()
-        if self.status is None or self.status['state'] in ('starting', 'running', 'draining'):
-            final = read_supervision(self.registry.parent)
-            if final: self.status = final
+        if self.local_failure: raise self.local_failure
         if self.status and self.status.get('failure'):
             kind = (ProcessDrainError if self.status.get('failureKind') == 'pipeDrain' else ProcessRecoveryError) if self.status.get('recoveryRequired') else OperationalError
             raise kind(self.status['failure'])
-        if self.process.poll() is not None and (not self.status or self.status['state'] != 'settled'):
-            raise ProcessRecoveryError('Managed supervisor exited without verified settlement; retain the journal')
+
+    def send(self, action, **fields):
+        if self.control is not None:
+            with contextlib.suppress(OSError):
+                self.control.sendall(json.dumps(dict(action=action, sessionID=self.status['sessionID'], **fields)).encode() + b'\n')
 
     def stop(self):
-        if self.control is not None:
-            with contextlib.suppress(OSError): self.control.sendall(b'{"action":"stop"}\n')
+        self.stop_deadline = self.stop_deadline or status_deadline(self.status) or process_clock() + 10
+        self.send('stop', deadline=self.stop_deadline)
         if self.process is not None and process_identity(self.process.pid) == getattr(self, 'identity', None):
             with contextlib.suppress(ProcessLookupError): os.kill(self.process.pid, signal.SIGTERM)
 
     def drain_deadline(self):
-        return min(process_clock() + 5, self.status.get('deadline', process_clock() + 10))
+        return min(process_clock() + 5, status_deadline(self.status) or process_clock() + 10)
 
     def pipe_failure(self):
-        message = 'Managed command exited but its output pipes did not close; external pipe ownership is unresolved. Recover or detach the checkout.'
-        self.status.update(state='failed', failure=message, failureKind='pipeDrain', recoveryRequired=True)
-        save_process_json(self.registry.parent / 'supervision.json', self.status)
-        raise ProcessDrainError(message)
+        message = 'Managed output pipes did not close; external pipe ownership is unresolved. Recover or detach the checkout.'
+        self.local_failure = ProcessDrainError(message)
+        self.send('pipeFailure', message=message)
+        raise self.local_failure
 
     def close_pipes(self):
         if self.control is not None: self.control.close(); self.control = None
@@ -422,43 +505,76 @@ class ManagedChild:
                 if pipe is not None and hasattr(pipe, 'close'):
                     with contextlib.suppress(OSError): pipe.close()
 
+    def fallback_step(self):
+        if self.fallback is None:
+            final = read_supervision(self.registry.parent)
+            if final: self.accept_status(final)
+            entries = read_registry(self.registry.parent)
+            self.fallback = Settlement(self.registry.parent, entries, self.identity,
+                                       Termination(self.stop_deadline or status_deadline(self.status)))
+            self.fallback.termination.begin()
+        quiet = self.fallback.step()
+        if quiet and self.pipes_drained:
+            if not self.status.get('processesSettled') or self.status.get('state') not in TERMINAL_STATES:
+                self.status.update(revision=self.status['revision'] + 1, state='failed', processesSettled=True,
+                    pipeDrainComplete=True, failure='Managed supervisor exited; command outcome is unknown' if self.command_returncode is None else 'Managed supervisor exited before completing its protocol',
+                    failureKind='supervisor', recoveryRequired=False)
+                if self.fallback.failure: self.status['failure'] += '; cleanup error: ' + self.fallback.failure
+                try: save_process_json(self.registry.parent / 'supervision.json', self.status)
+                except (OSError, ProcessRecoveryError) as error: self.status['failure'] += '; cleanup error: ' + str(error)
+            return True
+        if self.fallback.termination.expired: raise self.fallback.expired_error()
+        return False
+
     def __exit__(self, kind, error, traceback):
         try:
+            if isinstance(error, ProcessDrainError): self.local_failure = error
             if self.process.poll() is None: self.stop()
-            try: self.process.wait(timeout=11)
-            except subprocess.TimeoutExpired:
-                terminate_registered(self.registry.parent)
-                self.process.wait(timeout=1)
-            self.sample()
-            final = read_supervision(self.registry.parent)
-            if final is not None: self.status = final
-            if self.status and self.status['state'] in ('starting', 'running', 'draining'):
-                terminate_registered(self.registry.parent, deadline=self.status.get('deadline'))
+            for _ in self.output_chunks(finishing=True): pass
+            self.process.wait(timeout=1)
+            if self.status and self.status.get('processesSettled') and self.pipes_drained and not self.local_failure and not self.status.get('recoveryRequired'):
+                retire_evidence(self.registry.parent)
             self.check_status()
-            for name in ('children.json', 'supervision.json'): (self.registry.parent / name).unlink(missing_ok=True)
         finally: self.close_pipes()
 
-    def output_chunks(self, input=None, timeout=None):
-        process = self.process; payload = memoryview(input.encode(getattr(process.stdin, 'encoding', None) or 'utf-8') if isinstance(input, str) else input or b'')
+    def output_chunks(self, input=None, timeout=None, finishing=False):
+        process = self.process
+        payload = memoryview(input.encode(getattr(process.stdin, 'encoding', None) or 'utf-8') if isinstance(input, str) else input or b'')
         deadline = process_clock() + timeout if timeout is not None else None
         drain_deadline = None
         with selectors.DefaultSelector() as selector:
             if self.control is not None: selector.register(self.control, selectors.EVENT_READ, 'control')
             for name, pipe in [('stdout', process.stdout), ('stderr', process.stderr)]:
-                if pipe is not None:
+                if pipe is not None and not pipe.closed:
                     os.set_blocking(pipe.fileno(), False); selector.register(pipe, selectors.EVENT_READ, name)
-            if process.stdin is not None:
+            if process.stdin is not None and not process.stdin.closed:
                 if payload:
                     os.set_blocking(process.stdin.fileno(), False); selector.register(process.stdin, selectors.EVENT_WRITE, 'stdin')
                 else: process.stdin.close()
-            while selector.get_map() or process.poll() is None:
+            while True:
                 self.sample()
                 if deadline is not None and self.command_returncode is None and process_clock() >= deadline:
                     raise subprocess.TimeoutExpired(self.args, timeout)
-                for key, _ in selector.select(PROCESS_SAMPLE_SECONDS):
+                pipes = [key for key in selector.get_map().values() if key.data in ('stdout', 'stderr')]
+                if not pipes:
+                    self.pipes_drained = True
+                    if not self.acknowledged: self.send('drained'); self.acknowledged = True
+                owner_dead = process.poll() is not None
+                if owner_dead:
+                    if self.fallback_step(): break
+                if self.status and self.status.get('processesSettled') and not self.pipes_drained:
+                    drain_deadline = drain_deadline or self.drain_deadline()
+                    if process_clock() >= drain_deadline:
+                        if finishing: raise self.local_failure or ProcessDrainError('Pipe completion is unverified; retain the journal')
+                        self.pipe_failure()
+                limit = self.stop_deadline or status_deadline(self.status)
+                if limit is not None and process_clock() >= limit:
+                    raise ProcessRecoveryError('Settlement budget exhausted before verification; retain the journal')
+                for key, _ in selector.select(.025 if owner_dead else PROCESS_SAMPLE_SECONDS):
                     if key.data == 'control':
-                        self.sample(); continue
-                    if key.data == 'stdin':
+                        self.sample()
+                        if owner_dead: selector.unregister(key.fileobj)
+                    elif key.data == 'stdin':
                         try: count = os.write(process.stdin.fileno(), payload[:65536])
                         except BlockingIOError: continue
                         except BrokenPipeError: count = len(payload)
@@ -469,12 +585,7 @@ class ManagedChild:
                         except BlockingIOError: continue
                         if chunk: yield key.data, chunk
                         else: selector.unregister(key.fileobj); key.fileobj.close()
-                if process.poll() is not None:
-                    self.check_status()
-                    if self.control is not None and self.control.fileno() in selector.get_map(): selector.unregister(self.control)
-                    if drain_deadline is None: drain_deadline = self.drain_deadline()
-                    if selector.get_map() and process_clock() >= drain_deadline: self.pipe_failure()
-            self.check_status()
+            if not finishing: self.check_status()
 
     def lines(self, prompt):
         pending = bytearray()
@@ -496,7 +607,6 @@ def managed_run(args, cwd, env, timeout, input, text=True):
             pipe = getattr(child.process, name)
             return data.decode(pipe.encoding, errors=pipe.errors).replace('\r\n', '\n').replace('\r', '\n')
         return subprocess.CompletedProcess(args, child.command_returncode, output('stdout'), output('stderr'))
-
 
 class VerificationError(CandidateError):
     def __init__(self, message, command=None, shader_id=None, time=None):
@@ -1496,8 +1606,10 @@ def main():
             worker.perform()
     except WorkerInterrupted:
         try: terminate_registered(sys.argv[3])
-        except ProcessRecoveryError as error:
-            emit("failure", message=str(error), recoveryRequired=True); sys.exit(1)
+        except (OperationalError, OSError) as error:
+            pending = any((Path(sys.argv[3]) / name).exists() for name in ("children.json", "supervision.json"))
+            emit("failure", message="Worker interrupted; cleanup failed: " + str(error),
+                 recoveryRequired=isinstance(error, ProcessRecoveryError) or pending); sys.exit(1)
         sys.exit(130)
     except BaseException as error:
         if worker and worker.request and not isinstance(error, ProcessRecoveryError):

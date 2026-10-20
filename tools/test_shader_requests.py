@@ -903,7 +903,7 @@ worker.main()
         env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job))
         code="import os;exec('for _ in range(750):\\n p=os.fork()\\n if p==0:os._exit(0)\\n os.waitpid(p,0)');print(750)"
         with worker_module.ManagedChild([sys.executable,'-c',code],self.root,env) as child:
-            output,_=child.process.communicate(timeout=30)
+            output=b''.join(chunk for stream,chunk in child.output_chunks(timeout=30) if stream=='stdout').decode()
             self.assertEqual(output.strip(),'750')
             self.assertLess(child.registry.stat().st_size,1024)
             self.assertEqual(len(json.loads(child.registry.read_bytes())[0]['members']),1)
@@ -1015,7 +1015,7 @@ time.sleep(60)
         after=worker_module.process_clock()
         self.assertLessEqual(before,observed);self.assertLessEqual(observed,after)
         child=worker_module.ManagedChild.__new__(worker_module.ManagedChild)
-        child.status={'deadline':observed+10}
+        child.status={'formatVersion':2,'clock':worker_module.CLOCK_DOMAIN,'deadline':observed+10}
         self.assertGreater(child.drain_deadline(),after)
         self.assertLessEqual(child.drain_deadline(),worker_module.process_clock()+5)
 
@@ -1033,7 +1033,7 @@ time.sleep(60)
         code="import subprocess,sys,time;from pathlib import Path;p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);Path(sys.argv[1]).write_text(str(p.pid));time.sleep(60)"
         with self.assertRaisesRegex(worker_module.OperationalError,'64 KiB capacity'):
             with worker_module.ManagedChild([sys.executable,'-c',code,str(marker)],self.root,env,supervisor_script=script) as child:
-                child.process.communicate(timeout=8)
+                list(child.output_chunks(timeout=8))
         self.assertIsNone(worker_module.process_identity(int(marker.read_text())))
         self.assertIsNone(worker_module.process_identity(child.identity['pid']))
 
@@ -1041,7 +1041,7 @@ time.sleep(60)
         script=self.supervisor_fixture("real=w.group_members\ncalls=0\ndef observe(pid):\n global calls\n calls+=1\n if calls<=2:raise w.ProcessObservationError('Transient enumeration failure')\n return real(pid)\nw.group_members=observe")
         env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job))
         with worker_module.ManagedChild([sys.executable,'-c','import time;time.sleep(.8);print(42)'],self.root,env,supervisor_script=script) as child:
-            output,_=child.process.communicate(timeout=5)
+            output=b''.join(chunk for stream,chunk in child.output_chunks(timeout=5) if stream=='stdout').decode()
             self.assertEqual(output.strip(),'42')
         self.assertFalse((self.job/'supervision.json').exists())
 
@@ -1076,7 +1076,7 @@ time.sleep(60)
         env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job))
         with self.assertRaises(worker_module.ProcessRecoveryError):
             with worker_module.ManagedChild([sys.executable,'-c','import time;time.sleep(60)'],self.root,env,supervisor_script=script) as child:
-                child.process.communicate(timeout=15)
+                list(child.output_chunks(timeout=15))
         self.assertIsNone(worker_module.process_identity(child.status['command']['pid']))
         self.assertTrue((self.job/'children.json').exists())
         self.assertTrue(worker_module.read_supervision(self.job)['recoveryRequired'])
@@ -1177,4 +1177,123 @@ w.main()
             self.assertLess(time.monotonic()-started,1)
             registry.unlink()
 
+
+class ProcessSettlementTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary=tempfile.TemporaryDirectory();self.addCleanup(self.temporary.cleanup)
+        self.job=Path(self.temporary.name);self.env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job))
+
+    def supervisor_fixture(self, injected):
+        script=self.job/'supervisor-fixture.py'
+        script.write_text("import importlib.util,sys\nspec=importlib.util.spec_from_file_location('w',"+repr(str(SCRIPT))+");w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)\n"+injected+"\nsys.exit(w.supervise(int(sys.argv[2])))\n")
+        return script
+
+    def test_settlement_requires_observation_after_persistence_and_signalling(self):
+        anchor={'pid':100,'seconds':1,'microseconds':0};old=dict(anchor,pid=101);late=dict(anchor,pid=102)
+        live={100:anchor,101:old};clock=[0.];saves=[0]
+        def persist(*_):
+            saves[0]+=1
+            if saves[0]==1:live.pop(101);live[102]=late
+        def kill(pid,sig):
+            if pid!=101:live.pop(pid,None)
+        with patch.object(worker_module,'process_identity',side_effect=lambda pid:live.get(pid)), \
+             patch.object(worker_module,'group_members',side_effect=lambda _:list(live.values())), \
+             patch.object(worker_module,'save_registry',side_effect=persist), \
+             patch.object(worker_module,'process_clock',side_effect=lambda:clock[0]), \
+             patch.object(worker_module.os,'kill',side_effect=kill):
+            engine=worker_module.Settlement(self.job,[{'leader':anchor,'members':[anchor,old]}],anchor)
+            engine.termination.begin()
+            self.assertFalse(engine.step());self.assertIn(late,engine.identities)
+            clock[0]=.25
+            self.assertTrue(engine.step());self.assertEqual(live,{100:anchor})
+
+    def test_clock_excludes_sleep_and_legacy_deadlines_are_not_compared(self):
+        with patch.object(worker_module.time,'clock_gettime',return_value=7.) as clock:
+            self.assertEqual(worker_module.process_clock(),7.)
+            clock.assert_called_once_with(worker_module.time.CLOCK_UPTIME_RAW if sys.platform=='darwin' else worker_module.time.CLOCK_MONOTONIC)
+        self.assertIsNone(worker_module.status_deadline({'formatVersion':1,'deadline':999999}))
+        self.assertIsNone(worker_module.status_deadline({'formatVersion':2,'clock':'other','deadline':999999}))
+        with patch.object(worker_module,'process_clock',return_value=100.):
+            termination=worker_module.Termination(99.)
+            termination.begin();self.assertEqual(termination.deadline,99.);self.assertTrue(termination.expired)
+
+    def test_old_disk_status_cannot_replace_terminal_channel_status(self):
+        anchor={'pid':100,'seconds':1,'microseconds':0}
+        child=worker_module.ManagedChild.__new__(worker_module.ManagedChild);child.identity=anchor
+        child.status=dict(worker_module.new_status(anchor,str(uuid.uuid4())),revision=5,state='failed',failure='Original terminal failure')
+        child.accept_status(dict(child.status,revision=4,state='draining',failure=None))
+        self.assertEqual(child.status['failure'],'Original terminal failure')
+        with self.assertRaises(worker_module.ProcessRecoveryError):child.accept_status(dict(child.status,sessionID=str(uuid.uuid4()),revision=6))
+
+    def test_write_and_signal_failures_do_not_skip_other_verified_processes(self):
+        anchor={'pid':100,'seconds':1,'microseconds':0};a=dict(anchor,pid=101);b=dict(anchor,pid=102)
+        live={100:anchor,101:a,102:b};sent=[]
+        def kill(pid,sig):
+            sent.append(pid)
+            if pid==101:raise PermissionError('signal denied')
+            live.pop(pid,None)
+        with patch.object(worker_module,'process_identity',side_effect=lambda pid:live.get(pid)), \
+             patch.object(worker_module,'group_members',side_effect=lambda _:list(live.values())), \
+             patch.object(worker_module,'save_registry',side_effect=PermissionError('registry denied')), \
+             patch.object(worker_module.os,'kill',side_effect=kill):
+            engine=worker_module.Settlement(self.job,[{'leader':anchor,'members':[anchor,a,b]}],anchor)
+            engine.termination.begin();self.assertFalse(engine.step())
+            self.assertIn(101,sent);self.assertIn(102,sent)
+            self.assertIn('signal denied',engine.failure);self.assertIn('registry denied',engine.failure)
+
+    def test_known_only_supervisor_crash_settles_without_false_recovery(self):
+        child=worker_module.ManagedChild([sys.executable,'-u','-c',"import time;print('ready',flush=True);time.sleep(60)"],self.job,self.env,text=False)
+        with self.assertRaises(worker_module.OperationalError) as failure:
+            with child:
+                self.assertEqual(next(child.lines('')),'ready')
+                os.kill(child.identity['pid'],signal.SIGKILL);child.process.wait(timeout=2)
+        self.assertNotIsInstance(failure.exception,worker_module.ProcessRecoveryError)
+        self.assertIn('outcome is unknown',str(failure.exception))
+        self.assertIsNone(worker_module.process_identity(child.status['command']['pid']))
+        self.assertFalse((self.job/'children.json').exists());self.assertFalse((self.job/'supervision.json').exists())
+
+    def test_terminal_persistence_failure_keeps_newer_channel_diagnostic(self):
+        script=self.supervisor_fixture("real=w.save_process_json\ndef save(file,value):\n if isinstance(value,dict) and value.get('state')=='settled':raise PermissionError('terminal persistence denied')\n return real(file,value)\nw.save_process_json=save")
+        with self.assertRaisesRegex(worker_module.OperationalError,'terminal persistence denied') as failure:
+            with worker_module.ManagedChild(['/usr/bin/true'],self.job,self.env,supervisor_script=script) as child:
+                list(child.output_chunks(timeout=5))
+        self.assertNotIsInstance(failure.exception,worker_module.ProcessRecoveryError)
+        self.assertFalse((self.job/'children.json').exists())
+
+    def test_prelaunch_control_eof_writes_terminal_status_without_command(self):
+        parent,control=socket.socketpair();self.addCleanup(parent.close)
+        session=str(uuid.uuid4())
+        process=subprocess.Popen([sys.executable,'-I',str(SCRIPT),'_supervise',str(control.fileno())],env=dict(self.env,HOLODECK_SUPERVISION_SESSION=session),pass_fds=(control.fileno(),),start_new_session=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        control.close();parent.shutdown(socket.SHUT_WR)
+        out,err=process.communicate(timeout=5)
+        self.assertEqual(process.returncode,130,err)
+        status=worker_module.read_supervision(self.job)
+        self.assertEqual(status['state'],'cancelled');self.assertIsNone(status['commandReturnCode'])
+        self.assertTrue(status['pipeDrainComplete']);self.assertTrue(status['processesSettled'])
+
+    def test_interruption_cleanup_errors_emit_structured_failure(self):
+        config=self.job/'config.json';config.write_text('{}')
+        for kind in ('OperationalError','PermissionError'):
+            code="import importlib.util,sys\nspec=importlib.util.spec_from_file_location('w',sys.argv[1]);w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)\nclass Probe:\n def __init__(self,*a):raise w.WorkerInterrupted()\nw.Worker=Probe\ndef cleanup(*a):raise "+('w.' if kind=='OperationalError' else '')+kind+"('injected cleanup failure')\nw.terminate_registered=cleanup\nsys.argv=[sys.argv[1],'run',sys.argv[2],sys.argv[3]]\nw.main()"
+            result=subprocess.run([sys.executable,'-I','-c',code,str(SCRIPT),str(config),str(self.job)],capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,1);self.assertNotIn('Traceback',result.stderr)
+            event=json.loads(result.stdout);self.assertEqual(event['event'],'failure');self.assertIn('injected cleanup failure',event['message'])
+
+    def test_failed_pipe_failure_write_preserves_pending_barrier(self):
+        script=self.supervisor_fixture("real=w.save_process_json\ndef save(file,value):\n if isinstance(value,dict) and value.get('failureKind')=='pipeDrain':raise PermissionError('pipe evidence denied')\n return real(file,value)\nw.save_process_json=save")
+        marker=self.job/'escaped'
+        code="import subprocess,sys;from pathlib import Path;p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],start_new_session=True,stdin=subprocess.DEVNULL);Path(sys.argv[1]).write_text(str(p.pid))"
+        try:
+            with self.assertRaises(worker_module.ProcessRecoveryError):
+                with worker_module.ManagedChild([sys.executable,'-c',code,str(marker)],self.job,self.env,supervisor_script=script) as child:list(child.output_chunks(timeout=15))
+            self.assertTrue((self.job/'children.json').exists())
+            self.assertFalse(worker_module.read_supervision(self.job)['pipeDrainComplete'])
+            with self.assertRaises(worker_module.ProcessRecoveryError):worker_module.terminate_registered(self.job)
+        finally:
+            if marker.exists():
+                identity=worker_module.process_identity(int(marker.read_text()))
+                if identity and worker_module.process_identity(identity['pid'])==identity:os.kill(identity['pid'],signal.SIGKILL)
+
+
 if __name__=='__main__': unittest.main()
+
