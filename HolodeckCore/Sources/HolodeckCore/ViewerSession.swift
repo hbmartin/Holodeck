@@ -53,11 +53,15 @@ public final class ViewerSession {
         public let id = UUID()
         public let message: String
         public let operation: Operation
-        public let correlationID: UUID?
+        public let correlationIDs: Set<UUID>
+        public var correlationID: UUID? { correlationIDs.count == 1 ? correlationIDs.first : nil }
         public init(message: String, operation: Operation, correlationID: UUID? = nil) {
+            self.init(message: message, operation: operation, correlationIDs: correlationID.map { [$0] } ?? [])
+        }
+        public init(message: String, operation: Operation, correlationIDs: Set<UUID>) {
             self.message = message
             self.operation = operation
-            self.correlationID = correlationID
+            self.correlationIDs = correlationIDs
         }
     }
 
@@ -99,7 +103,8 @@ public final class ViewerSession {
     @ObservationIgnored private var hasBeenActive = false
     @ObservationIgnored private var savedID: String?
     @ObservationIgnored private var forcedRefreshPending = false
-    @ObservationIgnored private var pendingRefreshCorrelationID: UUID?
+    @ObservationIgnored private var refreshCorrelationIDs: Set<UUID> = []
+    @ObservationIgnored private var refreshFailureID: UUID?
 
     public init(catalogService: CatalogService, preferences: ShaderPreferences, policy: ViewerPolicy) {
         self.catalogService = catalogService
@@ -137,9 +142,18 @@ public final class ViewerSession {
     @discardableResult
     public func refresh(force: Bool = false, correlationID: UUID? = nil) -> Task<Void, Never> {
         if let refreshTask {
-            if force { forcedRefreshPending = true; pendingRefreshCorrelationID = correlationID }
+            if let correlationID {
+                refreshCorrelationIDs.insert(correlationID)
+                if let failure = catalogFailure, failure.id == refreshFailureID,
+                   failure.correlationIDs != refreshCorrelationIDs {
+                    catalogFailure = Failure(message: failure.message, operation: .catalog, correlationIDs: refreshCorrelationIDs)
+                    refreshFailureID = catalogFailure?.id
+                }
+            }
+            if force { forcedRefreshPending = true }
             return refreshTask
         }
+        refreshCorrelationIDs = correlationID.map { [$0] } ?? []; refreshFailureID = nil
         isRefreshing = true
         refreshResult = .cancelled
         let service = catalogService
@@ -148,10 +162,10 @@ public final class ViewerSession {
                 self?.isRefreshing = false
                 self?.refreshTask = nil
                 self?.forcedRefreshPending = false
+                self?.refreshCorrelationIDs.removeAll(); self?.refreshFailureID = nil
                 self?.onEvent?(.catalogFinished)
             }
             var forcePass = force
-            var passCorrelationID = correlationID
             repeat {
                 let cached = await service.current()
                 guard !Task.isCancelled else { return }
@@ -166,7 +180,7 @@ public final class ViewerSession {
                     switch outcome {
                     case .updated, .unchanged:
                         self.refreshResult = .checked
-                        self.catalogFailure = nil
+                        self.catalogFailure = nil; self.refreshFailureID = nil
                     case .throttled, .disabled:
                         self.refreshResult = .skipped
                         if self.catalog == nil {
@@ -180,14 +194,13 @@ public final class ViewerSession {
                     if let current { self.applyCatalog(current) }
                     self.refreshResult = error is CancellationError ? .cancelled : .failed(error.localizedDescription)
                     let message = self.catalogErrorMessage(error)
-                    if self.catalogFailure?.message != message || self.catalogFailure?.correlationID != passCorrelationID {
-                        self.catalogFailure = Failure(message: message, operation: .catalog, correlationID: passCorrelationID)
+                    if self.catalogFailure?.message != message || self.catalogFailure?.correlationIDs != self.refreshCorrelationIDs {
+                        self.catalogFailure = Failure(message: message, operation: .catalog, correlationIDs: self.refreshCorrelationIDs)
                     }
+                    self.refreshFailureID = self.catalogFailure?.id
                     self.onEvent?(.catalogFailed)
                 }
                 forcePass = self?.forcedRefreshPending == true
-                passCorrelationID = self?.pendingRefreshCorrelationID
-                self?.pendingRefreshCorrelationID = nil
                 self?.forcedRefreshPending = false
             } while forcePass && !Task.isCancelled
         }
@@ -336,7 +349,7 @@ public final class ViewerSession {
     }
 
     public func shutdown() {
-        forcedRefreshPending = false; pendingRefreshCorrelationID = nil
+        forcedRefreshPending = false; refreshCorrelationIDs.removeAll(); refreshFailureID = nil
         cancelPendingSelection()
         selectionTask?.cancel()
         refreshTask?.cancel()

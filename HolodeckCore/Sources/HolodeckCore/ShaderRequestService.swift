@@ -1218,6 +1218,7 @@ public actor ShaderRequestService {
     private func finishWorker(_ id: UUID) {
         let interrupted = execution?.interrupted == true
         activeProcess = nil; activeID = nil; workerTask = nil; execution = nil
+        emitUpdates()
         if records[id]?.detached != true, records[id]?.cleanupPending == true || (interrupted && records[id]?.status.stage.terminal == false) {
             recoveryID = id
             if !suspended { kick() }

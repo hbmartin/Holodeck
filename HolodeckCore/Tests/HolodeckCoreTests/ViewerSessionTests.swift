@@ -27,6 +27,31 @@ final class ViewerSessionTests: XCTestCase {
         return snapshot
     }
 
+    func testCoalescedRefreshRetainsEveryExplicitOwnerAndResetsForNextTask() async throws {
+        for multiple in [false, true] {
+            let gate = RecoveryGate(), first = UUID(), second = UUID()
+            let service = CatalogService(initialCatalog: TestCatalog.catalog, source: CatalogSource(kind: .standard) { _, _ in
+                try await gate.wait(); throw LocalCatalogError.timeout
+            }, storage: .disabled)
+            let session = ViewerSession(catalogService: service, preferences: .inMemory(), policy: .mac)
+            let initial = session.refresh(force: true)
+            let deadline = ContinuousClock.now + .seconds(3)
+            while !(await gate.hasEntered) {
+                guard ContinuousClock.now < deadline else { throw LocalCatalogError.timeout }; await Task.yield()
+            }
+            session.refresh(force: true, correlationID: first)
+            session.refresh(force: true) // An anonymous owner cannot erase the identified one.
+            if multiple { session.refresh(force: true, correlationID: second); session.refresh(force: true) }
+            await gate.release(); await initial.value
+            XCTAssertEqual(session.catalogFailure?.correlationIDs, multiple ? [first, second] : [first])
+            XCTAssertEqual(session.catalogFailure?.correlationID, multiple ? nil : first)
+            let prior = session.catalogFailure?.id
+            await session.refresh(force: true).value
+            XCTAssertEqual(session.catalogFailure?.correlationIDs, [])
+            XCTAssertNotEqual(session.catalogFailure?.id, prior)
+        }
+    }
+
     func testCatalogFailureCorrelationChangesWithTheRequestingOperation() async throws {
         let service = CatalogService(initialCatalog:TestCatalog.catalog,source:CatalogSource(kind:.standard) { _, _ in throw LocalCatalogError.timeout },storage:.disabled)
         let session = ViewerSession(catalogService:service,preferences:.inMemory(),policy:.mac)

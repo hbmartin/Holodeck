@@ -1097,32 +1097,46 @@ An unchanged existing shader may be successful if it already satisfies the promp
                           "previousOutput": self.checkpoint.get("outcome"), "previousPublication": self.previous_publication(), "verificationFeedback": feedback}, indent=2)
 
     def require_checker(self):
-        """Compare data-only library expectations with the native tool's verified bundled identity."""
+        """Validate data-only expectations and distinguish launch faults from identity mismatch."""
+        fields = ('repository', 'version', 'interfaceVersion', 'sourceCommit', 'sha256')
         try:
             raw = self.read_workspace('shader_checker.lock.json', limit=65536)
-            executable = os.stat(self.config['shaderTool'])
-            key = (raw, executable.st_ino, executable.st_size, executable.st_mtime_ns)
-            if getattr(self, '_checker_identity_key', None) == key: return
             pin = json.loads(raw)
-            fields = ('repository', 'version', 'interfaceVersion', 'sourceCommit', 'sha256')
             if not isinstance(pin, dict) or pin.get('repository') != 'hbmartin/HolodeckShaderCheck':
                 raise ValueError('unapproved checker repository')
             for name, pattern in [('version', r'1\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'), ('sourceCommit', r'[0-9a-f]{40}'), ('sha256', r'[0-9a-f]{64}')]:
-                if type(pin.get(name)) is not str or re.fullmatch(pattern, pin[name]) is None:
-                    raise ValueError('invalid checker lock ' + name)
-            if type(pin.get('interfaceVersion')) is not int or pin['interfaceVersion'] != 1:
-                raise ValueError('unsupported checker interface')
-            identity = json.loads(run([self.config['shaderTool'], 'library', 'artifact-info', '--json'], self.root, self.env, timeout=5).stdout)
-            if not isinstance(identity, dict) or any(type(identity.get(name)) is not type(pin[name]) or identity[name] != pin[name] for name in fields):
-                raise ValueError('bundled checker identity differs from the selected library lock')
-            info = json.loads(run([self.config['shaderTool'], 'library', 'info', '--json', '--python', self.config['python']], self.root, self.env, timeout=5).stdout)
-            if not isinstance(info, dict) or type(info.get('interfaceVersion')) is not int or info['interfaceVersion'] != pin['interfaceVersion'] or info.get('checkerVersion') != pin['version']:
-                raise ValueError('packaged checker reports a different version or interface')
-            self._checker_identity_key = key
-        except ProcessRecoveryError:
-            raise
-        except (ValueError, TypeError, KeyError, OSError, CandidateError, OperationalError, subprocess.TimeoutExpired) as error:
-            raise OperationalError('Update Holodeck and the shader library together: ' + str(error)) from error
+                if type(pin.get(name)) is not str or re.fullmatch(pattern, pin[name]) is None: raise ValueError('invalid ' + name)
+            if type(pin.get('interfaceVersion')) is not int or pin['interfaceVersion'] != 1: raise ValueError('unsupported checker interface')
+        except (OSError, ValueError, TypeError, CandidateError) as error:
+            raise OperationalError('Selected library checker lock is invalid or unreadable: ' + str(error)) from error
+        try: executable = os.stat(self.config['shaderTool'])
+        except OSError as error: raise OperationalError('Cannot inspect the configured shader tool: ' + str(error)) from error
+        key = (raw, executable.st_ino, executable.st_size, executable.st_mtime_ns)
+        if getattr(self, '_checker_identity_key', None) == key: return
+        def probe(arguments, label):
+            try: result = run([self.config['shaderTool'], 'library', *arguments], self.root, self.env, timeout=30)
+            except ProcessRecoveryError: raise
+            except subprocess.TimeoutExpired as error:
+                raise OperationalError(label + ' timed out after 30 seconds. Retry when the native tool can start normally.') from error
+            except (OSError, OperationalError) as error:
+                raise OperationalError(label + ' could not run: ' + str(error)) from error
+            try: response = json.loads(result.stdout)
+            except (ValueError, TypeError) as error: raise OperationalError(label + ' returned malformed JSON: ' + str(error)) from error
+            if not isinstance(response, dict): raise OperationalError(label + ' returned a malformed response')
+            return response
+        identity = probe(['artifact-info', '--json'], 'Native artifact identity probe')
+        if any(type(identity.get(name)) is not type(pin[name]) for name in fields) or any(
+                re.fullmatch(pattern, identity.get(name, '')) is None for name, pattern in
+                [('version', r'[0-9]+\.[0-9]+\.[0-9]+'), ('sourceCommit', r'[0-9a-f]{40}'), ('sha256', r'[0-9a-f]{64}')]):
+            raise OperationalError('Native artifact identity probe returned malformed identity fields')
+        if any(identity[name] != pin[name] for name in fields):
+            raise OperationalError('Update Holodeck and the shader library together: bundled checker identity differs from the selected library lock')
+        info = probe(['info', '--json', '--python', self.config['python']], 'Packaged checker information probe')
+        if type(info.get('interfaceVersion')) is not int or type(info.get('checkerVersion')) is not str or re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', info['checkerVersion']) is None:
+            raise OperationalError('Packaged checker information probe returned malformed version/interface fields')
+        if info['interfaceVersion'] != pin['interfaceVersion'] or info['checkerVersion'] != pin['version']:
+            raise OperationalError('Update Holodeck and the shader library together: packaged checker reports a different version or interface')
+        self._checker_identity_key = key
 
     def technical(self, baseline=False, commands=None):
         self.require_checker()

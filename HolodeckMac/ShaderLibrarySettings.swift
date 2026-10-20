@@ -22,8 +22,8 @@ final class MacLibraryModel {
         return failure.id
     }
     func representsCatalogFailure(_ failure: ViewerSession.Failure) -> Bool {
-        guard case .catalog = failure.operation, let correlationID = failure.correlationID else { return false }
-        return errors.values.contains { $0.correlationID == correlationID }
+        guard case .catalog = failure.operation else { return false }
+        return errors.values.contains { error in error.correlationID.map { failure.correlationIDs.contains($0) } ?? false }
     }
     var error: String? { (errors[.folder] ?? errors[.server] ?? errors[.manualReload] ?? errors[.publication] ?? errors[.approval] ?? errors[.revocation])?.message }
     var previewWarnings: [ShaderPreviewWarning] = []
@@ -39,6 +39,7 @@ final class MacLibraryModel {
     @ObservationIgnored private var sleepObservers: [NSObjectProtocol] = []
     #if DEBUG
     var exposesFailureAssociationTests = false
+    var catalogAlertPresentationCount = 0
     func injectUnrelatedCatalogFailureForTesting(revocation: Bool) {
         guard exposesFailureAssociationTests else { return }
         clearError(from: .folder); clearError(from: .manualReload); clearError(from: .publication)
@@ -331,6 +332,8 @@ struct ShaderLibrarySettings: View {
                     .font(.caption).foregroundStyle(.secondary)
                 #if DEBUG
                 if library.exposesFailureAssociationTests {
+                    Text("Catalog alert presentations").accessibilityValue(String(library.catalogAlertPresentationCount))
+                        .accessibilityIdentifier("test-catalog-alert-count")
                     Button("Inject Correlated Catalog Failure") { library.injectCorrelatedCatalogFailureForTesting() }.accessibilityIdentifier("test-correlated-catalog-failure")
                     Button("Inject Approval Catalog Failure") { library.injectUnrelatedCatalogFailureForTesting(revocation: false) }.accessibilityIdentifier("test-approval-catalog-failure")
                     Button("Inject Revocation Catalog Failure") { library.injectUnrelatedCatalogFailureForTesting(revocation: true) }.accessibilityIdentifier("test-revocation-catalog-failure")

@@ -874,10 +874,25 @@ worker.main()
         for field,value in [('version','1.99.0'),('sha256','c'*64),('sourceCommit','c'*40),('repository','someone/Other'),('interfaceVersion',True)]:
             with self.subTest(field=field):
                 (self.root/'shader_checker.lock.json').write_text(json.dumps(dict(CHECKER_PIN,**{field:value})))
-                with self.assertRaisesRegex(worker_module.OperationalError,'Update Holodeck'):
+                with self.assertRaisesRegex(worker_module.OperationalError,'invalid or unreadable' if field in ('repository','interfaceVersion') else 'Update Holodeck'):
                     worker.technical()
         (self.root/'shader_checker.lock.json').write_text(json.dumps(CHECKER_PIN))
         worker.require_checker()
+
+    def test_checker_probe_timeouts_and_malformed_responses_have_specific_diagnostics(self):
+        for fault,expected in [(subprocess.TimeoutExpired('native',30),'timed out after 30 seconds'),
+                               (OSError('cannot launch'),'could not run'),
+                               (subprocess.CompletedProcess([],0,'not JSON',''),'malformed JSON')]:
+            worker=worker_module.Worker(self.config,self.job)
+            with patch.object(worker_module,'run',side_effect=fault if isinstance(fault,Exception) else None,return_value=fault) as probe:
+                with self.assertRaises(worker_module.OperationalError) as error:worker.require_checker()
+                self.assertIn(expected,str(error.exception));self.assertNotIn('Update Holodeck',str(error.exception))
+                self.assertEqual(probe.call_args.kwargs['timeout'],30)
+        worker=worker_module.Worker(self.config,self.job)
+        identity=subprocess.CompletedProcess([],0,json.dumps(CHECKER_PIN),'')
+        with patch.object(worker_module,'run',side_effect=[identity,subprocess.TimeoutExpired('python',30)]) as probe:
+            with self.assertRaisesRegex(worker_module.OperationalError,'Packaged checker information probe timed out'):worker.require_checker()
+            self.assertEqual(probe.call_args.kwargs['timeout'],30)
 
     def test_managed_communicate_preserves_large_input_across_timeouts(self):
         env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job));payload='x'*2000000

@@ -1833,6 +1833,36 @@ final class ShaderRequestTests: XCTestCase {
         let config = await service.configurationValue();XCTAssertFalse(config.enabled)
     }
 
+    func testFinalWorkerRetirementPublishesDisableEligibilityAfterCompletedDelivery() async throws {
+        let (root, script) = try recoveryFixture(), gate = RecoveryGate(), observations = DisableEligibilityRecorder()
+        let authoring = try requestAuthoringFixture(root.appendingPathComponent("authoring"))
+        try """
+        import json,sys
+        print(json.dumps({'event':'preparePublication','requiredPreviewShaderIDs':[]}),flush=True)
+        assert json.loads(sys.stdin.readline())['ok']
+        print(json.dumps({'event':'result','result':{'outputKind':'edited','shaderID':'plasma','changed':False,'summary':'Published','approximations':[]}}),flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root,
+            workerScript: script, waitForWorker: { process in try await process.waitForExit(); try await gate.wait() })
+        await service.suspend(); try await service.start(configuration: .init(repository: authoring.path, enabled: true))
+        let request = ShaderRequest(prompt: "Complete", context: try context())
+        let stream = await service.updates()
+        let observer = Task {
+            for await jobs in stream {
+                let allowed = await service.canDisableRequests()
+                await observations.record(allowed, completed: jobs.first { $0.id == request.id }?.stage == .completed)
+            }
+        }
+        defer { observer.cancel(); Task { await gate.release() } }
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        await service.resume(); try await waitFor { await gate.hasEntered }
+        let result = await service.allJobs().first?.result
+        _ = try await service.control(operation: "requestActivated", payload: .init(requestID: request.id, sourceHash: result?.deliveredSourceHash), deviceID: "TV")
+        try await waitFor { await observations.completedWhileBlocked }
+        await gate.release()
+        try await waitFor { await observations.lastAllowed }
+    }
+
     func testNativeGroupObservationRetriesTransientFailuresAndNeverReturnsFalseEmptyGroup() throws {
         let current = try XCTUnwrap(RequestProcessIdentity(pid: getpid()))
         var attempts = 0, delays: [TimeInterval] = []
@@ -2085,5 +2115,16 @@ private actor JournalVisitRecorder {
     private var visits: [String: Int] = [:]
     func record(_ journal: URL) { visits[RequestPaths.canonical(journal), default: 0] += 1 }
     func count(_ journal: URL) -> Int { visits[RequestPaths.canonical(journal), default: 0] }
+}
+#endif
+
+#if os(macOS)
+private actor DisableEligibilityRecorder {
+    private(set) var completedWhileBlocked = false
+    private(set) var lastAllowed = false
+    func record(_ allowed: Bool, completed: Bool) {
+        lastAllowed = allowed
+        if completed && !allowed { completedWhileBlocked = true }
+    }
 }
 #endif
