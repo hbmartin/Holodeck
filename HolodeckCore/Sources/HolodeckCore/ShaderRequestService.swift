@@ -131,6 +131,7 @@ public actor ShaderRequestService {
     private let waitForWorker: @Sendable (RequestWorkerProcess) async throws -> Void
     private let reconcileWorker: @Sendable (URL) async throws -> Void
     private let recoveryWriter: @Sendable (Data, URL) throws -> Void
+    private let prepareCleanup: @Sendable () async -> Void
     private var configuration = ShaderRequestConfiguration()
     private var records: [UUID: Record] = [:]
     private var observers: [UUID: AsyncStream<[ShaderRequestStatus]>.Continuation] = [:]
@@ -188,13 +189,16 @@ public actor ShaderRequestService {
         self.waitForWorker = { try await $0.waitForExit() }
         self.reconcileWorker = { try RequestWorkerProcess.reconcileOrphan(in: $0) }
         self.recoveryWriter = { try $0.write(to: $1, options: .atomic) }
+        self.prepareCleanup = {}
     }
     init(catalog: DirectoryCatalog, directory: URL, workerScript: URL,
          reconcileWorker: @escaping @Sendable (URL) async throws -> Void = { try RequestWorkerProcess.reconcileOrphan(in: $0) },
          waitForWorker: @escaping @Sendable (RequestWorkerProcess) async throws -> Void = { try await $0.waitForExit() },
-         recoveryWriter: @escaping @Sendable (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) }) {
+         recoveryWriter: @escaping @Sendable (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) },
+         prepareCleanup: @escaping @Sendable () async -> Void = {}) {
         self.catalog = catalog; self.directory = directory; self.workerScript = workerScript
         self.reconcileWorker = reconcileWorker; self.waitForWorker = waitForWorker; self.recoveryWriter = recoveryWriter
+        self.prepareCleanup = prepareCleanup
     }
     private func workerProcess() -> RequestWorkerProcess { RequestWorkerProcess(script: workerScript) }
 
@@ -657,6 +661,42 @@ public actor ShaderRequestService {
         try await reconcileWorkers()
     }
 
+    private typealias DetachmentTarget = (journal: URL, requestID: UUID?, checkout: ShaderRequestConfiguration)
+    private func detachmentTargets(for selected: ShaderRequestConfiguration) -> [String: DetachmentTarget] {
+        var targets: [String: DetachmentTarget] = [:]
+        func add(_ journal: URL, _ id: UUID?, _ checkout: ShaderRequestConfiguration) {
+            let key = RequestPaths.canonical(journal)
+            targets[key] = (URL(fileURLWithPath: key), id, checkout)
+        }
+        let paths = Self.canonicalRepositories([selected.repository] + records.values.map { $0.configuration.repository })
+        for (id, record) in records where Self.samePublicationCheckout(record.configuration, selected, paths: paths) {
+            add(folder(id), id, record.configuration)
+        }
+        for entry in recovery.entries.values {
+            if let checkout = entry.configuration, Self.samePublicationCheckout(checkout, selected) {
+                add(URL(fileURLWithPath: entry.journal), entry.requestID, checkout)
+            }
+        }
+        for name in ["setup", "publication"] {
+            let journal = directory.appendingPathComponent(name)
+            if let checkout = try? Self.savedConfiguration(in: journal), Self.samePublicationCheckout(checkout, selected) {
+                let key = RequestPaths.canonical(journal)
+                if targets[key] == nil { add(journal, nil, checkout) }
+            }
+        }
+        if targets.isEmpty { add(directory.appendingPathComponent("detachment"), nil, selected) }
+        return targets
+    }
+    private func markPendingDetachment(_ targets: [String: DetachmentTarget]) {
+        for (key, target) in targets {
+            var entry = recovery.entries[key] ?? .init(journal: key, requestID: target.requestID,
+                configuration: target.checkout, disposition: .detach, message: "")
+            entry.disposition = .detach
+            entry.message = "Detachment is pending until worker processes are confirmed stopped."
+            recovery.entries[key] = entry
+        }
+    }
+
     public func detachCheckout(_ target: ShaderCheckoutDetachTarget) async throws {
         guard !selectingRepository else { throw ShaderRequestError.unavailable("Wait for the selected folder to finish loading before detaching.") }
         guard !detaching else { throw ShaderRequestError.unavailable("Checkout detachment is already in progress.") }
@@ -682,27 +722,8 @@ public actor ShaderRequestService {
         detaching = true
         defer { detaching = false; kick() }
         // Reserve detachment before yielding. Existing maintenance owns its lease until it retires.
-        var targets = ids.map { (folder($0), Optional($0), records[$0]!.configuration) }
-        for entry in recovery.entries.values where entry.configuration.map({ Self.samePublicationCheckout($0, selected) }) == true {
-            let journal = URL(fileURLWithPath: entry.journal)
-            if !targets.contains(where: { RequestPaths.canonical($0.0) == entry.journal }) {
-                targets.append((journal, entry.requestID, entry.configuration!))
-            }
-        }
-        for name in ["setup", "publication"] {
-            let journal = directory.appendingPathComponent(name)
-            if let checkout = try? Self.savedConfiguration(in: journal), Self.samePublicationCheckout(checkout, selected),
-               !targets.contains(where: { $0.0 == journal }) { targets.append((journal, nil, checkout)) }
-        }
-        if targets.isEmpty { targets.append((directory.appendingPathComponent("detachment"), nil, selected)) }
-        for (journal, requestID, checkout) in targets {
-            let key = RequestPaths.canonical(journal)
-            var entry = recovery.entries[key] ?? .init(journal: key, requestID: requestID, configuration: checkout,
-                disposition: .detach, message: "")
-            entry.disposition = .detach
-            entry.message = "Detachment is pending until worker processes are confirmed stopped."
-            recovery.entries[key] = entry
-        }
+        var targets = detachmentTargets(for: selected)
+        markPendingDetachment(targets)
         configuration.enabled = false; execution?.interrupted = true
         try persistRecovery(); try persist()
         try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
@@ -718,7 +739,12 @@ public actor ShaderRequestService {
             if reconciliationTask?.id == attempt.id { reconciliationTask = nil }
         }
         reconciliationKickID = nil
-        for (journal, _, checkout) in targets {
+        // Work can discover an additional recovery journal while it is draining.
+        targets.merge(detachmentTargets(for: selected)) { _, current in current }
+        markPendingDetachment(targets)
+        try persistRecovery(); try persist()
+        for (_, target) in targets.sorted(by: { $0.key < $1.key }) {
+            let (journal, _, checkout) = target
             do { try await reconcileWorker(journal) }
             catch {
                 if error is RequestWorkerTeardownError {
@@ -733,11 +759,11 @@ public actor ShaderRequestService {
                 }
             }
         }
-        for (journal, _, _) in targets {
+        for (journal, _, _) in targets.values {
             if let entry = recovery.entries[RequestPaths.canonical(journal)] { try finalizeDetachment(entry) }
         }
         try persist()
-        for (journal, _, _) in targets { recovery.entries[RequestPaths.canonical(journal)] = nil }
+        for key in targets.keys { recovery.entries[key] = nil }
         reconciled = false; reconciliationTask = nil; reconciliationKickID = nil
         if let entry = recovery.entries.values.first {
             reconciliationFailure = entry.message; reconciliationJournal = URL(fileURLWithPath: entry.journal)
@@ -1148,12 +1174,17 @@ public actor ShaderRequestService {
     }
     private func cleanup(_ id: UUID, operation: UUID) async {
         guard let record = records[id] else { finishWorker(id); return }
-        let process = workerProcess(); activeProcess = process
+        await prepareCleanup()
+        let process = workerProcess()
         do {
+            try checkExecution(operation)
+            activeProcess = process
             let job = folder(id)
             try await reconcileWorker(job)
+            try checkExecution(operation)
             var discarded = false
             for try await event in process.run(mode: "discard", configuration: record.configuration, directory: job) {
+                try checkExecution(operation)
                 if event.event == "failure" { throw ShaderRequestError.unavailable(event.message ?? "Cleanup failed") }
                 if event.event == "discarded" { discarded = true }
             }

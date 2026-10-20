@@ -408,10 +408,15 @@ class Worker:
                     if not expected:
                         quarantine.mkdir(parents=True, exist_ok=True, mode=0o700)
                         destination = quarantine / str(uuid.uuid4())
+                        record = destination.with_name(destination.name + '.json')
+                        write(record, {'originalPath': '/'.join(parts[:index + 1])})
+                        with record.open('rb') as metadata: os.fsync(metadata.fileno())
+                        parent = os.open(quarantine, os.O_RDONLY | os.O_DIRECTORY)
+                        try: os.fsync(parent)
+                        finally: os.close(parent)
                         try: os.rename(part, destination, src_dir_fd=fd)
                         except OSError as error:
                             raise OperationalError('Cannot quarantine owned obstruction ' + name + '; files retained: ' + str(error)) from error
-                        write(destination.with_name(destination.name + '.json'), {'originalPath': '/'.join(parts[:index + 1])})
                         break
                     if not leaf:
                         child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)

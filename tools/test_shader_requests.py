@@ -909,6 +909,27 @@ worker.main()
         self.assertEqual(json.loads(record.read_text())['originalPath'],name)
         self.assertLess(len(record.name),64);self.assertEqual(target.read_text(),'outside')
 
+    def test_quarantine_metadata_failure_leaves_original_in_place(self):
+        worker=worker_module.Worker(self.config,self.job)
+        target=self.base/'retained';target.write_bytes(b'original bytes')
+        obstruction=self.root/'obstruction';obstruction.symlink_to(target)
+        with patch.object(worker_module,'write',side_effect=OSError('metadata unavailable')):
+            with self.assertRaisesRegex(OSError,'metadata unavailable'):
+                worker.quarantine_obstructions(['obstruction'])
+        self.assertTrue(obstruction.is_symlink());self.assertEqual(target.read_bytes(),b'original bytes')
+        self.assertEqual(list((worker.gitdir/'holodeck-recovery'/self.job.name).iterdir()),[])
+
+    def test_quarantine_rename_failure_retains_original_path_record(self):
+        worker=worker_module.Worker(self.config,self.job)
+        target=self.base/'retained';target.write_bytes(b'original bytes')
+        obstruction=self.root/'obstruction';obstruction.symlink_to(target)
+        with patch.object(worker_module.os,'rename',side_effect=OSError('rename unavailable')):
+            with self.assertRaisesRegex(worker_module.OperationalError,'rename unavailable'):
+                worker.quarantine_obstructions(['obstruction'])
+        self.assertTrue(obstruction.is_symlink())
+        records=list((worker.gitdir/'holodeck-recovery'/self.job.name).glob('*.json'))
+        self.assertEqual(len(records),1);self.assertEqual(json.loads(records[0].read_bytes())['originalPath'],'obstruction')
+
     def test_late_fork_during_termination_retains_evidence_and_blocks_handoff(self):
         env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job));marker=self.base/'late-child'
         code="""import signal,subprocess,sys,time

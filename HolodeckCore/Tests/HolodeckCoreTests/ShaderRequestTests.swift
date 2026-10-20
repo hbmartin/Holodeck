@@ -1833,6 +1833,56 @@ final class ShaderRequestTests: XCTestCase {
         let config = await service.configurationValue();XCTAssertFalse(config.enabled)
     }
 
+    func testDetachPreventsScheduledDiscardAndIncludesJournalCreatedWhileDraining() async throws {
+        for _ in 0..<10 {
+            let (root, script) = try recoveryFixture(), gate = RequestPreparationGate()
+            let seed = try await recoveryService(root, script: script)
+            let config = ShaderRequestConfiguration(repository: root.path, enabled: true)
+            let request = ShaderRequest(prompt: "Keep unpublished work", context: try context())
+            _ = try await seed.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+            try await seed.cancelQueued(request.id)
+            let job = root.appendingPathComponent(request.id.uuidString), patch = job.appendingPathComponent("owned-patch")
+            let bytes = Data("unpublished work\r\n".utf8); try bytes.write(to: patch)
+            let journal = root.appendingPathComponent("journal.json")
+            var records = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: journal)) as? [[String: Any]])
+            records[0]["cleanupPending"] = true
+            try JSONSerialization.data(withJSONObject: records).write(to: journal)
+            let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")),
+                directory: root, workerScript: script, prepareCleanup: { await gate.hold() })
+            await service.suspend(); try await service.start(configuration: config); await service.resume()
+            try await waitFor { await gate.entered }
+            let detach = Task { try await service.detachCheckout(.request(request.id)) }
+            try await waitFor { await service.recoveryStatuses().contains { $0.disposition == .detach } }
+            let publication = root.appendingPathComponent("publication")
+            try FileManager.default.createDirectory(at: publication, withIntermediateDirectories: true)
+            try JSONEncoder().encode(config).write(to: publication.appendingPathComponent("configuration.json"))
+            try Data("{}".utf8).write(to: publication.appendingPathComponent("process.json"))
+            await gate.release(); try await detach.value
+            XCTAssertEqual(try Data(contentsOf: patch), bytes)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: job.appendingPathComponent("cleanup-started").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: publication.appendingPathComponent("process.json").path))
+            let statuses = await service.recoveryStatuses(); XCTAssertTrue(statuses.isEmpty)
+        }
+    }
+
+    func testDetachReconcilesCanonicalJournalOnlyOnceAcrossDirectoryAlias() async throws {
+        let (root, script) = try recoveryFixture(), visits = JournalVisitRecorder()
+        let alias = root.appendingPathComponent("alias"), setup = root.appendingPathComponent("setup")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: root)
+        try FileManager.default.createDirectory(at: setup, withIntermediateDirectories: true)
+        let config = ShaderRequestConfiguration(repository: root.path)
+        try JSONEncoder().encode(config).write(to: setup.appendingPathComponent("configuration.json"))
+        let entry = RequestRecoveryStore.Entry(journal: RequestPaths.canonical(setup), requestID: nil,
+            configuration: config, disposition: .resume, message: "Retained")
+        var store = RequestRecoveryStore(); store.entries[entry.journal] = entry
+        try JSONEncoder().encode(store).write(to: root.appendingPathComponent("recovery.json"))
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")),
+            directory: alias, workerScript: script, reconcileWorker: { await visits.record($0) })
+        try await service.initialize(configuration: config)
+        try await service.detachCheckout(.recovery(entry.id))
+        let count = await visits.count(setup); XCTAssertEqual(count, 1)
+    }
+
     func testDetachCancelsVerificationBeforeWorkerLaunchAndWaitsForLease() async throws {
         for _ in 0..<10 {
             let (root, script) = try recoveryFixture(), gate = RequestPreparationGate()
@@ -1961,5 +2011,13 @@ private final class RecoveryWriteProbe: @unchecked Sendable {
         lock.withLock { if first == nil { first = entry } }
     }
     var firstSelection: RequestRecoveryStore.Entry? { lock.withLock { first } }
+}
+#endif
+
+#if os(macOS)
+private actor JournalVisitRecorder {
+    private var visits: [String: Int] = [:]
+    func record(_ journal: URL) { visits[RequestPaths.canonical(journal), default: 0] += 1 }
+    func count(_ journal: URL) -> Int { visits[RequestPaths.canonical(journal), default: 0] }
 }
 #endif
