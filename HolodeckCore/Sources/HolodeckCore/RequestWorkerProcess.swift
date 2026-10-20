@@ -18,40 +18,111 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
         self.pid = pid; seconds = info.pbi_start_tvsec; microseconds = info.pbi_start_tvusec
     }
     var isCurrent: Bool { Self(pid: pid) == self }
-    static func group(_ pid: Int32) -> [Self] {
-        var pids = [Int32](repeating: 0, count: 8192)
-        let bytes = pids.withUnsafeMutableBytes { proc_listpids(UInt32(PROC_PGRP_ONLY), UInt32(pid), $0.baseAddress, Int32($0.count)) }
-        guard bytes > 0 else { return [] }
-        return pids.prefix(Int(bytes) / MemoryLayout<Int32>.size).compactMap { Self(pid: $0) }
+    static func group(_ pid: Int32) -> [Self] { (try? checkedGroup(pid)) ?? [] }
+    static func checkedGroup(_ pid: Int32) throws -> [Self] {
+        try retryGroupObservation { try enumerateGroup(pid) }
     }
-    struct Observation { var identities: [RequestProcessIdentity]; var uncertainty: String? }
+    static func retryGroupObservation(_ read: () throws -> [Self], wait: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }) throws -> [Self] {
+        for attempt in 0..<3 {
+            do { return try read() }
+            catch { if attempt == 2 { throw error }; wait(0.25) }
+        }
+        preconditionFailure("Exhausted process observation attempts")
+    }
+    private static func enumerateGroup(_ pid: Int32) throws -> [Self] {
+        var capacity = 1024
+        while capacity <= 262144 {
+            var pids = [Int32](repeating: 0, count: capacity)
+            errno = 0
+            let bytes = pids.withUnsafeMutableBytes { proc_listpids(UInt32(PROC_PGRP_ONLY), UInt32(pid), $0.baseAddress, Int32($0.count)) }
+            guard bytes >= 0, bytes != 0 || errno == 0 else { throw RequestWorkerTeardownError(cause: "Cannot enumerate owned process group.") }
+            if bytes < capacity * MemoryLayout<Int32>.size {
+                guard bytes % Int32(MemoryLayout<Int32>.size) == 0 else { throw RequestWorkerTeardownError(cause: "Invalid process group enumeration.") }
+                return pids.prefix(Int(bytes) / MemoryLayout<Int32>.size).compactMap { Self(pid: $0) }
+            }
+            capacity *= 2
+        }
+        throw RequestWorkerTeardownError(cause: "Process group enumeration exceeds its capacity.")
+    }
+    struct Supervision: Decodable {
+        let formatVersion: Int
+        let supervisor: RequestProcessIdentity
+        let command: RequestProcessIdentity?
+        let state: String
+        let failure: String?
+        let failureKind: String?
+        let recoveryRequired: Bool?
+    }
+    struct Observation {
+        var identities: [RequestProcessIdentity]
+        var uncertainty: String?
+        var sessions: [RequestProcessIdentity: [RequestProcessIdentity]] = [:]
+    }
     static func observe(in directory: URL, known additional: [Self] = []) throws -> Observation {
         struct Entry: Decodable { let leader: RequestProcessIdentity; let members: [RequestProcessIdentity] }
+        let supervisionFile = directory.appendingPathComponent("supervision.json")
+        let supervision: Supervision?
+        if FileManager.default.fileExists(atPath: supervisionFile.path) {
+            do { supervision = try JSONDecoder().decode(Supervision.self, from: BoundedCatalogReader(root: directory).read("supervision.json", limit: CatalogLimits.headBytes).bytes) }
+            catch {
+                if FileManager.default.fileExists(atPath: supervisionFile.path) { throw error }
+                supervision = nil
+            }
+            if let value = supervision {
+                guard value.formatVersion == 1, value.supervisor.pid > 1,
+                      ["starting", "running", "draining", "settled", "failed"].contains(value.state) else {
+                    throw ShaderRequestError.unavailable("Invalid supervision evidence. Repair the journal or detach while retaining its files.")
+                }
+                if value.recoveryRequired == true, value.failureKind == "pipeDrain" {
+                    throw ShaderRequestError.unavailable(value.failure ?? "External pipe ownership is unresolved. Repair or detach while retaining its evidence.")
+                }
+            }
+        } else { supervision = nil }
         let marker = directory.appendingPathComponent("children.json")
-        guard FileManager.default.fileExists(atPath: marker.path) else { return Observation(identities: []) }
+        guard FileManager.default.fileExists(atPath: marker.path) else {
+            if let supervision, supervision.supervisor.isCurrent {
+                throw RequestWorkerTeardownError(cause: "Live supervisor has no process registry.")
+            }
+            return Observation(identities: [])
+        }
         let entries: [Entry]
         do { entries = try JSONDecoder().decode([Entry].self, from: BoundedCatalogReader(root: directory).read("children.json", limit: CatalogLimits.headBytes).bytes) }
         catch {
             if !FileManager.default.fileExists(atPath: marker.path) { return Observation(identities: []) }
             throw error
         }
-        guard entries.allSatisfy({ $0.leader.pid > 1 && $0.members.allSatisfy { $0.pid > 1 } }) else {
+        guard entries.allSatisfy({ $0.leader.pid > 1 && $0.members.allSatisfy { $0.pid > 1 } }),
+              supervision == nil || entries.contains(where: { $0.leader == supervision?.supervisor }) else {
             throw ShaderRequestError.unavailable("Invalid validation process registry. Retain the journal and repair or detach this checkout.")
         }
         var result = Observation(identities: [])
         for entry in entries {
             let known = (entry.members + additional).filter(\.isCurrent)
-            if entry.leader.isCurrent { result.identities += known + group(entry.leader.pid) }
-            else {
+            if entry.leader.isCurrent {
+                let observed = try checkedGroup(entry.leader.pid)
+                result.identities += Array(Set(known + observed))
+                if entry.leader == supervision?.supervisor {
+                    result.sessions[entry.leader] = Array(Set(entry.members.filter(\.isCurrent) + observed))
+                }
+            } else {
                 result.identities += known
-                // A retired leader is never proof for adopting new group members.
+                // A retired anchor does not authorize adopting unfamiliar identities.
                 if Self(pid: entry.leader.pid) == nil,
-                   group(entry.leader.pid).contains(where: { !known.contains($0) }) {
+                   try checkedGroup(entry.leader.pid).contains(where: { !known.contains($0) }) {
                     result.uncertainty = "Unverified validation descendants remain."
                 }
             }
         }
         return result
+    }
+    static func shutdownTargets(_ identities: [Self], sessions: [Self: [Self]], signal: Int32) -> [Self] {
+        identities.filter { identity in
+            if let members = sessions[identity] {
+                return signal == SIGTERM || !members.contains(where: { $0 != identity && $0.isCurrent })
+            }
+            if signal == SIGTERM, sessions.values.contains(where: { $0.contains(identity) }) { return false }
+            return true
+        }
     }
     static func signal(_ identities: [Self], _ signal: Int32) {
         for identity in identities where identity.isCurrent { _ = kill(identity.pid, signal) }
@@ -122,6 +193,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     private var registryError: Error?
     private var leader: RequestProcessIdentity?
     private var owned: [Int32: RequestProcessIdentity] = [:]
+    private var supervisedSessions: [RequestProcessIdentity: [RequestProcessIdentity]] = [:]
     private var journal: URL?
     private var workerConfiguration: ShaderRequestConfiguration?
     private var firstError: Error?
@@ -161,6 +233,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         if let journal {
             do {
                 let observation = try RequestProcessIdentity.observe(in: journal, known: Array(owned.values))
+                supervisedSessions = observation.sessions
                 for identity in observation.identities { owned[identity.pid] = identity }
                 registryError = observation.uncertainty.map { RequestWorkerTeardownError(cause: $0) } ?? rootUncertainty
             } catch { registryError = error }
@@ -168,7 +241,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     }
     private func signalPendingLocked() {
         let signal = escalated || stopTime.map({ groups.now() - $0 >= 5 }) == true ? SIGKILL : SIGTERM
-        for identity in owned.values where groups.identity(identity.pid) == identity {
+        for identity in RequestProcessIdentity.shutdownTargets(Array(owned.values), sessions: supervisedSessions, signal: signal) where groups.identity(identity.pid) == identity {
             if signal == SIGTERM {
                 guard termSent.insert(identity).inserted else { continue }
             } else { guard killSent.insert(identity).inserted else { continue } }
@@ -278,6 +351,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     if let failure = lock.withLock({ firstError }) { throw failure }
                     try? FileManager.default.removeItem(at: directory.appendingPathComponent("process.json"))
                     try? FileManager.default.removeItem(at: directory.appendingPathComponent("children.json"))
+                    try? FileManager.default.removeItem(at: directory.appendingPathComponent("supervision.json"))
                     if lock.withLock({ cancelRequested }) { throw CancellationError() }
                     if process.terminationStatus != 0 { throw ShaderRequestError.unavailable("Worker exited \(process.terminationStatus). See its retained log.") }
                     continuation.finish()
@@ -322,13 +396,14 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
             let observation = try RequestProcessIdentity.observe(in: directory, known: targets)
             targets = Array(Set((targets + observation.identities).filter(\.isCurrent)))
             let signal = ProcessInfo.processInfo.systemUptime >= deadline - 5 ? SIGKILL : SIGTERM
-            let pending = targets.filter { identity in
+            let pending = RequestProcessIdentity.shutdownTargets(targets, sessions: observation.sessions, signal: signal).filter { identity in
                 signal == SIGTERM ? termSent.insert(identity).inserted : killSent.insert(identity).inserted
             }
             RequestProcessIdentity.signal(pending, signal)
             if observation.uncertainty == nil, !targets.contains(where: \.isCurrent) {
                 try? FileManager.default.removeItem(at: file)
-                try? FileManager.default.removeItem(at: directory.appendingPathComponent("children.json")); return
+                try? FileManager.default.removeItem(at: directory.appendingPathComponent("children.json"))
+                try? FileManager.default.removeItem(at: directory.appendingPathComponent("supervision.json")); return
             }
             guard ProcessInfo.processInfo.systemUptime < deadline else { throw RequestWorkerTeardownError(cause: observation.uncertainty) }
             Thread.sleep(forTimeInterval: 0.025)

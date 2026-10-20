@@ -43,6 +43,7 @@ nonisolated public struct ShaderRequestConfiguration: Codable, Sendable, Equatab
 
 nonisolated struct RequestWorkerEvent: Decodable, Sendable {
     var event: String
+    var recoveryRequired: Bool?
     var stage: String?
     var message: String?
     var question: String?
@@ -581,7 +582,7 @@ public actor ShaderRequestService {
     }
 
     nonisolated private static func hasProcessEvidence(_ journal: URL) -> Bool {
-        ["process.json", "children.json"].contains { FileManager.default.fileExists(atPath: journal.appendingPathComponent($0).path) }
+        ["process.json", "children.json", "supervision.json"].contains { FileManager.default.fileExists(atPath: journal.appendingPathComponent($0).path) }
     }
     private func persistRecovery() throws {
         try recoveryWriter(JSONEncoder().encode(recovery), directory.appendingPathComponent("recovery.json"))
@@ -751,7 +752,7 @@ public actor ShaderRequestService {
                     holdForRecovery(journal: journal, configuration: checkout, error: error); throw error
                 }
                 // Explicit detachment retains unverifiable markers without signalling them.
-                for name in ["process", "children"] {
+                for name in ["process", "children", "supervision"] {
                     let marker = journal.appendingPathComponent(name + ".json")
                     if FileManager.default.fileExists(atPath: marker.path) {
                         try FileManager.default.moveItem(at: marker, to: journal.appendingPathComponent(name + "-detached-" + UUID().uuidString + ".json"))
@@ -820,7 +821,7 @@ public actor ShaderRequestService {
                 switch event.event {
                 case "preparePublication": try await preparePublication(event, process: process, operation: operation)
                 case "publicationReady": ready = true
-                case "failure": throw ShaderRequestError.unavailable(event.message ?? "Publication rebuild failed")
+                case "failure": throw workerFailure(event)
                 default: break
                 }
             }
@@ -879,6 +880,15 @@ public actor ShaderRequestService {
     private func stopAndDrain(_ process: RequestWorkerProcess) async -> Error? {
         process.stop()
         do { try await settleProcess(process); return nil } catch { return error }
+    }
+
+    private func workerFailure(_ event: RequestWorkerEvent) -> Error {
+        let message = event.message ?? "Shader worker failed"
+        guard event.recoveryRequired == true else { return ShaderRequestError.unavailable(message) }
+        let failure = RequestWorkerTeardownError(cause: message)
+        holdForRecovery(journal: activeProcess?.recoveryTarget?.directory ?? activeID.map(folder) ?? directory.appendingPathComponent("publication"),
+            configuration: activeProcess?.recoveryTarget?.configuration ?? configurationForActiveWorker, error: failure)
+        return failure
     }
 
     private func checkExecution(_ id: UUID) throws {
@@ -962,7 +972,7 @@ public actor ShaderRequestService {
         do {
             for try await event in process.run(mode: "preflight", configuration: candidate, directory: directory.appendingPathComponent("setup")) {
                 try checkExecution(operation.id)
-                if event.event == "failure" { throw ShaderRequestError.unavailable(event.message ?? "Setup failed") }
+                if event.event == "failure" { throw workerFailure(event) }
                 if event.event == "preflight" { verified = true; candidate.checkoutID = event.checkoutID }
             }
             try await settleProcess(process)
@@ -1185,7 +1195,7 @@ public actor ShaderRequestService {
             var discarded = false
             for try await event in process.run(mode: "discard", configuration: record.configuration, directory: job) {
                 try checkExecution(operation)
-                if event.event == "failure" { throw ShaderRequestError.unavailable(event.message ?? "Cleanup failed") }
+                if event.event == "failure" { throw workerFailure(event) }
                 if event.event == "discarded" { discarded = true }
             }
             try await settleProcess(process)
@@ -1222,8 +1232,10 @@ public actor ShaderRequestService {
         let process = workerProcess(); activeProcess = process
         var outcomeSeen = false
         do {
+            try checkExecution(operation)
             let job = folder(id)
             try await reconcileWorker(job)
+            try checkExecution(operation)
             for try await event in process.run(mode: "run", configuration: record.configuration, directory: job) {
                 try checkExecution(operation)
                 switch event.event {
@@ -1269,7 +1281,7 @@ public actor ShaderRequestService {
                     try update(id, stage: records[id]?.revoked == true ? .failed : .awaitingActivation,
                                message: records[id]?.revoked == true ? "Pushed successfully; TV access was revoked" : "Waiting for the TV to play the result")
                     outcomeSeen = true
-                case "failure": throw ShaderRequestError.unavailable(event.message ?? "Shader request failed")
+                case "failure": throw workerFailure(event)
                 default: break
                 }
             }

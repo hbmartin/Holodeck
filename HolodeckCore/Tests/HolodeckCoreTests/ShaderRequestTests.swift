@@ -1833,6 +1833,72 @@ final class ShaderRequestTests: XCTestCase {
         let config = await service.configurationValue();XCTAssertFalse(config.enabled)
     }
 
+    func testNativeGroupObservationRetriesTransientFailuresAndNeverReturnsFalseEmptyGroup() throws {
+        let current = try XCTUnwrap(RequestProcessIdentity(pid: getpid()))
+        var attempts = 0, delays: [TimeInterval] = []
+        let recovered = try RequestProcessIdentity.retryGroupObservation({
+            attempts += 1
+            if attempts < 3 { throw POSIXError(.EINTR) }
+            return [current]
+        }, wait: { delays.append($0) })
+        XCTAssertEqual(recovered, [current]); XCTAssertEqual(attempts, 3); XCTAssertEqual(delays, [0.25, 0.25])
+        attempts = 0; delays = []
+        XCTAssertThrowsError(try RequestProcessIdentity.retryGroupObservation({
+            attempts += 1; throw POSIXError(.EIO)
+        }, wait: { delays.append($0) }))
+        XCTAssertEqual(attempts, 3); XCTAssertEqual(delays, [0.25, 0.25])
+    }
+
+    func testNativeWorkerAcceptsSuccessfulCommandWithLateHelperAndRetainedSupervisor() async throws {
+        let (root, script) = try recoveryFixture()
+        let bundled = try XCTUnwrap(RequestWorkerProcess.bundledScript)
+        try """
+        import contextlib,importlib.util,json,os,sys
+        from pathlib import Path
+        with contextlib.suppress(PermissionError): os.setsid()
+        spec=importlib.util.spec_from_file_location('w',\(String(reflecting: bundled.path)))
+        w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
+        job=Path(sys.argv[3]);env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(job))
+        code="import subprocess,sys;from pathlib import Path;p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);Path(sys.argv[1]).write_text(str(p.pid));print('finished')"
+        result=w.managed_run([sys.executable,'-c',code,str(job/'late-helper')],job,env,5,None)
+        assert result.returncode==0
+        print(json.dumps({'event':'preflight'}),flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let job = root.appendingPathComponent("native-supervisor"), process = RequestWorkerProcess(script: script)
+        var ready = false
+        for try await event in process.run(mode: "preflight", configuration: .init(repository: root.path), directory: job) {
+            if event.event == "preflight" { ready = true }
+        }
+        try await process.waitForExit(); XCTAssertTrue(ready)
+        let pid = try XCTUnwrap(Int32(String(contentsOf: job.appendingPathComponent("late-helper"), encoding: .utf8)))
+        XCTAssertNil(RequestProcessIdentity(pid: pid))
+        for name in ["process.json", "children.json", "supervision.json"] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: job.appendingPathComponent(name).path))
+        }
+    }
+
+    func testWorkerRecoveryFailureRetainsPatchWithoutDiscardIntent() async throws {
+        let (root, script) = try recoveryFixture()
+        try """
+        import json,sys
+        from pathlib import Path
+        job=Path(sys.argv[3]);(job/'owned-patch').write_bytes(b'keep these bytes')
+        print(json.dumps({'event':'failure','message':'External pipe ownership unresolved','recoveryRequired':True}),flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let service = try await recoveryService(root, script: script)
+        let request = ShaderRequest(prompt: "Keep recovery work", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        await service.resume()
+        try await waitFor { await service.recoveryStatuses().contains { $0.disposition == .resume } }
+        let job = root.appendingPathComponent(request.id.uuidString)
+        XCTAssertEqual(try Data(contentsOf: job.appendingPathComponent("owned-patch")), Data("keep these bytes".utf8))
+        let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("journal.json"))) as? [[String: Any]])
+        XCTAssertNotEqual(rows.first?["cleanupPending"] as? Bool, true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: job.appendingPathComponent("cleanup-started").path))
+        let store = try JSONDecoder().decode(RequestRecoveryStore.self, from: Data(contentsOf: root.appendingPathComponent("recovery.json")))
+        XCTAssertEqual(store.entries[RequestPaths.canonical(job)]?.disposition, .resume)
+    }
+
     func testDetachPreventsScheduledDiscardAndIncludesJournalCreatedWhileDraining() async throws {
         for _ in 0..<10 {
             let (root, script) = try recoveryFixture(), gate = RequestPreparationGate()
