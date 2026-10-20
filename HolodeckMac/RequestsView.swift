@@ -87,6 +87,11 @@ struct RequestSettingsView: View {
             ForEach(model.recoveries) { recovery in
                 CheckoutRecoveryView(model: model, recovery: recovery)
             }
+            #if DEBUG
+            if model.isStartupSelectionHeld {
+                Button("Finish Startup Selection", action: model.finishStartupSelection).accessibilityIdentifier("finish-startup-selection")
+            }
+            #endif
             Text(model.configuration.enabled ? "Requests enabled" : model.message).accessibilityIdentifier("request-setup-status")
             if let error = model.error { Text(error).foregroundStyle(.red).textSelection(.enabled) }
             Text("Requires Codex login, Git credentials and identity, Python 3.9 or later, and Xcode Metal compilers. Implementation and independent image review share this model setting. Verify setup again to apply changed settings.")

@@ -41,6 +41,10 @@ final class MacUITestDriver {
     }
 
     func didPresentFailure(in model: MacModel) {
+        if model.library?.exposesFailureAssociationTests == true,
+           let failure = model.session.failure, case .catalog = failure.operation {
+            model.library?.catalogAlertPresentationCount += 1
+        }
         if repeatsRendererInstallation, model.startupError != nil {
             repeatsRendererInstallation = false
             // Detect replacing this sheet even when the replacement has identical text.

@@ -874,10 +874,25 @@ worker.main()
         for field,value in [('version','1.99.0'),('sha256','c'*64),('sourceCommit','c'*40),('repository','someone/Other'),('interfaceVersion',True)]:
             with self.subTest(field=field):
                 (self.root/'shader_checker.lock.json').write_text(json.dumps(dict(CHECKER_PIN,**{field:value})))
-                with self.assertRaisesRegex(worker_module.OperationalError,'Update Holodeck'):
+                with self.assertRaisesRegex(worker_module.OperationalError,'invalid or unreadable' if field in ('repository','interfaceVersion') else 'Update Holodeck'):
                     worker.technical()
         (self.root/'shader_checker.lock.json').write_text(json.dumps(CHECKER_PIN))
         worker.require_checker()
+
+    def test_checker_probe_timeouts_and_malformed_responses_have_specific_diagnostics(self):
+        for fault,expected in [(subprocess.TimeoutExpired('native',30),'timed out after 30 seconds'),
+                               (OSError('cannot launch'),'could not run'),
+                               (subprocess.CompletedProcess([],0,'not JSON',''),'malformed JSON')]:
+            worker=worker_module.Worker(self.config,self.job)
+            with patch.object(worker_module,'run',side_effect=fault if isinstance(fault,Exception) else None,return_value=fault) as probe:
+                with self.assertRaises(worker_module.OperationalError) as error:worker.require_checker()
+                self.assertIn(expected,str(error.exception));self.assertNotIn('Update Holodeck',str(error.exception))
+                self.assertEqual(probe.call_args.kwargs['timeout'],30)
+        worker=worker_module.Worker(self.config,self.job)
+        identity=subprocess.CompletedProcess([],0,json.dumps(CHECKER_PIN),'')
+        with patch.object(worker_module,'run',side_effect=[identity,subprocess.TimeoutExpired('python',30)]) as probe:
+            with self.assertRaisesRegex(worker_module.OperationalError,'Packaged checker information probe timed out'):worker.require_checker()
+            self.assertEqual(probe.call_args.kwargs['timeout'],30)
 
     def test_managed_communicate_preserves_large_input_across_timeouts(self):
         env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job));payload='x'*2000000
@@ -886,18 +901,37 @@ worker.main()
 
     def test_registry_prunes_more_than_700_retired_identities(self):
         env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job))
-        with worker_module.ManagedChild([sys.executable,'-c','import time;time.sleep(.4)'],self.root,env) as child:
-            child.members += [{'pid':10000000+i,'seconds':1,'microseconds':0} for i in range(750)]
-            child.sample()
-            value=json.loads(child.registry.read_bytes())
-            self.assertEqual(value[0]['members'],[child.identity])
+        code="import os;exec('for _ in range(750):\\n p=os.fork()\\n if p==0:os._exit(0)\\n os.waitpid(p,0)');print(750)"
+        with worker_module.ManagedChild([sys.executable,'-c',code],self.root,env) as child:
+            output,_=child.process.communicate(timeout=30)
+            self.assertEqual(output.strip(),'750')
             self.assertLess(child.registry.stat().st_size,1024)
-            child.process.communicate(timeout=2)
+            self.assertEqual(len(json.loads(child.registry.read_bytes())[0]['members']),1)
         self.assertFalse((self.job/'children.json').exists())
 
     def test_group_observation_timeout_is_operational_not_candidate_timeout(self):
-        with patch.object(worker_module.subprocess,'run',side_effect=subprocess.TimeoutExpired('ps',2)):
+        with patch.object(worker_module,'_libproc',None), patch.object(worker_module.subprocess,'run',side_effect=subprocess.TimeoutExpired('ps',2)):
             with self.assertRaises(worker_module.ProcessObservationError):worker_module.group_members(99999)
+
+    def test_native_group_enumeration_grows_buffers_and_reports_errors(self):
+        class Native:
+            def __init__(self):self.sizes=[]
+            def proc_listpids(self,kind,pid,data,size):
+                self.sizes.append(size)
+                if len(self.sizes)==1:return size
+                worker_module.ctypes.memmove(data,struct.pack('=i',os.getpid()),4)
+                return 4
+        native=Native();identity=worker_module.process_identity(os.getpid())
+        with patch.object(worker_module,'_libproc',native), patch.object(worker_module,'process_identity',return_value=identity):
+            result=worker_module.group_members(os.getpgrp())
+        self.assertEqual(native.sizes,[4096,8192]);self.assertEqual(result[0]['pid'],os.getpid())
+        def failure(*args):worker_module.ctypes.set_errno(5);return 0
+        native.proc_listpids=failure
+        with patch.object(worker_module,'_libproc',native):
+            with self.assertRaises(worker_module.ProcessObservationError):worker_module.group_members(123)
+        native.proc_listpids=lambda kind,pid,data,size:size
+        with patch.object(worker_module,'_libproc',native):
+            with self.assertRaisesRegex(worker_module.ProcessObservationError,'capacity'):worker_module.group_members(123)
 
     def test_quarantine_uses_bounded_names_for_long_components(self):
         worker=worker_module.Worker(self.config,self.job);name='x'*240
@@ -909,7 +943,28 @@ worker.main()
         self.assertEqual(json.loads(record.read_text())['originalPath'],name)
         self.assertLess(len(record.name),64);self.assertEqual(target.read_text(),'outside')
 
-    def test_late_fork_during_termination_retains_evidence_and_blocks_handoff(self):
+    def test_quarantine_metadata_failure_leaves_original_in_place(self):
+        worker=worker_module.Worker(self.config,self.job)
+        target=self.base/'retained';target.write_bytes(b'original bytes')
+        obstruction=self.root/'obstruction';obstruction.symlink_to(target)
+        with patch.object(worker_module,'write',side_effect=OSError('metadata unavailable')):
+            with self.assertRaisesRegex(OSError,'metadata unavailable'):
+                worker.quarantine_obstructions(['obstruction'])
+        self.assertTrue(obstruction.is_symlink());self.assertEqual(target.read_bytes(),b'original bytes')
+        self.assertEqual(list((worker.gitdir/'holodeck-recovery'/self.job.name).iterdir()),[])
+
+    def test_quarantine_rename_failure_retains_original_path_record(self):
+        worker=worker_module.Worker(self.config,self.job)
+        target=self.base/'retained';target.write_bytes(b'original bytes')
+        obstruction=self.root/'obstruction';obstruction.symlink_to(target)
+        with patch.object(worker_module.os,'rename',side_effect=OSError('rename unavailable')):
+            with self.assertRaisesRegex(worker_module.OperationalError,'rename unavailable'):
+                worker.quarantine_obstructions(['obstruction'])
+        self.assertTrue(obstruction.is_symlink())
+        records=list((worker.gitdir/'holodeck-recovery'/self.job.name).glob('*.json'))
+        self.assertEqual(len(records),1);self.assertEqual(json.loads(records[0].read_bytes())['originalPath'],'obstruction')
+
+    def test_late_fork_during_termination_is_adopted_by_retained_supervisor(self):
         env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job));marker=self.base/'late-child'
         code="""import signal,subprocess,sys,time
 from pathlib import Path
@@ -922,12 +977,11 @@ sys.stdin.read();print('ready',flush=True)
 time.sleep(60)
 """
         try:
-            with self.assertRaises(worker_module.ProcessRecoveryError):
-                with worker_module.ManagedChild([sys.executable,'-c',code,str(marker)],self.root,env,stdin=True,text=False) as child:
-                    lines=child.lines('prompt');self.assertEqual(next(lines),'ready')
-                    # Exit the streaming invocation; the leader forks only after the final observation's TERM.
-            self.assertTrue((self.job/'children.json').exists())
-            self.assertIsNotNone(worker_module.process_identity(int(marker.read_text())))
+            with worker_module.ManagedChild([sys.executable,'-c',code,str(marker)],self.root,env,stdin=True,text=False) as child:
+                lines=child.lines('prompt');self.assertEqual(next(lines),'ready')
+            self.assertFalse((self.job/'children.json').exists())
+            self.assertFalse((self.job/'supervision.json').exists())
+            self.assertIsNone(worker_module.process_identity(int(marker.read_text())))
         finally:
             if marker.exists():
                 identity=worker_module.process_identity(int(marker.read_text()))
@@ -948,6 +1002,109 @@ time.sleep(60)
             self.assertEqual(list(child.lines('prompt')),['done'])
         self.assertIsNone(worker_module.process_identity(int(marker.read_text())))
         self.assertFalse((self.job/'children.json').exists())
+
+    def supervisor_fixture(self, injected):
+        script=self.base/('supervisor-'+str(uuid.uuid4())+'.py')
+        script.write_text("import importlib.util,sys\n"+"spec=importlib.util.spec_from_file_location('w',"+repr(str(SCRIPT))+");w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)\n"+injected+"\nsys.exit(w.supervise(int(sys.argv[2])))\n")
+        return script
+
+    def test_supervision_deadlines_share_one_clock_across_processes(self):
+        before=worker_module.process_clock()
+        code="import runpy,sys;w=runpy.run_path(sys.argv[1]);print(w['process_clock']())"
+        observed=float(subprocess.check_output([sys.executable,'-I','-c',code,str(SCRIPT)],text=True))
+        after=worker_module.process_clock()
+        self.assertLessEqual(before,observed);self.assertLessEqual(observed,after)
+        child=worker_module.ManagedChild.__new__(worker_module.ManagedChild)
+        child.status={'deadline':observed+10}
+        self.assertGreater(child.drain_deadline(),after)
+        self.assertLessEqual(child.drain_deadline(),worker_module.process_clock()+5)
+
+    def test_successful_exit_with_final_unsampled_helper_is_successful(self):
+        marker=self.base/'last-helper';env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job))
+        code="import subprocess,sys;from pathlib import Path;p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);Path(sys.argv[1]).write_text(str(p.pid));print('success')"
+        result=worker_module.run([sys.executable,'-c',code,str(marker)],self.root,env,timeout=5)
+        self.assertEqual(result.returncode,0);self.assertIn('success',result.stdout)
+        self.assertIsNone(worker_module.process_identity(int(marker.read_text())))
+        self.assertFalse((self.job/'supervision.json').exists())
+
+    def test_capacity_failure_still_terminates_every_verified_helper(self):
+        script=self.supervisor_fixture("real=w.save_registry\ndef save(file,entries):\n if any(len(e['members'])>2 for e in entries):raise w.ProcessRecoveryError('Injected 64 KiB capacity')\n return real(file,entries)\nw.save_registry=save")
+        marker=self.base/'capacity-helper';env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job))
+        code="import subprocess,sys,time;from pathlib import Path;p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);Path(sys.argv[1]).write_text(str(p.pid));time.sleep(60)"
+        with self.assertRaisesRegex(worker_module.OperationalError,'64 KiB capacity'):
+            with worker_module.ManagedChild([sys.executable,'-c',code,str(marker)],self.root,env,supervisor_script=script) as child:
+                child.process.communicate(timeout=8)
+        self.assertIsNone(worker_module.process_identity(int(marker.read_text())))
+        self.assertIsNone(worker_module.process_identity(child.identity['pid']))
+
+    def test_transient_native_observation_failures_retry_without_failing_command(self):
+        script=self.supervisor_fixture("real=w.group_members\ncalls=0\ndef observe(pid):\n global calls\n calls+=1\n if calls<=2:raise w.ProcessObservationError('Transient enumeration failure')\n return real(pid)\nw.group_members=observe")
+        env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job))
+        with worker_module.ManagedChild([sys.executable,'-c','import time;time.sleep(.8);print(42)'],self.root,env,supervisor_script=script) as child:
+            output,_=child.process.communicate(timeout=5)
+            self.assertEqual(output.strip(),'42')
+        self.assertFalse((self.job/'supervision.json').exists())
+
+    def test_control_channel_closure_drains_command_and_helpers(self):
+        marker=self.base/'control-helper';env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job))
+        code="import subprocess,sys,time;from pathlib import Path;p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);Path(sys.argv[1]).write_text(str(p.pid));print('ready',flush=True);time.sleep(60)"
+        with worker_module.ManagedChild([sys.executable,'-c',code,str(marker)],self.root,env,stdin=True,text=False) as child:
+            self.assertEqual(next(child.lines('prompt')),'ready')
+            child.control.close();child.control=None
+            child.process.wait(timeout=8)
+        self.assertIsNone(worker_module.process_identity(int(marker.read_text())))
+        self.assertFalse((self.job/'supervision.json').exists())
+
+    def test_supervisor_crash_stops_registered_command_and_retains_unknown_helper(self):
+        marker=self.base/'crash-helper';env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job))
+        code="import subprocess,sys,time;from pathlib import Path;p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);Path(sys.argv[1]).write_text(str(p.pid));print('ready',flush=True);time.sleep(60)"
+        try:
+            with self.assertRaises(worker_module.ProcessRecoveryError):
+                with worker_module.ManagedChild([sys.executable,'-c',code,str(marker)],self.root,env,stdin=True,text=False) as child:
+                    self.assertEqual(next(child.lines('prompt')),'ready')
+                    self.assertIsNotNone(child.status.get('command'))
+                    os.kill(child.identity['pid'],signal.SIGKILL);child.process.wait(timeout=2)
+            self.assertIsNone(worker_module.process_identity(child.status['command']['pid']))
+            self.assertTrue((self.job/'children.json').exists())
+        finally:
+            if marker.exists():
+                identity=worker_module.process_identity(int(marker.read_text()))
+                if identity and worker_module.process_identity(identity['pid'])==identity:os.kill(identity['pid'],signal.SIGKILL)
+
+    def test_persistent_observation_failure_is_operational_and_retains_evidence(self):
+        script=self.supervisor_fixture("def observe(pid):raise w.ProcessObservationError('Persistent enumeration failure')\nw.group_members=observe")
+        env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.job))
+        with self.assertRaises(worker_module.ProcessRecoveryError):
+            with worker_module.ManagedChild([sys.executable,'-c','import time;time.sleep(60)'],self.root,env,supervisor_script=script) as child:
+                child.process.communicate(timeout=15)
+        self.assertIsNone(worker_module.process_identity(child.status['command']['pid']))
+        self.assertTrue((self.job/'children.json').exists())
+        self.assertTrue(worker_module.read_supervision(self.job)['recoveryRequired'])
+
+    def test_external_pipe_holder_is_recovery_not_candidate_failure(self):
+        worker=worker_module.Worker(self.config,self.job);marker=self.base/'escaped-holder'
+        code="import subprocess,sys;from pathlib import Path;p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],start_new_session=True,stdin=subprocess.DEVNULL);Path(sys.argv[1]).write_text(str(p.pid))"
+        worker.require_checker=lambda:None
+        try:
+            with self.assertRaises(worker_module.ProcessRecoveryError):
+                worker.technical(commands=[[sys.executable,'-c',code,str(marker)]])
+            state=worker_module.read_supervision(self.job)
+            self.assertEqual(state['commandReturnCode'],0);self.assertEqual(state['failureKind'],'pipeDrain')
+            with self.assertRaises(worker_module.ProcessDrainError):worker_module.terminate_registered(self.job)
+        finally:
+            if marker.exists():
+                identity=worker_module.process_identity(int(marker.read_text()))
+                if identity and worker_module.process_identity(identity['pid'])==identity:os.kill(identity['pid'],signal.SIGKILL)
+
+    def test_registry_comparison_rejects_links_and_fifos_without_blocking(self):
+        registry=self.job/'children.json';target=self.base/'registry-target';target.write_bytes(b'[]')
+        for kind in ('symlink','fifo'):
+            if kind=='symlink':registry.symlink_to(target)
+            else:os.mkfifo(registry)
+            started=time.monotonic()
+            with self.assertRaises(worker_module.ProcessRecoveryError):worker_module.save_registry(registry,[])
+            self.assertLess(time.monotonic()-started,1);registry.unlink()
+        self.assertEqual(target.read_bytes(),b'[]')
 
     def test_validation_timeout_terminates_descendants_and_removes_registry(self):
         worker=worker_module.Worker(self.config,self.job)

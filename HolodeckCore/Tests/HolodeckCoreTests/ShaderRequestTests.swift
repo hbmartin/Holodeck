@@ -1833,6 +1833,152 @@ final class ShaderRequestTests: XCTestCase {
         let config = await service.configurationValue();XCTAssertFalse(config.enabled)
     }
 
+    func testFinalWorkerRetirementPublishesDisableEligibilityAfterCompletedDelivery() async throws {
+        let (root, script) = try recoveryFixture(), gate = RecoveryGate(), observations = DisableEligibilityRecorder()
+        let authoring = try requestAuthoringFixture(root.appendingPathComponent("authoring"))
+        try """
+        import json,sys
+        print(json.dumps({'event':'preparePublication','requiredPreviewShaderIDs':[]}),flush=True)
+        assert json.loads(sys.stdin.readline())['ok']
+        print(json.dumps({'event':'result','result':{'outputKind':'edited','shaderID':'plasma','changed':False,'summary':'Published','approximations':[]}}),flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root,
+            workerScript: script, waitForWorker: { process in try await process.waitForExit(); try await gate.wait() })
+        await service.suspend(); try await service.start(configuration: .init(repository: authoring.path, enabled: true))
+        let request = ShaderRequest(prompt: "Complete", context: try context())
+        let stream = await service.updates()
+        let observer = Task {
+            for await jobs in stream {
+                let allowed = await service.canDisableRequests()
+                await observations.record(allowed, completed: jobs.first { $0.id == request.id }?.stage == .completed)
+            }
+        }
+        defer { observer.cancel(); Task { await gate.release() } }
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        await service.resume(); try await waitFor { await gate.hasEntered }
+        let result = await service.allJobs().first?.result
+        _ = try await service.control(operation: "requestActivated", payload: .init(requestID: request.id, sourceHash: result?.deliveredSourceHash), deviceID: "TV")
+        try await waitFor { await observations.completedWhileBlocked }
+        await gate.release()
+        try await waitFor { await observations.lastAllowed }
+    }
+
+    func testNativeGroupObservationRetriesTransientFailuresAndNeverReturnsFalseEmptyGroup() throws {
+        let current = try XCTUnwrap(RequestProcessIdentity(pid: getpid()))
+        var attempts = 0, delays: [TimeInterval] = []
+        let recovered = try RequestProcessIdentity.retryGroupObservation({
+            attempts += 1
+            if attempts < 3 { throw POSIXError(.EINTR) }
+            return [current]
+        }, wait: { delays.append($0) })
+        XCTAssertEqual(recovered, [current]); XCTAssertEqual(attempts, 3); XCTAssertEqual(delays, [0.25, 0.25])
+        attempts = 0; delays = []
+        XCTAssertThrowsError(try RequestProcessIdentity.retryGroupObservation({
+            attempts += 1; throw POSIXError(.EIO)
+        }, wait: { delays.append($0) }))
+        XCTAssertEqual(attempts, 3); XCTAssertEqual(delays, [0.25, 0.25])
+    }
+
+    func testNativeWorkerAcceptsSuccessfulCommandWithLateHelperAndRetainedSupervisor() async throws {
+        let (root, script) = try recoveryFixture()
+        let bundled = try XCTUnwrap(RequestWorkerProcess.bundledScript)
+        try """
+        import contextlib,importlib.util,json,os,sys
+        from pathlib import Path
+        with contextlib.suppress(PermissionError): os.setsid()
+        spec=importlib.util.spec_from_file_location('w',\(String(reflecting: bundled.path)))
+        w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
+        job=Path(sys.argv[3]);env=dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(job))
+        code="import subprocess,sys;from pathlib import Path;p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);Path(sys.argv[1]).write_text(str(p.pid));print('finished')"
+        result=w.managed_run([sys.executable,'-c',code,str(job/'late-helper')],job,env,5,None)
+        assert result.returncode==0
+        print(json.dumps({'event':'preflight'}),flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let job = root.appendingPathComponent("native-supervisor"), process = RequestWorkerProcess(script: script)
+        var ready = false
+        for try await event in process.run(mode: "preflight", configuration: .init(repository: root.path), directory: job) {
+            if event.event == "preflight" { ready = true }
+        }
+        try await process.waitForExit(); XCTAssertTrue(ready)
+        let pid = try XCTUnwrap(Int32(String(contentsOf: job.appendingPathComponent("late-helper"), encoding: .utf8)))
+        XCTAssertNil(RequestProcessIdentity(pid: pid))
+        for name in ["process.json", "children.json", "supervision.json"] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: job.appendingPathComponent(name).path))
+        }
+    }
+
+    func testWorkerRecoveryFailureRetainsPatchWithoutDiscardIntent() async throws {
+        let (root, script) = try recoveryFixture()
+        try """
+        import json,sys
+        from pathlib import Path
+        job=Path(sys.argv[3]);(job/'owned-patch').write_bytes(b'keep these bytes')
+        print(json.dumps({'event':'failure','message':'External pipe ownership unresolved','recoveryRequired':True}),flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let service = try await recoveryService(root, script: script)
+        let request = ShaderRequest(prompt: "Keep recovery work", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        await service.resume()
+        try await waitFor { await service.recoveryStatuses().contains { $0.disposition == .resume } }
+        let job = root.appendingPathComponent(request.id.uuidString)
+        XCTAssertEqual(try Data(contentsOf: job.appendingPathComponent("owned-patch")), Data("keep these bytes".utf8))
+        let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("journal.json"))) as? [[String: Any]])
+        XCTAssertNotEqual(rows.first?["cleanupPending"] as? Bool, true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: job.appendingPathComponent("cleanup-started").path))
+        let store = try JSONDecoder().decode(RequestRecoveryStore.self, from: Data(contentsOf: root.appendingPathComponent("recovery.json")))
+        XCTAssertEqual(store.entries[RequestPaths.canonical(job)]?.disposition, .resume)
+    }
+
+    func testDetachPreventsScheduledDiscardAndIncludesJournalCreatedWhileDraining() async throws {
+        for _ in 0..<10 {
+            let (root, script) = try recoveryFixture(), gate = RequestPreparationGate()
+            let seed = try await recoveryService(root, script: script)
+            let config = ShaderRequestConfiguration(repository: root.path, enabled: true)
+            let request = ShaderRequest(prompt: "Keep unpublished work", context: try context())
+            _ = try await seed.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+            try await seed.cancelQueued(request.id)
+            let job = root.appendingPathComponent(request.id.uuidString), patch = job.appendingPathComponent("owned-patch")
+            let bytes = Data("unpublished work\r\n".utf8); try bytes.write(to: patch)
+            let journal = root.appendingPathComponent("journal.json")
+            var records = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: journal)) as? [[String: Any]])
+            records[0]["cleanupPending"] = true
+            try JSONSerialization.data(withJSONObject: records).write(to: journal)
+            let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")),
+                directory: root, workerScript: script, prepareCleanup: { await gate.hold() })
+            await service.suspend(); try await service.start(configuration: config); await service.resume()
+            try await waitFor { await gate.entered }
+            let detach = Task { try await service.detachCheckout(.request(request.id)) }
+            try await waitFor { await service.recoveryStatuses().contains { $0.disposition == .detach } }
+            let publication = root.appendingPathComponent("publication")
+            try FileManager.default.createDirectory(at: publication, withIntermediateDirectories: true)
+            try JSONEncoder().encode(config).write(to: publication.appendingPathComponent("configuration.json"))
+            try Data("{}".utf8).write(to: publication.appendingPathComponent("process.json"))
+            await gate.release(); try await detach.value
+            XCTAssertEqual(try Data(contentsOf: patch), bytes)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: job.appendingPathComponent("cleanup-started").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: publication.appendingPathComponent("process.json").path))
+            let statuses = await service.recoveryStatuses(); XCTAssertTrue(statuses.isEmpty)
+        }
+    }
+
+    func testDetachReconcilesCanonicalJournalOnlyOnceAcrossDirectoryAlias() async throws {
+        let (root, script) = try recoveryFixture(), visits = JournalVisitRecorder()
+        let alias = root.appendingPathComponent("alias"), setup = root.appendingPathComponent("setup")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: root)
+        try FileManager.default.createDirectory(at: setup, withIntermediateDirectories: true)
+        let config = ShaderRequestConfiguration(repository: root.path)
+        try JSONEncoder().encode(config).write(to: setup.appendingPathComponent("configuration.json"))
+        let entry = RequestRecoveryStore.Entry(journal: RequestPaths.canonical(setup), requestID: nil,
+            configuration: config, disposition: .resume, message: "Retained")
+        var store = RequestRecoveryStore(); store.entries[entry.journal] = entry
+        try JSONEncoder().encode(store).write(to: root.appendingPathComponent("recovery.json"))
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")),
+            directory: alias, workerScript: script, reconcileWorker: { await visits.record($0) })
+        try await service.initialize(configuration: config)
+        try await service.detachCheckout(.recovery(entry.id))
+        let count = await visits.count(setup); XCTAssertEqual(count, 1)
+    }
+
     func testDetachCancelsVerificationBeforeWorkerLaunchAndWaitsForLease() async throws {
         for _ in 0..<10 {
             let (root, script) = try recoveryFixture(), gate = RequestPreparationGate()
@@ -1961,5 +2107,24 @@ private final class RecoveryWriteProbe: @unchecked Sendable {
         lock.withLock { if first == nil { first = entry } }
     }
     var firstSelection: RequestRecoveryStore.Entry? { lock.withLock { first } }
+}
+#endif
+
+#if os(macOS)
+private actor JournalVisitRecorder {
+    private var visits: [String: Int] = [:]
+    func record(_ journal: URL) { visits[RequestPaths.canonical(journal), default: 0] += 1 }
+    func count(_ journal: URL) -> Int { visits[RequestPaths.canonical(journal), default: 0] }
+}
+#endif
+
+#if os(macOS)
+private actor DisableEligibilityRecorder {
+    private(set) var completedWhileBlocked = false
+    private(set) var lastAllowed = false
+    func record(_ allowed: Bool, completed: Bool) {
+        lastAllowed = allowed
+        if completed && !allowed { completedWhileBlocked = true }
+    }
 }
 #endif

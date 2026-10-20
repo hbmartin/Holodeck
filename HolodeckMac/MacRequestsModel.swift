@@ -20,11 +20,13 @@ final class MacRequestsModel {
     @ObservationIgnored private var observation: Task<Void, Never>?
     @ObservationIgnored private var publicationObservation: Task<Void, Never>?
     @ObservationIgnored private var pendingRepository: URL?
-    @ObservationIgnored private var selectionTask: Task<ShaderRepositorySelection, Error>?
+    private struct Selection { let configuration: ShaderRequestConfiguration; let publication: CatalogReloadResult? }
+    @ObservationIgnored private var selectionTask: Task<Selection, Error>?
+    @ObservationIgnored private var selectionIsProposal = false
     @ObservationIgnored private var selectionID: UUID?
     @ObservationIgnored private var didInitialize = false
     @ObservationIgnored private var publicationSequence: UInt64?
-    @ObservationIgnored private var initialization: Task<Void, Error>?
+    @ObservationIgnored private var initialization: Task<ShaderRequestConfiguration, Error>?
 
     init(catalog: DirectoryCatalog, defaults: UserDefaults?, namespace: String?) {
         self.defaults = defaults
@@ -56,11 +58,17 @@ final class MacRequestsModel {
             }
         }
         #endif
+        #if DEBUG
+        holdsStartupSelection = namespace != nil && fixture.hasExplicitStorageSuite && fixture.contains("--ui-test-hold-startup-selection")
+        #endif
         let service = service, config = configuration
-        let initialization = Task { try await service.initialize(configuration: config) }
+        let initialization = Task {
+            try await service.initialize(configuration: config)
+            return await service.configurationValue()
+        }
         self.initialization = initialization
         observation = Task { [weak self] in
-            do { try await initialization.value }
+            do { _ = try await initialization.value }
             catch { self?.error = error.localizedDescription }
             for await jobs in await service.updates() {
                 guard let self else { break }
@@ -71,7 +79,7 @@ final class MacRequestsModel {
             }
         }
         publicationObservation = Task { [weak self] in
-            try? await initialization.value
+            _ = try? await initialization.value
             var generation: UUID?
             for await event in await service.publicationUpdates() {
                 guard let self else { break }
@@ -85,32 +93,61 @@ final class MacRequestsModel {
         }
     }
     isolated deinit { observation?.cancel(); publicationObservation?.cancel() }
+    private func initializeAcceptedConfiguration() async throws {
+        let accepted = try await initialization?.value
+        // No await between the one-time decision and installing this shared result.
+        if !didInitialize, let accepted { acceptSelection(accepted); didInitialize = true }
+    }
     func initialized() async throws {
-        try await initialization?.value
-        if !didInitialize { configuration = await service.configurationValue(); didInitialize = true }
-        if let task = selectionTask, let id = selectionID { _ = try await finishSelection(task, id: id) }
-        if let proposal = pendingRepository {
-            pendingRepository = nil
-            do { acceptSelection(try await service.selectRepository(proposal)) }
-            catch {
-                self.error = "The proposed shader folder was not accepted: " + error.localizedDescription
-                acceptSelection(await service.configurationValue())
-            }
+        try await initializeAcceptedConfiguration()
+        while true {
+            if let task = selectionTask, let id = selectionID {
+                let proposal = selectionIsProposal
+                do { _ = try await finishSelection(task, id: id, proposal: proposal) }
+                catch { if !proposal { throw error } }
+            } else if let proposal = pendingRepository {
+                pendingRepository = nil
+                let id = UUID(), service = service
+                selectionID = id; selectionIsProposal = true
+                selectionTask = Task {
+                    #if DEBUG
+                    await self.waitForStartupSelectionIfNeeded()
+                    #endif
+                    try Task.checkCancellation()
+                    return Selection(configuration: try await service.selectRepository(proposal), publication: nil)
+                }
+            } else { return }
         }
     }
-    private func finishSelection(_ task: Task<ShaderRepositorySelection, Error>, id: UUID) async throws -> ShaderRepositorySelection {
+    private func finishSelection(_ task: Task<Selection, Error>, id: UUID, proposal: Bool = false) async throws -> Selection {
         defer {
-            if selectionID == id { selectionTask = nil; selectionID = nil; pendingRepository = nil }
+            if selectionID == id { selectionTask = nil; selectionID = nil; selectionIsProposal = false }
         }
         do {
             let result = try await task.value
             if selectionID == id { acceptSelection(result.configuration) }
             return result
         } catch {
-            if selectionID == id { acceptSelection(await service.configurationValue()) }
+            let accepted = await service.configurationValue()
+            if selectionID == id {
+                acceptSelection(accepted)
+                if proposal { self.error = "The proposed shader folder was not accepted: " + error.localizedDescription }
+            }
             throw error
         }
     }
+    #if DEBUG
+    var holdsStartupSelection = false
+    var isStartupSelectionHeld = false
+    @ObservationIgnored private var startupSelectionContinuation: CheckedContinuation<Void, Never>?
+    private func waitForStartupSelectionIfNeeded() async {
+        guard holdsStartupSelection else { return }
+        holdsStartupSelection = false; isStartupSelectionHeld = true
+        await withCheckedContinuation { startupSelectionContinuation = $0 }
+        isStartupSelectionHeld = false
+    }
+    func finishStartupSelection() { startupSelectionContinuation?.resume(); startupSelectionContinuation = nil }
+    #endif
     var hasUnfinishedJobs: Bool { pendingCleanup || !recoveries.isEmpty || jobs.contains { !$0.stage.terminal } }
     /// A startup bookmark is a proposal until the service accepts it.
     func proposeRepository(_ url: URL) {
@@ -122,12 +159,19 @@ final class MacRequestsModel {
         save()
     }
     func reloadRepository(_ url: URL) async throws -> CatalogReloadResult {
-        try await initialization?.value
+        try await initializeAcceptedConfiguration()
+        if selectionIsProposal || pendingRepository != nil { try await initialized() }
         if let task = selectionTask, let id = selectionID { _ = try? await finishSelection(task, id: id) }
         let id = UUID(), service = service
-        pendingRepository = url; selectionID = id
-        let task = Task { try await service.reloadRepository(url) }; selectionTask = task
-        return try await finishSelection(task, id: id).publication
+        selectionID = id; selectionIsProposal = false
+        let task = Task {
+            let result = try await service.reloadRepository(url)
+            return Selection(configuration: result.configuration, publication: result.publication)
+        }
+        selectionTask = task
+        let result = try await finishSelection(task, id: id)
+        guard let publication = result.publication else { throw ShaderRequestError.invalidRequest }
+        return publication
     }
     private func save() { defaults?.set(try? JSONEncoder().encode(configuration), forKey: "holodeck.requestConfiguration") }
     func verify() {

@@ -288,6 +288,8 @@ final class HolodeckMacUITests: XCTestCase {
             XCTAssertTrue(app.staticTexts["Independent catalog failure"].exists)
             app.windows["holodeck-viewer-window"].buttons["OK"].firstMatch.click()
             waitForLibraryError("Previous "+origin+" failed",in:app)
+            let presentations = element("test-catalog-alert-count", in: app)
+            XCTAssertEqual(presentations.value as? String, "1")
             app.terminate()
         }
     }
@@ -300,7 +302,42 @@ final class HolodeckMacUITests: XCTestCase {
         XCTAssertTrue(settings.waitForExistence(timeout:15));settings.click();waitForLibraryIdle(in:app)
         element("test-correlated-catalog-failure",in:app).click()
         waitForLibraryError("Correlated catalog failure",in:app)
+        let presentations = element("test-catalog-alert-count", in: app)
+        XCTAssertTrue(presentations.waitForExistence(timeout: 10))
+        let unexpected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value != %@", "0"), object: presentations)
+        unexpected.isInverted = true
+        XCTAssertEqual(XCTWaiter.wait(for: [unexpected], timeout: 2), .completed)
         XCTAssertFalse(app.staticTexts["Unable to Load Scenes"].exists)
+    }
+
+    func testVerifyWaitsForStartupProposalAndLaunchesAgainstAcceptedFolder() throws {
+        let f = try managedRecoveryFixture(), app = f.app
+        let directory = f.marker.deletingLastPathComponent().deletingLastPathComponent()
+        try FileManager.default.removeItem(at: f.marker)
+        let preferences = directory.appendingPathComponent("preferences.json")
+        var config = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: preferences)) as? [String: Any])
+        config["enabled"] = false; try JSONSerialization.data(withJSONObject: config).write(to: preferences)
+        let selected = FileManager.default.temporaryDirectory.appendingPathComponent("StartupProposal-" + UUID().uuidString)
+        try FileManager.default.copyItem(at: f.authoring, to: selected)
+        addTeardownBlock { try? FileManager.default.removeItem(at: selected) }
+        app.launchArguments += ["--ui-test-hold-startup-selection"]
+        app.launchEnvironment["HOLODECK_UI_TEST_SHADER_BOOKMARK"] = try selected.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil).base64EncodedString()
+        app.launch(); app.activate()
+        let settings = element("shader-library-settings", in: app)
+        XCTAssertTrue(settings.waitForExistence(timeout: 15)); settings.click()
+        let release = element("finish-startup-selection", in: app)
+        XCTAssertTrue(release.waitForExistence(timeout: 10))
+        let setup = directory.appendingPathComponent("setup/configuration.json")
+        try? FileManager.default.removeItem(at: setup)
+        element("enable-shader-requests", in: app).click()
+        let prematurelyLaunched = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in FileManager.default.fileExists(atPath: setup.path) }, object: nil)
+        prematurelyLaunched.isInverted = true
+        XCTAssertEqual(XCTWaiter.wait(for: [prematurelyLaunched], timeout: 1), .completed)
+        release.click()
+        let launched = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in FileManager.default.fileExists(atPath: setup.path) }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [launched], timeout: 15), .completed)
+        let actual = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: setup)) as? [String: Any])
+        XCTAssertEqual(actual["repository"] as? String, selected.resolvingSymlinksInPath().path)
     }
 
     func testRejectedStartupBookmarkStillRestoresCachedLibraryAndServer() throws {
