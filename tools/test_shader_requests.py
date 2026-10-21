@@ -2,6 +2,8 @@
 No Codex API calls or production pushes. The command fixtures retain invocation evidence.
 """
 import base64
+import ast
+import copy
 import importlib.util
 import json
 import os
@@ -1476,6 +1478,9 @@ class ProcessSettlementTests(unittest.TestCase):
             with patch.object(process_module,'boot_identity',return_value=boot),patch.object(process_module,'process_clock',return_value=1.):
                 self.assertIsNone(worker_module.status_budget(status))
                 termination=worker_module.Termination(budget=record);termination.begin();self.assertEqual(termination.deadline,11.)
+        with patch.object(process_module,'process_clock',return_value=1.):
+            self.assertIsNone(worker_module.status_budget(status))
+            termination=worker_module.Termination(budget=record);termination.begin();self.assertEqual(termination.deadline,11.)
         for value in (float('inf'),float('-inf'),float('nan'),True,10**1000):
             status['termination']=dict(record,deadline=value)
             self.assertFalse(worker_module.valid_budget(status['termination']))
@@ -1494,6 +1499,91 @@ class ProcessSettlementTests(unittest.TestCase):
             with self.assertRaises(worker_module.ProcessRecoveryError):worker_module.terminate_registered(self.job,budget=budget)
             kill.assert_not_called();self.assertGreaterEqual(observe.call_count,1)
         self.assertTrue((self.job/'supervision.json').exists())
+
+    def test_supervisor_loop_error_preserves_control_ack_and_original_cause(self):
+        script=self.supervisor_fixture("real=w.Settlement.step\nfailed=False\ndef step(self,*a,**kwargs):\n global failed\n if not failed:\n  failed=True\n  raise RuntimeError('original one-shot supervision error')\n return real(self,*a,**kwargs)\nw.Settlement.step=step")
+        with self.assertRaisesRegex(worker_module.OperationalError,'original one-shot supervision error') as failure:
+            with worker_module.ManagedChild([sys.executable,'-c','import time;time.sleep(.2)'],self.job,self.env,supervisor_script=script) as child:
+                list(child.output_chunks(timeout=5))
+        self.assertNotIsInstance(failure.exception,worker_module.ProcessRecoveryError)
+        self.assertTrue(child.status['pipeDrainComplete']);self.assertFalse(child.status['recoveryRequired'])
+        self.assertEqual(child.status['failureKind'],'supervision');self.assertFalse(child.registry.exists())
+
+    def test_pipe_deadline_is_classified_between_process_sample_ticks(self):
+        tree=ast.parse(PROCESS_SCRIPT.read_text())
+        supervisor=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='supervise')
+        loop=next(n for n in ast.walk(supervisor) if isinstance(n,ast.While) and isinstance(n.test,ast.Constant) and n.test.value is True)
+        arguments='control_open control pending engine status command stop work_settled drain_deadline wakeup'
+        function=ast.parse('def probe('+','.join(arguments.split())+'):\n pass\n').body[0]
+        function.body=[copy.deepcopy(loop)]
+        reports=[];namespace=dict(process_module.__dict__)
+        namespace.update(report=lambda state,**fields:reports.append(dict(state=state,**fields)),process_clock=lambda:100.)
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[function],type_ignores=[])),'<supervisor-loop>','exec'),namespace)
+        class Control:
+            def recv(self,*a):raise BlockingIOError()
+        class Termination:
+            started=90.;deadline=100.;expired=True
+            def record(self):return {'deadline':100.}
+        class Engine:
+            termination=Termination();failure_kind=None;failure=None;next_sample=100.2
+            def step(self):return False
+            def fail(self,error,kind):self.failure=str(error);self.failure_kind=kind
+        class Command:
+            def poll(self):return 0
+        status=dict(commandReturnCode=0,termination={'deadline':100.},processesSettled=True,pipeDrainComplete=False)
+        rc=namespace['probe'](True,Control(),bytearray(),Engine(),status,Command(),[False],True,100.,None)
+        self.assertEqual(rc,2);self.assertTrue(status['processesSettled'])
+        self.assertEqual(reports[-1]['failureKind'],'pipeDrain');self.assertIn('output pipes',reports[-1]['failure'])
+
+    def test_malformed_supervision_does_not_skip_known_command_cleanup(self):
+        marker=self.job/'command-ready'
+        code="import os,sys,time;from pathlib import Path;os.close(1);os.close(2);Path(sys.argv[1]).touch();time.sleep(60)"
+        child=worker_module.ManagedChild([sys.executable,'-c',code,str(marker)],self.job,self.env);identity=None
+        try:
+            with self.assertRaises(worker_module.ProcessRecoveryError):
+                with child:
+                    identity=child.status['command'];deadline=time.monotonic()+5
+                    while not marker.exists():
+                        self.assertLess(time.monotonic(),deadline);time.sleep(.005)
+                    os.kill(child.identity['pid'],signal.SIGKILL);child.process.wait(timeout=2)
+                    (self.job/'supervision.json').write_text('{')
+                    list(child.output_chunks(timeout=5))
+            self.assertIsNone(worker_module.process_identity(identity['pid']))
+            self.assertTrue(child.registry.exists());self.assertEqual((self.job/'supervision.json').read_text(),'{')
+        finally:
+            if identity and worker_module.process_identity(identity['pid'])==identity:os.kill(identity['pid'],signal.SIGKILL)
+
+    def test_local_stop_budget_survives_missing_boot_identity(self):
+        child=worker_module.ManagedChild(['/usr/bin/true'],self.job,self.env)
+        child.identity={'pid':100,'seconds':1,'microseconds':0}
+        child.status=worker_module.new_status(child.identity,str(uuid.uuid4()))
+        with patch.object(process_module,'boot_identity',return_value=None),patch.object(process_module,'process_clock',return_value=100.):child.stop()
+        self.assertEqual(child.stop_deadline,110.)
+        with patch.object(process_module,'boot_identity',return_value=None),patch.object(process_module,'process_clock',return_value=111.),patch.object(process_module,'process_identity',return_value=None),patch.object(process_module,'group_members',return_value=[]):
+            with self.assertRaises(worker_module.ProcessRecoveryError):child.fallback_step()
+        self.assertIs(child.fallback.termination,child.stop_termination)
+        self.assertEqual(child.fallback.termination.deadline,110.)
+
+    def test_verified_context_exit_does_not_wait_for_an_empty_selector(self):
+        selector_type=process_module.selectors.DefaultSelector
+        class ReadySelector:
+            def __init__(self):self.delegate=selector_type()
+            def __enter__(self):return self
+            def __exit__(self,*args):return self.delegate.__exit__(*args)
+            def __getattr__(self,name):return getattr(self.delegate,name)
+            def select(self,timeout=None):
+                if not self.delegate.get_map() and timeout:
+                    raise AssertionError('Verified command waited without any pending I/O')
+                return self.delegate.select(timeout)
+        patcher=None
+        try:
+            with worker_module.ManagedChild(['/usr/bin/true'],self.job,self.env) as child:
+                list(child.output_chunks(timeout=5))
+                self.assertTrue(child.status['processesSettled']);self.assertTrue(child.pipes_drained)
+                patcher=patch.object(process_module.selectors,'DefaultSelector',ReadySelector);patcher.start()
+        finally:
+            if patcher:patcher.stop()
+        self.assertFalse(child.registry.exists())
 
 
 if __name__=='__main__': unittest.main()

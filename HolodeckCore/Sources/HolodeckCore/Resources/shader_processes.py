@@ -65,7 +65,8 @@ def valid_budget(value):
 def status_budget(status):
     value = status.get('termination') if status and status.get('formatVersion') == 3 else None
     boot = boot_identity()
-    if valid_budget(value) and boot is not None and value.get('bootID') == boot: return value
+    if (valid_budget(value) and boot is not None and value.get('bootID') == boot
+            and value['startedAt'] <= process_clock() + .01): return value
     return None
 
 
@@ -246,7 +247,8 @@ class Termination:
         self.adopt(budget)
 
     def adopt(self, budget):
-        if valid_budget(budget) and self.boot is not None and budget.get('bootID') == self.boot:
+        if (valid_budget(budget) and self.boot is not None and budget.get('bootID') == self.boot
+                and budget['startedAt'] <= process_clock() + .01):
             limit = min(budget['deadline'], process_clock() + 10)
             if self.deadline is None or limit < self.deadline:
                 self.deadline = limit; self.start_time = budget['startedAt']; self.attempt = budget['attemptID']
@@ -323,10 +325,14 @@ class Settlement:
             quiet &= not any(i != self.anchor for i in entry['members'])
         return quiet and not self.uncertain
 
-    def step(self, delegate=False):
-        # Signals are attempted even when evidence persistence or observation fails.
+    def signal_known(self, delegate):
         if self.termination.started is not None and (not delegate or process_clock() >= self.termination.started + 5):
             for error in self.termination.signal(self.identities, exclude=[self.anchor]): self.fail(error, 'signal')
+
+    def step(self, delegate=False):
+        # Keep both phases: known work is signalled even if observation fails;
+        # newly adopted work is signalled after the observation/persistence barrier.
+        self.signal_known(delegate)
         if process_clock() < self.next_sample and not self.termination.expired: return False
         self.next_sample = process_clock() + PROCESS_SAMPLE_SECONDS
         try:
@@ -338,8 +344,7 @@ class Settlement:
         try:
             if not quiet: save_registry(self.directory / 'children.json', self.entries)
         except (OSError, ProcessRecoveryError) as error: self.fail(error, 'registry')
-        if self.termination.started is not None and (not delegate or process_clock() >= self.termination.started + 5):
-            for error in self.termination.signal(self.identities, exclude=[self.anchor]): self.fail(error, 'signal')
+        self.signal_known(delegate)
         if quiet or not any(i != self.anchor and process_identity(i['pid']) == i for i in self.identities):
             # Never use the snapshot preceding a signal or fsync as completion proof.
             try: return self.observe()
@@ -354,8 +359,13 @@ class Settlement:
 
 
 def terminate_registered(directory, deadline=None, budget=None):
-    directory = Path(directory); entries = read_registry(directory); status = read_supervision(directory)
+    directory = Path(directory); evidence_errors = []
+    try: entries = read_registry(directory)
+    except (OperationalError, OSError) as error: entries = []; evidence_errors.append(str(error))
+    try: status = read_supervision(directory)
+    except (OperationalError, OSError) as error: status = None; evidence_errors.append(str(error))
     entries = ownership_entries(entries, status)
+    if not entries and evidence_errors: raise ProcessRecoveryError('; '.join(evidence_errors))
     if not entries and status is None: return
     anchor = status['supervisor'] if status else None
     termination = Termination(deadline, budget); termination.begin()
@@ -372,7 +382,10 @@ def terminate_registered(directory, deadline=None, budget=None):
                 # The fresh group contains only the trusted owner. Retire it last.
                 for error in termination.signal([anchor]): engine.fail(error, 'signal')
             else:
-                final = read_supervision(directory) or status
+                try: final = read_supervision(directory) or status
+                except (OperationalError, OSError) as error:
+                    evidence_errors.append(str(error)); final = status
+                if evidence_errors: raise ProcessRecoveryError('; '.join(evidence_errors))
                 pending = final and final.get('formatVersion', 1) >= 2 and not final['pipeDrainComplete']
                 if pending or (final and final.get('failureKind') == 'pipeDrain' and final.get('recoveryRequired')):
                     raise ProcessDrainError((final or {}).get('failure') or 'Pipe completion is unverified; retain the journal and recover or detach the checkout')
@@ -469,13 +482,19 @@ def supervise(control_fd):
                     try:
                         message = control.recv(65536)
                         if not message:
-                            control_open = False; stop[0] = True; wakeup.forget(control)
+                            control_open = False; stop[0] = True; wakeup.forget(control); control.close()
                         pending.extend(message)
                     except BlockingIOError: pass
                     except OSError as error:
-                        engine.fail(error, 'control'); control_open = False; stop[0] = True; wakeup.forget(control)
+                        engine.fail(error, 'control'); control_open = False; stop[0] = True; wakeup.forget(control); control.close()
                     while b'\n' in pending:
-                        line, _, pending = pending.partition(b'\n'); message = json.loads(line)
+                        line, _, pending = pending.partition(b'\n')
+                        try:
+                            message = json.loads(line)
+                            if not isinstance(message, dict): raise ValueError('Expected a managed control object')
+                        except (ValueError, TypeError) as error:
+                            engine.fail(error, 'control'); control_open = False; stop[0] = True
+                            wakeup.forget(control); control.close(); break
                         if message.get('action') == 'stop' and message.get('sessionID') == status['sessionID']:
                             stop[0] = True
                             engine.termination.adopt(message.get('termination'))
@@ -497,20 +516,20 @@ def supervise(control_fd):
                         drain_deadline = min(process_clock() + 5, engine.termination.deadline)
                         report('draining', durable=False)
                     if not control_open and not status['pipeDrainComplete']:
-                        report('failed', failure='Parent control channel closed before output pipe acknowledgment', failureKind='control', recoveryRequired=True)
+                        report('failed', failure=engine.failure or 'Parent control channel closed before output pipe acknowledgment', failureKind=engine.failure_kind or 'control', recoveryRequired=True)
                         return 2
                     if status['pipeDrainComplete']:
                         report('failed' if engine.failure else 'settled', failure=engine.failure, failureKind=engine.failure_kind, recoveryRequired=False)
                         return 0 if not engine.failure else 2
-                    if engine.failure_kind == 'pipeDrain' or process_clock() >= drain_deadline:
-                        engine.fail(ProcessDrainError('Managed output pipes did not close; external pipe ownership is unresolved. Recover or detach the checkout.'), 'pipeDrain')
-                        report('failed', failure=engine.failure, failureKind='pipeDrain', recoveryRequired=True)
-                        return 2
+                if work_settled and not status['pipeDrainComplete'] and (engine.failure_kind == 'pipeDrain' or process_clock() >= drain_deadline):
+                    engine.fail(ProcessDrainError('Managed output pipes did not close; external pipe ownership is unresolved. Recover or detach the checkout.'), 'pipeDrain')
+                    report('failed', failure=engine.failure, failureKind='pipeDrain', recoveryRequired=True)
+                    return 2
                 if engine.termination.expired:
                     report('failed', failure=str(engine.expired_error()), failureKind=engine.failure_kind or 'settlement', recoveryRequired=True)
                     return 2
             except BaseException as error:
-                engine.fail(error, 'supervision'); stop[0] = True; control_open = False; pending.clear(); wakeup.forget(control)
+                engine.fail(error, 'supervision'); stop[0] = True; pending.clear()
             remaining = engine.next_sample - process_clock()
             for limit in (engine.termination.deadline, drain_deadline):
                 if limit is not None: remaining = min(remaining, limit - process_clock())
@@ -532,7 +551,7 @@ class ManagedChild:
         self.registry = Path(env['HOLODECK_REQUEST_DIRECTORY']) / 'children.json'
         self.process = None; self.control = None; self.status = None; self.pending = bytearray(); self.control_eof = False; self.stop_sent = False; self.channel_error = None
         self.local_failure = None; self.pipes_drained = False; self.acknowledged = False; self.fallback = None
-        self.stop_deadline = None; self.stop_budget = None; self.cleanup_errors = []; self.fallback_evidence_error = None
+        self.stop_deadline = None; self.stop_budget = None; self.stop_termination = None; self.cleanup_errors = []; self.fallback_evidence_error = None
 
     def __enter__(self):
         terminate_registered(self.registry.parent)
@@ -614,7 +633,8 @@ class ManagedChild:
 
     def stop(self):
         if self.stop_budget is None:
-            self.stop_budget = Termination(budget=status_budget(self.status)).record()
+            self.stop_termination = Termination(budget=status_budget(self.status))
+            self.stop_budget = self.stop_termination.record()
             self.stop_deadline = self.stop_budget['deadline']
         self.send('stop', termination=self.stop_budget)
         identity = getattr(self, 'identity', None)
@@ -641,30 +661,34 @@ class ManagedChild:
                     with contextlib.suppress(OSError): pipe.close()
 
     def fallback_step(self):
-        if self.fallback is None:
-            final = read_supervision(self.registry.parent)
-            if final: self.accept_status(final)
+        evidence_errors = []
+        if self.fallback is None or self.fallback_evidence_error:
+            try:
+                final = read_supervision(self.registry.parent)
+                if final: self.accept_status(final)
+            except (OperationalError, OSError) as error: evidence_errors.append(str(error))
             try: entries = read_registry(self.registry.parent)
             except (OperationalError, OSError) as error:
-                self.fallback_evidence_error = error
-                entries = [{'leader': self.identity, 'members': [i for i in (self.identity, self.status.get('command')) if i]}]
-            entries = ownership_entries(entries, self.status, [self.identity, self.status.get('command')])
-            self.fallback = Settlement(self.registry.parent, entries, self.identity,
-                                       Termination(budget=self.stop_budget or status_budget(self.status)))
-            self.fallback.termination.begin()
-        if self.fallback_evidence_error:
-            try:
-                self.fallback.entries = ownership_entries(read_registry(self.registry.parent), self.status, self.fallback.identities)
-                self.fallback_evidence_error = None
-            except (OperationalError, OSError) as error: self.fallback.fail(error, 'registry')
+                evidence_errors.append(str(error)); entries = self.fallback.entries if self.fallback else []
+            known = self.fallback.identities if self.fallback else []
+            entries = ownership_entries(entries, self.status, [self.identity, self.status.get('command'), *known])
+            self.fallback_evidence_error = '; '.join(evidence_errors) or None
+            if self.fallback is None:
+                self.fallback = Settlement(self.registry.parent, entries, self.identity,
+                                           self.stop_termination or Termination(budget=status_budget(self.status)))
+                self.fallback.termination.begin()
+            else: self.fallback.entries = entries
         quiet = self.fallback.step()
-        if quiet and self.pipes_drained and self.fallback_evidence_error is None:
-            if (not self.status.get('processesSettled') or self.status.get('state') not in TERMINAL_STATES
+        if quiet and self.pipes_drained and self.fallback_evidence_error:
+            raise ProcessRecoveryError('Verified work settled; process evidence remains unverifiable: ' + self.fallback_evidence_error)
+        if quiet and self.pipes_drained:
+            if (self.fallback.failure or not self.status.get('processesSettled') or self.status.get('state') not in TERMINAL_STATES
                     or (not self.status.get('pipeDrainComplete') and self.status.get('failureKind') != 'pipeDrain')):
                 self.status.update(revision=self.status['revision'] + 1, state='failed', processesSettled=True,
-                    pipeDrainComplete=True, failure=self.status.get('failure') or ('Managed supervisor exited; command outcome is unknown' if self.command_returncode is None else 'Managed supervisor exited before completing its protocol'),
+                    pipeDrainComplete=True, failure=self.status.get('failure') or self.fallback.failure or ('Managed supervisor exited; command outcome is unknown' if self.command_returncode is None else 'Managed supervisor exited before completing its protocol'),
                     failureKind='supervisor', recoveryRequired=False)
-                if self.fallback.failure: self.status['failure'] += '; cleanup error: ' + self.fallback.failure
+                if self.fallback.failure and self.fallback.failure not in self.status['failure']:
+                    self.status['failure'] += '; cleanup error: ' + self.fallback.failure
                 try: save_process_json(self.registry.parent / 'supervision.json', self.status)
                 except (OSError, ProcessRecoveryError) as error: self.status['failure'] += '; cleanup error: ' + str(error)
             return True
@@ -675,6 +699,9 @@ class ManagedChild:
         try:
             if isinstance(error, ProcessDrainError): self.local_failure = error
             if self.process.poll() is None: self.stop()
+            # Reverify at context exit without waiting out a sample interval from
+            # the already successful output iterator. Failed observations still back off.
+            if self.fallback is not None: self.fallback.next_sample = 0
             for _ in self.output_chunks(finishing=True): pass
             self.process.wait(timeout=1)
             if self.status and self.status.get('processesSettled') and self.pipes_drained and not self.local_failure and not self.status.get('recoveryRequired'):

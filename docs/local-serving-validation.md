@@ -462,3 +462,42 @@ Startup measurements use `tools/profile_shader_supervision.py --baseline 22dd0a8
 The per-command interpreter lifetime is intentionally retained. The optimization removes worker-only imports, replaces startup polling with readiness/SIGCHLD wakeups and batches compatible directory syncs without removing execution or completion barriers.
 
 Evidence uses `/tmp/holodeck-final-*`: `accepted{39,315}-{0,1,2}.log`, matching manifests/status logs, `process-regressions.log`, `core-accepted.log`, `ui-complete.log`, `tv-tests.log`, `tv-test-summary.json`, `gpu.log`, `benchmark{39,315}.json`, `release-audited.log`, `package.log`, `mac-package.log` and `tv-package.log`. Metal compilation is also recorded in `/tmp/holodeck-settlement-metal.log`. The full-core skips cover three unrelated catalog profiles, the separately run worker profile, live LAN/TLS and live Codex publication. Physical Apple TV execution, TV UI tests and live requests were not run. No live app replacement, enabling of requests, checker release, library-lock change, merge or deployment occurred; Linux checker/library CI is unchanged.
+
+## PR #31 ownership and recovery follow-up (2026-10-21)
+
+This follow-up starts from merged main `15aaf29` and keeps one supervisor per command. Its four commits cover independently verified ownership/evidence, worker-first cancellation, boot-aware settlement budgets, and native observation/control diagnostics with regression and benchmark evidence. Checker bytes, checker locks, Linux CI, template-edit restrictions and root-alias support are unchanged.
+
+Missing or malformed registry data cannot erase a command birth identity retained in supervision status or memory. Both Python cleanup and native observation collect independently valid evidence before deciding what can be settled. Unverifiable static metadata and pipe completion use a distinct native evidence error: normal operations remain blocked, while explicit Detach can retain those markers after verified work retires. Live or unfamiliar descendants and failed group observation remain teardown failures. Detach also finishes draining when retirement returns an evidence-only error, preserving exact unpublished bytes in the same operation.
+
+Cancellation first obtains the required fresh worker-group observation, then interrupts the worker without signalling commands underneath it. The worker's interruption handler owns command cleanup; native fallback takes over after the verified worker retires. TERM/KILL tracking, the five-second escalation and ten-second operation ceiling remain intact. Startup and context-manager cleanup preserve interruption identity and report cleanup problems separately, preventing ordinary failure-driven discard.
+
+Supervision format 3 adds attempt UUID, boot identity, clock domain, start time and finite deadline metadata. A live handoff retains its remaining budget; a new recovery attempt gets a fresh bounded budget. Expired handoffs only verify final state and retain unresolved evidence. Formats 1/2 and legacy registries remain readable, but their raw deadlines are not inherited. Persisted deadlines with another/unknown boot or future start are not reused; an already-established local in-memory stop budget remains effective even if boot identity is unavailable.
+
+Native group and birth observations use shared per-pass caches outside the ownership lock. State commits validate operation generation; signalling runs on a separate queue with final birth checks. Known supervisor anchors remain protected independently of stale delegation maps. Functional control channels continue accepting drain acknowledgments after unrelated supervision errors; unusable channels close explicitly. Pipe expiry is classified separately from process settlement even between sampling ticks.
+
+Final validation:
+
+- **111 worker tests passed on Python 3.9.6 and 111 on Python 3.15.0**, with no skips/errors/failures. Three partitions per version were checked against the complete manifest: 111 unique names, no omissions or duplicates. Worker/runtime hashes were unchanged throughout the final runs. The unlimited-repair regression also passed two additional runs on Python 3.9.
+- **302 Swift core tests executed, six opt-in skips, zero failures**, with real authoring/GPU integration enabled. The worker profile ran separately in Release; three unrelated catalog profiles, live LAN/TLS and live Codex publication were skipped.
+- **15 Release packaged-resource/native-supervision tests passed**, including a late helper, preserved interruptions, lock responsiveness, legacy evidence, budget identity and explicit Detach. Native idle supervision measured **30.2 polls/s and 1.11% of one CPU core**.
+- **Four Mac UI recovery/request regressions passed**: queued cancellation, retained-files Detach, reconciliation retry, and publication recovery. **46 tvOS simulator unit tests passed**, with no skips/failures.
+- **Both final Release app builds passed**, with signing disabled. Both Mac copies and the tvOS copy of each worker resource match source exactly; neither app contains Python bytecode caches. The packaged native artifact identity matches the selected library lock without enabling requests.
+- The packaged checker compiled **66 authoring assets plus shader/snippet templates for macOS and tvOS**. The separate Mac GPU run passed **seven profile checks**.
+
+Benchmark reproduction: `python tools/profile_shader_supervision.py --baseline 15aaf29 --interleave`, using each supported interpreter. Both artifact trees are copied unchanged to the same temporary filesystem. The comparison alternates baseline/current order across 31 short-command samples and five 18-Git-command fixtures; counts and 15-second idle CPU are measured separately. These are local measurements, not CI timing thresholds.
+
+| Measurement | Python 3.9.6: PR #31 → follow-up | Python 3.15.0: PR #31 → follow-up |
+| --- | --- | --- |
+| Short command median (ms) | 135.0 → 135.3 | 68.4 → 68.0 |
+| 18-command fixture median (ms) | 2406.4 → 2425.3 | 1213.7 → 1236.4 |
+| Evidence replacements per command | 5 → 5 | 5 → 5 |
+| Fsync calls per command | 10 → 10 | 10 → 10 |
+| Interpreter launches per command | 2 → 2 | 2 → 2 |
+| Idle reaped-child CPU | 1.47 → 1.48% | 1.07 → 1.09% |
+| Idle parent CPU | 0.10 → 0.11% | 0.10 → 0.10% |
+
+Development profiling caught an unnecessary 250 ms wait when context cleanup repeated an already-successful settlement. Context exit now forces a fresh observation immediately; a structural regression rejects empty-selector waiting after verified completion. Superseded development runs are not counted above, including an early Python 3.9 run with an unknown command outcome. The final unchanged-source suites and repeated repair checks passed. Exhausted-handoff tests assert the retained evidence and original budget while allowing the error subtype to reflect whether asynchronous retirement has actually been verified.
+
+Evidence uses `/tmp/holodeck-pr31followup-*`: `accepted{39,315}-{0,1,2}` logs/manifests/results, `accepted-summary.json`, `verified-core.log`, `verified-release.log`, `ui.log`, `tv-summary.json`, `verified-{mac,tv}-package.log`, `package-proof.json`, `evidence-summary.json`, `benchmark{39,315}.json`, `metal.log` and `gpu.log`. The worker SHA-256 is `259fc8da7405c80faff82f30a8a2718f5a478df91344f9fa13d1dd2375908c4b`; the process runtime SHA-256 is `9a7a53ad683985f3093cdeb827100cce62d8df494902be9766c523578ed0b1d3`.
+
+Physical Apple TV, TV UI, live LAN/TLS and live Codex publication were not run. No live installation replacement, request enablement, checker release or library-lock update occurred. A later rollout must drain requests before installing the matching host and worker.
