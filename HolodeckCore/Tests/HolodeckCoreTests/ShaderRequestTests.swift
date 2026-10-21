@@ -2221,6 +2221,47 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: setup.appendingPathComponent("process.json").path))
         let remaining = await service.recoveryStatuses(); XCTAssertEqual(remaining.count,1); XCTAssertNil(remaining.first?.checkout)
     }
+
+    func testLegacyPipeEvidenceSurvivesMissingRegistryAndRequiresExplicitDetach() throws {
+        let (root, _) = try recoveryFixture(), job = root.appendingPathComponent("legacy-pipes")
+        try FileManager.default.createDirectory(at: job, withIntermediateDirectories: true)
+        let marker = job.appendingPathComponent("supervision.json")
+        let value: [String: Any] = ["formatVersion":1,"supervisor":["pid":Int32.max,"seconds":1,"microseconds":0],
+            "state":"failed","failureKind":"pipeDrain","failure":"Unresolved external pipes","recoveryRequired":true]
+        let bytes = try JSONSerialization.data(withJSONObject:value)
+        try bytes.write(to:marker)
+        let observation = try RequestProcessIdentity.observe(in:job)
+        XCTAssertNotNil(observation.evidenceError)
+        XCTAssertThrowsError(try RequestWorkerProcess.reconcileOrphan(in:job)) { XCTAssertTrue($0 is RequestWorkerEvidenceError) }
+        XCTAssertEqual(try Data(contentsOf:marker),bytes)
+    }
+
+    func testMalformedRegistryIsEvidenceErrorWithoutTeardownTimeout() throws {
+        let (root, _) = try recoveryFixture(), job = root.appendingPathComponent("malformed-registry")
+        try FileManager.default.createDirectory(at:job,withIntermediateDirectories:true)
+        let marker = job.appendingPathComponent("children.json"), bytes = Data("{".utf8)
+        try bytes.write(to:marker)
+        let probe = NativeObservationProbe()
+        XCTAssertThrowsError(try RequestWorkerProcess.reconcileOrphan(in:job,groups:.init(now:{probe.now},wait:{probe.advance($0)}))) {
+            XCTAssertTrue($0 is RequestWorkerEvidenceError)
+        }
+        XCTAssertEqual(probe.now,0); XCTAssertEqual(try Data(contentsOf:marker),bytes)
+    }
+
+    func testDetachArchivesMalformedChildEvidenceAndPreservesWork() async throws {
+        let (root, script) = try recoveryFixture(), initial = try await recoveryService(root,script:script)
+        let request = ShaderRequest(prompt:"Preserve work",context:try context())
+        _ = try await initial.control(operation:"requestSubmit",payload:.init(request:request),deviceID:"TV")
+        try await initial.cancelQueued(request.id)
+        let job = root.appendingPathComponent(request.id.uuidString), marker = job.appendingPathComponent("children.json")
+        let work = root.appendingPathComponent("unpublished.txt"), bytes = Data([0,255,10,13])
+        try bytes.write(to:work);try Data("{".utf8).write(to:marker)
+        let service = try await recoveryService(root,script:script)
+        try await service.detachCheckout(.request(request.id))
+        XCTAssertEqual(try Data(contentsOf:work),bytes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath:marker.path))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath:job.path).contains{$0.hasPrefix("children-detached-")})
+    }
     #endif
 }
 

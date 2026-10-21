@@ -1400,5 +1400,37 @@ class ProcessSettlementTests(unittest.TestCase):
                 identity=worker_module.process_identity(int(marker.read_text()))
                 if identity and worker_module.process_identity(identity['pid'])==identity:os.kill(identity['pid'],signal.SIGKILL)
 
+    def test_missing_registry_fallback_settles_known_command_with_closed_pipes(self):
+        marker=self.job/'closed-pipes'
+        code="import os,sys,time;from pathlib import Path;os.close(1);os.close(2);Path(sys.argv[1]).touch();time.sleep(60)"
+        child=worker_module.ManagedChild([sys.executable,'-c',code,str(marker)],self.job,self.env)
+        identity=None
+        try:
+            with self.assertRaises(worker_module.OperationalError) as failure:
+                with child:
+                    identity=child.status['command'];deadline=time.monotonic()+5
+                    while not marker.exists():
+                        self.assertLess(time.monotonic(),deadline);time.sleep(.005)
+                    os.kill(child.identity['pid'],signal.SIGKILL);child.process.wait(timeout=2)
+                    child.registry.unlink()
+                    list(child.output_chunks(timeout=5))
+            self.assertNotIsInstance(failure.exception,worker_module.ProcessRecoveryError)
+            self.assertIsNone(worker_module.process_identity(identity['pid']))
+            self.assertTrue(child.status['processesSettled']);self.assertFalse(child.registry.exists())
+        finally:
+            if identity and worker_module.process_identity(identity['pid'])==identity:os.kill(identity['pid'],signal.SIGKILL)
+
+    def test_terminal_fallback_retries_transient_group_observation(self):
+        real=process_module.group_members;calls=[]
+        def observe(pid):
+            calls.append(pid)
+            if len(calls)<=2:raise worker_module.ProcessObservationError('Transient terminal enumeration')
+            return real(pid)
+        with patch.object(process_module,'group_members',side_effect=observe):
+            with worker_module.ManagedChild(['/usr/bin/true'],self.job,self.env) as child:
+                list(child.output_chunks(timeout=5))
+        self.assertGreaterEqual(len(calls),3)
+        self.assertEqual(child.command_returncode,0);self.assertFalse(child.registry.exists())
+
 
 if __name__=='__main__': unittest.main()

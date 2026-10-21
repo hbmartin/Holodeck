@@ -1290,7 +1290,7 @@ public actor ShaderRequestService {
             if !outcomeSeen { throw ShaderRequestError.unavailable("Worker ended without a verified result.") }
         } catch {
             process.stop()
-            if error is RequestWorkerTeardownError {
+            if error is RequestWorkerTeardownError || error is RequestWorkerEvidenceError {
                 holdForRecovery(journal: folder(id), configuration: record.configuration, error: error)
             } else if execution?.interrupted == false, records[id]?.detached != true {
                 records[id]?.cleanupPending = true

@@ -168,6 +168,19 @@ def read_registry(directory):
     return entries
 
 
+def ownership_entries(entries, status=None, known=()):
+    """Missing/partial registries never erase independently verified birth identities."""
+    entries = [{'leader': e['leader'], 'members': list(e['members'])} for e in entries]
+    if status:
+        anchor = status['supervisor']
+        entry = next((e for e in entries if e['leader'] == anchor), None)
+        if entry is None:
+            entry = {'leader': anchor, 'members': []}; entries.append(entry)
+        entry['members'] = list({(i['pid'], i['seconds'], i['microseconds']): i
+                                for i in entry['members'] + [anchor] + [i for i in [status.get('command'), *known] if i]}.values())
+    return entries
+
+
 def read_supervision(directory):
     value = read_process_json(Path(directory) / 'supervision.json')
     if value is None: return None
@@ -294,13 +307,9 @@ class Settlement:
 
 def terminate_registered(directory, deadline=None):
     directory = Path(directory); entries = read_registry(directory); status = read_supervision(directory)
+    entries = ownership_entries(entries, status)
     if not entries and status is None: return
     anchor = status['supervisor'] if status else None
-    if (not entries and status and status.get('processesSettled') and status.get('pipeDrainComplete')
-            and process_identity(anchor['pid']) != anchor):
-        retire_evidence(directory); return
-    if anchor and not any(e['leader'] == anchor for e in entries):
-        raise ProcessRecoveryError('Supervisor identity does not match its process registry')
     termination = Termination(status_deadline(status) if deadline is None else deadline); termination.begin()
     engine = Settlement(directory, entries, anchor, termination)
     if anchor and process_identity(anchor['pid']) == anchor:
@@ -571,11 +580,6 @@ class ManagedChild:
                     with contextlib.suppress(OSError): pipe.close()
 
     def fallback_step(self):
-        if (self.status.get('state') in TERMINAL_STATES and self.status.get('processesSettled')
-                and self.status.get('pipeDrainComplete') and not self.status.get('recoveryRequired')
-                and not group_members(self.identity['pid'])
-                and not (self.status.get('command') and process_identity(self.status['command']['pid']) == self.status['command'])):
-            return self.pipes_drained
         if self.fallback is None:
             final = read_supervision(self.registry.parent)
             if final: self.accept_status(final)
@@ -583,12 +587,13 @@ class ManagedChild:
             except (OperationalError, OSError) as error:
                 self.fallback_evidence_error = error
                 entries = [{'leader': self.identity, 'members': [i for i in (self.identity, self.status.get('command')) if i]}]
+            entries = ownership_entries(entries, self.status, [self.identity, self.status.get('command')])
             self.fallback = Settlement(self.registry.parent, entries, self.identity,
                                        Termination(self.stop_deadline or status_deadline(self.status)))
             self.fallback.termination.begin()
         if self.fallback_evidence_error:
             try:
-                self.fallback.entries = read_registry(self.registry.parent)
+                self.fallback.entries = ownership_entries(read_registry(self.registry.parent), self.status, self.fallback.identities)
                 self.fallback_evidence_error = None
             except (OperationalError, OSError) as error: self.fallback.fail(error, 'registry')
         quiet = self.fallback.step()
