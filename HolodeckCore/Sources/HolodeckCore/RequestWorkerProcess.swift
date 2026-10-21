@@ -12,6 +12,37 @@ nonisolated struct RequestWorkerEvidenceError: LocalizedError, Sendable {
     var errorDescription: String? { cause + " Repair the journal or detach while retaining its files and evidence." }
 }
 
+nonisolated struct RequestSettlementBudget: Codable, Sendable {
+    var attemptID: UUID
+    var bootID: String?
+    var clock: String
+    var startedAt: TimeInterval
+    var deadline: TimeInterval
+    static let bootIdentity: String? = {
+        var bytes = [CChar](repeating: 0, count: 128), count = 128
+        guard sysctlbyname("kern.bootsessionuuid", &bytes, &count, nil, 0) == 0,
+              let uuid = UUID(uuidString: String(decoding: bytes.prefix { $0 != 0 }.map { UInt8(bitPattern:$0) }, as:UTF8.self)) else { return nil }
+        return uuid.uuidString.lowercased()
+    }()
+    init(now: TimeInterval, boot: String? = Self.bootIdentity) {
+        attemptID = UUID(); bootID = boot; clock = "darwin-uptime-raw"; startedAt = now; deadline = now + 10
+    }
+    var valid: Bool {
+        clock == "darwin-uptime-raw" && (bootID == nil || UUID(uuidString:bootID!) != nil) &&
+        startedAt.isFinite && deadline.isFinite && deadline >= startedAt && deadline - startedAt <= 10.001
+    }
+    func inherited(now: TimeInterval, boot: String?) -> Self? {
+        guard valid, let boot, bootID == boot, startedAt <= now + 0.01 else { return nil }
+        var value = self; value.deadline = min(value.deadline,now + 10); return value
+    }
+    func capped(by peer: Self?, now: TimeInterval, boot: String?) -> Self {
+        guard let value = peer?.inherited(now:now,boot:boot), value.deadline < deadline else { return self }
+        return value
+    }
+    func expired(at now: TimeInterval) -> Bool { now >= deadline }
+    func escalated(at now: TimeInterval) -> Bool { now >= startedAt + 5 }
+}
+
 nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashable {
     let pid: Int32
     let seconds: UInt64
@@ -53,13 +84,15 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
         let pipeDrainComplete: Bool?
         let processesSettled: Bool?
         let deadline: TimeInterval?
+        let termination: RequestSettlementBudget?
     }
     struct Observation {
         var identities: [RequestProcessIdentity]
         var uncertainty: String?
         var evidenceError: String?
         var sessions: [RequestProcessIdentity: [RequestProcessIdentity]] = [:]
-        var deadline: TimeInterval?
+        var budget: RequestSettlementBudget?
+        var deadline: TimeInterval? { budget?.deadline }
     }
     static func observe(in directory: URL, known additional: [Self] = [],
                         group: (Int32) throws -> [Self] = checkedGroup) throws -> Observation {
@@ -71,9 +104,10 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
             let file = directory.appendingPathComponent("supervision.json")
             if FileManager.default.fileExists(atPath: file.path) {
                 let value = try JSONDecoder().decode(Supervision.self, from: reader.read("supervision.json", limit: CatalogLimits.headBytes).bytes)
-                guard [1, 2].contains(value.formatVersion), value.supervisor.pid > 1, (value.command?.pid ?? 2) > 1,
+                guard [1, 2, 3].contains(value.formatVersion), value.supervisor.pid > 1, (value.command?.pid ?? 2) > 1,
                       ["starting", "running", "draining", "settled", "failed", "cancelled"].contains(value.state),
-                      value.formatVersion == 1 || (value.sessionID != nil && (value.revision ?? -1) >= 0 && value.clock == "darwin-uptime-raw" && value.pipeDrainComplete != nil && value.processesSettled != nil && value.deadline?.isFinite != false) else {
+                      value.formatVersion == 1 || (value.sessionID != nil && (value.revision ?? -1) >= 0 && value.clock == "darwin-uptime-raw" && value.pipeDrainComplete != nil && value.processesSettled != nil && value.deadline?.isFinite != false),
+                      value.formatVersion != 3 || value.termination?.valid != false else {
                     throw RequestWorkerEvidenceError(cause: "Invalid supervision evidence.")
                 }
                 supervision = value
@@ -108,9 +142,7 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
                 (supervision.formatVersion >= 2 && !supervision.supervisor.isCurrent && supervision.pipeDrainComplete != true) {
                 result.evidenceError = supervision.failure ?? "Output pipe completion is unverified."
             }
-            if supervision.formatVersion == 2, supervision.processesSettled != true || supervision.pipeDrainComplete != true {
-                result.deadline = supervision.deadline
-            }
+            if supervision.formatVersion == 3, supervision.supervisor.isCurrent { result.budget = supervision.termination }
         }
         for entry in entries {
             let known = (entry.members + additional).filter(\.isCurrent)
@@ -189,6 +221,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         var now: @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
         var wait: @Sendable (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
         var schedule: @Sendable (DispatchWorkItem) -> Void = { DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: $0) }
+        var boot: @Sendable () -> String? = { RequestSettlementBudget.bootIdentity }
     }
     static let bootstrap = """
     import json,runpy,sys
@@ -205,7 +238,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     private let input = Pipe(), output = Pipe(), error = Pipe()
     private let lock = NSLock(), drained = DispatchGroup()
     private var started = false, stopping = false, completed = false
-    private var stopTime: TimeInterval?
+    private var terminationBudget: RequestSettlementBudget?
     private var cancelRequested = false, escalated = false
     private var termSent: Set<RequestProcessIdentity> = [], killSent: Set<RequestProcessIdentity> = []
     private var registryError: Error?
@@ -273,7 +306,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
             }
             if let directory {
                 let result = try RequestProcessIdentity.observe(in: directory, known: observed, group: group)
-                observation.identities = result.identities; observation.sessions = result.sessions; observation.deadline = result.deadline
+                observation.identities = result.identities; observation.sessions = result.sessions; observation.budget = result.budget
                 observation.uncertainty = result.uncertainty ?? observation.uncertainty; observation.evidenceError = result.evidenceError
             }
         } catch { failure = error }
@@ -294,7 +327,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 return false
             }
             observationFailures = 0
-            if stopping, let deadline = observation.deadline { stopTime = min(stopTime ?? deadline - 10, deadline - 10) }
+            if stopping, let budget = terminationBudget { terminationBudget = budget.capped(by:observation.budget,now:groups.now(),boot:groups.boot()) }
             if stoppingAtSnapshot { rootStopObserved = true }
             registryError = observation.uncertainty.map { RequestWorkerTeardownError(cause: $0) } ?? observation.evidenceError.map { RequestWorkerEvidenceError(cause: $0) }
             return false
@@ -303,7 +336,8 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         if shouldStop { beginTeardown(cancelled: false) }
     }
     private func signalPendingLocked() {
-        let signal = escalated || stopTime.map({ groups.now() - $0 >= 5 }) == true ? SIGKILL : SIGTERM
+        guard terminationBudget?.expired(at:groups.now()) != true else { return }
+        let signal = escalated || terminationBudget?.escalated(at:groups.now()) == true ? SIGKILL : SIGTERM
         let targets: [RequestProcessIdentity]
         if let leader, groups.identity(leader.pid) == leader {
             // The worker must enter its interruption handler before command failure
@@ -324,7 +358,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
             guard !completed else { return }
             cancelRequested = cancelRequested || cancelled
             if !stopping { nextObservation = 0 }
-            stopping = true; stopTime = stopTime ?? groups.now()
+            stopping = true; terminationBudget = terminationBudget ?? RequestSettlementBudget(now:groups.now(),boot:groups.boot())
             guard started else { return }
             signalPendingLocked()
             if escalation == nil {
@@ -393,7 +427,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                         refreshOwned()
                         let expired = lock.withLock { () -> Bool in
                             if stopping { signalPendingLocked() }
-                            return stopTime.map { groups.now() - $0 >= 10 } ?? false
+                            return terminationBudget?.expired(at:groups.now()) ?? false
                         }
                         if expired { lock.withLock { teardownFailed = true }; break }
                         RunLoop.current.run(until: Date().addingTimeInterval(0.05))
@@ -414,10 +448,10 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                             if lock.withLock({ registryError == nil && !owned.values.contains { groups.identity($0.pid) == $0 } }) { break }
                         }
                         // Permit short natural EOF/registry settlement without declaring cancellation.
-                        if lock.withLock({ stopTime == nil }), groups.now() - leaderExited >= 0.1 {
+                        if lock.withLock({ terminationBudget == nil }), groups.now() - leaderExited >= 0.1 {
                             beginTeardown(cancelled: false)
                         }
-                        if lock.withLock({ stopTime.map { groups.now() - $0 >= 10 } ?? false }) {
+                        if lock.withLock({ terminationBudget?.expired(at:groups.now()) ?? false }) {
                             lock.withLock { teardownFailed = true }; break
                         }
                         groups.wait(0.025)
@@ -471,7 +505,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
             } catch { markerError = error.localizedDescription }
         }
         var targets = root.map { [$0] } ?? []
-        var deadline = groups.now() + 10
+        let budget = RequestSettlementBudget(now:groups.now(),boot:groups.boot())
         var termSent: Set<RequestProcessIdentity> = [], killSent: Set<RequestProcessIdentity> = []
         var uncertainty: String?, failures = 0
         var evidenceError = markerError
@@ -490,12 +524,11 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 }
                 let observation = try RequestProcessIdentity.observe(in: directory, known: targets, group: group)
                 targets += observation.identities; sessions = observation.sessions
-                deadline = min(deadline, observation.deadline ?? deadline)
                 uncertainty = observation.uncertainty; evidenceError = observation.evidenceError ?? markerError; failures = 0
             } catch { failures += 1; uncertainty = error.localizedDescription }
             targets = Array(Set(targets.filter(\.isCurrent)))
-            let signal = groups.now() >= deadline - 5 ? SIGKILL : SIGTERM
-            let pending = RequestProcessIdentity.shutdownTargets(targets, sessions: sessions, signal: signal, allowOwnerRetirement: failures == 0)
+            let signal = budget.escalated(at:groups.now()) ? SIGKILL : SIGTERM
+            let pending = budget.expired(at:groups.now()) ? [] : root.flatMap { $0.isCurrent ? [$0] : nil } ?? RequestProcessIdentity.shutdownTargets(targets, sessions: sessions, signal: signal, allowOwnerRetirement: failures == 0)
             let term = pending.filter { termSent.insert($0).inserted }
             RequestProcessIdentity.signal(term, SIGTERM)
             if signal == SIGKILL {
@@ -520,7 +553,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 } catch let error as RequestWorkerEvidenceError { throw error }
                 catch { failures += 1; uncertainty = error.localizedDescription }
             }
-            guard groups.now() < deadline else { throw RequestWorkerTeardownError(cause: uncertainty) }
+            guard !budget.expired(at:groups.now()) else { throw RequestWorkerTeardownError(cause: uncertainty) }
             // Retries are observation intervals, never sleeps inside an ownership lock.
             groups.wait(0.25)
         }

@@ -1031,7 +1031,7 @@ time.sleep(60)
         after=worker_module.process_clock()
         self.assertLessEqual(before,observed);self.assertLessEqual(observed,after)
         child=worker_module.ManagedChild.__new__(worker_module.ManagedChild)
-        child.status={'formatVersion':2,'clock':worker_module.CLOCK_DOMAIN,'deadline':observed+10}
+        child.status=dict(worker_module.new_status({'pid':100,'seconds':1,'microseconds':0},str(uuid.uuid4())),termination=worker_module.Termination(observed+10).record())
         self.assertGreater(child.drain_deadline(),after)
         self.assertLessEqual(child.drain_deadline(),worker_module.process_clock()+5)
 
@@ -1380,7 +1380,7 @@ class ProcessSettlementTests(unittest.TestCase):
     def test_interruption_cleanup_errors_emit_structured_failure(self):
         config=self.job/'config.json';config.write_text('{}')
         for kind in ('OperationalError','PermissionError'):
-            code="import importlib.util,sys\nspec=importlib.util.spec_from_file_location('w',sys.argv[1]);w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)\nclass Probe:\n def __init__(self,*a):raise w.WorkerInterrupted()\nw.Worker=Probe\ndef cleanup(*a):raise "+('w.' if kind=='OperationalError' else '')+kind+"('injected cleanup failure')\nw.terminate_registered=cleanup\nsys.argv=[sys.argv[1],'run',sys.argv[2],sys.argv[3]]\nw.main()"
+            code="import importlib.util,sys\nspec=importlib.util.spec_from_file_location('w',sys.argv[1]);w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)\nclass Probe:\n def __init__(self,*a):raise w.WorkerInterrupted()\nw.Worker=Probe\ndef cleanup(*a,**kwargs):raise "+('w.' if kind=='OperationalError' else '')+kind+"('injected cleanup failure')\nw.terminate_registered=cleanup\nsys.argv=[sys.argv[1],'run',sys.argv[2],sys.argv[3]]\nw.main()"
             result=subprocess.run([sys.executable,'-I','-c',code,str(SCRIPT),str(config),str(self.job)],capture_output=True,text=True,timeout=5)
             self.assertEqual(result.returncode,1);self.assertNotIn('Traceback',result.stderr)
             event=json.loads(result.stdout);self.assertEqual(event['event'],'failure');self.assertIn('injected cleanup failure',event['message'])
@@ -1451,6 +1451,49 @@ class ProcessSettlementTests(unittest.TestCase):
             self.assertFalse(child.__exit__(type(interruption),interruption,None))
         self.assertEqual(interruption.cleanup_errors,['settlement uncertain'])
         self.assertTrue(interruption.recovery_required)
+
+    def test_budget_handoff_exhaustion_and_new_recovery_are_distinct(self):
+        with patch.object(process_module,'process_clock',return_value=100.):
+            original=worker_module.Termination();record=original.record()
+        status=dict(worker_module.new_status({'pid':100,'seconds':1,'microseconds':0},str(uuid.uuid4())),termination=record)
+        with patch.object(process_module,'process_clock',return_value=106.):
+            inherited=worker_module.Termination(budget=worker_module.status_budget(status));inherited.begin()
+            self.assertEqual(inherited.deadline,110.);self.assertEqual(inherited.started,100.)
+            self.assertEqual(inherited.record()['attemptID'],record['attemptID'])
+        with patch.object(process_module,'process_clock',return_value=111.):
+            inherited=worker_module.Termination(budget=worker_module.status_budget(status));inherited.begin()
+            self.assertTrue(inherited.expired)
+            with patch.object(process_module.os,'kill') as kill:inherited.signal([{'pid':100,'seconds':1,'microseconds':0}])
+            kill.assert_not_called()
+            fresh=worker_module.Termination();fresh.begin()
+            self.assertEqual(fresh.deadline,121.);self.assertNotEqual(fresh.record()['attemptID'],record['attemptID'])
+
+    def test_budget_reboot_unavailable_boot_and_nonfinite_records(self):
+        anchor={'pid':100,'seconds':1,'microseconds':0}
+        with patch.object(process_module,'process_clock',return_value=100000.):record=worker_module.Termination().record()
+        status=dict(worker_module.new_status(anchor,str(uuid.uuid4())),termination=record)
+        for boot in (None,str(uuid.uuid4())):
+            with patch.object(process_module,'boot_identity',return_value=boot),patch.object(process_module,'process_clock',return_value=1.):
+                self.assertIsNone(worker_module.status_budget(status))
+                termination=worker_module.Termination(budget=record);termination.begin();self.assertEqual(termination.deadline,11.)
+        for value in (float('inf'),float('-inf'),float('nan'),True,10**1000):
+            status['termination']=dict(record,deadline=value)
+            self.assertFalse(worker_module.valid_budget(status['termination']))
+            (self.job/'supervision.json').write_text(json.dumps(status))
+            with self.assertRaises(worker_module.ProcessRecoveryError):worker_module.read_supervision(self.job)
+        for version in (1,2):
+            self.assertIsNone(worker_module.status_deadline(dict(status,formatVersion=version,deadline=999999)))
+
+    def test_expired_handoff_verifies_without_new_signals(self):
+        anchor={'pid':100,'seconds':1,'microseconds':0};command=dict(anchor,pid=101)
+        with patch.object(process_module,'process_clock',return_value=0.):budget=worker_module.Termination().record()
+        status=dict(worker_module.new_status(anchor,str(uuid.uuid4())),termination=budget,command=command,state='draining')
+        worker_module.save_process_json(self.job/'supervision.json',status)
+        worker_module.save_registry(self.job/'children.json',[{'leader':anchor,'members':[command]}])
+        with patch.object(process_module,'process_clock',return_value=11.),patch.object(process_module,'process_identity',side_effect=lambda pid:command if pid==101 else None),patch.object(process_module,'group_members',return_value=[command]) as observe,patch.object(process_module.os,'kill') as kill:
+            with self.assertRaises(worker_module.ProcessRecoveryError):worker_module.terminate_registered(self.job,budget=budget)
+            kill.assert_not_called();self.assertGreaterEqual(observe.call_count,1)
+        self.assertTrue((self.job/'supervision.json').exists())
 
 
 if __name__=='__main__': unittest.main()

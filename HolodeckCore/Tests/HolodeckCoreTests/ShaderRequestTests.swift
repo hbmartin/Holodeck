@@ -1994,7 +1994,7 @@ final class ShaderRequestTests: XCTestCase {
         w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
         job=Path(sys.argv[3]);anchor=w.process_identity(os.getpid())
         w.save_registry(job/'children.json',[{'leader':anchor,'members':[anchor]}])
-        status=w.new_status(anchor,str(uuid.uuid4()));status.update(state='draining',deadline=.5)
+        status=w.new_status(anchor,str(uuid.uuid4()));status.update(state='draining',termination=dict(w.Termination().record(),startedAt=-9.5,deadline=.5))
         w.save_process_json(job/'supervision.json',status)
         signal.signal(signal.SIGTERM,signal.SIG_IGN)
         print(json.dumps({'event':'ready'}),flush=True)
@@ -2007,17 +2007,18 @@ final class ShaderRequestTests: XCTestCase {
                 if event.event == "ready" { worker.stop() }
             }
             XCTFail("Unacknowledged pipe barrier was ignored")
-        } catch is RequestWorkerTeardownError {}
+        } catch is RequestWorkerEvidenceError {}
         XCTAssertLessThanOrEqual(probe.now,0.55)
-        do { try await worker.waitForExit(); XCTFail("Unverified settlement was accepted") } catch is RequestWorkerTeardownError {}
+        try await worker.waitForExit()
+        XCTAssertTrue(FileManager.default.fileExists(atPath:root.appendingPathComponent("job/supervision.json").path))
     }
 
-    func testNativeFallbackInheritsTaggedDeadlineWithoutRestartingBudget() throws {
+    func testNativeRecoveryGetsFreshBudgetAndIgnoresLegacyDeadline() throws {
         let (root, _) = try recoveryFixture(), job = root.appendingPathComponent("deadline")
         try FileManager.default.createDirectory(at: job, withIntermediateDirectories: true)
         let child = Process(), pipe = Pipe()
         child.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        child.arguments = ["-u", "-c", "import time;print('ready',flush=True);time.sleep(60)"]
+        child.arguments = ["-u", "-c", "import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);print('ready',flush=True);time.sleep(60)"]
         child.standardOutput = pipe; try child.run(); _ = pipe.fileHandleForReading.availableData
         defer { if child.isRunning { child.terminate(); child.waitUntilExit() } }
         let anchor = try XCTUnwrap(RequestProcessIdentity(pid: child.processIdentifier))
@@ -2027,7 +2028,7 @@ final class ShaderRequestTests: XCTestCase {
             "supervisor":identity,"state":"draining","processesSettled":false,"pipeDrainComplete":false,"deadline":0.5]
         let file = job.appendingPathComponent("supervision.json")
         try JSONSerialization.data(withJSONObject: status).write(to: file)
-        XCTAssertEqual(try RequestProcessIdentity.observe(in: job).deadline,0.5)
+        XCTAssertNil(try RequestProcessIdentity.observe(in: job).deadline)
         status["formatVersion"] = 1
         try JSONSerialization.data(withJSONObject: status).write(to: file)
         XCTAssertNil(try RequestProcessIdentity.observe(in: job).deadline)
@@ -2035,7 +2036,7 @@ final class ShaderRequestTests: XCTestCase {
         try JSONSerialization.data(withJSONObject: status).write(to: file)
         let probe = NativeObservationProbe()
         XCTAssertThrowsError(try RequestWorkerProcess.reconcileOrphan(in: job, groups: .init(now: { probe.now }, wait: { probe.advance($0) })))
-        XCTAssertLessThanOrEqual(probe.now,0.5)
+        XCTAssertGreaterThanOrEqual(probe.now,5); XCTAssertLessThanOrEqual(probe.now,10)
         XCTAssertTrue(FileManager.default.fileExists(atPath:file.path))
         child.waitUntilExit(); XCTAssertFalse(anchor.isCurrent)
     }
@@ -2293,6 +2294,20 @@ final class ShaderRequestTests: XCTestCase {
         worker.stop();await consuming.value;try await worker.waitForExit()
         XCTAssertEqual(probe.firstPID,pid)
         XCTAssertEqual(try Data(contentsOf:work),original)
+    }
+
+    func testSettlementBudgetSeparatesBootHandoffAndFreshRecovery() throws {
+        let boot = UUID().uuidString.lowercased(), original = RequestSettlementBudget(now:100,boot:boot)
+        let inherited = try XCTUnwrap(original.inherited(now:106,boot:boot))
+        XCTAssertEqual(inherited.deadline,110);XCTAssertEqual(inherited.startedAt,100);XCTAssertEqual(inherited.attemptID,original.attemptID)
+        XCTAssertTrue(try XCTUnwrap(original.inherited(now:111,boot:boot)).expired(at:111))
+        let fresh = RequestSettlementBudget(now:111,boot:boot)
+        XCTAssertEqual(fresh.deadline,121);XCTAssertNotEqual(fresh.attemptID,original.attemptID)
+        XCTAssertNil(original.inherited(now:1,boot:UUID().uuidString.lowercased()))
+        XCTAssertNil(original.inherited(now:1,boot:nil))
+        var invalid = original;invalid.deadline = .infinity;XCTAssertFalse(invalid.valid)
+        invalid.deadline = 100000;XCTAssertFalse(invalid.valid)
+        XCTAssertNotNil(RequestSettlementBudget.bootIdentity)
     }
     #endif
 }

@@ -3,6 +3,8 @@
 import contextlib
 import ctypes
 import json
+import math
+import functools
 import os
 from pathlib import Path
 import selectors
@@ -35,6 +37,36 @@ def process_clock():
     # Shared across processes, and (like native systemUptime) excludes system sleep.
     clock = time.CLOCK_UPTIME_RAW if sys.platform == 'darwin' else time.CLOCK_MONOTONIC
     return time.clock_gettime(clock)
+
+
+@functools.lru_cache(maxsize=1)
+def boot_identity():
+    try:
+        if sys.platform == 'darwin':
+            data = ctypes.create_string_buffer(128); size = ctypes.c_size_t(len(data))
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.sysctlbyname(b'kern.bootsessionuuid', data, ctypes.byref(size), None, 0) != 0: return None
+            return str(uuid.UUID(data.value.decode('ascii')))
+        return str(uuid.UUID(Path('/proc/sys/kernel/random/boot_id').read_text().strip()))
+    except (OSError, ValueError, UnicodeError): return None
+
+
+def valid_budget(value):
+    if not isinstance(value, dict) or value.get('clock') != CLOCK_DOMAIN: return False
+    try:
+        uuid.UUID(value['attemptID'])
+        if value.get('bootID') is not None: uuid.UUID(value['bootID'])
+        start, end = value['startedAt'], value['deadline']
+        return (type(start) in (int, float) and type(end) in (int, float)
+                and math.isfinite(start) and math.isfinite(end) and 0 <= end - start <= 10.001)
+    except (KeyError, ValueError, TypeError, AttributeError, OverflowError): return False
+
+
+def status_budget(status):
+    value = status.get('termination') if status and status.get('formatVersion') == 3 else None
+    boot = boot_identity()
+    if valid_budget(value) and boot is not None and value.get('bootID') == boot: return value
+    return None
 
 
 class ProcessObservationError(ProcessRecoveryError):
@@ -184,41 +216,60 @@ def ownership_entries(entries, status=None, known=()):
 def read_supervision(directory):
     value = read_process_json(Path(directory) / 'supervision.json')
     if value is None: return None
-    if (not isinstance(value, dict) or type(value.get('formatVersion')) is not int or value['formatVersion'] not in (1, 2)
+    if (not isinstance(value, dict) or type(value.get('formatVersion')) is not int or value['formatVersion'] not in (1, 2, 3)
             or not valid_identity(value.get('supervisor')) or value.get('state') not in ('starting', 'running', 'draining', *TERMINAL_STATES)
             or (value.get('command') is not None and not valid_identity(value['command']))):
         raise ProcessRecoveryError('Invalid supervision evidence; retain the journal')
-    if value['formatVersion'] == 2:
+    if value['formatVersion'] >= 2:
         try: uuid.UUID(value['sessionID'])
         except (KeyError, ValueError, TypeError, AttributeError) as error: raise ProcessRecoveryError('Invalid supervision session') from error
         if (type(value.get('revision')) is not int or value['revision'] < 0 or value.get('clock') != CLOCK_DOMAIN
                 or type(value.get('pipeDrainComplete')) is not bool or type(value.get('processesSettled')) is not bool):
             raise ProcessRecoveryError('Invalid supervision revision, clock or completion evidence')
+    if value['formatVersion'] == 3 and value.get('termination') is not None and not valid_budget(value['termination']):
+        raise ProcessRecoveryError('Invalid termination budget; retain the journal')
     return value
 
 
 def new_status(anchor, session):
-    return dict(formatVersion=2, sessionID=session, revision=0, clock=CLOCK_DOMAIN, supervisor=anchor,
+    return dict(formatVersion=3, sessionID=session, revision=0, clock=CLOCK_DOMAIN, supervisor=anchor,
                 command=None, state='starting', commandReturnCode=None, processesSettled=False, pipeDrainComplete=False)
 
 
 class Termination:
-    def __init__(self, deadline=None):
-        self.deadline = deadline; self.term_sent = set(); self.kill_sent = set()
+    def __init__(self, deadline=None, budget=None):
+        self.deadline = None; self.start_time = None; self.term_sent = set(); self.kill_sent = set()
+        self.attempt = str(uuid.uuid4()); self.boot = boot_identity()
+        if deadline is not None:
+            if type(deadline) not in (int, float) or not math.isfinite(deadline): raise ProcessRecoveryError('Invalid local settlement deadline')
+            self.deadline = min(deadline, process_clock() + 10); self.start_time = self.deadline - 10
+        self.adopt(budget)
+
+    def adopt(self, budget):
+        if valid_budget(budget) and self.boot is not None and budget.get('bootID') == self.boot:
+            limit = min(budget['deadline'], process_clock() + 10)
+            if self.deadline is None or limit < self.deadline:
+                self.deadline = limit; self.start_time = budget['startedAt']; self.attempt = budget['attemptID']
+
+    def record(self):
+        self.begin()
+        return dict(attemptID=self.attempt, bootID=self.boot, clock=CLOCK_DOMAIN,
+                    startedAt=self.started, deadline=self.deadline)
 
     @property
-    def started(self): return self.deadline - 10 if self.deadline is not None else None
+    def started(self): return self.start_time
 
     def begin(self):
-        if self.deadline is None: self.deadline = process_clock() + 10
+        if self.deadline is None: self.start_time = process_clock(); self.deadline = self.start_time + 10
 
     def signal(self, identities, exclude=()):
         self.begin(); errors = []
+        if self.expired: return errors
         for identity in identities:
             if identity in exclude or process_identity(identity['pid']) != identity: continue
             key = (identity['pid'], identity['seconds'], identity['microseconds'])
             signals = [(signal.SIGTERM, self.term_sent)]
-            if process_clock() >= self.deadline - 5: signals.append((signal.SIGKILL, self.kill_sent))
+            if process_clock() >= self.started + 5: signals.append((signal.SIGKILL, self.kill_sent))
             for sig, sent in signals:
                 if key in sent: continue
                 sent.add(key)
@@ -233,11 +284,8 @@ class Termination:
 
 
 def status_deadline(status):
-    # Version 1 used a different Darwin clock. Never compare its absolute deadline.
-    if status and status.get('formatVersion') == 2 and status.get('clock') == CLOCK_DOMAIN:
-        deadline = status.get('deadline')
-        if type(deadline) in (int, float): return deadline
-    return None
+    budget = status_budget(status)
+    return budget['deadline'] if budget else None
 
 
 class Settlement:
@@ -277,9 +325,9 @@ class Settlement:
 
     def step(self, delegate=False):
         # Signals are attempted even when evidence persistence or observation fails.
-        if self.termination.started is not None and (not delegate or process_clock() >= self.termination.deadline - 5):
+        if self.termination.started is not None and (not delegate or process_clock() >= self.termination.started + 5):
             for error in self.termination.signal(self.identities, exclude=[self.anchor]): self.fail(error, 'signal')
-        if process_clock() < self.next_sample: return False
+        if process_clock() < self.next_sample and not self.termination.expired: return False
         self.next_sample = process_clock() + PROCESS_SAMPLE_SECONDS
         try:
             quiet = self.observe(); self.observation_errors = 0
@@ -290,7 +338,7 @@ class Settlement:
         try:
             if not quiet: save_registry(self.directory / 'children.json', self.entries)
         except (OSError, ProcessRecoveryError) as error: self.fail(error, 'registry')
-        if self.termination.started is not None and (not delegate or process_clock() >= self.termination.deadline - 5):
+        if self.termination.started is not None and (not delegate or process_clock() >= self.termination.started + 5):
             for error in self.termination.signal(self.identities, exclude=[self.anchor]): self.fail(error, 'signal')
         if quiet or not any(i != self.anchor and process_identity(i['pid']) == i for i in self.identities):
             # Never use the snapshot preceding a signal or fsync as completion proof.
@@ -305,14 +353,14 @@ class Settlement:
         return ProcessRecoveryError(message + '; settlement budget exhausted before verification. Retain the journal and recover or detach the checkout.')
 
 
-def terminate_registered(directory, deadline=None):
+def terminate_registered(directory, deadline=None, budget=None):
     directory = Path(directory); entries = read_registry(directory); status = read_supervision(directory)
     entries = ownership_entries(entries, status)
     if not entries and status is None: return
     anchor = status['supervisor'] if status else None
-    termination = Termination(status_deadline(status) if deadline is None else deadline); termination.begin()
+    termination = Termination(deadline, budget); termination.begin()
     engine = Settlement(directory, entries, anchor, termination)
-    if anchor and process_identity(anchor['pid']) == anchor:
+    if anchor and not termination.expired and process_identity(anchor['pid']) == anchor:
         try: os.kill(anchor['pid'], signal.SIGTERM)
         except ProcessLookupError: pass
         except OSError as error: engine.fail(error, 'signal')
@@ -325,7 +373,7 @@ def terminate_registered(directory, deadline=None):
                 for error in termination.signal([anchor]): engine.fail(error, 'signal')
             else:
                 final = read_supervision(directory) or status
-                pending = final and final.get('formatVersion') == 2 and not final['pipeDrainComplete']
+                pending = final and final.get('formatVersion', 1) >= 2 and not final['pipeDrainComplete']
                 if pending or (final and final.get('failureKind') == 'pipeDrain' and final.get('recoveryRequired')):
                     raise ProcessDrainError((final or {}).get('failure') or 'Pipe completion is unverified; retain the journal and recover or detach the checkout')
                 retire_evidence(directory)
@@ -428,11 +476,9 @@ def supervise(control_fd):
                         engine.fail(error, 'control'); control_open = False; stop[0] = True; wakeup.forget(control)
                     while b'\n' in pending:
                         line, _, pending = pending.partition(b'\n'); message = json.loads(line)
-                        if message.get('action') == 'stop':
+                        if message.get('action') == 'stop' and message.get('sessionID') == status['sessionID']:
                             stop[0] = True
-                            inherited = message.get('deadline')
-                            if type(inherited) in (int, float):
-                                engine.termination.deadline = min(engine.termination.deadline or inherited, inherited)
+                            engine.termination.adopt(message.get('termination'))
                         if message.get('sessionID') == status['sessionID']:
                             if message.get('action') == 'drained':
                                 status['pipeDrainComplete'] = True; engine.next_sample = 0
@@ -442,8 +488,8 @@ def supervise(control_fd):
                 if rc is not None and status['commandReturnCode'] is None:
                     status['commandReturnCode'] = rc; engine.termination.begin(); engine.next_sample = 0
                 if stop[0]: engine.termination.begin()
-                if engine.termination.started is not None and status.get('deadline') != engine.termination.deadline:
-                    report('draining', deadline=engine.termination.deadline)
+                if engine.termination.started is not None and status.get('termination') != engine.termination.record():
+                    report('draining', termination=engine.termination.record())
                 quiet = engine.step()
                 if engine.termination.started is not None and quiet and (command is None or rc is not None):
                     if not work_settled:
@@ -486,7 +532,7 @@ class ManagedChild:
         self.registry = Path(env['HOLODECK_REQUEST_DIRECTORY']) / 'children.json'
         self.process = None; self.control = None; self.status = None; self.pending = bytearray(); self.control_eof = False; self.stop_sent = False; self.channel_error = None
         self.local_failure = None; self.pipes_drained = False; self.acknowledged = False; self.fallback = None
-        self.stop_deadline = None; self.cleanup_errors = []; self.fallback_evidence_error = None
+        self.stop_deadline = None; self.stop_budget = None; self.cleanup_errors = []; self.fallback_evidence_error = None
 
     def __enter__(self):
         terminate_registered(self.registry.parent)
@@ -567,8 +613,10 @@ class ManagedChild:
                 self.control.sendall(json.dumps(dict(action=action, sessionID=self.status['sessionID'], **fields)).encode() + b'\n')
 
     def stop(self):
-        self.stop_deadline = self.stop_deadline or status_deadline(self.status) or process_clock() + 10
-        self.send('stop', deadline=self.stop_deadline)
+        if self.stop_budget is None:
+            self.stop_budget = Termination(budget=status_budget(self.status)).record()
+            self.stop_deadline = self.stop_budget['deadline']
+        self.send('stop', termination=self.stop_budget)
         identity = getattr(self, 'identity', None)
         if self.process is not None and identity is not None and not self.stop_sent and process_identity(self.process.pid) == identity:
             self.stop_sent = True
@@ -602,7 +650,7 @@ class ManagedChild:
                 entries = [{'leader': self.identity, 'members': [i for i in (self.identity, self.status.get('command')) if i]}]
             entries = ownership_entries(entries, self.status, [self.identity, self.status.get('command')])
             self.fallback = Settlement(self.registry.parent, entries, self.identity,
-                                       Termination(self.stop_deadline or status_deadline(self.status)))
+                                       Termination(budget=self.stop_budget or status_budget(self.status)))
             self.fallback.termination.begin()
         if self.fallback_evidence_error:
             try:
@@ -724,7 +772,7 @@ def managed_run(args, cwd, env, timeout, input, text=True):
             return data.decode(pipe.encoding, errors=pipe.errors).replace('\r\n', '\n').replace('\r', '\n')
         return subprocess.CompletedProcess(args, child.command_returncode, output('stdout'), output('stderr'))
 
-__all__ = ['OperationalError', 'ProcessRecoveryError', 'ProcessObservationError', 'ProcessDrainError', 'CLOCK_DOMAIN', 'REGISTRY_LIMIT', 'PROCESS_SAMPLE_SECONDS', 'process_clock', 'process_identity', 'group_members', 'merge_members', 'read_process_bytes', 'read_process_json', 'save_process_json', 'save_registry', 'valid_identity', 'read_registry', 'read_supervision', 'new_status', 'status_deadline', 'Termination', 'Settlement', 'terminate_registered', 'supervise', 'ManagedChild', 'managed_run']
+__all__ = ['OperationalError', 'ProcessRecoveryError', 'ProcessObservationError', 'ProcessDrainError', 'CLOCK_DOMAIN', 'REGISTRY_LIMIT', 'PROCESS_SAMPLE_SECONDS', 'process_clock', 'process_identity', 'group_members', 'merge_members', 'read_process_bytes', 'read_process_json', 'save_process_json', 'save_registry', 'valid_identity', 'read_registry', 'read_supervision', 'new_status', 'status_deadline', 'boot_identity', 'valid_budget', 'status_budget', 'Termination', 'Settlement', 'terminate_registered', 'supervise', 'ManagedChild', 'managed_run']
 
 if __name__ == '__main__':
     if len(sys.argv) != 3 or sys.argv[1] != '_supervise': raise SystemExit('Internal supervisor entry point')

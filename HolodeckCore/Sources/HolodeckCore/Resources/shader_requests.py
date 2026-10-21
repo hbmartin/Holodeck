@@ -1043,7 +1043,7 @@ def main():
     except WorkerInterrupted as interruption:
         cleanup_errors = list(getattr(interruption, 'cleanup_errors', []))
         recovery_required = getattr(interruption, 'recovery_required', False)
-        try: terminate_registered(sys.argv[3])
+        try: terminate_registered(sys.argv[3], budget=status_budget(read_supervision(sys.argv[3])))
         except (OperationalError, OSError) as error:
             cleanup_errors.append(str(error))
             recovery_required |= isinstance(error, ProcessRecoveryError) or any(
