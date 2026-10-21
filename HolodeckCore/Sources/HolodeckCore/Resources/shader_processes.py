@@ -472,6 +472,12 @@ def supervise(control_fd):
     finally: wakeup.close(); control.close()
 
 
+def interruption_cleanup(error, cleanup_error, recovery_required):
+    """Keep BaseException cancellation distinct from ordinary command failure."""
+    error.cleanup_errors = getattr(error, 'cleanup_errors', []) + [str(cleanup_error)]
+    error.recovery_required = getattr(error, 'recovery_required', False) or recovery_required
+
+
 class ManagedChild:
     def __init__(self, args, cwd, env, *, stdin=False, stderr=subprocess.PIPE, text=True, supervisor_script=None):
         self.args, self.cwd, self.env = [str(a) for a in args], cwd, env
@@ -511,8 +517,15 @@ class ManagedChild:
                 self.close_pipes()
                 try: self.process.wait(timeout=10)
                 except subprocess.TimeoutExpired as cleanup_error:
+                    if not isinstance(error, Exception):
+                        interruption_cleanup(error, cleanup_error, True); raise error
                     raise ProcessRecoveryError('Unregistered supervisor did not exit after startup cancellation; retain the journal') from cleanup_error
-                retire_evidence(self.registry.parent)
+                try: retire_evidence(self.registry.parent)
+                except (OperationalError, OSError) as cleanup_error:
+                    if not isinstance(error, Exception):
+                        interruption_cleanup(error, cleanup_error, True); raise error
+                    raise
+                if not isinstance(error, Exception): raise
                 raise OperationalError('Managed startup failed before command execution: ' + str(error)) from error
             if self.process is not None:
                 self.stop()
@@ -623,6 +636,10 @@ class ManagedChild:
             if self.process.returncode != 0:
                 raise OperationalError('Managed supervisor exited ' + str(self.process.returncode) + ' after verified settlement')
         except (OperationalError, OSError) as cleanup_error:
+            if error is not None and not isinstance(error, Exception):
+                interruption_cleanup(error, cleanup_error, isinstance(cleanup_error, ProcessRecoveryError)
+                                     or not (self.status and self.status.get('processesSettled') and self.pipes_drained))
+                return False
             if error is not None and cleanup_error is not error and str(cleanup_error) != str(error):
                 unresolved = isinstance(cleanup_error, ProcessRecoveryError) or not (self.status and self.status.get('processesSettled') and self.pipes_drained)
                 failure = ProcessRecoveryError if unresolved else OperationalError

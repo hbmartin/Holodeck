@@ -2262,6 +2262,38 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath:marker.path))
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath:job.path).contains{$0.hasPrefix("children-detached-")})
     }
+
+    func testWorkerIsInterruptedBeforeNativeDescendantTermination() async throws {
+        let (root, script) = try recoveryFixture(), bundled = try XCTUnwrap(RequestWorkerProcess.bundledScript)
+        let work = root.appendingPathComponent("retained.bin"), original = Data([0,255,13,10])
+        try original.write(to:work)
+        try """
+        import importlib.util,os,sys
+        from pathlib import Path
+        spec=importlib.util.spec_from_file_location('w',\(String(reflecting:bundled.path)))
+        w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
+        class Worker:
+            def __init__(self,config,directory):
+                self.request={'id':'test'};self.checkpoint={};self.directory=Path(directory)
+                self.work=Path(config['repository'])/'retained.bin'
+            def perform(self):
+                code="import signal,sys,time,json;signal.signal(signal.SIGTERM,lambda *a:sys.exit(7));print(json.dumps(dict(event='ready')),flush=True);time.sleep(60)"
+                with w.ManagedChild([sys.executable,'-c',code],self.directory,dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.directory))) as child:
+                    for line in child.lines(''):print(line,flush=True)
+                    if child.command_returncode:raise w.OperationalError('Command was killed before worker interruption')
+            def clean(self,*args,**kwargs):self.work.write_bytes(b'ordinary failure cleanup')
+        w.Worker=Worker;w.main()
+        """.write(to:script,atomically:true,encoding:.utf8)
+        let probe = WorkerCancellationProbe(), worker = RequestWorkerProcess(script:script,groups:.init(signal:{probe.signal($0,$1)}))
+        worker.afterObservationCommit = { probe.observe($0) }
+        let consuming = Task { do { for try await _ in worker.run(mode:"run",configuration:.init(repository:root.path),directory:root.appendingPathComponent("job")) {} } catch {} }
+        defer { consuming.cancel();worker.stop() }
+        try await waitFor { probe.hasDescendants }
+        let pid = worker.process.processIdentifier
+        worker.stop();await consuming.value;try await worker.waitForExit()
+        XCTAssertEqual(probe.firstPID,pid)
+        XCTAssertEqual(try Data(contentsOf:work),original)
+    }
     #endif
 }
 
@@ -2376,6 +2408,21 @@ private final class NativeObservationProbe: @unchecked Sendable {
         if wait { _ = gate.wait(timeout: .now() + 5) }
         if fail { throw POSIXError(.EIO) }
         return try RequestProcessIdentity.checkedGroup(pid)
+    }
+}
+#endif
+
+#if os(macOS)
+private final class WorkerCancellationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var descendants = false
+    private var first: Int32?
+    func observe(_ values: [RequestProcessIdentity]) { lock.withLock { descendants = descendants || values.count >= 3 } }
+    var hasDescendants: Bool { lock.withLock { descendants } }
+    var firstPID: Int32? { lock.withLock { first } }
+    func signal(_ pid: Int32, _ value: Int32) -> Int32 {
+        lock.withLock { if first == nil { first = pid } }
+        return kill(pid,value)
     }
 }
 #endif

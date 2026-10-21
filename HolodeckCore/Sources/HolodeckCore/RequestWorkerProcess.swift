@@ -225,6 +225,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     var beforeReplyWrite: (() -> Void)?
     var beforeIdentityWrite: (() throws -> Void)?
     var beforeLogWrite: (() throws -> Void)?
+    var afterObservationCommit: (([RequestProcessIdentity]) -> Void)?
     init(script: URL? = nil, groups: GroupOperations = .init()) { scriptOverride = script; self.groups = groups }
     var recoveryTarget: (directory: URL, configuration: ShaderRequestConfiguration)? {
         lock.withLock {
@@ -298,14 +299,21 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
             registryError = observation.uncertainty.map { RequestWorkerTeardownError(cause: $0) } ?? observation.evidenceError.map { RequestWorkerEvidenceError(cause: $0) }
             return false
         }
+        afterObservationCommit?(lock.withLock { Array(owned.values) })
         if shouldStop { beginTeardown(cancelled: false) }
     }
     private func signalPendingLocked() {
         let signal = escalated || stopTime.map({ groups.now() - $0 >= 5 }) == true ? SIGKILL : SIGTERM
-        let identities = owned.values.filter { identity in
-            identity != leader || rootStopObserved || observationFailures >= 3 || signal == SIGKILL
+        let targets: [RequestProcessIdentity]
+        if let leader, groups.identity(leader.pid) == leader {
+            // The worker must enter its interruption handler before command failure
+            // can trigger ordinary cleanup. It owns descendant shutdown until retired.
+            targets = rootStopObserved || observationFailures >= 3 || signal == SIGKILL ? [leader] : []
+        } else {
+            targets = RequestProcessIdentity.shutdownTargets(Array(owned.values), sessions: supervisedSessions,
+                signal: signal, allowOwnerRetirement: observationFailures == 0 && rootStopObserved)
         }
-        for identity in RequestProcessIdentity.shutdownTargets(Array(identities), sessions: supervisedSessions, signal: signal, allowOwnerRetirement: observationFailures == 0 && rootStopObserved) where groups.identity(identity.pid) == identity {
+        for identity in targets where groups.identity(identity.pid) == identity {
             if termSent.insert(identity).inserted { _ = groups.signal(identity.pid, SIGTERM) }
             if signal == SIGKILL, groups.identity(identity.pid) == identity, killSent.insert(identity).inserted { _ = groups.signal(identity.pid, SIGKILL) }
         }

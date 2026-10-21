@@ -1432,5 +1432,25 @@ class ProcessSettlementTests(unittest.TestCase):
         self.assertGreaterEqual(len(calls),3)
         self.assertEqual(child.command_returncode,0);self.assertFalse(child.registry.exists())
 
+    def test_startup_cancellation_preserves_base_exception_identity(self):
+        for kind in (KeyboardInterrupt,worker_module.WorkerInterrupted):
+            interruption=kind('startup interruption')
+            with patch.object(process_module,'process_identity',side_effect=interruption),patch.object(process_module.os,'kill') as kill:
+                with self.assertRaises(kind) as failure:
+                    with worker_module.ManagedChild(['/usr/bin/true'],self.job,self.env):pass
+            self.assertIs(failure.exception,interruption);kill.assert_not_called()
+            self.assertFalse((self.job/'supervision.json').exists())
+
+    def test_context_cleanup_failure_preserves_worker_interruption(self):
+        child=worker_module.ManagedChild(['/usr/bin/true'],self.job,self.env)
+        interruption=worker_module.WorkerInterrupted('cancelled')
+        class Process:
+            def poll(self):return 0
+        child.process=Process()
+        with patch.object(child,'output_chunks',side_effect=worker_module.ProcessRecoveryError('settlement uncertain')),patch.object(child,'close_pipes'):
+            self.assertFalse(child.__exit__(type(interruption),interruption,None))
+        self.assertEqual(interruption.cleanup_errors,['settlement uncertain'])
+        self.assertTrue(interruption.recovery_required)
+
 
 if __name__=='__main__': unittest.main()
