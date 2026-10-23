@@ -729,7 +729,13 @@ public actor ShaderRequestService {
         try persistRecovery(); try persist()
         try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
         cancelPublicationRequests(); activeProcess?.stop()
-        if let process = activeProcess { try await settleProcess(process) }
+        if let process = activeProcess {
+            do { try await settleProcess(process) }
+            catch is RequestWorkerEvidenceError {
+                // Verified processes have retired. Drain the operation, then let the
+                // exact-journal reconciliation below retain its unverifiable markers.
+            }
+        }
         if let task = workerTask { await task.value }
         await waitForMaintenance()
         let lease = try beginMaintenance(forDetachment: true)
@@ -1290,7 +1296,7 @@ public actor ShaderRequestService {
             if !outcomeSeen { throw ShaderRequestError.unavailable("Worker ended without a verified result.") }
         } catch {
             process.stop()
-            if error is RequestWorkerTeardownError {
+            if error is RequestWorkerTeardownError || error is RequestWorkerEvidenceError {
                 holdForRecovery(journal: folder(id), configuration: record.configuration, error: error)
             } else if execution?.interrupted == false, records[id]?.detached != true {
                 records[id]?.cleanupPending = true

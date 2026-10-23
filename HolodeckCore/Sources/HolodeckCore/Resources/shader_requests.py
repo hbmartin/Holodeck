@@ -1040,12 +1040,17 @@ def main():
             worker.discard()
         else:
             worker.perform()
-    except WorkerInterrupted:
-        try: terminate_registered(sys.argv[3])
+    except WorkerInterrupted as interruption:
+        cleanup_errors = list(getattr(interruption, 'cleanup_errors', []))
+        recovery_required = getattr(interruption, 'recovery_required', False)
+        try: terminate_registered(sys.argv[3], budget=status_budget(read_supervision(sys.argv[3])))
         except (OperationalError, OSError) as error:
-            pending = any((Path(sys.argv[3]) / name).exists() for name in ("children.json", "supervision.json"))
-            emit("failure", message="Worker interrupted; cleanup failed: " + str(error),
-                 recoveryRequired=isinstance(error, ProcessRecoveryError) or pending); sys.exit(1)
+            cleanup_errors.append(str(error))
+            recovery_required |= isinstance(error, ProcessRecoveryError) or any(
+                (Path(sys.argv[3]) / name).exists() for name in ("children.json", "supervision.json"))
+        if cleanup_errors:
+            emit("failure", message="Worker interrupted; cleanup failed: " + '; cleanup error: '.join(cleanup_errors),
+                 recoveryRequired=recovery_required); sys.exit(1)
         sys.exit(130)
     except BaseException as error:
         if worker and worker.request and not isinstance(error, ProcessRecoveryError):

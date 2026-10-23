@@ -30,6 +30,7 @@ def main():
     parser.add_argument('--iterations', type=int, default=31)
     parser.add_argument('--worker', type=Path, default=WORKER)
     parser.add_argument('--idle-seconds', type=float, default=15)
+    parser.add_argument('--interleave', action='store_true', help='Alternate baseline/current command samples to reduce load drift')
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='holodeck-supervision-profile-') as scratch:
         directory = Path(scratch)
@@ -46,29 +47,43 @@ def main():
         results = {'python': sys.version, 'baselineRef': args.baseline,
                    'currentWorkerSHA256': hashlib.sha256(current.read_bytes()).hexdigest(),
                    'currentRuntimeSHA256': hashlib.sha256((current_directory / 'shader_processes.py').read_bytes()).hexdigest()}
+        results['comparisonOrder'] = 'alternating' if args.interleave else 'sequential'
+        cases = {}
+        command = ['/usr/bin/git', '--version']
         for label, module in versions:
             journal = directory / label; journal.mkdir()
             env = dict(os.environ, HOLODECK_REQUEST_DIRECTORY=str(journal), PYTHONDONTWRITEBYTECODE='1')
-            command = ['/usr/bin/git', '--version']
-            module.managed_run(command, directory, env, 10, None)
-            samples = []
-            for _ in range(args.iterations):
-                started = time.perf_counter()
-                assert module.managed_run(command, directory, env, 10, None).returncode == 0
-                samples.append((time.perf_counter() - started) * 1000)
-            results[label] = {'shortCommandMedianMs': statistics.median(samples)}
-            # Exercise the actual Worker.git path without contacting any remote.
             repository = directory / (label + '-repository'); repository.mkdir()
             subprocess.run(['/usr/bin/git', 'init', '-q', repository], check=True)
+            cases[label] = (module, journal, env, repository)
+            results[label] = {}
+            assert module.managed_run(command, directory, env, 10, None).returncode == 0
+        def short(label):
+            module, journal, env, repository = cases[label]
+            started = time.perf_counter()
+            assert module.managed_run(command, directory, env, 10, None).returncode == 0
+            return (time.perf_counter() - started) * 1000
+        def fixture(label):
+            module, journal, env, repository = cases[label]
             config = dict(repository=str(repository), git='/usr/bin/git', python=sys.executable,
                           codex='/usr/bin/false', shaderTool='/usr/bin/false')
-            samples = []
+            started = time.perf_counter(); worker = module.Worker(config, journal)
             for _ in range(5):
-                started = time.perf_counter(); worker = module.Worker(config, journal)
-                for _ in range(5):
-                    worker.git('status', '--porcelain'); worker.git('rev-parse', '--show-toplevel'); worker.git('ls-files', '-z')
-                samples.append((time.perf_counter() - started) * 1000)
-            results[label]['eighteenGitCommandsMedianMs'] = statistics.median(samples)
+                worker.git('status', '--porcelain'); worker.git('rev-parse', '--show-toplevel'); worker.git('ls-files', '-z')
+            return (time.perf_counter() - started) * 1000
+        for metric, measure, count in [('shortCommandMedianMs', short, args.iterations),
+                                       ('eighteenGitCommandsMedianMs', fixture, 5)]:
+            samples = {label: [] for label, _ in versions}
+            if args.interleave:
+                for index in range(count):
+                    labels = ['baseline', 'current'] if index % 2 else ['current', 'baseline']
+                    for label in labels: samples[label].append(measure(label))
+            else:
+                for label, _ in versions:
+                    samples[label] = [measure(label) for _ in range(count)]
+            for label in samples: results[label][metric] = statistics.median(samples[label])
+        for label, module in versions:
+            _, journal, env, repository = cases[label]
             # Instrument separately so measurement hooks do not affect launch timings.
             runtime = getattr(module, 'processes', module)
             owner_script = Path(runtime.__file__)
