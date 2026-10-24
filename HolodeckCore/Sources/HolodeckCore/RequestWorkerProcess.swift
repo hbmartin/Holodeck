@@ -49,10 +49,6 @@ nonisolated struct RequestSettlementBudget: Codable, Sendable {
         clock == "darwin-uptime-raw" && (bootID == nil || UUID(uuidString:bootID!) != nil) &&
         startedAt.isFinite && deadline.isFinite && deadline >= startedAt && deadline - startedAt <= 10.001
     }
-    func inherited(now: TimeInterval, boot: String?) -> Self? {
-        guard valid, let boot, bootID == boot, startedAt <= now + 0.01 else { return nil }
-        var value = self; value.deadline = min(value.deadline,now + 10); return value
-    }
     func expired(at now: TimeInterval) -> Bool { now >= deadline }
     func escalated(at now: TimeInterval) -> Bool { now >= startedAt + 5 }
 }
@@ -92,7 +88,6 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
         let failure: String?
         let failureKind: String?
         let recoveryRequired: Bool?
-        let retryable: Bool?
         let sessionID: UUID?
         let revision: Int?
         let clock: String?
@@ -112,8 +107,6 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
         var observationFailure: String?
         var sessions: [RequestProcessIdentity: [RequestProcessIdentity]] = [:]
         var supervisors: Set<RequestProcessIdentity> = []
-        var budget: RequestSettlementBudget?
-        var deadline: TimeInterval? { budget?.deadline }
     }
     static func evidenceExists(_ file: URL) -> Bool {
         var info = stat()
@@ -187,7 +180,6 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
                 (supervision.formatVersion >= 2 && !pass.current(supervision.supervisor) && supervision.pipeDrainComplete != true) {
                 result.addEvidenceError(supervision.failureKind == "pipeDrain" ? (supervision.failure ?? "Output pipe completion is unverified.") : "Output pipe completion is unverified.")
             }
-            if supervision.formatVersion == 3, pass.current(supervision.supervisor) { result.budget = supervision.termination }
         }
         for entry in entries {
             let known = Array(Set(entry.members + additional)).filter { pass.current($0) }
@@ -337,7 +329,9 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     private var signalPassPending = false
     private var nextSignalPass: TimeInterval = 0
     var beforeReplyWrite: (() -> Void)?
+    var beforeBirthCapture: (() -> Void)?
     var beforeIdentityWrite: (() throws -> Void)?
+    var beforeGateRelease: (() throws -> Void)?
     var beforeLogWrite: (() throws -> Void)?
     var beforeSignalPass: (() -> Void)?
     var afterObservationCommit: (([RequestProcessIdentity]) -> Void)?
@@ -381,7 +375,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         if let directory {
             do {
                 let result = try RequestProcessIdentity.observe(in:directory,known:observed,group:pass.group,identity:pass.birth)
-                observation.identities = result.identities; observation.sessions = result.sessions; observation.supervisors = result.supervisors; observation.budget = result.budget
+                observation.identities = result.identities; observation.sessions = result.sessions; observation.supervisors = result.supervisors
                 observation.uncertainty = result.uncertainty ?? observation.uncertainty; observation.evidenceErrors = result.evidenceErrors
                 if let detail = result.observationFailure { failure = RequestWorkerTeardownError(cause:detail) }
             } catch { failure = error }
@@ -401,7 +395,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 observationFailures += 1; registryError = failure
                 if observationFailures >= 3 {
                     let detail = (failure as? RequestWorkerTeardownError)?.cause ?? failure.localizedDescription
-                    firstError = firstError ?? ShaderRequestError.unavailable("Repeated process observation failure: " + detail)
+                    firstError = firstError ?? RequestWorkerSupervisionError(message: "Repeated process observation failure: " + detail)
                     return true
                 }
                 return false
@@ -492,7 +486,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     }
     private func record(_ error: Error) {
         lock.withLock { firstError = firstError ?? error }
-        stop()
+        beginTeardown(cancelled: false)
     }
 
     func run(mode: String, configuration: ShaderRequestConfiguration, directory: URL, operationID: UUID? = nil) -> AsyncThrowingStream<RequestWorkerEvent, Error> {
@@ -510,10 +504,11 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 do {
                     guard let script = scriptOverride ?? Self.bundledScript else { throw ShaderRequestError.unavailable("Bundled shader request worker is missing.") }
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                    let configurationData = try JSONEncoder().encode(configuration)
-                    guard var workerConfiguration = try JSONSerialization.jsonObject(with:configurationData) as? [String:Any] else { throw ShaderRequestError.unavailable("Worker configuration is invalid.") }
-                    if let operationID { workerConfiguration["workerOperationID"] = operationID.uuidString }
-                    try RequestJournalWriter.write(JSONSerialization.data(withJSONObject:workerConfiguration),to:directory.appendingPathComponent("configuration.json"))
+                    if let operationID {
+                        try RequestWorkerOperation.validateLaunch(id: operationID, configuration: configuration, in: directory)
+                    } else {
+                        try RequestJournalWriter.write(RequestWorkerOperation.encodedConfiguration(configuration, id: nil), to: directory.appendingPathComponent("configuration.json"))
+                    }
                     process.executableURL = URL(fileURLWithPath: configuration.python)
                     let launchToken = UUID().uuidString
                     process.arguments = ["-I", "-c", Self.bootstrap, launchToken, script.path, mode, directory.appendingPathComponent("configuration.json").path, directory.path]
@@ -535,8 +530,11 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     try lock.withLock {
                         guard !stopping else { throw CancellationError() }
                         guard fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) == 0 else { throw POSIXError(.EIO) }
-                        try process.run(); started = true
+                        do { try process.run() }
+                        catch { throw ShaderRequestError.unavailable("Worker interpreter could not launch: " + error.localizedDescription) }
+                        started = true
                     }
+                    beforeBirthCapture?()
                     var birth: RequestProcessIdentity?
                     for observation in 0..<3 {
                         if !process.isRunning || lock.withLock({ stopping }) { break }
@@ -549,15 +547,21 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     }
                     guard let birth else {
                         if lock.withLock({ stopping }) { throw CancellationError() }
-                        if !process.isRunning { throw ShaderRequestError.unavailable("Worker interpreter exited before launch registration. See its retained log.") }
+                        if !process.isRunning { throw startupExitError() }
                         throw RequestWorkerSupervisionError(message:"Worker birth identity could not be established; checkout execution was not released.")
                     }
                     try beforeIdentityWrite?()
                     try RequestJournalWriter.write(JSONEncoder().encode(WorkerIdentity(pid: birth.pid, script: script.path,
                         directory: directory.path, birth: birth)), to: directory.appendingPathComponent("process.json"))
-                    guard groups.identity(birth.pid) == birth else { throw RequestWorkerOwnershipError() }
+                    try beforeGateRelease?()
+                    if lock.withLock({ cancelRequested }) { throw CancellationError() }
+                    guard groups.identity(birth.pid) == birth else {
+                        if !process.isRunning { throw startupExitError() }
+                        throw RequestWorkerOwnershipError()
+                    }
                     try lock.withLock {
-                        guard !stopping, process.isRunning else { throw CancellationError() }
+                        guard !stopping else { throw CancellationError() }
+                        guard process.isRunning else { throw startupExitError() }
                         try input.fileHandleForWriting.write(contentsOf:Data((launchToken + "\n").utf8))
                         gateReleased = true
                     }
@@ -604,11 +608,15 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     try? FileManager.default.removeItem(at: directory.appendingPathComponent("children.json"))
                     try? FileManager.default.removeItem(at: directory.appendingPathComponent("supervision.json"))
                     if lock.withLock({ cancelRequested }) { throw CancellationError() }
+                    if process.terminationReason == .uncaughtSignal {
+                        throw RequestWorkerSupervisionError(message: "Worker terminated by signal \(process.terminationStatus) after launch. See its retained log.")
+                    }
                     if process.terminationStatus != 0 { throw ShaderRequestError.unavailable("Worker exited \(process.terminationStatus). See its retained log.") }
                     continuation.finish()
                 } catch {
+                    let error = lock.withLock { firstError } ?? error
                     if lock.withLock({ started && !gateReleased }) {
-                        stop()
+                        beginTeardown(cancelled: false)
                         while process.isRunning || pipes.wait(timeout:.now()) != .success {
                             refreshOwned(); signalPending()
                             if lock.withLock({ terminationBudget?.expired(at:groups.now()) == true }) {
@@ -623,7 +631,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     if let evidence = error as? RequestWorkerEvidenceError { lock.withLock { retainedEvidenceError = evidence } }
                     if process.isRunning { stop() }
                     if error is CancellationError || error is RequestWorkerTeardownError || error is RequestWorkerEvidenceError ||
-                       error is RequestWorkerOwnershipError || error is RequestWorkerSupervisionError {
+                       error is RequestWorkerOwnershipError || error is RequestWorkerSupervisionError || error is ShaderRequestError {
                         continuation.finish(throwing:error)
                     } else {
                         continuation.finish(throwing:RequestWorkerSupervisionError(message:error.localizedDescription,underlyingError:error,retryable:!(error is POSIXError || error is CocoaError)))
@@ -632,6 +640,10 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
             }
             continuation.onTermination = { [weak self] reason in if case .cancelled = reason { self?.stop() } }
         }
+    }
+    private func startupExitError() -> ShaderRequestError {
+        let reason = process.terminationReason == .uncaughtSignal ? "signal" : "exit"
+        return .unavailable("Worker interpreter exited before checkout execution was released (" + reason + " " + String(process.terminationStatus) + "). See retained worker-stderr.log and worker.log.")
     }
     func waitForExit() async throws {
         let finished: Bool = await withCheckedContinuation { continuation in

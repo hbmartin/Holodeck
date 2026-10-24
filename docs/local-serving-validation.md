@@ -539,3 +539,44 @@ Benchmark reproduction: `python tools/profile_shader_supervision.py --baseline f
 Evidence uses `/tmp/holodeck-pr32-*`: `verified-python{39,315}-{0,1,2}` logs/manifests/results, `verified-python-summary.json`, `verified-core.log`, `verified-release.log`, `verified-ui.log`, `verified-mac-build.log`, `verified-tv-build.log`, `verified-package-proof.json`, `verified-benchmark{39,315}.json`, `verified-metal.log`, `verified-gpu.log`, and `verified-native-summary.json`. Development failures are not counted as passing runs: the dangling-link reader and orphan fixtures were corrected before final core validation, and the keyboard-focus UI failure is recorded above.
 
 The worker SHA-256 is `014724c5b06ee79e98a1dfe7b1b26649535238636827725ea025db577ae0654d`; the runtime SHA-256 is `51457dc2ede3168b2c6751040c6edb27fb1f8519b994e267067482d24f2f6ca1`. No checker artifact or library lock changed. Physical Apple TV, TV UI, live LAN/TLS and live Codex publication were not run. The live installation and request settings were not changed; a later rollout must drain requests before installing the matching native host and bundled worker. Linux CI is unchanged.
+
+## PR #33 follow-up: recoverable operations and isolated retry completion (2026-10-24)
+
+The follow-up starts from merge commit `8f2a7a3` (the same tree reviewed in PR #33). Operation-journal format 2 records both configuration-binding states before replacement and replays only the recorded transition. Existing format-1 journals remain readable; unexplained legacy mismatches require explicit recovery after checkout ownership and process settlement are verified. Detach retains binding files and marker evidence in a durable UUID archive. Cleanup configuration corrections remain journaled until request records, preferences, and worker bindings converge.
+
+Checker identity probes retain every supervision-error subtype, and oversized complete or incomplete control frames close their channel without starving process cleanup. Startup interpreter failures report their actual exit or signal and do not consume the supervision retry. Each attempt must supply its own completion event; catalog preparations belong to that attempt, while confirmed commit delivery remains deduplicated across the logical operation. Exact-journal recovery clears only its own reconciliation invalidation. Legacy PID/argv ownership behavior is unchanged.
+
+The new regressions inject interruption at each durable binding boundary, reject unrelated transitions, repair legacy mismatches through the real service action, restore corrected tool paths from both initial and paused operations, and prevent configuration changes when intent persistence fails. They cover independent recovery entries, replaced checkout identities, resumable archives and dangling markers, late cancellation diagnostics, completion isolation in all four modes, interpreter exits at three startup gates, deterministic launch failure, and duplicate committed results.
+
+Final local acceptance used frozen runtime sources; their hashes were checked before/after testing and against both Release apps. Python 3.9.6 and 3.15.0 each passed **119 unique worker tests**, with no skips. Swift core passed **340 tests with six opt-in skips**, including all 23 local scenes. Release passed **140 tests with one opt-in skip**, including seven native packaged-resource tests and the supervision profile. All four targeted Mac UI tests passed together using the isolated `.RecoveryTests` app identity. Both Release apps built successfully with signing disabled.
+
+Core skips were three unrelated catalog performance probes, the worker profile (subsequently run in Release), live LAN/TLS, and live Codex publication. Release skipped only live Codex publication. Physical TV and simulator runtime checks were not run. No live installation, request settings, checker artifact, library lock, or CI configuration changed.
+
+Both bundled copies of each worker file in the Mac app and the tvOS copy matched the source bytes; neither app contained `.pyc` files. Packaged `Worker.require_checker()` accepted the selected library identity. The unchanged checker compiled **66 authoring assets and shader/snippet templates for macOS and tvOS**; Mac GPU verification passed **seven profile checks**.
+
+Supervision benchmarks compare merge `8f2a7a3` with this tree using the same interpreter/filesystem, alternating execution order, 31 warm short-command samples and five fixtures of 18 Git commands. Timings are local evidence, not CI assertions.
+
+| Interpreter | Short command median, baseline → current (ms) | 18 Git commands median, baseline → current (ms) |
+| --- | --- | --- |
+| Python 3.9.6 | 192.468 → 192.834 | 2954.780 → 3011.385 |
+| Python 3.15.0 | 75.752 → 75.620 | 1449.307 → 1474.808 |
+
+Every managed-command fixture retained **two interpreter launches, five atomic replacements, and ten fsyncs**. A new logical-operation binding uses three durable transitions (pending binding, configuration, committed binding); those operation writes are separate from managed-command measurements. Structural tests verify that automatic retry performs exact-journal reconciliation without another full scan and that explicit invalidation still checks other journals.
+
+| Interpreter | Idle parent CPU, baseline → current | Idle reaped-child CPU, baseline → current |
+| --- | --- | --- |
+| Python 3.9.6 | 0.059% → 0.054% | 1.185% → 1.292% |
+| Python 3.15.0 | 0.048% → 0.043% | 0.965% → 0.701% |
+
+The separate Release native teardown profile measured **30.30 wait polls/s** and **0.394% of one CPU core** in the supervising test process.
+
+Reproduction commands:
+
+```sh
+/usr/bin/python3 -B tools/test_shader_requests.py
+python3 -B tools/test_shader_requests.py
+HOLODECK_AUTHORING_FIXTURE=/Volumes/Pro2T/HolodeckShaders HOLODECK_GPU_TESTS=1 swift test --package-path HolodeckCore
+HOLODECK_PROFILE_WORKER=1 swift test --package-path HolodeckCore -c release --filter 'ShaderRequestTests|ShaderLibraryToolTests'
+/usr/bin/python3 -B tools/profile_shader_supervision.py --baseline 8f2a7a3 --interleave
+python3 -B tools/profile_shader_supervision.py --baseline 8f2a7a3 --interleave
+```

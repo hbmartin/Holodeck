@@ -897,6 +897,27 @@ worker.main()
             with self.assertRaisesRegex(worker_module.OperationalError,'invalid or unreadable'):
                 worker.require_checker()
 
+    def test_checker_probe_supervision_faults_preserve_type_retryability_and_work(self):
+        for information_probe in (False, True):
+            for fault in (worker_module.SupervisionError('probe lifecycle fault'),
+                          worker_module.SupervisionError('probe persistence fault', retryable=False),
+                          worker_module.ProcessRecoveryError('probe has unresolved ownership')):
+                with self.subTest(information_probe=information_probe, fault=str(fault)):
+                    worker=worker_module.Worker(self.config,self.job)
+                    worker.request={'id':'fixture'};worker.checkpoint={}
+                    worker.perform=lambda:worker.require_checker()
+                    work=self.job/'unpublished';work.write_bytes(b'\x00\xffKEEP\r\n')
+                    saved_patch=self.job/'changes.patch';saved_patch.write_bytes(b'PATCH')
+                    replies=([subprocess.CompletedProcess([],0,json.dumps(CHECKER_PIN),'')] if information_probe else [])+[fault]
+                    output=io.StringIO()
+                    with patch.object(worker_module,'Worker',return_value=worker),patch.object(worker_module,'run',side_effect=replies),patch.object(worker,'clean') as clean,patch.object(worker_module.os,'setsid'),patch.object(worker_module.signal,'signal'),patch.object(sys,'argv',[str(SCRIPT),'run',str(self.job/'probe-config.json'),str(self.job)]),contextlib.redirect_stdout(output):
+                        (self.job/'probe-config.json').write_text('{}')
+                        with self.assertRaises(SystemExit):worker_module.main()
+                    event=json.loads(output.getvalue());clean.assert_not_called()
+                    self.assertEqual(event['failureKind'],'supervision');self.assertEqual(event['retryable'],fault.retryable)
+                    self.assertEqual(event['recoveryRequired'],isinstance(fault,worker_module.ProcessRecoveryError))
+                    self.assertEqual(work.read_bytes(),b'\x00\xffKEEP\r\n');self.assertEqual(saved_patch.read_bytes(),b'PATCH')
+
     def test_checker_probe_timeouts_and_malformed_responses_have_specific_diagnostics(self):
         for fault,expected in [(subprocess.TimeoutExpired('native',30),'timed out after 30 seconds'),
                                (OSError('cannot launch'),'could not run'),
@@ -1652,6 +1673,45 @@ w.main()
                 with self.assertRaises(SystemExit):worker_module.main()
             event=json.loads(output.getvalue());self.assertTrue(event['recoveryRequired']);self.assertEqual(event['failureKind'],'interrupted')
             self.assertIn('unresolved ownership',event['message']);self.assertEqual(work.read_bytes(),b'RETAIN')
+
+    def test_oversized_control_frames_close_channel_without_starving_settlement(self):
+        tree=ast.parse(PROCESS_SCRIPT.read_text())
+        supervisor=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='supervise')
+        loop=next(n for n in ast.walk(supervisor) if isinstance(n,ast.While) and isinstance(n.test,ast.Constant) and n.test.value is True)
+        function=ast.parse('def probe(control_open,control,pending,engine,status,command,stop,work_settled,drain_deadline,wakeup):\n pass\n').body[0]
+        function.body=[copy.deepcopy(loop)]
+        for complete in (False,True):
+            with self.subTest(complete=complete):
+                reports=[];namespace=dict(process_module.__dict__)
+                namespace.update(report=lambda state,**fields:reports.append(dict(state=state,**fields)),process_clock=lambda:100.)
+                exec(compile(ast.fix_missing_locations(ast.Module(body=[function],type_ignores=[])),'<supervisor-loop>','exec'),namespace)
+                class Control:
+                    closed=False
+                    def recv(self,*a):raise BlockingIOError()
+                    def close(self):self.closed=True
+                class Termination:
+                    started=100.;deadline=110.;expired=False
+                    def record(self):return {'deadline':110.}
+                    def begin(self):pass
+                class Engine:
+                    termination=Termination();failure_kind=None;failure=None;next_sample=100.;calls=0
+                    def step(self):self.calls+=1;return True
+                    def fail(self,error,kind):self.failure=str(error);self.failure_kind=kind
+                class Command:
+                    def poll(self):return 0
+                class Wakeup:
+                    calls=0
+                    def wait(self,*a):
+                        self.calls+=1
+                        if self.calls>3:raise AssertionError('Control rejection starved settlement')
+                    def forget(self,*a):pass
+                control=Control();engine=Engine();wakeup=Wakeup()
+                payload=bytearray(b'{"action":"'+b'x'*(worker_module.REGISTRY_LIMIT+1)+(b'"}\n' if complete else b''))
+                status=dict(commandReturnCode=0,termination={'deadline':110.},processesSettled=False,pipeDrainComplete=True)
+                rc=namespace['probe'](True,control,payload,engine,status,Command(),[False],False,None,wakeup)
+                self.assertEqual(rc,2);self.assertTrue(control.closed);self.assertGreater(engine.calls,0)
+                self.assertLessEqual(wakeup.calls,2);self.assertEqual(reports[-1]['failureKind'],'control')
+                self.assertFalse(reports[-1]['recoveryRequired']);self.assertIn('64 KiB',reports[-1]['failure'])
 
     def test_supervisor_internal_fault_preserves_partial_control_frame(self):
         tree=ast.parse(PROCESS_SCRIPT.read_text())
