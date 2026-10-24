@@ -7,6 +7,10 @@ nonisolated struct RequestWorkerTeardownError: LocalizedError, Sendable {
     var errorDescription: String? { "Worker processes did not exit within ten seconds. Checkout recovery is required; process evidence was retained." + (cause.map { " Original error: " + $0 } ?? "") }
 }
 
+nonisolated struct RequestWorkerOwnershipError: LocalizedError, Sendable {
+    var errorDescription: String? { "Worker ownership cannot be verified. Registered commands were left untouched; repair the worker marker and retry recovery before reusing or detaching the checkout." }
+}
+
 nonisolated struct RequestWorkerEvidenceError: LocalizedError, Sendable {
     let cause: String
     var errorDescription: String? { cause + " Repair the journal or detach while retaining its files and evidence." }
@@ -178,8 +182,9 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
             return true
         }
     }
-    static func signal(_ identities: [Self], _ signal: Int32) {
-        for identity in identities where identity.isCurrent { _ = kill(identity.pid, signal) }
+    static func signal(_ identities: [Self], _ signal: Int32, identity: (Int32) -> Self? = { Self(pid:$0) },
+                       send: (Int32,Int32) -> Int32 = { kill($0,$1) }) {
+        for value in identities where identity(value.pid) == value { _ = send(value.pid, signal) }
     }
 }
 
@@ -257,11 +262,14 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         var boot: @Sendable () -> String? = { RequestSettlementBudget.bootIdentity }
     }
     static let bootstrap = """
-    import json,runpy,sys
+    import json,os,runpy,sys
     if sys.version_info < (3,9):
         print(json.dumps({'event':'failure','message':'The shader checker requires Python 3.9 or later; choose a supported interpreter.'}),flush=True)
         sys.exit(2)
-    sys.argv=sys.argv[1:]
+    try: os.setsid()
+    except PermissionError: pass
+    if sys.stdin.readline() != sys.argv[1]+'\\n': sys.exit(125)
+    sys.argv=sys.argv[2:]
     runpy.run_path(sys.argv[0],run_name='__main__')
     """
     static var bundledScript: URL? { Bundle.module.url(forResource: "shader_requests", withExtension: "py") }
@@ -290,6 +298,8 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     private var observationFailures = 0
     private var observationInFlight = false
     private var rootStopObserved = false
+    private var gateReleased = false
+    private var rootTermSentAt: TimeInterval?
     private var teardownFailed = false
     private var retainedEvidenceError: RequestWorkerEvidenceError?
     private var escalation: DispatchWorkItem?
@@ -362,7 +372,6 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 return false
             }
             observationFailures = 0
-            if stopping, let budget = terminationBudget { terminationBudget = budget.capped(by:observation.budget,now:groups.now(),boot:bootID) }
             if stoppingAtSnapshot { rootStopObserved = true }
             registryError = observation.uncertainty.map { RequestWorkerTeardownError(cause: $0) } ?? observation.evidenceError.map { RequestWorkerEvidenceError(cause: $0) }
             return false
@@ -374,10 +383,14 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         signalQueue.async { [self] in
             let snapshot = lock.withLock { () -> (RequestProcessIdentity?,[RequestProcessIdentity],[RequestProcessIdentity:[RequestProcessIdentity]],Bool,Bool,UInt64,Set<RequestProcessIdentity>)? in
                 guard started,stopping,!completed,terminationBudget?.expired(at:groups.now()) != true else { return nil }
-                return (leader,Array(owned.values),supervisedSessions,escalated || terminationBudget?.escalated(at:groups.now()) == true,
+                return (leader,Array(owned.values),supervisedSessions,(leader.map { root in
+                            owned[root.pid] == root && rootTermSentAt.map { groups.now() >= $0 + 5 } == true
+                        } ?? false) || (leader == nil && terminationBudget?.escalated(at:groups.now()) == true),
                         rootStopObserved || observationFailures >= 3,ownershipGeneration,supervisorAnchors)
             }
-            guard let (root,identities,sessions,kill,rootReady,generation,anchors) = snapshot else { return }
+            guard let (root,identities,sessions,rootEscalated,rootReady,generation,anchors) = snapshot else { return }
+            let rootLive = root.map { passBirth in groups.identity(passBirth.pid) == passBirth } == true
+            let kill = rootLive ? rootEscalated : lock.withLock { terminationBudget?.escalated(at:groups.now()) == true }
             let signal = kill ? SIGKILL : SIGTERM
             let pass = RequestObservationPass(group:groups.group,identity:groups.identity)
             let targets: [RequestProcessIdentity]
@@ -398,7 +411,12 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 for value in [SIGTERM] + (kill ? [SIGKILL] : []) {
                     let reserved = lock.withLock { () -> Bool in
                         guard !completed,ownershipGeneration == generation,terminationBudget?.expired(at:groups.now()) != true else { return false }
-                        return value == SIGTERM ? termSent.insert(identity).inserted : killSent.insert(identity).inserted
+                        if value == SIGTERM {
+                            let inserted = termSent.insert(identity).inserted
+                            if inserted, identity == root { rootTermSentAt = groups.now() }
+                            return inserted
+                        }
+                        return killSent.insert(identity).inserted
                     }
                     if reserved,groups.identity(identity.pid) == identity,groups.signal(identity.pid,value) != 0,errno != ESRCH {
                         lock.withLock { registryError = RequestWorkerTeardownError(cause:"Cannot signal verified process: " + String(cString:strerror(errno))) }
@@ -415,6 +433,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
             if !stopping { nextObservation = 0 }
             stopping = true; terminationBudget = terminationBudget ?? RequestSettlementBudget(now:groups.now(),boot:bootID)
             guard started else { return }
+            if !gateReleased { try? input.fileHandleForWriting.close() }
             if escalation == nil {
                 let work = DispatchWorkItem { [weak self] in
                     guard let self else { return }
@@ -451,7 +470,8 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                     try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("configuration.json"), options: .atomic)
                     process.executableURL = URL(fileURLWithPath: configuration.python)
-                    process.arguments = ["-I", "-c", Self.bootstrap, script.path, mode, directory.appendingPathComponent("configuration.json").path, directory.path]
+                    let launchToken = UUID().uuidString
+                    process.arguments = ["-I", "-c", Self.bootstrap, launchToken, script.path, mode, directory.appendingPathComponent("configuration.json").path, directory.path]
                     process.standardInput = input; process.standardOutput = output; process.standardError = error
                     process.currentDirectoryURL = URL(fileURLWithPath: configuration.repository)
                     let parser = RequestEventParser()
@@ -472,16 +492,30 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                         guard fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) == 0 else { throw POSIXError(.EIO) }
                         try process.run(); started = true
                     }
-                    let birth = groups.identity(process.processIdentifier)
+                    var birth: RequestProcessIdentity?
+                    for observation in 0..<3 {
+                        if !process.isRunning || lock.withLock({ stopping }) { break }
+                        if let value = groups.identity(process.processIdentifier) { birth = value; break }
+                        if observation < 2 { groups.wait(0.25) }
+                    }
                     lock.withLock {
                         leader = birth; ownershipGeneration &+= 1
                         if let birth { owned[birth.pid] = birth }
                     }
-                    do {
-                        try beforeIdentityWrite?()
-                        try JSONEncoder().encode(WorkerIdentity(pid: process.processIdentifier, script: script.path, directory: directory.path, birth: leader))
-                            .write(to: directory.appendingPathComponent("process.json"), options: .atomic)
-                    } catch { record(error) }
+                    guard let birth else {
+                        if lock.withLock({ stopping }) { throw CancellationError() }
+                        if !process.isRunning { throw ShaderRequestError.unavailable("Worker interpreter exited before launch registration. See its retained log.") }
+                        throw RequestWorkerSupervisionError(message:"Worker birth identity could not be established; checkout execution was not released.")
+                    }
+                    try beforeIdentityWrite?()
+                    try RequestJournalWriter.write(JSONEncoder().encode(WorkerIdentity(pid: birth.pid, script: script.path,
+                        directory: directory.path, birth: birth)), to: directory.appendingPathComponent("process.json"))
+                    guard groups.identity(birth.pid) == birth else { throw RequestWorkerOwnershipError() }
+                    try lock.withLock {
+                        guard !stopping, process.isRunning else { throw CancellationError() }
+                        try input.fileHandleForWriting.write(contentsOf:Data((launchToken + "\n").utf8))
+                        gateReleased = true
+                    }
                     while process.isRunning {
                         refreshOwned()
                         signalPending()
@@ -526,6 +560,19 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     if process.terminationStatus != 0 { throw ShaderRequestError.unavailable("Worker exited \(process.terminationStatus). See its retained log.") }
                     continuation.finish()
                 } catch {
+                    if lock.withLock({ started && !gateReleased }) {
+                        stop()
+                        while process.isRunning || pipes.wait(timeout:.now()) != .success {
+                            refreshOwned(); signalPending()
+                            if lock.withLock({ terminationBudget?.expired(at:groups.now()) == true }) {
+                                lock.withLock { teardownFailed = true }; break
+                            }
+                            groups.wait(0.025)
+                        }
+                    }
+                    if lock.withLock({ teardownFailed }) {
+                        continuation.finish(throwing:RequestWorkerTeardownError(cause:error.localizedDescription)); return
+                    }
                     if let evidence = error as? RequestWorkerEvidenceError { lock.withLock { retainedEvidenceError = evidence } }
                     if process.isRunning { stop() }
                     continuation.finish(throwing: error)
@@ -551,17 +598,17 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 let identity: WorkerIdentity
                 do { identity = try JSONDecoder().decode(WorkerIdentity.self, from: BoundedCatalogReader(root: directory).read("process.json", limit: CatalogLimits.headBytes).bytes) }
                 catch { throw ShaderRequestError.unavailable("Worker identity is unreadable. Repair the journal marker or detach the checkout while retaining its evidence.") }
-                guard identity.pid > 1, RequestPaths.canonical(URL(fileURLWithPath: identity.directory)) == RequestPaths.canonical(directory) else {
+                guard identity.pid > 1, identity.birth.map({ $0.pid == identity.pid }) != false, RequestPaths.canonical(URL(fileURLWithPath: identity.directory)) == RequestPaths.canonical(directory) else {
                     throw ShaderRequestError.unavailable("Worker identity does not belong to this request journal.")
                 }
                 if let birth = identity.birth {
                     root = birth // A retired birth still identifies the group whose unfamiliar members must remain unowned.
-                } else if let birth = RequestProcessIdentity(pid: identity.pid) {
+                } else if let birth = groups.identity(identity.pid) {
                     let task = Process(), output = Pipe()
                     task.executableURL = URL(fileURLWithPath: "/bin/ps"); task.arguments = ["-p", String(identity.pid), "-o", "command="]
                     task.standardOutput = output; try task.run()
                     let command = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self); task.waitUntilExit()
-                    if birth.isCurrent, command.contains(identity.script), command.contains(identity.directory) { root = birth }
+                    if groups.identity(birth.pid) == birth, command.contains(identity.script), command.contains(identity.directory) { root = birth }
                 }
             } catch { markerError = error.localizedDescription }
         }
@@ -590,25 +637,26 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 if let detail = observation.observationFailure { throw RequestWorkerTeardownError(cause:detail) }
                 uncertainty = observation.uncertainty ?? uncertainty; evidenceError = observation.evidenceError ?? markerError; failures = 0
             } catch { failures += 1; uncertainty = error.localizedDescription }
-            targets = Array(Set(targets.filter(\.isCurrent)))
+            targets = Array(Set(targets.filter { groups.identity($0.pid) == $0 }))
+            if root == nil, !targets.isEmpty { throw RequestWorkerOwnershipError() }
             let signal = budget.escalated(at:groups.now()) ? SIGKILL : SIGTERM
-            let pending = budget.expired(at:groups.now()) ? [] : root.flatMap { $0.isCurrent ? [$0] : nil } ?? RequestProcessIdentity.shutdownTargets(targets, sessions: sessions, signal: signal, allowOwnerRetirement: failures == 0)
+            let pending = budget.expired(at:groups.now()) ? [] : root.flatMap { groups.identity($0.pid) == $0 ? [$0] : nil } ?? RequestProcessIdentity.shutdownTargets(targets, sessions: sessions, signal: signal, allowOwnerRetirement: failures == 0, identity:groups.identity)
             let term = pending.filter { termSent.insert($0).inserted }
-            RequestProcessIdentity.signal(term, SIGTERM)
+            RequestProcessIdentity.signal(term, SIGTERM, identity:groups.identity, send:groups.signal)
             if signal == SIGKILL {
                 let killable = pending.filter { identity in
                     guard anchors.contains(identity), identity != root else { return true }
                     do { return try !groups.group(identity.pid).contains { $0 != identity } }
                     catch { uncertainty = error.localizedDescription; failures += 1; return false }
                 }
-                RequestProcessIdentity.signal(killable.filter { killSent.insert($0).inserted }, SIGKILL)
+                RequestProcessIdentity.signal(killable.filter { killSent.insert($0).inserted }, SIGKILL, identity:groups.identity, send:groups.signal)
             }
-            if uncertainty == nil, !targets.contains(where: \.isCurrent) {
+            if uncertainty == nil, !targets.contains(where: { groups.identity($0.pid) == $0 }) {
                 // A second observation after signalling closes the final-fork window.
                 do {
-                    let final = try RequestProcessIdentity.observe(in: directory, known: targets, group: groups.group)
+                    let final = try RequestProcessIdentity.observe(in: directory, known: targets, group: groups.group, identity:groups.identity)
                     let rootGroup = try root.flatMap { root -> [RequestProcessIdentity]? in
-                        let current = RequestProcessIdentity(pid: root.pid)
+                        let current = groups.identity(root.pid)
                         return current == nil || current == root ? try groups.group(root.pid) : nil
                     } ?? []
                     if final.observationFailure == nil, final.uncertainty == nil, final.identities.isEmpty, rootGroup.isEmpty {

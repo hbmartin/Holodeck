@@ -32,22 +32,8 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
         } catch { throw RequestWorkerEvidenceError(cause: "Worker operation journal is unreadable: " + error.localizedDescription) }
     }
     func save(in directory: URL) throws {
-        do { try write(in: URL(fileURLWithPath: RequestPaths.canonical(directory))) }
+        do { try RequestJournalWriter.write(JSONEncoder().encode(self), to: directory.appendingPathComponent(Self.filename)) }
         catch { throw RequestWorkerEvidenceError(cause: "Cannot persist worker retry state: " + error.localizedDescription) }
-    }
-    private func write(in directory: URL) throws {
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let temporary = directory.appendingPathComponent(".operation-" + UUID().uuidString)
-        let descriptor = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
-        guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
-        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-        defer { try? handle.close(); try? FileManager.default.removeItem(at: temporary) }
-        try handle.write(contentsOf: JSONEncoder().encode(self)); try handle.synchronize()
-        guard rename(temporary.path, directory.appendingPathComponent(Self.filename).path) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
-        let parent = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-        guard parent >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
-        defer { close(parent) }
-        guard fsync(parent) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
     }
     static func begin(mode: String, in directory: URL) throws -> Self {
         if var saved = try read(in: directory), saved.mode == mode, saved.phase != .complete {
@@ -63,6 +49,24 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
         if let saved = try read(in: directory), saved.phase == .paused {
             try Self(mode: saved.mode).save(in: directory)
         }
+    }
+}
+
+nonisolated enum RequestJournalWriter {
+    static func write(_ data: Data, to file: URL) throws {
+        let directory = URL(fileURLWithPath: RequestPaths.canonical(file.deletingLastPathComponent()))
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let temporary = directory.appendingPathComponent(".operation-" + UUID().uuidString)
+        let descriptor = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+        guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close(); try? FileManager.default.removeItem(at: temporary) }
+        try handle.write(contentsOf: data); try handle.synchronize()
+        guard rename(temporary.path, directory.appendingPathComponent(file.lastPathComponent).path) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        let parent = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard parent >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        defer { close(parent) }
+        guard fsync(parent) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
     }
 }
 

@@ -1984,34 +1984,89 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertFalse(birth.isCurrent); XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
     }
 
-    func testLiveNativeTeardownUsesRemainingSupervisorBudget() async throws {
+    func testOlderCommandBudgetCannotBackdateWorkerRootEscalation() async throws {
         let (root, script) = try recoveryFixture(), bundled = try XCTUnwrap(RequestWorkerProcess.bundledScript)
         try """
-        import contextlib,importlib.util,json,os,signal,sys,time,uuid
+        import importlib.util,json,os,signal,sys,time,uuid
         from pathlib import Path
-        with contextlib.suppress(PermissionError):os.setsid()
-        spec=importlib.util.spec_from_file_location('w',\(String(reflecting: bundled.path)))
+        spec=importlib.util.spec_from_file_location('w',\(String(reflecting:bundled.path)))
         w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
         job=Path(sys.argv[3]);anchor=w.process_identity(os.getpid())
         w.save_registry(job/'children.json',[{'leader':anchor,'members':[anchor]}])
-        status=w.new_status(anchor,str(uuid.uuid4()));status.update(state='draining',termination=dict(w.Termination().record(),startedAt=-9.5,deadline=.5))
+        now=w.process_clock();budget=w.Termination().record();budget.update(startedAt=now-6,deadline=now+4)
+        status=w.new_status(anchor,str(uuid.uuid4()));status.update(state='draining',termination=budget,pipeDrainComplete=True,processesSettled=True)
         w.save_process_json(job/'supervision.json',status)
-        signal.signal(signal.SIGTERM,signal.SIG_IGN)
+        def stop(*a):
+            (job/'interrupted').touch()
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM,stop)
         print(json.dumps({'event':'ready'}),flush=True)
         while True:time.sleep(.01)
-        """.write(to: script, atomically: true, encoding: .utf8)
-        let probe = NativeObservationProbe()
-        let worker = RequestWorkerProcess(script: script, groups: .init(now: { probe.now }, wait: { probe.advance($0) }))
+        """.write(to:script,atomically:true,encoding:.utf8)
+        let probe = SignalRecordingProbe(), worker = RequestWorkerProcess(script:script,groups:.init(signal:{probe.signal($0,$1)}))
+        let job = root.appendingPathComponent("job")
         do {
-            for try await event in worker.run(mode: "run", configuration: .init(repository: root.path), directory: root.appendingPathComponent("job")) {
+            for try await event in worker.run(mode:"run",configuration:.init(repository:root.path),directory:job) {
                 if event.event == "ready" { worker.stop() }
             }
-            XCTFail("Unacknowledged pipe barrier was ignored")
-        } catch { XCTAssertTrue(error is RequestWorkerEvidenceError || error is RequestWorkerTeardownError) }
-        XCTAssertLessThanOrEqual(probe.now,0.55)
-        do { try await worker.waitForExit(); XCTFail("Unverifiable pipe evidence was discarded") }
-        catch { XCTAssertTrue(error is RequestWorkerEvidenceError || error is RequestWorkerTeardownError) }
-        XCTAssertTrue(FileManager.default.fileExists(atPath:root.appendingPathComponent("job/supervision.json").path))
+        } catch is CancellationError {}
+        try await worker.waitForExit()
+        XCTAssertTrue(FileManager.default.fileExists(atPath:job.appendingPathComponent("interrupted").path))
+        XCTAssertEqual(probe.signals(for:worker.process.processIdentifier),[SIGTERM])
+    }
+
+    func testUnverifiedWorkerBirthNeverReleasesCheckoutExecution() async throws {
+        let (root, script) = try recoveryFixture(), marker = root.appendingPathComponent("executed")
+        try "from pathlib import Path;Path(\(String(reflecting:marker.path))).touch()".write(to:script,atomically:true,encoding:.utf8)
+        let worker = RequestWorkerProcess(script:script,groups:.init(identity:{_ in nil}))
+        do {
+            for try await _ in worker.run(mode:"run",configuration:.init(repository:root.path),directory:root.appendingPathComponent("job")) {}
+            XCTFail("Unverified launch succeeded")
+        } catch { XCTAssertTrue(error is RequestWorkerSupervisionError) }
+        try await worker.waitForExit()
+        XCTAssertFalse(worker.process.isRunning);XCTAssertFalse(FileManager.default.fileExists(atPath:marker.path))
+    }
+
+    func testCancellationBeforeRegistrationClosesWorkerLaunchGate() async throws {
+        let (root, script) = try recoveryFixture(), gate = PausedIdentityProbe(), marker = root.appendingPathComponent("executed")
+        try "from pathlib import Path;Path(\(String(reflecting:marker.path))).touch()".write(to:script,atomically:true,encoding:.utf8)
+        let worker = RequestWorkerProcess(script:script)
+        worker.beforeIdentityWrite = { gate.armOnce(); _ = gate.identity(getpid()) }
+        let consuming = Task { do { for try await _ in worker.run(mode:"run",configuration:.init(repository:root.path),directory:root.appendingPathComponent("job")) {} } catch {} }
+        defer { gate.release();worker.stop();consuming.cancel() }
+        try await waitFor { gate.entered }
+        worker.stop();gate.release();await consuming.value;try await worker.waitForExit()
+        XCTAssertFalse(worker.process.isRunning);XCTAssertFalse(FileManager.default.fileExists(atPath:marker.path))
+    }
+
+    func testUnknownWorkerMarkerCannotCancelLiveRegisteredCommand() async throws {
+        let (root, script) = try recoveryFixture(), bundled = try XCTUnwrap(RequestWorkerProcess.bundledScript)
+        let job = root.appendingPathComponent("job"), work = root.appendingPathComponent("retained.bin"), bytes = Data([0,255,13,10])
+        try bytes.write(to:work)
+        try """
+        import importlib.util,os,sys
+        from pathlib import Path
+        spec=importlib.util.spec_from_file_location('w',\(String(reflecting:bundled.path)))
+        w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
+        class Worker:
+            def __init__(self,*a):self.request={'id':'fixture'};self.checkpoint={};self.directory=Path(sys.argv[3])
+            def perform(self):
+                with w.ManagedChild([sys.executable,'-c',"import time;time.sleep(60)"],self.directory,dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.directory))) as child:
+                    self.directory.joinpath('ready').touch()
+                    list(child.output_chunks())
+                    if child.command_returncode:raise w.OperationalError('Command was killed beneath live worker')
+            def clean(self):self.directory.parent.joinpath('retained.bin').write_bytes(b'DISCARDED')
+        w.Worker=Worker;w.main()
+        """.write(to:script,atomically:true,encoding:.utf8)
+        let worker = RequestWorkerProcess(script:script)
+        let consuming = Task { do { for try await _ in worker.run(mode:"run",configuration:.init(repository:root.path),directory:job) {} } catch {} }
+        defer { worker.stop();consuming.cancel() }
+        try await waitFor { FileManager.default.fileExists(atPath:job.appendingPathComponent("ready").path) }
+        try Data("{".utf8).write(to:job.appendingPathComponent("process.json"))
+        XCTAssertThrowsError(try RequestWorkerProcess.reconcileOrphan(in:job)) { XCTAssertTrue($0 is RequestWorkerOwnershipError) }
+        XCTAssertTrue(worker.process.isRunning);XCTAssertEqual(try Data(contentsOf:work),bytes)
+        worker.stop();await consuming.value;try await worker.waitForExit()
+        XCTAssertEqual(try Data(contentsOf:work),bytes)
     }
 
     func testNativeRecoveryGetsFreshBudgetAndIgnoresLegacyDeadline() throws {
@@ -2035,6 +2090,7 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertNil(try RequestProcessIdentity.observe(in: job).deadline)
         status["formatVersion"] = 2
         try JSONSerialization.data(withJSONObject: status).write(to: file)
+        try JSONSerialization.data(withJSONObject:["pid":anchor.pid,"birth":identity,"script":"fixture.py","directory":job.path]).write(to:job.appendingPathComponent("process.json"))
         let probe = NativeObservationProbe()
         XCTAssertThrowsError(try RequestWorkerProcess.reconcileOrphan(in: job, groups: .init(now: { probe.now }, wait: { probe.advance($0) })))
         XCTAssertGreaterThanOrEqual(probe.now,5); XCTAssertLessThanOrEqual(probe.now,10)
@@ -2481,6 +2537,12 @@ private actor RequestPreparationGate {
 #endif
 
 #if os(macOS)
+private final class SignalRecordingProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls: [(Int32,Int32)] = []
+    func signal(_ pid: Int32, _ signal: Int32) -> Int32 { lock.withLock { calls.append((pid,signal)) };return kill(pid,signal) }
+    func signals(for pid: Int32) -> [Int32] { lock.withLock { calls.filter{$0.0 == pid}.map{$0.1} } }
+}
 private final class RequestSignalProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var signals = 0

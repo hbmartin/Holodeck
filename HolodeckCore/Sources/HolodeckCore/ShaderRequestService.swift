@@ -759,7 +759,7 @@ public actor ShaderRequestService {
             let (journal, _, checkout) = target
             do { try await reconcileWorker(journal) }
             catch {
-                if error is RequestWorkerTeardownError {
+                if error is RequestWorkerTeardownError || error is RequestWorkerOwnershipError {
                     holdForRecovery(journal: journal, configuration: checkout, error: error); throw error
                 }
                 // Explicit detachment retains unverifiable markers without signalling them.
@@ -1273,7 +1273,7 @@ public actor ShaderRequestService {
                 try update(id, stage: record.status.stage, message: record.status.message)
             } else { try update(id, stage: .failed, message: record.cleanupMessage ?? "Owned checkout cleanup completed; see the retained request diagnostic") }
         } catch {
-            if error is RequestWorkerEvidenceError || error is RequestWorkerTeardownError || error is RequestWorkerSupervisionError {
+            if error is RequestWorkerEvidenceError || error is RequestWorkerOwnershipError || error is RequestWorkerTeardownError || error is RequestWorkerSupervisionError {
                 holdForRecovery(journal: folder(id), configuration: record.configuration, error: error)
             }
             if execution?.interrupted == false, records[id]?.detached != true {
@@ -1359,7 +1359,7 @@ public actor ShaderRequestService {
             try checkExecution(operation)
             if !outcomeSeen { throw ShaderRequestError.unavailable("Worker ended without a verified result.") }
         } catch {
-            if error is RequestWorkerTeardownError || error is RequestWorkerEvidenceError || error is RequestWorkerSupervisionError {
+            if error is RequestWorkerTeardownError || error is RequestWorkerOwnershipError || error is RequestWorkerEvidenceError || error is RequestWorkerSupervisionError {
                 holdForRecovery(journal: folder(id), configuration: record.configuration, error: error)
             } else if execution?.interrupted == false, records[id]?.detached != true {
                 records[id]?.cleanupPending = true
