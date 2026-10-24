@@ -39,7 +39,8 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
         do {
             let value = try JSONDecoder().decode(Self.self, from: BoundedCatalogReader(root: directory).read(filename, limit: CatalogLimits.headBytes).bytes)
             guard [1, 2].contains(value.formatVersion), ["run", "preflight", "publication", "discard"].contains(value.mode),
-                  value.formatVersion == 2 || value.binding == nil else {
+                  value.formatVersion == 2 || value.binding == nil,
+                  value.formatVersion == 1 || value.target != nil else {
                 throw RequestWorkerEvidenceError(cause: "Invalid worker operation journal.")
             }
             if let binding = value.binding {
@@ -153,10 +154,17 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
         guard !mismatch || (repairLegacyMismatch && saved.formatVersion == 1) else {
             throw RequestWorkerEvidenceError(cause: "Worker operation binding does not match; explicit legacy recovery or Detach is required.")
         }
-        guard saved.phase == .paused || saved.phase == .retryRunning || mismatch else { return }
+        let bytes = try configurationBytes(in: directory)
+        var configurationChanged = false
+        if let configuration, let bytes {
+            let original = try JSONDecoder().decode(ShaderRequestConfiguration.self, from: bytes)
+            guard Target(original) == Target(configuration) else { throw RequestWorkerEvidenceError(cause: "Recovery configuration belongs to another checkout.") }
+            configurationChanged = try JSONSerialization.data(withJSONObject: configurationObject(bytes), options: .sortedKeys) != encodedConfiguration(configuration, id: saved.id)
+        }
+        guard saved.phase == .paused || saved.phase == .retryRunning || mismatch || configurationChanged else { return }
         let replacement: ShaderRequestConfiguration
         if let configuration { replacement = configuration }
-        else if let bytes = try configurationBytes(in: directory) { replacement = try JSONDecoder().decode(ShaderRequestConfiguration.self, from: bytes) }
+        else if let bytes { replacement = try JSONDecoder().decode(ShaderRequestConfiguration.self, from: bytes) }
         else { throw RequestWorkerEvidenceError(cause: "Saved checkout configuration is required to restart this operation.") }
         _ = try rotate(mode: saved.mode, configuration: replacement, in: directory, writer: writer)
     }
@@ -168,6 +176,7 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
     }
     static func validateLaunch(id: UUID, configuration: ShaderRequestConfiguration, in directory: URL) throws {
         guard let saved = try read(in: directory), saved.id == id, saved.binding == nil,
+              saved.phase == .initial || saved.phase == .retryRunning,
               try expectedID(in: directory) == id,
               let bytes = try configurationBytes(in: directory),
               try JSONSerialization.data(withJSONObject: configurationObject(bytes), options: .sortedKeys) == encodedConfiguration(configuration, id: id) else {
@@ -199,6 +208,8 @@ nonisolated enum RequestJournalWriter {
             }
             guard renameat(root, file, archive, file) == 0, fsync(archive) == 0, fsync(root) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
         }
+        // Replay also commits moves whose preceding fsync failed after rename.
+        guard fsync(archive) == 0, fsync(root) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
     }
     static func write(_ data: Data, to file: URL) throws {
         let directory = URL(fileURLWithPath: RequestPaths.canonical(file.deletingLastPathComponent()))

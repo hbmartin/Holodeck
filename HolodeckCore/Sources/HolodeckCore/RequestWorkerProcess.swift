@@ -49,10 +49,6 @@ nonisolated struct RequestSettlementBudget: Codable, Sendable {
         clock == "darwin-uptime-raw" && (bootID == nil || UUID(uuidString:bootID!) != nil) &&
         startedAt.isFinite && deadline.isFinite && deadline >= startedAt && deadline - startedAt <= 10.001
     }
-    func inherited(now: TimeInterval, boot: String?) -> Self? {
-        guard valid, let boot, bootID == boot, startedAt <= now + 0.01 else { return nil }
-        var value = self; value.deadline = min(value.deadline,now + 10); return value
-    }
     func expired(at now: TimeInterval) -> Bool { now >= deadline }
     func escalated(at now: TimeInterval) -> Bool { now >= startedAt + 5 }
 }
@@ -92,7 +88,6 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
         let failure: String?
         let failureKind: String?
         let recoveryRequired: Bool?
-        let retryable: Bool?
         let sessionID: UUID?
         let revision: Int?
         let clock: String?
@@ -112,8 +107,6 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
         var observationFailure: String?
         var sessions: [RequestProcessIdentity: [RequestProcessIdentity]] = [:]
         var supervisors: Set<RequestProcessIdentity> = []
-        var budget: RequestSettlementBudget?
-        var deadline: TimeInterval? { budget?.deadline }
     }
     static func evidenceExists(_ file: URL) -> Bool {
         var info = stat()
@@ -187,7 +180,6 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
                 (supervision.formatVersion >= 2 && !pass.current(supervision.supervisor) && supervision.pipeDrainComplete != true) {
                 result.addEvidenceError(supervision.failureKind == "pipeDrain" ? (supervision.failure ?? "Output pipe completion is unverified.") : "Output pipe completion is unverified.")
             }
-            if supervision.formatVersion == 3, pass.current(supervision.supervisor) { result.budget = supervision.termination }
         }
         for entry in entries {
             let known = Array(Set(entry.members + additional)).filter { pass.current($0) }
@@ -383,7 +375,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         if let directory {
             do {
                 let result = try RequestProcessIdentity.observe(in:directory,known:observed,group:pass.group,identity:pass.birth)
-                observation.identities = result.identities; observation.sessions = result.sessions; observation.supervisors = result.supervisors; observation.budget = result.budget
+                observation.identities = result.identities; observation.sessions = result.sessions; observation.supervisors = result.supervisors
                 observation.uncertainty = result.uncertainty ?? observation.uncertainty; observation.evidenceErrors = result.evidenceErrors
                 if let detail = result.observationFailure { failure = RequestWorkerTeardownError(cause:detail) }
             } catch { failure = error }
@@ -403,7 +395,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 observationFailures += 1; registryError = failure
                 if observationFailures >= 3 {
                     let detail = (failure as? RequestWorkerTeardownError)?.cause ?? failure.localizedDescription
-                    firstError = firstError ?? ShaderRequestError.unavailable("Repeated process observation failure: " + detail)
+                    firstError = firstError ?? RequestWorkerSupervisionError(message: "Repeated process observation failure: " + detail)
                     return true
                 }
                 return false
@@ -616,6 +608,9 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     try? FileManager.default.removeItem(at: directory.appendingPathComponent("children.json"))
                     try? FileManager.default.removeItem(at: directory.appendingPathComponent("supervision.json"))
                     if lock.withLock({ cancelRequested }) { throw CancellationError() }
+                    if process.terminationReason == .uncaughtSignal {
+                        throw RequestWorkerSupervisionError(message: "Worker terminated by signal \(process.terminationStatus) after launch. See its retained log.")
+                    }
                     if process.terminationStatus != 0 { throw ShaderRequestError.unavailable("Worker exited \(process.terminationStatus). See its retained log.") }
                     continuation.finish()
                 } catch {
