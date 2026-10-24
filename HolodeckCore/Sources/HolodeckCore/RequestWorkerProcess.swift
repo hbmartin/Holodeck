@@ -337,7 +337,9 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     private var signalPassPending = false
     private var nextSignalPass: TimeInterval = 0
     var beforeReplyWrite: (() -> Void)?
+    var beforeBirthCapture: (() -> Void)?
     var beforeIdentityWrite: (() throws -> Void)?
+    var beforeGateRelease: (() throws -> Void)?
     var beforeLogWrite: (() throws -> Void)?
     var beforeSignalPass: (() -> Void)?
     var afterObservationCommit: (([RequestProcessIdentity]) -> Void)?
@@ -492,7 +494,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     }
     private func record(_ error: Error) {
         lock.withLock { firstError = firstError ?? error }
-        stop()
+        beginTeardown(cancelled: false)
     }
 
     func run(mode: String, configuration: ShaderRequestConfiguration, directory: URL, operationID: UUID? = nil) -> AsyncThrowingStream<RequestWorkerEvent, Error> {
@@ -536,8 +538,11 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     try lock.withLock {
                         guard !stopping else { throw CancellationError() }
                         guard fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) == 0 else { throw POSIXError(.EIO) }
-                        try process.run(); started = true
+                        do { try process.run() }
+                        catch { throw ShaderRequestError.unavailable("Worker interpreter could not launch: " + error.localizedDescription) }
+                        started = true
                     }
+                    beforeBirthCapture?()
                     var birth: RequestProcessIdentity?
                     for observation in 0..<3 {
                         if !process.isRunning || lock.withLock({ stopping }) { break }
@@ -550,15 +555,21 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     }
                     guard let birth else {
                         if lock.withLock({ stopping }) { throw CancellationError() }
-                        if !process.isRunning { throw ShaderRequestError.unavailable("Worker interpreter exited before launch registration. See its retained log.") }
+                        if !process.isRunning { throw startupExitError() }
                         throw RequestWorkerSupervisionError(message:"Worker birth identity could not be established; checkout execution was not released.")
                     }
                     try beforeIdentityWrite?()
                     try RequestJournalWriter.write(JSONEncoder().encode(WorkerIdentity(pid: birth.pid, script: script.path,
                         directory: directory.path, birth: birth)), to: directory.appendingPathComponent("process.json"))
-                    guard groups.identity(birth.pid) == birth else { throw RequestWorkerOwnershipError() }
+                    try beforeGateRelease?()
+                    if lock.withLock({ cancelRequested }) { throw CancellationError() }
+                    guard groups.identity(birth.pid) == birth else {
+                        if !process.isRunning { throw startupExitError() }
+                        throw RequestWorkerOwnershipError()
+                    }
                     try lock.withLock {
-                        guard !stopping, process.isRunning else { throw CancellationError() }
+                        guard !stopping else { throw CancellationError() }
+                        guard process.isRunning else { throw startupExitError() }
                         try input.fileHandleForWriting.write(contentsOf:Data((launchToken + "\n").utf8))
                         gateReleased = true
                     }
@@ -608,8 +619,9 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     if process.terminationStatus != 0 { throw ShaderRequestError.unavailable("Worker exited \(process.terminationStatus). See its retained log.") }
                     continuation.finish()
                 } catch {
+                    let error = lock.withLock { firstError } ?? error
                     if lock.withLock({ started && !gateReleased }) {
-                        stop()
+                        beginTeardown(cancelled: false)
                         while process.isRunning || pipes.wait(timeout:.now()) != .success {
                             refreshOwned(); signalPending()
                             if lock.withLock({ terminationBudget?.expired(at:groups.now()) == true }) {
@@ -624,7 +636,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     if let evidence = error as? RequestWorkerEvidenceError { lock.withLock { retainedEvidenceError = evidence } }
                     if process.isRunning { stop() }
                     if error is CancellationError || error is RequestWorkerTeardownError || error is RequestWorkerEvidenceError ||
-                       error is RequestWorkerOwnershipError || error is RequestWorkerSupervisionError {
+                       error is RequestWorkerOwnershipError || error is RequestWorkerSupervisionError || error is ShaderRequestError {
                         continuation.finish(throwing:error)
                     } else {
                         continuation.finish(throwing:RequestWorkerSupervisionError(message:error.localizedDescription,underlyingError:error,retryable:!(error is POSIXError || error is CocoaError)))
@@ -633,6 +645,10 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
             }
             continuation.onTermination = { [weak self] reason in if case .cancelled = reason { self?.stop() } }
         }
+    }
+    private func startupExitError() -> ShaderRequestError {
+        let reason = process.terminationReason == .uncaughtSignal ? "signal" : "exit"
+        return .unavailable("Worker interpreter exited before checkout execution was released (" + reason + " " + String(process.terminationStatus) + "). See retained worker-stderr.log and worker.log.")
     }
     func waitForExit() async throws {
         let finished: Bool = await withCheckedContinuation { continuation in

@@ -1405,7 +1405,7 @@ final class ShaderRequestTests: XCTestCase {
         var config = ShaderRequestConfiguration(repository: root.path); config.python = interpreter.path
         let worker = RequestWorkerProcess(script: script); var diagnostic: String?
         do { for try await event in worker.run(mode: "run", configuration: config, directory: root.appendingPathComponent("unsupported")) { diagnostic = event.message } }
-        catch { XCTAssertTrue(error.localizedDescription.contains("Worker exited 2")) }
+        catch { XCTAssertTrue(error.localizedDescription.contains("exited 2") || error.localizedDescription.contains("exit 2")) }
         try await worker.waitForExit(); XCTAssertTrue(diagnostic?.contains("Python 3.9 or later") == true)
         XCTAssertFalse(try String(contentsOf: root.appendingPathComponent("unsupported/worker-stderr.log"), encoding: .utf8).contains("SyntaxError"))
     }
@@ -1882,7 +1882,7 @@ final class ShaderRequestTests: XCTestCase {
                 if event.event == "failure" { failure = event }
             }
             XCTFail("Missing runtime launched successfully")
-        } catch { XCTAssertTrue(error.localizedDescription.contains("Worker exited 2")) }
+        } catch { XCTAssertTrue(error.localizedDescription.contains("exited 2") || error.localizedDescription.contains("exit 2")) }
         try await worker.waitForExit()
         XCTAssertTrue(failure?.message?.contains("process runtime is missing or unreadable") == true)
         XCTAssertEqual(failure?.recoveryRequired, false)
@@ -2840,6 +2840,151 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertTrue(RequestProcessIdentity.evidenceExists(archives[0].appendingPathComponent(RequestWorkerOperation.filename)))
     }
 
+    private func injectCompletionThenFault(_ script: URL, mode: String, preparation: Bool = false) throws {
+        let source = try String(contentsOf: script, encoding: .utf8)
+        let prefix = """
+        import json,sys
+        from pathlib import Path
+        mode=sys.argv[1];job=Path(sys.argv[3])
+        def emit(event,**data):print(json.dumps(dict(event=event,**data)),flush=True)
+        if mode==\(String(reflecting:mode)):
+            counter=job/'isolated-attempts';n=int(counter.read_text())+1 if counter.exists() else 1;counter.write_text(str(n))
+            if \(preparation ? "True" : "False"):
+                emit('preparePublication',requiredPreviewShaderIDs=[])
+                assert json.loads(sys.stdin.readline())['ok']
+            if n==1:
+                if mode=='preflight':emit('preflight',checkoutID='first-attempt-only')
+                if mode=='publication':emit('publicationReady')
+                if mode=='discard':emit('discarded')
+                if mode=='run':emit('clarification',question='First attempt only',options=['A','B'])
+                emit('failure',failureKind='supervision',retryable=True,recoveryRequired=False,message='Fault after completion')
+                raise SystemExit(1)
+            raise SystemExit(0)
+        """
+        try (prefix + "\n" + source).write(to: script, atomically: true, encoding: .utf8)
+    }
+
+    func testEveryRetryRequiresItsOwnCompletionEvent() async throws {
+        do {
+            let (root, script) = try recoveryFixture(); try injectCompletionThenFault(script, mode: "preflight")
+            let service = try await recoveryService(root, script: script, enabled: false); await service.resume()
+            do { try await service.verify(configuration: .init(repository: root.path)); XCTFail("Stale preflight was accepted") }
+            catch { XCTAssertTrue(error.localizedDescription.contains("completion event")) }
+            let accepted = await service.configurationValue(); XCTAssertFalse(accepted.enabled); XCTAssertNil(accepted.checkoutID)
+        }
+        do {
+            let f = try await publicationRecoveryFixture(); try injectCompletionThenFault(f.script, mode: "publication", preparation: true)
+            await f.service.resume()
+            do { try await f.service.ensurePublication(force: true); XCTFail("Stale publication confirmation was accepted") }
+            catch { XCTAssertTrue(error.localizedDescription.contains("completion event")) }
+            let publication = await f.service.publicationStatus(); XCTAssertNil(publication)
+        }
+        do {
+            let (root, script) = try recoveryFixture(); try injectCompletionThenFault(script, mode: "discard")
+            let initial = try await recoveryService(root, script: script)
+            let request = ShaderRequest(prompt: "Cleanup confirmation", context: try context())
+            _ = try await initial.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+            try await initial.cancelQueued(request.id)
+            var records = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("journal.json"))) as? [[String: Any]])
+            records[0]["cleanupPending"] = true
+            try JSONSerialization.data(withJSONObject: records).write(to: root.appendingPathComponent("journal.json"))
+            let service = try await recoveryService(root, script: script); await service.resume()
+            try await waitFor { await service.allJobs().first?.message.contains("completion event") == true }
+            let pending = await service.hasPendingCleanup(); XCTAssertTrue(pending)
+            XCTAssertEqual(try String(contentsOf: root.appendingPathComponent(request.id.uuidString + "/isolated-attempts"), encoding: .utf8), "2")
+        }
+        do {
+            let (root, script) = try recoveryFixture(); try injectCompletionThenFault(script, mode: "run")
+            let service = try await recoveryService(root, script: script)
+            let request = ShaderRequest(prompt: "Result confirmation", context: try context())
+            _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+            await service.resume()
+            try await waitFor { await service.allJobs().first?.stage == .failed }
+            let status = await service.allJobs().first; XCTAssertTrue(status?.message.contains("completion event") == true)
+            await service.suspend()
+        }
+    }
+
+    func testInterpreterExitBeforeEachLaunchGateStageHasTerminalDiagnostic() async throws {
+        for stage in ["birth", "identity", "gate"] {
+            let (root, script) = try recoveryFixture(), marker = root.appendingPathComponent("executed")
+            try "from pathlib import Path;Path(\(String(reflecting:marker.path))).touch()".write(to: script, atomically: true, encoding: .utf8)
+            let worker = RequestWorkerProcess(script: script)
+            let crash = { kill(worker.process.processIdentifier, SIGKILL); worker.process.waitUntilExit() }
+            switch stage {
+            case "birth": worker.beforeBirthCapture = crash
+            case "identity": worker.beforeIdentityWrite = crash
+            default: worker.beforeGateRelease = crash
+            }
+            do {
+                for try await _ in worker.run(mode: "run", configuration: .init(repository: root.path), directory: root.appendingPathComponent("job")) {}
+                XCTFail("Crashed interpreter succeeded")
+            } catch {
+                XCTAssertTrue(error is ShaderRequestError, "\(stage): \(error)")
+                XCTAssertTrue(error.localizedDescription.contains("signal 9")); XCTAssertTrue(error.localizedDescription.contains("worker-stderr.log"))
+            }
+            try await worker.waitForExit(); XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        }
+    }
+
+    func testDeterministicInterpreterLaunchFailureDoesNotRetryOrPause() async throws {
+        let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script, enabled: false)
+        await service.resume()
+        var configuration = ShaderRequestConfiguration(repository: root.path); configuration.python = root.appendingPathComponent("missing-python").path
+        do { try await service.verify(configuration: configuration); XCTFail("Missing interpreter succeeded") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("could not launch")) }
+        let operation = try XCTUnwrap(RequestWorkerOperation.read(in: root.appendingPathComponent("setup")))
+        XCTAssertEqual(operation.phase, .complete)
+        let recovery = await service.recoveryStatuses(); XCTAssertTrue(recovery.isEmpty)
+    }
+
+    func testCancellationDuringRetryPreparationKeepsOriginalFailure() async throws {
+        let (root, script) = try recoveryFixture(), gate = RequestPreparationGate()
+        try injectSupervisionFaults(script, mode: "preflight", count: 1)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root,
+            workerScript: script, reconcileWorker: { journal in
+                if try RequestWorkerOperation.read(in: journal)?.phase == .retryPending { await gate.hold() }
+                try RequestWorkerProcess.reconcileOrphan(in: journal)
+            })
+        try await service.initialize(configuration: .init(repository: root.path))
+        let verifying = Task { try await service.verify(configuration: .init(repository: root.path)) }
+        try await waitFor { await gate.entered }; verifying.cancel(); await gate.release()
+        do { try await verifying.value; XCTFail("Cancelled Verify succeeded") } catch is CancellationError {}
+        let recoveries = await service.recoveryStatuses()
+        XCTAssertTrue(recoveries.contains { $0.message.contains("Injected supervision fault") })
+        XCTAssertFalse(recoveries.contains { $0.message.contains("CancellationError") })
+        XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("setup/supervision-launches"), encoding: .utf8), "1")
+    }
+    func testConfirmedCommitIsDeliveredOnceAcrossSupervisionRetry() async throws {
+        let f = try await publicationRecoveryFixture()
+        let source = try String(contentsOf: f.script, encoding: .utf8), commit = String(repeating: "a", count: 40)
+        let prefix = """
+        import json,sys
+        from pathlib import Path
+        job=Path(sys.argv[3])
+        def emit(event,**data):print(json.dumps(dict(event=event,**data)),flush=True)
+        if sys.argv[1]=='run':
+            counter=job/'commit-attempts';n=int(counter.read_text())+1 if counter.exists() else 1;counter.write_text(str(n))
+            if n==1:
+                emit('preparePublication',requiredPreviewShaderIDs=[])
+                assert json.loads(sys.stdin.readline())['ok']
+            emit('result',result=dict(outputKind='edited',shaderID='plasma',changed=False,summary='Confirmed',approximations=[],commitSHA='\(commit)'))
+            if n==1:
+                emit('failure',failureKind='supervision',retryable=True,recoveryRequired=False,message='Fault after confirmed commit')
+                raise SystemExit(1)
+            raise SystemExit(0)
+        """
+        try (prefix + "\n" + source).write(to: f.script, atomically: true, encoding: .utf8)
+        let request = ShaderRequest(prompt: "Deliver once", context: try context())
+        _ = try await f.service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        await f.service.activateScheduling(); await f.service.resume()
+        let job = f.root.appendingPathComponent(request.id.uuidString)
+        try await waitFor { (try? RequestWorkerOperation.read(in: job)?.phase) == .complete }
+        let status = await f.service.allJobs().first, publication = await f.service.publicationStatus()
+        XCTAssertEqual(status?.stage, .awaitingActivation); XCTAssertEqual(status?.result?.commitSHA, commit)
+        XCTAssertEqual(publication?.sequence, 1)
+        XCTAssertEqual(try String(contentsOf: job.appendingPathComponent("commit-attempts"), encoding: .utf8), "2")
+    }
     #endif
 }
 
