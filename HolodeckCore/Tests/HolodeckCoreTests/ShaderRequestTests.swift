@@ -2355,6 +2355,115 @@ final class ShaderRequestTests: XCTestCase {
         let acknowledgements = try JSONDecoder().decode([DetachedCheckoutAcknowledgement].self,from:Data(contentsOf:root.appendingPathComponent("detached-checkouts.json")))
         XCTAssertTrue(acknowledgements.contains{$0.requestID == request.id})
     }
+
+    private func injectSupervisionFaults(_ script: URL, mode: String, count: Int) throws {
+        let source = try String(contentsOf: script, encoding: .utf8)
+        let prefix = """
+        import json,sys
+        from pathlib import Path
+        mode=sys.argv[1]; job=Path(sys.argv[3])
+        if mode==\(String(reflecting:mode)):
+            counter=job/'supervision-launches'
+            count=int(counter.read_text())+1 if counter.exists() else 1
+            counter.write_text(str(count))
+            limit=job.parent/'supervision-fault-limit'
+            if count<=int(limit.read_text()):
+                print(json.dumps(dict(event='failure',failureKind='supervision',recoveryRequired=False,message='Injected supervision fault')),flush=True)
+                raise SystemExit(1)
+        """
+        try (prefix + "\n" + source).write(to:script,atomically:true,encoding:.utf8)
+        try String(count).write(to:script.deletingLastPathComponent().appendingPathComponent("supervision-fault-limit"),atomically:true,encoding:.utf8)
+    }
+
+    func testVerifyRetriesSettledSupervisionFaultOnce() async throws {
+        let (root, script) = try recoveryFixture()
+        try injectSupervisionFaults(script,mode:"preflight",count:1)
+        let service = try await recoveryService(root,script:script,enabled:false)
+        await service.resume()
+        try await service.verify(configuration:.init(repository:root.path))
+        let job = root.appendingPathComponent("setup")
+        XCTAssertEqual(try String(contentsOf:job.appendingPathComponent("supervision-launches"),encoding:.utf8),"2")
+        XCTAssertEqual(try RequestWorkerOperation.read(in:job)?.phase,.complete)
+        let recoveries = await service.recoveryStatuses();XCTAssertTrue(recoveries.isEmpty)
+    }
+
+    func testRequestSupervisionRetryExhaustionPreservesWorkAndManualRetryResetsIt() async throws {
+        let (root, script) = try recoveryFixture()
+        var source = try String(contentsOf:script,encoding:.utf8)
+        let last = try XCTUnwrap(source.range(of:"while True: time.sleep(.005)",options:.backwards))
+        source.replaceSubrange(last,with:"emit('clarification',question='Choose output',options=['A','B'])")
+        try source.write(to:script,atomically:true,encoding:.utf8)
+        try injectSupervisionFaults(script,mode:"run",count:2)
+        let service = try await recoveryService(root,script:script)
+        let request = ShaderRequest(prompt:"Preserve work",context:try context())
+        _ = try await service.control(operation:"requestSubmit",payload:.init(request:request),deviceID:"TV")
+        let job = root.appendingPathComponent(request.id.uuidString), patch = job.appendingPathComponent("changes.patch"), bytes = Data([0,255,13,10])
+        try bytes.write(to:patch);await service.resume()
+        try await waitFor { (try? RequestWorkerOperation.read(in:job)?.phase) == .paused }
+        XCTAssertEqual(try String(contentsOf:job.appendingPathComponent("supervision-launches"),encoding:.utf8),"2")
+        XCTAssertEqual(try Data(contentsOf:patch),bytes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath:job.appendingPathComponent("cleanup-started").path))
+        let resumed = try await recoveryService(root,script:script)
+        await resumed.resume()
+        try await waitFor { !(await resumed.recoveryStatuses()).isEmpty }
+        XCTAssertEqual(try String(contentsOf:job.appendingPathComponent("supervision-launches"),encoding:.utf8),"2")
+        try "0".write(to:root.appendingPathComponent("supervision-fault-limit"),atomically:true,encoding:.utf8)
+        try await resumed.retryReconciliation()
+        try await waitFor { await resumed.allJobs().first?.stage == .awaitingClarification }
+        XCTAssertEqual(try String(contentsOf:job.appendingPathComponent("supervision-launches"),encoding:.utf8),"3")
+        XCTAssertEqual(try Data(contentsOf:patch),bytes)
+    }
+
+    func testCleanupRetriesSupervisionFaultWithoutLosingCleanupIntent() async throws {
+        let (root, script) = try recoveryFixture()
+        try injectSupervisionFaults(script,mode:"discard",count:1)
+        let initial = try await recoveryService(root,script:script)
+        let request = ShaderRequest(prompt:"Cleanup",context:try context())
+        _ = try await initial.control(operation:"requestSubmit",payload:.init(request:request),deviceID:"TV")
+        try await initial.cancelQueued(request.id)
+        let file = root.appendingPathComponent("journal.json")
+        var records = try XCTUnwrap(JSONSerialization.jsonObject(with:Data(contentsOf:file)) as? [[String:Any]])
+        records[0]["cleanupPending"] = true
+        try JSONSerialization.data(withJSONObject:records).write(to:file)
+        let job = root.appendingPathComponent(request.id.uuidString)
+        try Data("owned".utf8).write(to:job.appendingPathComponent("owned-patch"))
+        let service = try await recoveryService(root,script:script)
+        await service.resume()
+        try await waitFor { (try? RequestWorkerOperation.read(in:job)?.phase) == .complete }
+        XCTAssertEqual(try String(contentsOf:job.appendingPathComponent("supervision-launches"),encoding:.utf8),"2")
+        XCTAssertFalse(FileManager.default.fileExists(atPath:job.appendingPathComponent("owned-patch").path))
+        let pending = await service.hasPendingCleanup();XCTAssertFalse(pending)
+    }
+
+    func testPublicationRetriesSettledSupervisionFaultOnce() async throws {
+        let f = try await publicationRecoveryFixture()
+        try injectSupervisionFaults(f.script,mode:"publication",count:1)
+        await f.service.resume()
+        try await f.service.ensurePublication(force:true)
+        let job = f.root.appendingPathComponent("publication")
+        XCTAssertEqual(try String(contentsOf:job.appendingPathComponent("supervision-launches"),encoding:.utf8),"2")
+        XCTAssertEqual(try RequestWorkerOperation.read(in:job)?.phase,.complete)
+        let recovery = await f.service.recoveryStatuses();XCTAssertTrue(recovery.isEmpty)
+    }
+
+    func testOperationJournalSurvivesRestartAndRejectsUnverifiableMetadata() throws {
+        let (root, _) = try recoveryFixture(), job = root.appendingPathComponent("operation")
+        var initial = try RequestWorkerOperation.begin(mode:"run",in:job)
+        initial.phase = .retryPending;try initial.save(in:job)
+        let pending = try RequestWorkerOperation.begin(mode:"run",in:job)
+        XCTAssertEqual(pending.id,initial.id);XCTAssertEqual(pending.phase,.retryPending)
+        initial.phase = .retryRunning;try initial.save(in:job)
+        XCTAssertThrowsError(try RequestWorkerOperation.begin(mode:"run",in:job))
+        XCTAssertEqual(try RequestWorkerOperation.read(in:job)?.phase,.paused)
+        try RequestWorkerOperation.restartPaused(in:job)
+        XCTAssertNotEqual(try RequestWorkerOperation.read(in:job)?.id,initial.id)
+        let marker = job.appendingPathComponent(RequestWorkerOperation.filename)
+        try Data("{".utf8).write(to:marker)
+        XCTAssertThrowsError(try RequestWorkerOperation.begin(mode:"run",in:job))
+        try FileManager.default.removeItem(at:marker)
+        try FileManager.default.createSymbolicLink(at:marker,withDestinationURL:root.appendingPathComponent("missing"))
+        XCTAssertThrowsError(try RequestWorkerOperation.read(in:job))
+    }
     #endif
 }
 

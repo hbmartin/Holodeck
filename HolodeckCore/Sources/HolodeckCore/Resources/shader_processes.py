@@ -22,7 +22,12 @@ class OperationalError(RuntimeError):
     pass
 
 
-class ProcessRecoveryError(OperationalError):
+class SupervisionError(OperationalError):
+    """A host lifecycle failure never authorizes discarding unpublished work."""
+    pass
+
+
+class ProcessRecoveryError(SupervisionError):
     pass
 
 
@@ -529,7 +534,7 @@ def supervise(control_fd):
                     report('failed', failure=str(engine.expired_error()), failureKind=engine.failure_kind or 'settlement', recoveryRequired=True)
                     return 2
             except BaseException as error:
-                engine.fail(error, 'supervision'); stop[0] = True; pending.clear()
+                engine.fail(error, 'supervision'); stop[0] = True
             remaining = engine.next_sample - process_clock()
             for limit in (engine.termination.deadline, drain_deadline):
                 if limit is not None: remaining = min(remaining, limit - process_clock())
@@ -591,11 +596,13 @@ class ManagedChild:
                         interruption_cleanup(error, cleanup_error, True); raise error
                     raise
                 if not isinstance(error, Exception): raise
-                raise OperationalError('Managed startup failed before command execution: ' + str(error)) from error
+                raise SupervisionError('Managed startup failed before command execution: ' + str(error)) from error
             if self.process is not None:
                 self.stop()
                 self.__exit__(*sys.exc_info())
             else: self.close_pipes()
+            if isinstance(error, Exception) and not isinstance(error, SupervisionError):
+                raise SupervisionError("Managed startup failed: " + str(error)) from error
             raise
         finally: child_control.close()
 
@@ -623,7 +630,7 @@ class ManagedChild:
         self.sample()
         if self.local_failure: raise self.local_failure
         if self.status and self.status.get('failure'):
-            kind = (ProcessDrainError if self.status.get('failureKind') == 'pipeDrain' else ProcessRecoveryError) if self.status.get('recoveryRequired') else OperationalError
+            kind = (ProcessDrainError if self.status.get('failureKind') == 'pipeDrain' else ProcessRecoveryError) if self.status.get('recoveryRequired') else SupervisionError
             raise kind(self.status['failure'])
 
     def send(self, action, **fields):
@@ -707,9 +714,9 @@ class ManagedChild:
             if self.status and self.status.get('processesSettled') and self.pipes_drained and not self.local_failure and not self.status.get('recoveryRequired'):
                 retire_evidence(self.registry.parent)
             self.check_status()
-            if self.cleanup_errors: raise OperationalError('; cleanup error: '.join(self.cleanup_errors))
+            if self.cleanup_errors: raise SupervisionError('; cleanup error: '.join(self.cleanup_errors))
             if self.process.returncode != 0:
-                raise OperationalError('Managed supervisor exited ' + str(self.process.returncode) + ' after verified settlement')
+                raise SupervisionError('Managed supervisor exited ' + str(self.process.returncode) + ' after verified settlement')
         except (OperationalError, OSError) as cleanup_error:
             if error is not None and not isinstance(error, Exception):
                 interruption_cleanup(error, cleanup_error, isinstance(cleanup_error, ProcessRecoveryError)
@@ -717,8 +724,9 @@ class ManagedChild:
                 return False
             if error is not None and cleanup_error is not error and str(cleanup_error) != str(error):
                 unresolved = isinstance(cleanup_error, ProcessRecoveryError) or not (self.status and self.status.get('processesSettled') and self.pipes_drained)
-                failure = ProcessRecoveryError if unresolved else OperationalError
+                failure = ProcessRecoveryError if unresolved else SupervisionError
                 raise failure('Original command error: ' + str(error) + '; cleanup error: ' + str(cleanup_error)) from cleanup_error
+            if not isinstance(cleanup_error, SupervisionError): raise SupervisionError(str(cleanup_error)) from cleanup_error
             raise
         finally: self.close_pipes()
 
@@ -799,7 +807,7 @@ def managed_run(args, cwd, env, timeout, input, text=True):
             return data.decode(pipe.encoding, errors=pipe.errors).replace('\r\n', '\n').replace('\r', '\n')
         return subprocess.CompletedProcess(args, child.command_returncode, output('stdout'), output('stderr'))
 
-__all__ = ['OperationalError', 'ProcessRecoveryError', 'ProcessObservationError', 'ProcessDrainError', 'CLOCK_DOMAIN', 'REGISTRY_LIMIT', 'PROCESS_SAMPLE_SECONDS', 'process_clock', 'process_identity', 'group_members', 'merge_members', 'read_process_bytes', 'read_process_json', 'save_process_json', 'save_registry', 'valid_identity', 'read_registry', 'read_supervision', 'new_status', 'status_deadline', 'boot_identity', 'valid_budget', 'status_budget', 'Termination', 'Settlement', 'terminate_registered', 'supervise', 'ManagedChild', 'managed_run']
+__all__ = ['OperationalError', 'SupervisionError', 'ProcessRecoveryError', 'ProcessObservationError', 'ProcessDrainError', 'CLOCK_DOMAIN', 'REGISTRY_LIMIT', 'PROCESS_SAMPLE_SECONDS', 'process_clock', 'process_identity', 'group_members', 'merge_members', 'read_process_bytes', 'read_process_json', 'save_process_json', 'save_registry', 'valid_identity', 'read_registry', 'read_supervision', 'new_status', 'status_deadline', 'boot_identity', 'valid_budget', 'status_budget', 'Termination', 'Settlement', 'terminate_registered', 'supervise', 'ManagedChild', 'managed_run']
 
 if __name__ == '__main__':
     if len(sys.argv) != 3 or sys.argv[1] != '_supervise': raise SystemExit('Internal supervisor entry point')

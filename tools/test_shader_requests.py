@@ -4,6 +4,8 @@ No Codex API calls or production pushes. The command fixtures retain invocation 
 import base64
 import ast
 import copy
+import contextlib
+import io
 import importlib.util
 import json
 import os
@@ -1584,6 +1586,99 @@ class ProcessSettlementTests(unittest.TestCase):
         finally:
             if patcher:patcher.stop()
         self.assertFalse(child.registry.exists())
+
+
+    def test_interrupted_main_settles_registry_even_when_supervision_is_corrupt(self):
+        config=self.job/'config.json';config.write_text('{}')
+        process=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],start_new_session=True)
+        self.addCleanup(lambda:process.poll() is None and process.kill())
+        identity=worker_module.process_identity(process.pid)
+        worker_module.save_registry(self.job/'children.json',[{'leader':identity,'members':[identity]}])
+        (self.job/'supervision.json').write_text('{')
+        class Worker:
+            def __init__(self,*a):raise worker_module.WorkerInterrupted('stop')
+        output=io.StringIO()
+        with patch.object(worker_module,'Worker',Worker),patch.object(worker_module.os,'setsid'),patch.object(worker_module.signal,'signal'),patch.object(sys,'argv',[str(SCRIPT),'run',str(config),str(self.job)]),contextlib.redirect_stdout(output):
+            with self.assertRaises(SystemExit):worker_module.main()
+        process.wait(timeout=2)
+        event=json.loads(output.getvalue());self.assertTrue(event['recoveryRequired'])
+        self.assertIn('Invalid process evidence',event['message']);self.assertTrue((self.job/'supervision.json').exists())
+
+    def test_internal_supervision_fault_preserves_work_through_worker_main(self):
+        supervisor=self.supervisor_fixture("real=w.Settlement.step\nfailed=False\ndef step(self,*a,**kw):\n global failed\n if not failed:\n  failed=True\n  raise RuntimeError('internal supervision fault')\n return real(self,*a,**kw)\nw.Settlement.step=step")
+        work=self.job/'unpublished';work.write_bytes(b'\x00\xffretained\r\n')
+        patch_file=self.job/'changes.patch';patch_file.write_bytes(b'PATCH')
+        config=self.job/'config.json';config.write_text('{}')
+        code="""import importlib.util,os,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('w',sys.argv[1]);w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
+class Worker:
+ def __init__(self,*a):self.request={'id':'fixture'};self.checkpoint={};self.directory=Path(sys.argv[3])
+ def perform(self):
+  with w.ManagedChild([sys.executable,'-c','import time;time.sleep(.2)'],self.directory,dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.directory)),supervisor_script=SUPERVISOR) as child:list(child.output_chunks())
+ def clean(self):self.directory.joinpath('unpublished').write_bytes(b'DISCARDED')
+w.Worker=Worker
+sys.argv=[sys.argv[1],'run',sys.argv[2],sys.argv[3]]
+w.main()
+""".replace('SUPERVISOR',repr(str(supervisor)))
+        result=subprocess.run([sys.executable,'-B','-I','-c',code,str(SCRIPT),str(config),str(self.job)],capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,1,result.stderr)
+        event=json.loads(result.stdout);self.assertEqual(event['failureKind'],'supervision');self.assertFalse(event['recoveryRequired'])
+        self.assertEqual(work.read_bytes(),b'\x00\xffretained\r\n');self.assertEqual(patch_file.read_bytes(),b'PATCH')
+
+    def test_all_base_exception_cancellations_keep_recovery_metadata_and_work(self):
+        config=self.job/'config.json';config.write_text('{}')
+        for kind in (worker_module.WorkerInterrupted,KeyboardInterrupt,SystemExit):
+            work=self.job/'changes.patch';work.write_bytes(b'RETAIN')
+            class Worker:
+                request={'id':'fixture'};checkpoint={};directory=self.job
+                def __init__(self,*a):pass
+                def perform(self):
+                    error=kind('cancelled')
+                    process_module.interruption_cleanup(error,worker_module.ProcessRecoveryError('unresolved ownership'),True)
+                    raise error
+                def clean(self):work.unlink()
+            output=io.StringIO()
+            with patch.object(worker_module,'Worker',Worker),patch.object(worker_module.os,'setsid'),patch.object(worker_module.signal,'signal'),patch.object(worker_module,'terminate_registered'),patch.object(sys,'argv',[str(SCRIPT),'run',str(config),str(self.job)]),contextlib.redirect_stdout(output):
+                with self.assertRaises(SystemExit):worker_module.main()
+            event=json.loads(output.getvalue());self.assertTrue(event['recoveryRequired']);self.assertEqual(event['failureKind'],'interrupted')
+            self.assertIn('unresolved ownership',event['message']);self.assertEqual(work.read_bytes(),b'RETAIN')
+
+    def test_supervisor_internal_fault_preserves_partial_control_frame(self):
+        tree=ast.parse(PROCESS_SCRIPT.read_text())
+        supervisor=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='supervise')
+        loop=next(n for n in ast.walk(supervisor) if isinstance(n,ast.While) and isinstance(n.test,ast.Constant) and n.test.value is True)
+        function=ast.parse('def probe(control_open,control,pending,engine,status,command,stop,work_settled,drain_deadline,wakeup):\n pass\n').body[0]
+        function.body=[copy.deepcopy(loop)];reports=[];namespace=dict(process_module.__dict__)
+        namespace.update(report=lambda state,**fields:reports.append(dict(state=state,**fields)),process_clock=lambda:100.)
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[function],type_ignores=[])),'<supervisor-loop>','exec'),namespace)
+        class Control:
+            calls=0;closed=False
+            def recv(self,*a):
+                self.calls+=1
+                if self.calls==1:raise BlockingIOError()
+                return b'ined","sessionID":"s"}\n'
+            def close(self):self.closed=True
+        class Termination:
+            started=100.;deadline=110.;expired=False
+            def record(self):return {'deadline':110.}
+            def begin(self):pass
+        class Engine:
+            termination=Termination();failure_kind=None;failure=None;next_sample=100.;calls=0
+            def step(self):
+                self.calls+=1
+                if self.calls==1:raise RuntimeError('one-shot fault')
+                return True
+            def fail(self,error,kind):self.failure=str(error);self.failure_kind=self.failure_kind or kind
+        class Command:
+            def poll(self):return 0
+        class Wakeup:
+            def wait(self,*a):pass
+            def forget(self,*a):pass
+        control=Control();status=dict(sessionID='s',commandReturnCode=0,termination={'deadline':110.},processesSettled=False,pipeDrainComplete=False)
+        namespace['probe'](True,control,bytearray(b'{"action":"dra'),Engine(),status,Command(),[False],False,None,Wakeup())
+        self.assertTrue(status['pipeDrainComplete']);self.assertFalse(control.closed)
+        self.assertFalse(reports[-1]['recoveryRequired']);self.assertEqual(reports[-1]['failureKind'],'supervision')
 
 
 if __name__=='__main__': unittest.main()
