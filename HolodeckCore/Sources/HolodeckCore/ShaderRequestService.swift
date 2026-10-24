@@ -44,6 +44,8 @@ nonisolated public struct ShaderRequestConfiguration: Codable, Sendable, Equatab
 nonisolated struct RequestWorkerEvent: Decodable, Sendable {
     var event: String
     var recoveryRequired: Bool?
+    var failureKind: String?
+    var retryable: Bool?
     var stage: String?
     var message: String?
     var question: String?
@@ -624,6 +626,9 @@ public actor ShaderRequestService {
         reconciled = false
         // Existing waiters retain their own attempt identity and cannot clear a subsequent retry.
         reconciliationTask = nil; reconciliationKickID = nil
+        for entry in recovery.entries.values {
+            try RequestWorkerOperation.restartPaused(in: URL(fileURLWithPath: entry.journal))
+        }
         try await reconcileWorkers()
         try persist(); kick()
     }
@@ -656,6 +661,7 @@ public actor ShaderRequestService {
             configuration.repository = repository; configuration.python = python; configuration.git = git
             try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
         }
+        try RequestWorkerOperation.restartPaused(in: job)
         records[id]?.cleanupFailure = nil; recoveryID = id
         reconciled = false; reconciliationTask = nil; reconciliationKickID = nil
         try persist()
@@ -754,7 +760,7 @@ public actor ShaderRequestService {
             let (journal, _, checkout) = target
             do { try await reconcileWorker(journal) }
             catch {
-                if error is RequestWorkerTeardownError {
+                if error is RequestWorkerTeardownError || error is RequestWorkerOwnershipError {
                     holdForRecovery(journal: journal, configuration: checkout, error: error); throw error
                 }
                 // Explicit detachment retains unverifiable markers without signalling them.
@@ -810,7 +816,6 @@ public actor ShaderRequestService {
         }
     }
     private func runPublication(operation: UUID) async {
-        let process = workerProcess(); activeProcess = process
         do {
             if activePublication?.force != true {
                 do {
@@ -822,7 +827,7 @@ public actor ShaderRequestService {
             }
             try checkExecution(operation)
             var ready = false
-            for try await event in process.run(mode: "publication", configuration: configuration, directory: directory.appendingPathComponent("publication")) {
+            try await runWorker(mode: "publication", configuration: configuration, journal: directory.appendingPathComponent("publication"), operation: operation) { event, process in
                 try checkExecution(operation)
                 switch event.event {
                 case "preparePublication": try await preparePublication(event, process: process, operation: operation)
@@ -831,7 +836,6 @@ public actor ShaderRequestService {
                 default: break
                 }
             }
-            try await settleProcess(process)
             try checkExecution(operation)
             guard ready, let preparedID else { throw ShaderRequestError.unavailable("Publication rebuild did not complete.") }
             let publication = try await catalog.install(preparedID)
@@ -839,7 +843,6 @@ public actor ShaderRequestService {
             try persist()
             finishPublication(revision: publication.catalog.publicationRevision)
         } catch {
-            let stoppedError = await stopAndDrain(process)
             if let preparedID { await catalog.discard(preparedID); self.preparedID = nil }
             if execution?.interrupted == true,
                activePublication?.waiters.isEmpty == false || activePublication?.ownsRetry == true {
@@ -853,7 +856,7 @@ public actor ShaderRequestService {
                 }
                 activePublication = nil
                 finishPublication()
-            } else { finishPublication(error: stoppedError ?? (execution?.interrupted == true ? CancellationError() : error)) }
+            } else { finishPublication(error: execution?.interrupted == true ? CancellationError() : error) }
         }
     }
     private func finishPublication(error: Error? = nil, revision: String? = nil) {
@@ -890,14 +893,81 @@ public actor ShaderRequestService {
 
     private func workerFailure(_ event: RequestWorkerEvent) -> Error {
         let message = event.message ?? "Shader worker failed"
-        guard event.recoveryRequired == true else { return ShaderRequestError.unavailable(message) }
+        guard event.recoveryRequired == true else {
+            if event.failureKind == "supervision" || event.failureKind == "interrupted" {
+                return RequestWorkerSupervisionError(message: message, retryable: event.failureKind == "supervision" && event.retryable != false)
+            }
+            return ShaderRequestError.unavailable(message)
+        }
         let failure = RequestWorkerTeardownError(cause: message)
         holdForRecovery(journal: activeProcess?.recoveryTarget?.directory ?? activeID.map(folder) ?? directory.appendingPathComponent("publication"),
             configuration: activeProcess?.recoveryTarget?.configuration ?? configurationForActiveWorker, error: failure)
         return failure
     }
 
+    private func runWorker(mode: String, configuration: ShaderRequestConfiguration, journal: URL, operation: UUID,
+                           receive: (RequestWorkerEvent, RequestWorkerProcess) async throws -> Void) async throws {
+        var attempt: RequestWorkerOperation
+        do {
+            try checkExecution(operation)
+            attempt = try RequestWorkerOperation.begin(mode: mode, in: journal)
+            try await reconcileWorker(journal)
+            try checkExecution(operation)
+            if attempt.phase == .retryPending { attempt.phase = .retryRunning; try attempt.save(in: journal) }
+        } catch {
+            if !(error is CancellationError) { holdForRecovery(journal: journal, configuration: configuration, error: error) }
+            throw error
+        }
+        while true {
+            try checkExecution(operation)
+            let process = workerProcess(); activeProcess = process
+            do {
+                for try await event in process.run(mode: mode, configuration: configuration, directory: journal, operationID: attempt.id) {
+                    try checkExecution(operation)
+                    if event.event == "failure" { throw workerFailure(event) }
+                    try await receive(event, process)
+                }
+                try await settleProcess(process)
+                try checkExecution(operation)
+                attempt.phase = .complete; try attempt.save(in: journal)
+                return
+            } catch {
+                let settlementError = await stopAndDrain(process)
+                if let settlementError { throw settlementError }
+                try checkExecution(operation)
+                guard let fault = error as? RequestWorkerSupervisionError else { throw error }
+                holdForRecovery(journal: journal, configuration: configuration, error: fault)
+                do {
+                    try persistRecovery() // A failed recovery write must prevent automatic relaunch.
+                    guard fault.retryable, attempt.phase == .initial else {
+                        attempt.phase = .paused; try attempt.save(in: journal); throw fault
+                    }
+                    attempt.phase = .retryPending; try attempt.save(in: journal)
+                    if let preparedID { await catalog.discard(preparedID); self.preparedID = nil }
+                    try checkExecution(operation)
+                    try await reconcileWorker(journal)
+                    try checkExecution(operation)
+                    attempt.phase = .retryRunning; try attempt.save(in: journal)
+                    let key = RequestPaths.canonical(journal)
+                    recovery.entries[key] = nil
+                    if reconciliationJournal.map({ RequestPaths.canonical($0) }) == key {
+                        reconciliationFailure = nil; reconciliationJournal = nil; reconciliationConfiguration = nil
+                    }
+                    try persist()
+                    if mode == "run", let id = activeID, records[id]?.status.stage.terminal == false,
+                       records[id]?.status.stage != .awaitingActivation, records[id]?.status.stage != .awaitingClarification {
+                        try update(id, stage: .repairing, message: "Retrying preserved work after a supervision failure")
+                    }
+                } catch {
+                    holdForRecovery(journal: journal, configuration: configuration, error: error)
+                    throw error
+                }
+            }
+        }
+    }
+
     private func checkExecution(_ id: UUID) throws {
+        try Task.checkCancellation()
         guard execution?.id == id, execution?.interrupted == false, !suspended else { throw CancellationError() }
     }
 
@@ -972,21 +1042,18 @@ public actor ShaderRequestService {
         candidate.detachedOwner = try await Task.detached { try Self.detachedOwner(for: checkout, acknowledgements: acknowledgements) }.value
         candidate.checkoutID = nil
         try checkExecution(operation.id)
-        let process = workerProcess()
-        activeProcess = process
         var verified = false
         do {
-            for try await event in process.run(mode: "preflight", configuration: candidate, directory: directory.appendingPathComponent("setup")) {
+            try RequestWorkerOperation.restartPaused(in: directory.appendingPathComponent("setup"))
+            try await runWorker(mode: "preflight", configuration: candidate, journal: directory.appendingPathComponent("setup"), operation: operation.id) { event, _ in
                 try checkExecution(operation.id)
                 if event.event == "failure" { throw workerFailure(event) }
                 if event.event == "preflight" { verified = true; candidate.checkoutID = event.checkoutID }
             }
-            try await settleProcess(process)
             try checkExecution(operation.id)
             guard verified else { throw ShaderRequestError.unavailable("Setup did not complete.") }
         } catch {
-            let stoppedError = await stopAndDrain(process)
-            throw stoppedError ?? error
+            throw error
         }
         candidate.detachedOwner = nil
         if !Self.samePublicationCheckout(configuration, candidate) { cancelPublicationRequests() }
@@ -1191,20 +1258,15 @@ public actor ShaderRequestService {
     private func cleanup(_ id: UUID, operation: UUID) async {
         guard let record = records[id] else { finishWorker(id); return }
         await prepareCleanup()
-        let process = workerProcess()
         do {
             try checkExecution(operation)
-            activeProcess = process
             let job = folder(id)
-            try await reconcileWorker(job)
-            try checkExecution(operation)
             var discarded = false
-            for try await event in process.run(mode: "discard", configuration: record.configuration, directory: job) {
+            try await runWorker(mode: "discard", configuration: record.configuration, journal: job, operation: operation) { event, _ in
                 try checkExecution(operation)
                 if event.event == "failure" { throw workerFailure(event) }
                 if event.event == "discarded" { discarded = true }
             }
-            try await settleProcess(process)
             try checkExecution(operation)
             guard discarded else { throw ShaderRequestError.unavailable("Cleanup did not complete.") }
             records[id]?.cleanupPending = false; records[id]?.cleanupFailure = nil
@@ -1212,9 +1274,11 @@ public actor ShaderRequestService {
                 try update(id, stage: record.status.stage, message: record.status.message)
             } else { try update(id, stage: .failed, message: record.cleanupMessage ?? "Owned checkout cleanup completed; see the retained request diagnostic") }
         } catch {
-            let stoppedError = await stopAndDrain(process)
+            if error is RequestWorkerEvidenceError || error is RequestWorkerOwnershipError || error is RequestWorkerTeardownError || error is RequestWorkerSupervisionError {
+                holdForRecovery(journal: folder(id), configuration: record.configuration, error: error)
+            }
             if execution?.interrupted == false, records[id]?.detached != true {
-                records[id]?.cleanupFailure = (stoppedError ?? error).localizedDescription
+                records[id]?.cleanupFailure = error.localizedDescription
                 setupMessage = "Checkout recovery is required. Correct the saved folder/tool paths and retry cleanup, or detach the checkout."
                 try? update(id, stage: .failed, message: "Cleanup failed: \(error.localizedDescription). \(setupMessage)")
             }
@@ -1236,14 +1300,11 @@ public actor ShaderRequestService {
     }
     private func execute(_ id: UUID, operation: UUID) async {
         guard let record = records[id] else { finishWorker(id); return }
-        let process = workerProcess(); activeProcess = process
         var outcomeSeen = false
         do {
             try checkExecution(operation)
             let job = folder(id)
-            try await reconcileWorker(job)
-            try checkExecution(operation)
-            for try await event in process.run(mode: "run", configuration: record.configuration, directory: job) {
+            try await runWorker(mode: "run", configuration: record.configuration, journal: job, operation: operation) { event, process in
                 try checkExecution(operation)
                 switch event.event {
                 case "stage":
@@ -1264,6 +1325,10 @@ public actor ShaderRequestService {
                                message: records[id]?.revoked == true ? "Discarding revoked unpublished work" : "Waiting for a TV answer")
                     outcomeSeen = true
                 case "result":
+                    if outcomeSeen, let result = event.result, records[id]?.status.result?.commitSHA == result.commitSHA {
+                        if let preparedID { await catalog.discard(preparedID); self.preparedID = nil }
+                        return
+                    }
                     guard let result = event.result, ShaderRequest.validID(result.shaderID), let preparedID else {
                         throw ShaderRequestError.invalidRequest
                     }
@@ -1275,14 +1340,14 @@ public actor ShaderRequestService {
                     if records[id]?.revoked == true {
                         try update(id, stage: .failed, message: "Pushed successfully; TV access was revoked")
                         outcomeSeen = true
-                        continue
+                        return
                     }
                     guard let output = publication.catalog.shaders.first(where: { $0.id == result.shaderID }) else {
                         try JSONEncoder().encode(["attemptID": UUID().uuidString, "shaderID": result.shaderID, "diagnostic": "The committed output was removed before TV delivery. Recreate it under a fresh unused ID."])
                             .write(to: job.appendingPathComponent("repair.json"), options: .atomic)
                         try update(id, stage: .repairing, message: "Recreating the output removed before delivery")
                         outcomeSeen = true
-                        continue
+                        return
                     }
                     records[id]?.status.result?.deliveredSourceHash = output.sourceHash
                     try update(id, stage: records[id]?.revoked == true ? .failed : .awaitingActivation,
@@ -1295,8 +1360,7 @@ public actor ShaderRequestService {
             try checkExecution(operation)
             if !outcomeSeen { throw ShaderRequestError.unavailable("Worker ended without a verified result.") }
         } catch {
-            process.stop()
-            if error is RequestWorkerTeardownError || error is RequestWorkerEvidenceError {
+            if error is RequestWorkerTeardownError || error is RequestWorkerOwnershipError || error is RequestWorkerEvidenceError || error is RequestWorkerSupervisionError {
                 holdForRecovery(journal: folder(id), configuration: record.configuration, error: error)
             } else if execution?.interrupted == false, records[id]?.detached != true {
                 records[id]?.cleanupPending = true
@@ -1304,10 +1368,6 @@ public actor ShaderRequestService {
                 try? update(id, stage: .failed, message: error.localizedDescription)
             }
         }
-        // A suspended/revoked process must release its lease before recovery or cleanup starts.
-        if execution?.interrupted == true { process.stop() }
-        do { try await settleProcess(process) }
-        catch { /* settleProcess persisted recovery without introducing discard intent. */ }
         if records[id]?.revoked == true, records[id]?.status.stage.terminal == false, records[id]?.detached != true {
             records[id]?.cleanupPending = true
             records[id]?.cleanupMessage = "TV access was revoked; any pushed commit remains"

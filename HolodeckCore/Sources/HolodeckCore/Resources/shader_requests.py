@@ -1040,20 +1040,24 @@ def main():
             worker.discard()
         else:
             worker.perform()
-    except WorkerInterrupted as interruption:
-        cleanup_errors = list(getattr(interruption, 'cleanup_errors', []))
-        recovery_required = getattr(interruption, 'recovery_required', False)
-        try: terminate_registered(sys.argv[3], budget=status_budget(read_supervision(sys.argv[3])))
-        except (OperationalError, OSError) as error:
-            cleanup_errors.append(str(error))
-            recovery_required |= isinstance(error, ProcessRecoveryError) or any(
-                (Path(sys.argv[3]) / name).exists() for name in ("children.json", "supervision.json"))
-        if cleanup_errors:
-            emit("failure", message="Worker interrupted; cleanup failed: " + '; cleanup error: '.join(cleanup_errors),
-                 recoveryRequired=recovery_required); sys.exit(1)
-        sys.exit(130)
     except BaseException as error:
-        if worker and worker.request and not isinstance(error, ProcessRecoveryError):
+        if not isinstance(error, Exception):
+            cleanup_errors = list(getattr(error, 'cleanup_errors', []))
+            recovery_required = getattr(error, 'recovery_required', False)
+            try: budget = status_budget(read_supervision(sys.argv[3]))
+            except (OperationalError, OSError): budget = None  # Settlement independently reports unreadable evidence.
+            try: terminate_registered(sys.argv[3], budget=budget)
+            except (OperationalError, OSError) as cleanup_error:
+                cleanup_errors.append(str(cleanup_error))
+                recovery_required |= isinstance(cleanup_error, ProcessRecoveryError) or any(
+                    (Path(sys.argv[3]) / name).exists() for name in ("children.json", "supervision.json"))
+            if cleanup_errors or recovery_required:
+                message = 'Worker interrupted' + (': ' + str(error) if str(error) else '')
+                if cleanup_errors: message += '; cleanup failed: ' + '; cleanup error: '.join(dict.fromkeys(cleanup_errors))
+                emit("failure", message=message, failureKind="interrupted", recoveryRequired=recovery_required)
+                sys.exit(1)
+            sys.exit(130)
+        if worker and worker.request and not isinstance(error, SupervisionError):
             # A lost push acknowledgement is reconciled before any destructive cleanup.
             published = False
             sha = worker.checkpoint.get("commitSHA")
@@ -1071,7 +1075,9 @@ def main():
             else:
                 with contextlib.suppress(Exception):
                     worker.clean(revision=sha)
-        emit("failure", message=str(error), recoveryRequired=isinstance(error, ProcessRecoveryError))
+        emit("failure", message=str(error), failureKind="supervision" if isinstance(error, SupervisionError) else "operational",
+             retryable=isinstance(error, SupervisionError) and error.retryable,
+             recoveryRequired=isinstance(error, ProcessRecoveryError))
         sys.exit(1)
 
 

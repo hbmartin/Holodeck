@@ -106,6 +106,8 @@ final class HolodeckMacUITests: XCTestCase {
         let available = XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: retry)
         XCTAssertEqual(XCTWaiter.wait(for: [available], timeout: 10), .completed)
         let python = element("recovery-python", in: app)
+        app.activate()
+        XCTAssertTrue(app.wait(for:.runningForeground,timeout:5))
         python.click(); python.typeKey("a", modifierFlags: .command); python.typeText("/usr/bin/python3")
         XCTAssertTrue(element("recovery-repository", in: app).exists)
         XCTAssertTrue(element("recovery-git", in: app).exists)

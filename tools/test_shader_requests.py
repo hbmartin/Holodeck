@@ -4,6 +4,8 @@ No Codex API calls or production pushes. The command fixtures retain invocation 
 import base64
 import ast
 import copy
+import contextlib
+import io
 import importlib.util
 import json
 import os
@@ -1023,7 +1025,7 @@ time.sleep(60)
 
     def supervisor_fixture(self, injected):
         script=self.base/('supervisor-'+str(uuid.uuid4())+'.py')
-        script.write_text("import importlib.util,sys\n"+"spec=importlib.util.spec_from_file_location('w',"+repr(str(PROCESS_SCRIPT))+");w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)\n"+injected+"\nsys.exit(w.supervise(int(sys.argv[2])))\n")
+        script.write_text("import importlib.util,sys\nsys.dont_write_bytecode=True\n"+"spec=importlib.util.spec_from_file_location('w',"+repr(str(PROCESS_SCRIPT))+");w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)\n"+injected+"\nsys.exit(w.supervise(int(sys.argv[2])))\n")
         return script
 
     def test_supervision_deadlines_share_one_clock_across_processes(self):
@@ -1033,7 +1035,7 @@ time.sleep(60)
         after=worker_module.process_clock()
         self.assertLessEqual(before,observed);self.assertLessEqual(observed,after)
         child=worker_module.ManagedChild.__new__(worker_module.ManagedChild)
-        child.status=dict(worker_module.new_status({'pid':100,'seconds':1,'microseconds':0},str(uuid.uuid4())),termination=worker_module.Termination(observed+10).record())
+        child.status=dict(worker_module.new_status({'pid':100,'seconds':1,'microseconds':0},str(uuid.uuid4())),termination=worker_module.Termination().record())
         self.assertGreater(child.drain_deadline(),after)
         self.assertLessEqual(child.drain_deadline(),worker_module.process_clock()+5)
 
@@ -1205,7 +1207,7 @@ class ProcessSettlementTests(unittest.TestCase):
 
     def supervisor_fixture(self, injected):
         script=self.job/'supervisor-fixture.py'
-        script.write_text("import importlib.util,sys\nspec=importlib.util.spec_from_file_location('w',"+repr(str(PROCESS_SCRIPT))+");w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)\n"+injected+"\nsys.exit(w.supervise(int(sys.argv[2])))\n")
+        script.write_text("import importlib.util,sys\nsys.dont_write_bytecode=True\nspec=importlib.util.spec_from_file_location('w',"+repr(str(PROCESS_SCRIPT))+");w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)\n"+injected+"\nsys.exit(w.supervise(int(sys.argv[2])))\n")
         return script
 
     def test_unverified_supervisor_birth_aborts_without_executing_or_signalling(self):
@@ -1216,6 +1218,12 @@ class ProcessSettlementTests(unittest.TestCase):
         self.assertNotIsInstance(failure.exception,worker_module.ProcessRecoveryError);kill.assert_not_called()
         self.assertIsNotNone(child.process.poll());self.assertFalse(marker.exists())
         self.assertFalse((self.job/'children.json').exists());self.assertFalse((self.job/'supervision.json').exists())
+
+        child=worker_module.ManagedChild(['/usr/bin/true'],self.job,self.env)
+        with patch.object(process_module,'process_identity',return_value=None),patch.object(process_module,'retire_evidence',side_effect=PermissionError('startup evidence persistence denied')):
+            with self.assertRaises(worker_module.SupervisionError) as failure:child.__enter__()
+        self.assertFalse(failure.exception.retryable)
+        self.assertIsNotNone(child.process.poll());self.assertFalse(marker.exists())
 
     def test_startup_returns_when_ready_while_command_waits_for_parent_input(self):
         child=worker_module.ManagedChild([sys.executable,'-c','import sys;print(len(sys.stdin.read()),flush=True)'],self.job,self.env,stdin=True,text=False)
@@ -1303,8 +1311,9 @@ class ProcessSettlementTests(unittest.TestCase):
                 self.assertTrue(termination.expired)
         self.assertIsNone(worker_module.status_deadline({'formatVersion':1,'deadline':999999}))
         self.assertIsNone(worker_module.status_deadline({'formatVersion':2,'clock':'other','deadline':999999}))
+        with patch.object(process_module,'process_clock',return_value=89.):budget=worker_module.Termination().record()
         with patch.object(process_module,'process_clock',return_value=100.):
-            termination=worker_module.Termination(99.)
+            termination=worker_module.Termination(budget=budget)
             termination.begin();self.assertEqual(termination.deadline,99.);self.assertTrue(termination.expired)
 
     def test_terminal_status_survives_control_channel_reset(self):
@@ -1348,6 +1357,7 @@ class ProcessSettlementTests(unittest.TestCase):
             engine.termination.begin();self.assertFalse(engine.step())
             self.assertIn(101,sent);self.assertIn(102,sent)
             self.assertIn('signal denied',engine.failure);self.assertIn('registry denied',engine.failure)
+            self.assertFalse(engine.retryable)
 
     def test_known_only_supervisor_crash_settles_without_false_recovery(self):
         child=worker_module.ManagedChild([sys.executable,'-u','-c',"import time;print('ready',flush=True);time.sleep(60)"],self.job,self.env,text=False)
@@ -1366,6 +1376,7 @@ class ProcessSettlementTests(unittest.TestCase):
             with worker_module.ManagedChild(['/usr/bin/true'],self.job,self.env,supervisor_script=script) as child:
                 list(child.output_chunks(timeout=5))
         self.assertNotIsInstance(failure.exception,worker_module.ProcessRecoveryError)
+        self.assertFalse(failure.exception.retryable)
         self.assertFalse((self.job/'children.json').exists())
 
     def test_prelaunch_control_eof_writes_terminal_status_without_command(self):
@@ -1382,7 +1393,7 @@ class ProcessSettlementTests(unittest.TestCase):
     def test_interruption_cleanup_errors_emit_structured_failure(self):
         config=self.job/'config.json';config.write_text('{}')
         for kind in ('OperationalError','PermissionError'):
-            code="import importlib.util,sys\nspec=importlib.util.spec_from_file_location('w',sys.argv[1]);w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)\nclass Probe:\n def __init__(self,*a):raise w.WorkerInterrupted()\nw.Worker=Probe\ndef cleanup(*a,**kwargs):raise "+('w.' if kind=='OperationalError' else '')+kind+"('injected cleanup failure')\nw.terminate_registered=cleanup\nsys.argv=[sys.argv[1],'run',sys.argv[2],sys.argv[3]]\nw.main()"
+            code="import importlib.util,sys\nsys.dont_write_bytecode=True\nspec=importlib.util.spec_from_file_location('w',sys.argv[1]);w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)\nclass Probe:\n def __init__(self,*a):raise w.WorkerInterrupted()\nw.Worker=Probe\ndef cleanup(*a,**kwargs):raise "+('w.' if kind=='OperationalError' else '')+kind+"('injected cleanup failure')\nw.terminate_registered=cleanup\nsys.argv=[sys.argv[1],'run',sys.argv[2],sys.argv[3]]\nw.main()"
             result=subprocess.run([sys.executable,'-I','-c',code,str(SCRIPT),str(config),str(self.job)],capture_output=True,text=True,timeout=5)
             self.assertEqual(result.returncode,1);self.assertNotIn('Traceback',result.stderr)
             event=json.loads(result.stdout);self.assertEqual(event['event'],'failure');self.assertIn('injected cleanup failure',event['message'])
@@ -1558,7 +1569,7 @@ class ProcessSettlementTests(unittest.TestCase):
         child.identity={'pid':100,'seconds':1,'microseconds':0}
         child.status=worker_module.new_status(child.identity,str(uuid.uuid4()))
         with patch.object(process_module,'boot_identity',return_value=None),patch.object(process_module,'process_clock',return_value=100.):child.stop()
-        self.assertEqual(child.stop_deadline,110.)
+        self.assertEqual(child.stop_termination.deadline,110.)
         with patch.object(process_module,'boot_identity',return_value=None),patch.object(process_module,'process_clock',return_value=111.),patch.object(process_module,'process_identity',return_value=None),patch.object(process_module,'group_members',return_value=[]):
             with self.assertRaises(worker_module.ProcessRecoveryError):child.fallback_step()
         self.assertIs(child.fallback.termination,child.stop_termination)
@@ -1584,6 +1595,121 @@ class ProcessSettlementTests(unittest.TestCase):
         finally:
             if patcher:patcher.stop()
         self.assertFalse(child.registry.exists())
+
+
+    def test_interrupted_main_settles_registry_even_when_supervision_is_corrupt(self):
+        config=self.job/'config.json';config.write_text('{}')
+        process=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],start_new_session=True)
+        self.addCleanup(lambda:process.poll() is None and process.kill())
+        identity=worker_module.process_identity(process.pid)
+        worker_module.save_registry(self.job/'children.json',[{'leader':identity,'members':[identity]}])
+        (self.job/'supervision.json').write_text('{')
+        class Worker:
+            def __init__(self,*a):raise worker_module.WorkerInterrupted('stop')
+        output=io.StringIO()
+        with patch.object(worker_module,'Worker',Worker),patch.object(worker_module.os,'setsid'),patch.object(worker_module.signal,'signal'),patch.object(sys,'argv',[str(SCRIPT),'run',str(config),str(self.job)]),contextlib.redirect_stdout(output):
+            with self.assertRaises(SystemExit):worker_module.main()
+        process.wait(timeout=2)
+        event=json.loads(output.getvalue());self.assertTrue(event['recoveryRequired'])
+        self.assertIn('Invalid process evidence',event['message']);self.assertTrue((self.job/'supervision.json').exists())
+
+    def test_internal_supervision_fault_preserves_work_through_worker_main(self):
+        supervisor=self.supervisor_fixture("real=w.Settlement.step\nfailed=False\ndef step(self,*a,**kw):\n global failed\n if not failed:\n  failed=True\n  raise RuntimeError('internal supervision fault')\n return real(self,*a,**kw)\nw.Settlement.step=step")
+        work=self.job/'unpublished';work.write_bytes(b'\x00\xffretained\r\n')
+        patch_file=self.job/'changes.patch';patch_file.write_bytes(b'PATCH')
+        config=self.job/'config.json';config.write_text('{}')
+        code="""import importlib.util,os,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('w',sys.argv[1]);w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
+class Worker:
+ def __init__(self,*a):self.request={'id':'fixture'};self.checkpoint={};self.directory=Path(sys.argv[3])
+ def perform(self):
+  with w.ManagedChild([sys.executable,'-c','import time;time.sleep(.2)'],self.directory,dict(os.environ,HOLODECK_REQUEST_DIRECTORY=str(self.directory)),supervisor_script=SUPERVISOR) as child:list(child.output_chunks())
+ def clean(self):self.directory.joinpath('unpublished').write_bytes(b'DISCARDED')
+w.Worker=Worker
+sys.argv=[sys.argv[1],'run',sys.argv[2],sys.argv[3]]
+w.main()
+""".replace('SUPERVISOR',repr(str(supervisor)))
+        result=subprocess.run([sys.executable,'-B','-I','-c',code,str(SCRIPT),str(config),str(self.job)],capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,1,result.stderr)
+        event=json.loads(result.stdout);self.assertEqual(event['failureKind'],'supervision');self.assertFalse(event['recoveryRequired'])
+        self.assertEqual(work.read_bytes(),b'\x00\xffretained\r\n');self.assertEqual(patch_file.read_bytes(),b'PATCH')
+
+    def test_all_base_exception_cancellations_keep_recovery_metadata_and_work(self):
+        config=self.job/'config.json';config.write_text('{}')
+        for kind in (worker_module.WorkerInterrupted,KeyboardInterrupt,SystemExit):
+            work=self.job/'changes.patch';work.write_bytes(b'RETAIN')
+            class Worker:
+                request={'id':'fixture'};checkpoint={};directory=self.job
+                def __init__(self,*a):pass
+                def perform(self):
+                    error=kind('cancelled')
+                    process_module.interruption_cleanup(error,worker_module.ProcessRecoveryError('unresolved ownership'),True)
+                    raise error
+                def clean(self):work.unlink()
+            output=io.StringIO()
+            with patch.object(worker_module,'Worker',Worker),patch.object(worker_module.os,'setsid'),patch.object(worker_module.signal,'signal'),patch.object(worker_module,'terminate_registered'),patch.object(sys,'argv',[str(SCRIPT),'run',str(config),str(self.job)]),contextlib.redirect_stdout(output):
+                with self.assertRaises(SystemExit):worker_module.main()
+            event=json.loads(output.getvalue());self.assertTrue(event['recoveryRequired']);self.assertEqual(event['failureKind'],'interrupted')
+            self.assertIn('unresolved ownership',event['message']);self.assertEqual(work.read_bytes(),b'RETAIN')
+
+    def test_supervisor_internal_fault_preserves_partial_control_frame(self):
+        tree=ast.parse(PROCESS_SCRIPT.read_text())
+        supervisor=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='supervise')
+        loop=next(n for n in ast.walk(supervisor) if isinstance(n,ast.While) and isinstance(n.test,ast.Constant) and n.test.value is True)
+        function=ast.parse('def probe(control_open,control,pending,engine,status,command,stop,work_settled,drain_deadline,wakeup):\n pass\n').body[0]
+        function.body=[copy.deepcopy(loop)];reports=[];namespace=dict(process_module.__dict__)
+        namespace.update(report=lambda state,**fields:reports.append(dict(state=state,**fields)),process_clock=lambda:100.)
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[function],type_ignores=[])),'<supervisor-loop>','exec'),namespace)
+        class Control:
+            calls=0;closed=False
+            def recv(self,*a):
+                self.calls+=1
+                if self.calls==1:raise BlockingIOError()
+                return b'ined","sessionID":"s"}\n'
+            def close(self):self.closed=True
+        class Termination:
+            started=100.;deadline=110.;expired=False
+            def record(self):return {'deadline':110.}
+            def begin(self):pass
+        class Engine:
+            termination=Termination();failure_kind=None;failure=None;next_sample=100.;calls=0
+            def step(self):
+                self.calls+=1
+                if self.calls==1:raise RuntimeError('one-shot fault')
+                return True
+            def fail(self,error,kind):self.failure=str(error);self.failure_kind=self.failure_kind or kind
+        class Command:
+            def poll(self):return 0
+        class Wakeup:
+            def wait(self,*a):pass
+            def forget(self,*a):pass
+        control=Control();status=dict(sessionID='s',commandReturnCode=0,termination={'deadline':110.},processesSettled=False,pipeDrainComplete=False)
+        namespace['probe'](True,control,bytearray(b'{"action":"dra'),Engine(),status,Command(),[False],False,None,Wakeup())
+        self.assertTrue(status['pipeDrainComplete']);self.assertFalse(control.closed)
+        self.assertFalse(reports[-1]['recoveryRequired']);self.assertEqual(reports[-1]['failureKind'],'supervision')
+
+    def test_boot_identity_caches_success_but_retries_failures(self):
+        boot=str(uuid.uuid4())
+        with patch.object(process_module,'_boot_identity',None),patch.object(process_module,'read_boot_identity',side_effect=[None,boot]) as read:
+            self.assertIsNone(worker_module.boot_identity())
+            self.assertEqual(worker_module.boot_identity(),boot)
+            self.assertEqual(worker_module.boot_identity(),boot)
+            self.assertEqual(read.call_count,2)
+
+    def test_failed_evidence_reads_follow_observation_interval(self):
+        child=worker_module.ManagedChild(['/usr/bin/true'],self.job,self.env)
+        child.identity={'pid':100,'seconds':1,'microseconds':0};child.status=worker_module.new_status(child.identity,str(uuid.uuid4()))
+        class Fallback:
+            identities=[];entries=[]
+            class termination:expired=False
+            def step(self):return False
+        child.fallback=Fallback();child.fallback_evidence_error='bad evidence';now=[100.]
+        with patch.object(process_module,'process_clock',side_effect=lambda:now[0]),patch.object(process_module,'read_supervision',side_effect=worker_module.ProcessRecoveryError('bad evidence')) as status,patch.object(process_module,'read_registry',return_value=[]) as registry:
+            for _ in range(40):self.assertFalse(child.fallback_step())
+            self.assertEqual(status.call_count,1);self.assertEqual(registry.call_count,1)
+            now[0]+=.25;self.assertFalse(child.fallback_step())
+            self.assertEqual(status.call_count,2);self.assertEqual(registry.call_count,2)
 
 
 if __name__=='__main__': unittest.main()
