@@ -510,10 +510,11 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 do {
                     guard let script = scriptOverride ?? Self.bundledScript else { throw ShaderRequestError.unavailable("Bundled shader request worker is missing.") }
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                    let configurationData = try JSONEncoder().encode(configuration)
-                    guard var workerConfiguration = try JSONSerialization.jsonObject(with:configurationData) as? [String:Any] else { throw ShaderRequestError.unavailable("Worker configuration is invalid.") }
-                    if let operationID { workerConfiguration["workerOperationID"] = operationID.uuidString }
-                    try RequestJournalWriter.write(JSONSerialization.data(withJSONObject:workerConfiguration),to:directory.appendingPathComponent("configuration.json"))
+                    if let operationID {
+                        try RequestWorkerOperation.validateLaunch(id: operationID, configuration: configuration, in: directory)
+                    } else {
+                        try RequestJournalWriter.write(RequestWorkerOperation.encodedConfiguration(configuration, id: nil), to: directory.appendingPathComponent("configuration.json"))
+                    }
                     process.executableURL = URL(fileURLWithPath: configuration.python)
                     let launchToken = UUID().uuidString
                     process.arguments = ["-I", "-c", Self.bootstrap, launchToken, script.path, mode, directory.appendingPathComponent("configuration.json").path, directory.path]

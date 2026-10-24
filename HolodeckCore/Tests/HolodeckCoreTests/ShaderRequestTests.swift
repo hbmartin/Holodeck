@@ -970,9 +970,10 @@ final class ShaderRequestTests: XCTestCase {
         try await service.initialize(configuration: .init(repository: root.path))
         let old = Task { try await service.retryReconciliation() }
         try await waitFor { await gate.entered }
-        try await service.retryReconciliation()
+        do { try await service.retryReconciliation(); XCTFail("Overlapping recovery acquired the lease") } catch {}
         await gate.release()
         do { try await old.value; XCTFail("Old attempt unexpectedly succeeded") } catch {}
+        try await service.retryReconciliation()
         let statuses = await service.recoveryStatuses()
         XCTAssertTrue(statuses.isEmpty)
     }
@@ -994,7 +995,7 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertEqual(statuses.first?.stage, .cancelled)
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
         let evidence = try FileManager.default.contentsOfDirectory(atPath: job.path)
-        XCTAssertTrue(evidence.contains { $0.hasPrefix("process-detached-") })
+        XCTAssertTrue(evidence.contains { $0.hasPrefix("detached-") })
         try await restarted.deleteFinished(request.id)
         let acknowledgements = try JSONDecoder().decode([DetachedCheckoutAcknowledgement].self, from: Data(contentsOf: root.appendingPathComponent("detached-checkouts.json")))
         XCTAssertTrue(acknowledgements.contains { $0.requestID == request.id })
@@ -1248,10 +1249,11 @@ final class ShaderRequestTests: XCTestCase {
             try await waitFor { await reconciliation.entered }
             let request = Task { try await f.service.ensurePublication(force: true) }
             try await waitFor { await f.service.pendingPublicationWaiterCount == 1 }
-            await f.service.resume(); try await f.service.retryReconciliation()
-            try await waitFor { await preparation.entered }
+            do { try await f.service.retryReconciliation(); XCTFail("Overlapping recovery acquired the lease") } catch {}
             await reconciliation.release()
             do { try await old.value; XCTFail("Old reconciliation unexpectedly succeeded") } catch {}
+            try await f.service.retryReconciliation(); await f.service.resume()
+            try await waitFor { await preparation.entered }
             let state = await f.service.publicationOperationStatus()
             XCTAssertEqual(state.phase, .preparing); XCTAssertNil(state.failure)
             await preparation.release(); try await request.value
@@ -1496,6 +1498,8 @@ final class ShaderRequestTests: XCTestCase {
             let saved = try XCTUnwrap((try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("journal.json"))) as? [[String: Any]])?.first)
             XCTAssertNotEqual(saved["cleanupPending"] as? Bool, true)
             XCTAssertEqual(try String(contentsOf: job.appendingPathComponent("changes.patch"), encoding: .utf8), "preserved")
+            let gitdir = try initializeRecoveryGit(root)
+            try JSONSerialization.data(withJSONObject: ["id": request.id.uuidString, "directory": RequestPaths.canonical(job)]).write(to: gitdir.appendingPathComponent("holodeck-request-owner.json"))
             let restarted = try await recoveryService(root, script: script)
             try await restarted.retryReconciliation()
             await restarted.resume()
@@ -1746,7 +1750,7 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertEqual(recovery?.repository, root.path); XCTAssertNil(recovery?.requestID)
         try await service.detachCheckout(.recovery(try XCTUnwrap(recovery?.id)))
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
-        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: publication.path).contains { $0.hasPrefix("process-detached-") })
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: publication.path).contains { $0.hasPrefix("detached-") })
     }
 
     func testPublicationEventsRetainFailureAcrossNextPreparingAndResolveOnSuccess() async throws {
@@ -2320,7 +2324,7 @@ final class ShaderRequestTests: XCTestCase {
         try await service.detachCheckout(.request(request.id))
         XCTAssertEqual(try Data(contentsOf:work),bytes)
         XCTAssertFalse(FileManager.default.fileExists(atPath:marker.path))
-        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath:job.path).contains{$0.hasPrefix("children-detached-")})
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath:job.path).contains{$0.hasPrefix("detached-")})
     }
 
     func testWorkerIsInterruptedBeforeNativeDescendantTermination() async throws {
@@ -2466,6 +2470,8 @@ final class ShaderRequestTests: XCTestCase {
         try await waitFor { !(await resumed.recoveryStatuses()).isEmpty }
         XCTAssertEqual(try String(contentsOf:job.appendingPathComponent("supervision-launches"),encoding:.utf8),"2")
         try "0".write(to:root.appendingPathComponent("supervision-fault-limit"),atomically:true,encoding:.utf8)
+        let gitdir = try initializeRecoveryGit(root)
+        try JSONSerialization.data(withJSONObject: ["id": request.id.uuidString, "directory": RequestPaths.canonical(job)]).write(to: gitdir.appendingPathComponent("holodeck-request-owner.json"))
         try await resumed.retryReconciliation()
         try await waitFor { await resumed.allJobs().first?.stage == .awaitingClarification }
         XCTAssertEqual(try String(contentsOf:job.appendingPathComponent("supervision-launches"),encoding:.utf8),"3")
@@ -2521,25 +2527,25 @@ final class ShaderRequestTests: XCTestCase {
 
     func testOperationJournalSurvivesRestartAndRejectsUnverifiableMetadata() throws {
         let (root, _) = try recoveryFixture(), job = root.appendingPathComponent("operation")
-        var initial = try RequestWorkerOperation.begin(mode:"run",in:job)
+        var initial = try RequestWorkerOperation.begin(mode:"run",configuration:.init(repository:root.path),in:job)
         initial.phase = .retryPending;try initial.save(in:job)
-        let pending = try RequestWorkerOperation.begin(mode:"run",in:job)
+        let pending = try RequestWorkerOperation.begin(mode:"run",configuration:.init(repository:root.path),in:job)
         XCTAssertEqual(pending.id,initial.id);XCTAssertEqual(pending.phase,.retryPending)
-        try JSONSerialization.data(withJSONObject:["workerOperationID":initial.id.uuidString]).write(to:job.appendingPathComponent("configuration.json"))
+        try RequestWorkerOperation.encodedConfiguration(.init(repository:root.path),id:initial.id).write(to:job.appendingPathComponent("configuration.json"))
         initial.phase = .retryRunning;try initial.save(in:job)
-        XCTAssertThrowsError(try RequestWorkerOperation.begin(mode:"run",in:job))
+        XCTAssertThrowsError(try RequestWorkerOperation.begin(mode:"run",configuration:.init(repository:root.path),in:job))
         XCTAssertEqual(try RequestWorkerOperation.read(in:job)?.phase,.paused)
         try RequestWorkerOperation.restartPaused(in:job)
         XCTAssertNotEqual(try RequestWorkerOperation.read(in:job)?.id,initial.id)
         XCTAssertEqual(try RequestWorkerOperation.expectedID(in:job),try RequestWorkerOperation.read(in:job)?.id)
         let marker = job.appendingPathComponent(RequestWorkerOperation.filename)
         try Data("{".utf8).write(to:marker)
-        XCTAssertThrowsError(try RequestWorkerOperation.begin(mode:"run",in:job))
+        XCTAssertThrowsError(try RequestWorkerOperation.begin(mode:"run",configuration:.init(repository:root.path),in:job))
         try FileManager.default.removeItem(at:marker)
         try FileManager.default.createSymbolicLink(at:marker,withDestinationURL:root.appendingPathComponent("missing"))
         XCTAssertThrowsError(try RequestWorkerOperation.read(in:job))
         try FileManager.default.removeItem(at:marker)
-        XCTAssertThrowsError(try RequestWorkerOperation.begin(mode:"run",in:job)) { XCTAssertTrue($0.localizedDescription.contains("missing")) }
+        XCTAssertThrowsError(try RequestWorkerOperation.begin(mode:"run",configuration:.init(repository:root.path),in:job)) { XCTAssertTrue($0.localizedDescription.contains("missing")) }
     }
 
     func testPipeUncertaintyDoesNotOverwriteRegistryOrInventItsCause() throws {
@@ -2657,6 +2663,183 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertEqual(probe.signalled,[identity.pid])
         XCTAssertFalse(FileManager.default.fileExists(atPath:job.appendingPathComponent("process.json").path))
     }
+    func testOperationBindingReplaysEveryDurableInterruptionWithoutNewAllowance() throws {
+        for reset in [false, true] {
+            for cut in 1...3 {
+                let (root, _) = try recoveryFixture(), job = root.appendingPathComponent("binding")
+                let configuration = ShaderRequestConfiguration(repository: root.path)
+                var prior = try RequestWorkerOperation.begin(mode: "preflight", configuration: configuration, in: job)
+                prior.phase = reset ? .paused : .complete; try prior.save(in: job)
+                var writes = 0
+                let writer: RequestWorkerOperation.Writer = { data, file in
+                    try RequestJournalWriter.write(data, to: file); writes += 1
+                    if writes == cut { throw CancellationError() }
+                }
+                XCTAssertThrowsError(try {
+                    if reset { try RequestWorkerOperation.restartPaused(in: job, configuration: configuration, writer: writer) }
+                    else { _ = try RequestWorkerOperation.begin(mode: "preflight", configuration: configuration, in: job, writer: writer) }
+                }())
+                let interrupted = try XCTUnwrap(RequestWorkerOperation.read(in: job))
+                XCTAssertNotEqual(interrupted.id, prior.id)
+                let resumed = try RequestWorkerOperation.begin(mode: "preflight", configuration: configuration, in: job)
+                XCTAssertEqual(resumed.id, interrupted.id); XCTAssertEqual(resumed.phase, .initial)
+                XCTAssertNil(resumed.binding)
+                try RequestWorkerOperation.validateLaunch(id: resumed.id, configuration: configuration, in: job)
+            }
+        }
+    }
+
+    func testOperationBindingRejectsUnrecordedConfigurationAndCheckout() throws {
+        let (root, _) = try recoveryFixture(), job = root.appendingPathComponent("binding")
+        let configuration = ShaderRequestConfiguration(repository: root.path)
+        var prior = try RequestWorkerOperation.begin(mode: "publication", configuration: configuration, in: job)
+        prior.phase = .complete; try prior.save(in: job)
+        var writes = 0
+        XCTAssertThrowsError(try RequestWorkerOperation.begin(mode: "publication", configuration: configuration, in: job, writer: { data, file in
+            try RequestJournalWriter.write(data, to: file); writes += 1
+            if writes == 1 { throw POSIXError(.ENOSPC) }
+        }))
+        var modified = configuration; modified.git = "/unexpected/git"
+        try RequestWorkerOperation.encodedConfiguration(modified, id: prior.id).write(to: job.appendingPathComponent("configuration.json"))
+        XCTAssertThrowsError(try RequestWorkerOperation.begin(mode: "publication", configuration: configuration, in: job))
+        XCTAssertThrowsError(try RequestWorkerOperation.begin(mode: "publication", configuration: .init(repository: root.appendingPathComponent("other").path), in: job))
+        XCTAssertNotNil(try RequestWorkerOperation.read(in: job)?.binding)
+    }
+
+    func testLegacyUnexplainedBindingRequiresExplicitRecovery() throws {
+        let (root, _) = try recoveryFixture(), job = root.appendingPathComponent("legacy-binding")
+        let configuration = ShaderRequestConfiguration(repository: root.path)
+        let prior = try RequestWorkerOperation.begin(mode: "preflight", configuration: configuration, in: job)
+        let legacy: [String: Any] = ["formatVersion": 1, "id": UUID().uuidString, "mode": "preflight", "phase": "initial"]
+        try JSONSerialization.data(withJSONObject: legacy).write(to: job.appendingPathComponent(RequestWorkerOperation.filename))
+        XCTAssertThrowsError(try RequestWorkerOperation.begin(mode: "preflight", configuration: configuration, in: job))
+        XCTAssertThrowsError(try RequestWorkerOperation.restartPaused(in: job, configuration: configuration))
+        try RequestWorkerOperation.restartPaused(in: job, configuration: configuration, repairLegacyMismatch: true)
+        let restored = try RequestWorkerOperation.begin(mode: "preflight", configuration: configuration, in: job)
+        XCTAssertNotEqual(restored.id, prior.id); XCTAssertEqual(restored.formatVersion, 2)
+        try RequestWorkerOperation.validateLaunch(id: restored.id, configuration: configuration, in: job)
+    }
+
+    func testOrdinaryFailureAfterRetryClosesOperationForNextVerify() async throws {
+        let (root, script) = try recoveryFixture()
+        let source = try String(contentsOf: script, encoding: .utf8)
+        let prefix = """
+        import json,sys
+        from pathlib import Path
+        job=Path(sys.argv[3]); counter=job/'attempts'
+        n=int(counter.read_text())+1 if counter.exists() else 1;counter.write_text(str(n))
+        if n<=2:
+            print(json.dumps(dict(event='failure',failureKind='supervision' if n==1 else 'operational',retryable=n==1,recoveryRequired=False,message='internal fault' if n==1 else 'dirty checkout')),flush=True)
+            raise SystemExit(1)
+        """
+        try (prefix + "\n" + source).write(to: script, atomically: true, encoding: .utf8)
+        let service = try await recoveryService(root, script: script, enabled: false); await service.resume()
+        do { try await service.verify(configuration: .init(repository: root.path)); XCTFail("Ordinary failure succeeded") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("dirty checkout")) }
+        XCTAssertEqual(try RequestWorkerOperation.read(in: root.appendingPathComponent("setup"))?.phase, .complete)
+        try await service.verify(configuration: .init(repository: root.path))
+    }
+
+    func testDetachmentArchivesBindingsAndDanglingMarkersResumably() throws {
+        let (root, _) = try recoveryFixture(), job = root.appendingPathComponent("archive")
+        _ = try RequestWorkerOperation.begin(mode: "publication", configuration: .init(repository: root.path), in: job)
+        let marker = job.appendingPathComponent("supervision.json")
+        try FileManager.default.createSymbolicLink(at: marker, withDestinationURL: root.appendingPathComponent("missing"))
+        let id = UUID(), archive = job.appendingPathComponent("detached-" + id.uuidString)
+        try FileManager.default.createDirectory(at: archive, withIntermediateDirectories: true)
+        try FileManager.default.moveItem(at: job.appendingPathComponent(RequestWorkerOperation.filename), to: archive.appendingPathComponent(RequestWorkerOperation.filename))
+        try RequestJournalWriter.archive(in: job, id: id)
+        try RequestJournalWriter.archive(in: job, id: id)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(marker))
+        XCTAssertTrue(RequestProcessIdentity.evidenceExists(archive.appendingPathComponent("supervision.json")))
+        XCTAssertTrue(RequestProcessIdentity.evidenceExists(archive.appendingPathComponent("configuration.json")))
+        _ = try RequestWorkerOperation.begin(mode: "publication", configuration: .init(repository: root.path), in: job)
+    }
+
+    func testDetachPausedPublicationThenVerifyAllowsFreshRebuild() async throws {
+        let f = try await publicationRecoveryFixture()
+        try injectSupervisionFaults(f.script, mode: "publication", count: 2)
+        await f.service.resume()
+        do { try await f.service.ensurePublication(force: true); XCTFail("Fault succeeded") } catch {}
+        let entries = await f.service.recoveryStatuses(); let entry = try XCTUnwrap(entries.first)
+        try await f.service.detachCheckout(.recovery(entry.id))
+        try "0".write(to: f.root.appendingPathComponent("supervision-fault-limit"), atomically: true, encoding: .utf8)
+        try await f.service.verify(configuration: .init(repository: f.authoring.path))
+        try await f.service.ensurePublication(force: true)
+        XCTAssertEqual(try RequestWorkerOperation.read(in: f.root.appendingPathComponent("publication"))?.phase, .complete)
+    }
+    func testRecoveryRepairsHealthyJournalEvenWhenAnotherIsCorrupt() async throws {
+        let (root, script) = try recoveryFixture(), configuration = ShaderRequestConfiguration(repository: root.path)
+        let good = root.appendingPathComponent("publication"), bad = root.appendingPathComponent("setup")
+        var operation = try RequestWorkerOperation.begin(mode: "publication", configuration: configuration, in: good)
+        operation.phase = .paused; try operation.save(in: good)
+        try FileManager.default.createDirectory(at: bad, withIntermediateDirectories: true)
+        try Data("{".utf8).write(to: bad.appendingPathComponent(RequestWorkerOperation.filename))
+        var store = RequestRecoveryStore()
+        for journal in [good, bad] {
+            let key = RequestPaths.canonical(journal)
+            store.entries[key] = .init(journal: key, requestID: nil, configuration: configuration, disposition: .resume, message: "Original supervision failure")
+        }
+        try JSONEncoder().encode(store).write(to: root.appendingPathComponent("recovery.json"))
+        let service = try await recoveryService(root, script: script, enabled: false)
+        do { try await service.retryReconciliation(); XCTFail("Corrupt journal was ignored") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("setup")) }
+        let repaired = try XCTUnwrap(RequestWorkerOperation.read(in: good))
+        XCTAssertNotEqual(repaired.id, operation.id)
+        try RequestWorkerOperation.validateLaunch(id: repaired.id, configuration: configuration, in: good)
+        do { try await service.retryReconciliation(); XCTFail("Corruption disappeared") } catch {}
+        XCTAssertEqual(try RequestWorkerOperation.read(in: good)?.id, repaired.id)
+        let retained = try JSONDecoder().decode(RequestRecoveryStore.self, from: Data(contentsOf: root.appendingPathComponent("recovery.json")))
+        XCTAssertEqual(retained.entries.count, 2)
+        XCTAssertTrue(retained.entries[RequestPaths.canonical(bad)]?.message.contains("Original supervision failure") == true)
+    }
+
+    func testExplicitRecoveryCompletesSavedCleanupConfigurationIntent() async throws {
+        let (root, script) = try recoveryFixture(), gitdir = try initializeRecoveryGit(root)
+        let initial = try await recoveryService(root, script: script)
+        let request = ShaderRequest(prompt: "Recover corrected paths", context: try context())
+        _ = try await initial.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        try await initial.cancelQueued(request.id)
+        let job = root.appendingPathComponent(request.id.uuidString), key = RequestPaths.canonical(job)
+        try JSONSerialization.data(withJSONObject: ["id": request.id.uuidString, "directory": key]).write(to: gitdir.appendingPathComponent("holodeck-request-owner.json"))
+        var recordData = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("journal.json"))) as? [[String: Any]])
+        recordData[0]["cleanupPending"] = true; recordData[0]["cleanupFailure"] = "Original cleanup failure"
+        try JSONSerialization.data(withJSONObject: recordData).write(to: root.appendingPathComponent("journal.json"))
+        let previous = try JSONDecoder().decode(ShaderRequestConfiguration.self, from: JSONSerialization.data(withJSONObject: recordData[0]["configuration"]!))
+        var corrected = previous; corrected.python = "/usr/bin/python3"; corrected.git = "/usr/bin/git"
+        var operation = try RequestWorkerOperation.begin(mode: "discard", configuration: previous, in: job)
+        operation.phase = .paused; try operation.save(in: job)
+        var store = RequestRecoveryStore()
+        var entry = RequestRecoveryStore.Entry(journal: key, requestID: request.id, configuration: previous, disposition: .cleanup, message: "Original cleanup failure")
+        entry.configurationRepair = .init(previous: previous, corrected: corrected, requestIDs: [request.id], updatePreferences: true)
+        store.entries[key] = entry
+        try JSONEncoder().encode(store).write(to: root.appendingPathComponent("recovery.json"))
+        let resumed = try await recoveryService(root, script: script)
+        try await resumed.retryReconciliation()
+        let repairedRecords = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("journal.json"))) as? [[String: Any]])
+        let saved = try JSONDecoder().decode(ShaderRequestConfiguration.self, from: JSONSerialization.data(withJSONObject: repairedRecords[0]["configuration"]!))
+        XCTAssertEqual(saved.python, corrected.python); XCTAssertEqual(saved.git, corrected.git)
+        try RequestWorkerOperation.validateLaunch(id: try XCTUnwrap(RequestWorkerOperation.read(in: job)?.id), configuration: corrected, in: job)
+        let finalStore = try JSONDecoder().decode(RequestRecoveryStore.self, from: Data(contentsOf: root.appendingPathComponent("recovery.json")))
+        XCTAssertTrue(finalStore.entries.isEmpty)
+    }
+    func testLegacyPendingDetachAcquiresDurableArchiveIntentBeforeRetirement() async throws {
+        let (root, script) = try recoveryFixture(), journal = root.appendingPathComponent("publication")
+        let configuration = ShaderRequestConfiguration(repository: root.path)
+        var operation = try RequestWorkerOperation.begin(mode: "publication", configuration: configuration, in: journal)
+        operation.phase = .paused; try operation.save(in: journal)
+        var store = RequestRecoveryStore()
+        let key = RequestPaths.canonical(journal)
+        store.entries[key] = .init(journal: key, requestID: nil, configuration: configuration, disposition: .detach, message: "Legacy pending detach")
+        try JSONEncoder().encode(store).write(to: root.appendingPathComponent("recovery.json"))
+        let service = try await recoveryService(root, script: script, enabled: false)
+        try await service.retryReconciliation()
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(journal.appendingPathComponent("configuration.json")))
+        let archives = try FileManager.default.contentsOfDirectory(at: journal, includingPropertiesForKeys: nil).filter { $0.lastPathComponent.hasPrefix("detached-") }
+        XCTAssertEqual(archives.count, 1)
+        XCTAssertTrue(RequestProcessIdentity.evidenceExists(archives[0].appendingPathComponent(RequestWorkerOperation.filename)))
+    }
+
     #endif
 }
 
