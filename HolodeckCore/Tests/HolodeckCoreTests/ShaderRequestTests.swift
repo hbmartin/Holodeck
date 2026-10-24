@@ -942,13 +942,11 @@ final class ShaderRequestTests: XCTestCase {
         let (root, _) = try recoveryFixture(), script = root.appendingPathComponent("completed.py")
         try "import json; print(json.dumps({'event':'done'}),flush=True)".write(to: script, atomically: true, encoding: .utf8)
         let probe = RequestSignalProbe()
-        let worker = RequestWorkerProcess(script: script, groups: .init(signal: { probe.signal($0, $1) }, schedule: { probe.schedule($0) }))
+        let worker = RequestWorkerProcess(script: script, groups: .init(signal: { probe.signal($0, $1) }))
         for try await _ in worker.run(mode: "run", configuration: .init(repository: root.path), directory: root.appendingPathComponent("completed")) {}
         try await worker.waitForExit()
         worker.stop(); worker.stop()
-        probe.fireTimers()
         XCTAssertEqual(probe.signalCount, 0)
-        XCTAssertEqual(probe.timerCount, 0)
     }
 
     func testReconciliationFailureIsVisibleWithoutJobsAndCanRetry() async throws {
@@ -2416,7 +2414,7 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertTrue(acknowledgements.contains{$0.requestID == request.id})
     }
 
-    private func injectSupervisionFaults(_ script: URL, mode: String, count: Int) throws {
+    private func injectSupervisionFaults(_ script: URL, mode: String, count: Int, retryable: Bool = true) throws {
         let source = try String(contentsOf: script, encoding: .utf8)
         let prefix = """
         import json,sys
@@ -2428,7 +2426,7 @@ final class ShaderRequestTests: XCTestCase {
             counter.write_text(str(count))
             limit=job.parent/'supervision-fault-limit'
             if count<=int(limit.read_text()):
-                print(json.dumps(dict(event='failure',failureKind='supervision',recoveryRequired=False,message='Injected supervision fault')),flush=True)
+                print(json.dumps(dict(event='failure',failureKind='supervision',retryable=\(retryable ? "True" : "False"),recoveryRequired=False,message='Injected supervision fault')),flush=True)
                 raise SystemExit(1)
         """
         try (prefix + "\n" + source).write(to:script,atomically:true,encoding:.utf8)
@@ -2474,6 +2472,21 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf:patch),bytes)
     }
 
+    func testPersistenceSupervisionFailurePausesWithoutAutomaticRetry() async throws {
+        let (root, script) = try recoveryFixture()
+        try injectSupervisionFaults(script,mode:"run",count:2,retryable:false)
+        let service = try await recoveryService(root,script:script)
+        let request = ShaderRequest(prompt:"Retain on persistence failure",context:try context())
+        _ = try await service.control(operation:"requestSubmit",payload:.init(request:request),deviceID:"TV")
+        let job = root.appendingPathComponent(request.id.uuidString), patch = job.appendingPathComponent("changes.patch"), bytes = Data([0,255,13,10])
+        try bytes.write(to:patch);await service.resume()
+        try await waitFor { (try? RequestWorkerOperation.read(in:job)?.phase) == .paused }
+        XCTAssertEqual(try String(contentsOf:job.appendingPathComponent("supervision-launches"),encoding:.utf8),"1")
+        XCTAssertEqual(try Data(contentsOf:patch),bytes)
+        let statuses = await service.recoveryStatuses();XCTAssertTrue(statuses.contains{$0.disposition == .resume})
+        XCTAssertFalse(FileManager.default.fileExists(atPath:job.appendingPathComponent("cleanup-started").path))
+    }
+
     func testCleanupRetriesSupervisionFaultWithoutLosingCleanupIntent() async throws {
         let (root, script) = try recoveryFixture()
         try injectSupervisionFaults(script,mode:"discard",count:1)
@@ -2512,17 +2525,21 @@ final class ShaderRequestTests: XCTestCase {
         initial.phase = .retryPending;try initial.save(in:job)
         let pending = try RequestWorkerOperation.begin(mode:"run",in:job)
         XCTAssertEqual(pending.id,initial.id);XCTAssertEqual(pending.phase,.retryPending)
+        try JSONSerialization.data(withJSONObject:["workerOperationID":initial.id.uuidString]).write(to:job.appendingPathComponent("configuration.json"))
         initial.phase = .retryRunning;try initial.save(in:job)
         XCTAssertThrowsError(try RequestWorkerOperation.begin(mode:"run",in:job))
         XCTAssertEqual(try RequestWorkerOperation.read(in:job)?.phase,.paused)
         try RequestWorkerOperation.restartPaused(in:job)
         XCTAssertNotEqual(try RequestWorkerOperation.read(in:job)?.id,initial.id)
+        XCTAssertEqual(try RequestWorkerOperation.expectedID(in:job),try RequestWorkerOperation.read(in:job)?.id)
         let marker = job.appendingPathComponent(RequestWorkerOperation.filename)
         try Data("{".utf8).write(to:marker)
         XCTAssertThrowsError(try RequestWorkerOperation.begin(mode:"run",in:job))
         try FileManager.default.removeItem(at:marker)
         try FileManager.default.createSymbolicLink(at:marker,withDestinationURL:root.appendingPathComponent("missing"))
         XCTAssertThrowsError(try RequestWorkerOperation.read(in:job))
+        try FileManager.default.removeItem(at:marker)
+        XCTAssertThrowsError(try RequestWorkerOperation.begin(mode:"run",in:job)) { XCTAssertTrue($0.localizedDescription.contains("missing")) }
     }
 
     func testPipeUncertaintyDoesNotOverwriteRegistryOrInventItsCause() throws {
@@ -2610,6 +2627,36 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf:job.appendingPathComponent("supervision-launches"),encoding:.utf8),"1")
         XCTAssertEqual(try Data(contentsOf:patch),bytes)
     }
+
+    func testNativeBootIdentityCacheRetriesFailureAndKeepsSuccess() {
+        let probe = BootIdentityProbe(), cache = RequestBootIdentityCache(read:{probe.read()})
+        XCTAssertNil(cache.value());XCTAssertEqual(cache.value(),probe.boot);XCTAssertEqual(cache.value(),probe.boot)
+        XCTAssertEqual(probe.calls,2)
+    }
+
+    func testHealthyWorkerDoesNotQueueIdleSignalPasses() async throws {
+        let (root, script) = try recoveryFixture(), signals = EmptyObservationProbe(), observations = EmptyObservationProbe()
+        let worker = RequestWorkerProcess(script:script)
+        worker.beforeSignalPass = { signals.observe() }
+        worker.afterObservationCommit = { _ in observations.observe() }
+        let consuming = Task { do { for try await _ in worker.run(mode:"run",configuration:.init(repository:root.path),directory:root.appendingPathComponent("job")) {} } catch {} }
+        defer { worker.stop();consuming.cancel() }
+        try await waitFor { observations.count >= 3 }
+        XCTAssertEqual(signals.count,0)
+        worker.stop();await consuming.value;try await worker.waitForExit()
+        XCTAssertGreaterThanOrEqual(signals.count,1)
+    }
+
+    func testLegacyOrphanArgumentsUseInjectedProcessOperations() throws {
+        let (root, _) = try recoveryFixture(), job = root.appendingPathComponent("legacy-injected")
+        try FileManager.default.createDirectory(at:job,withIntermediateDirectories:true)
+        let identity = try JSONDecoder().decode(RequestProcessIdentity.self,from:Data("{\"pid\":2147483646,\"seconds\":1,\"microseconds\":0}".utf8))
+        let probe = InjectedOwnershipProbe([identity])
+        try JSONSerialization.data(withJSONObject:["pid":identity.pid,"script":"fixture.py","directory":job.path]).write(to:job.appendingPathComponent("process.json"))
+        try RequestWorkerProcess.reconcileOrphan(in:job,groups:.init(identity:{probe.identity($0)},signal:{probe.signal($0,$1)},group:{probe.group($0)},now:{probe.now},wait:{probe.wait($0)},arguments:{_ in ["fixture.py",job.path]}))
+        XCTAssertEqual(probe.signalled,[identity.pid])
+        XCTAssertFalse(FileManager.default.fileExists(atPath:job.appendingPathComponent("process.json").path))
+    }
     #endif
 }
 
@@ -2627,6 +2674,12 @@ private actor RequestPreparationGate {
 #endif
 
 #if os(macOS)
+private final class BootIdentityProbe: @unchecked Sendable {
+    private let lock = NSLock();private var count = 0
+    let boot = UUID().uuidString.lowercased()
+    func read() -> String? { lock.withLock { count += 1;return count == 1 ? nil : boot } }
+    var calls: Int { lock.withLock{count} }
+}
 private final class EmptyObservationProbe: @unchecked Sendable {
     private let lock = NSLock();private var value = 0
     func observe() { lock.withLock{value += 1} }
@@ -2655,12 +2708,8 @@ private final class SignalRecordingProbe: @unchecked Sendable {
 private final class RequestSignalProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var signals = 0
-    private var timers: [DispatchWorkItem] = []
     func signal(_ pid: Int32, _ signal: Int32) -> Int32 { lock.withLock { signals += 1 }; return 0 }
-    func schedule(_ item: DispatchWorkItem) { lock.withLock { timers.append(item) } }
-    func fireTimers() { let items = lock.withLock { timers }; items.forEach { $0.perform() } }
     var signalCount: Int { lock.withLock { signals } }
-    var timerCount: Int { lock.withLock { timers.count } }
 }
 private actor ReconciliationRetryGate {
     private(set) var entered = false

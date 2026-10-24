@@ -16,18 +16,32 @@ nonisolated struct RequestWorkerEvidenceError: LocalizedError, Sendable {
     var errorDescription: String? { cause + " Repair the journal or detach while retaining its files and evidence." }
 }
 
+nonisolated final class RequestBootIdentityCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private let read: @Sendable () -> String?
+    private var cached: String?
+    init(read: @escaping @Sendable () -> String?) { self.read = read }
+    func value() -> String? {
+        if let value = lock.withLock({cached}) { return value }
+        guard let value = read() else { return nil }
+        return lock.withLock { cached = cached ?? value;return cached }
+    }
+}
+
 nonisolated struct RequestSettlementBudget: Codable, Sendable {
     var attemptID: UUID
     var bootID: String?
     var clock: String
     var startedAt: TimeInterval
     var deadline: TimeInterval
-    static let bootIdentity: String? = {
+    private static let bootCache = RequestBootIdentityCache(read:readBootIdentity)
+    static var bootIdentity: String? { bootCache.value() }
+    private static func readBootIdentity() -> String? {
         var bytes = [CChar](repeating: 0, count: 128), count = 128
         guard sysctlbyname("kern.bootsessionuuid", &bytes, &count, nil, 0) == 0,
               let uuid = UUID(uuidString: String(decoding: bytes.prefix { $0 != 0 }.map { UInt8(bitPattern:$0) }, as:UTF8.self)) else { return nil }
         return uuid.uuidString.lowercased()
-    }()
+    }
     init(now: TimeInterval, boot: String? = Self.bootIdentity) {
         attemptID = UUID(); bootID = boot; clock = "darwin-uptime-raw"; startedAt = now; deadline = now + 10
     }
@@ -38,10 +52,6 @@ nonisolated struct RequestSettlementBudget: Codable, Sendable {
     func inherited(now: TimeInterval, boot: String?) -> Self? {
         guard valid, let boot, bootID == boot, startedAt <= now + 0.01 else { return nil }
         var value = self; value.deadline = min(value.deadline,now + 10); return value
-    }
-    func capped(by peer: Self?, now: TimeInterval, boot: String?) -> Self {
-        guard let value = peer?.inherited(now:now,boot:boot), value.deadline < deadline else { return self }
-        return value
     }
     func expired(at now: TimeInterval) -> Bool { now >= deadline }
     func escalated(at now: TimeInterval) -> Bool { now >= startedAt + 5 }
@@ -82,6 +92,7 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
         let failure: String?
         let failureKind: String?
         let recoveryRequired: Bool?
+        let retryable: Bool?
         let sessionID: UUID?
         let revision: Int?
         let clock: String?
@@ -280,7 +291,6 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         var group: @Sendable (Int32) throws -> [RequestProcessIdentity] = { try RequestProcessIdentity.checkedGroup($0) }
         var now: @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
         var wait: @Sendable (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
-        var schedule: @Sendable (DispatchWorkItem) -> Void = { DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: $0) }
         var boot: @Sendable () -> String? = { RequestSettlementBudget.bootIdentity }
         var arguments: @Sendable (Int32) throws -> [String] = { try RequestProcessIdentity.arguments($0) }
     }
@@ -299,14 +309,13 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     let process = Process()
     private let scriptOverride: URL?
     private let groups: GroupOperations
-    private let bootID: String?
     private let input = Pipe(), output = Pipe(), error = Pipe()
     private let lock = NSLock(), drained = DispatchGroup()
     private let signalQueue = DispatchQueue(label:"Holodeck.worker-signals")
     private var ownershipGeneration: UInt64 = 0
     private var started = false, stopping = false, completed = false
     private var terminationBudget: RequestSettlementBudget?
-    private var cancelRequested = false, escalated = false
+    private var cancelRequested = false
     private var termSent: Set<RequestProcessIdentity> = [], killSent: Set<RequestProcessIdentity> = []
     private var registryError: Error?
     private var leader: RequestProcessIdentity?
@@ -325,12 +334,14 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     private var rootTermSentAt: TimeInterval?
     private var teardownFailed = false
     private var retainedEvidenceError: RequestWorkerEvidenceError?
-    private var escalation: DispatchWorkItem?
+    private var signalPassPending = false
+    private var nextSignalPass: TimeInterval = 0
     var beforeReplyWrite: (() -> Void)?
     var beforeIdentityWrite: (() throws -> Void)?
     var beforeLogWrite: (() throws -> Void)?
+    var beforeSignalPass: (() -> Void)?
     var afterObservationCommit: (([RequestProcessIdentity]) -> Void)?
-    init(script: URL? = nil, groups: GroupOperations = .init()) { scriptOverride = script; self.groups = groups; bootID = groups.boot() }
+    init(script: URL? = nil, groups: GroupOperations = .init()) { scriptOverride = script; self.groups = groups }
     var recoveryTarget: (directory: URL, configuration: ShaderRequestConfiguration)? {
         lock.withLock {
             guard let journal, let workerConfiguration else { return nil }
@@ -340,10 +351,10 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
 
     func reply(_ accepted: Bool, message: String? = nil) throws {
         struct Reply: Encodable { let ok: Bool; let message: String? }
-        try lock.withLock { guard started, !stopping, process.isRunning else { throw CancellationError() } }
+        try lock.withLock { guard started, gateReleased, !stopping, process.isRunning else { throw CancellationError() } }
         beforeReplyWrite?()
         try lock.withLock {
-            guard started, !stopping, process.isRunning else { throw CancellationError() }
+            guard started, gateReleased, !stopping, process.isRunning else { throw CancellationError() }
             var bytes = try JSONEncoder().encode(Reply(ok: accepted, message: message)); bytes.append(10)
             try input.fileHandleForWriting.write(contentsOf: bytes)
         }
@@ -381,6 +392,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         let shouldStop = lock.withLock { () -> Bool in
             observationInFlight = false
             guard !completed, journal == directory, leader == root, ownershipGeneration == generation else { return false }
+            if Set(owned.values) != verified { nextSignalPass = 0 }
             owned = Dictionary(uniqueKeysWithValues:verified.map { ($0.pid,$0) })
             termSent.formIntersection(verified); killSent.formIntersection(verified)
             // Failed observations never delegate through a stale cached supervisor map.
@@ -395,7 +407,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 return false
             }
             observationFailures = 0
-            if stoppingAtSnapshot { rootStopObserved = true }
+            if stoppingAtSnapshot, !rootStopObserved { rootStopObserved = true;nextSignalPass = 0 }
             registryError = observation.uncertainty.map { RequestWorkerTeardownError(cause: $0) } ?? observation.evidenceError.map { RequestWorkerEvidenceError(cause: $0) }
             return false
         }
@@ -403,12 +415,27 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         if shouldStop { beginTeardown(cancelled: false) }
     }
     private func signalPending() {
+        let enqueue = lock.withLock { () -> Bool in
+            let now = groups.now()
+            guard started,stopping,!completed,!signalPassPending,now >= nextSignalPass,
+                  terminationBudget?.expired(at:now) != true else { return false }
+            let rootRunning = process.isRunning
+            let candidates = rootRunning ? leader.map{[$0]} ?? [] : Array(owned.values)
+            let due = candidates.contains { identity in
+                if !termSent.contains(identity) { return true }
+                let escalate = rootRunning ? rootTermSentAt.map{now >= $0 + 5} == true : terminationBudget?.escalated(at:now) == true
+                return escalate && !killSent.contains(identity)
+            }
+            guard due else { return false }
+            signalPassPending = true;nextSignalPass = now + 0.25;return true
+        }
+        guard enqueue else { return }
         signalQueue.async { [self] in
+            defer { lock.withLock{signalPassPending = false} }
+            beforeSignalPass?()
             let snapshot = lock.withLock { () -> (RequestProcessIdentity?,[RequestProcessIdentity],[RequestProcessIdentity:[RequestProcessIdentity]],Bool,Bool,UInt64,Set<RequestProcessIdentity>)? in
                 guard started,stopping,!completed,terminationBudget?.expired(at:groups.now()) != true else { return nil }
-                return (leader,Array(owned.values),supervisedSessions,(leader.map { root in
-                            owned[root.pid] == root && rootTermSentAt.map { groups.now() >= $0 + 5 } == true
-                        } ?? false) || (leader == nil && terminationBudget?.escalated(at:groups.now()) == true),
+                return (leader,Array(owned.values),supervisedSessions,rootTermSentAt.map { groups.now() >= $0 + 5 } == true,
                         rootStopObserved || observationFailures >= 3,ownershipGeneration,supervisorAnchors)
             }
             guard let (root,identities,sessions,rootEscalated,rootReady,generation,anchors) = snapshot else { return }
@@ -426,6 +453,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     allowOwnerRetirement:rootReady,identity:pass.birth)
             }
             for identity in targets where groups.identity(identity.pid) == identity {
+                if lock.withLock({ kill ? killSent.contains(identity) : termSent.contains(identity) }) { continue }
                 if kill, anchors.contains(identity), identity != root {
                     // Retire owners only after a fresh, successful sole-member observation.
                     do { if try pass.group(identity.pid).contains(where: { $0 != identity }) { continue } }
@@ -450,24 +478,15 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     }
     func stop() { beginTeardown(cancelled: true) }
     private func beginTeardown(cancelled: Bool) {
+        let boot = groups.boot()
         lock.withLock {
             guard !completed else { return }
             cancelRequested = cancelRequested || cancelled
-            if !stopping { nextObservation = 0 }
-            stopping = true; terminationBudget = terminationBudget ?? RequestSettlementBudget(now:groups.now(),boot:bootID)
+            if !stopping { nextObservation = 0;nextSignalPass = 0 }
+            stopping = true; terminationBudget = terminationBudget ?? RequestSettlementBudget(now:groups.now(),boot:boot)
             guard started else { return }
             if !gateReleased { try? input.fileHandleForWriting.close() }
-            if escalation == nil {
-                let work = DispatchWorkItem { [weak self] in
-                    guard let self else { return }
-                    self.lock.withLock {
-                        guard !self.completed else { return }
-                        self.escalated = true
-                    }
-                    self.signalPending()
-                }
-                escalation = work; groups.schedule(work)
-            }
+
         }
         signalPending()
     }
@@ -476,7 +495,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         stop()
     }
 
-    func run(mode: String, configuration: ShaderRequestConfiguration, directory: URL) -> AsyncThrowingStream<RequestWorkerEvent, Error> {
+    func run(mode: String, configuration: ShaderRequestConfiguration, directory: URL, operationID: UUID? = nil) -> AsyncThrowingStream<RequestWorkerEvent, Error> {
         AsyncThrowingStream { continuation in
             lock.withLock { journal = directory; workerConfiguration = configuration }
             drained.enter()
@@ -485,13 +504,16 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 var readers: [RequestPipeDrain] = []
                 defer {
                     readers.forEach { $0.cancel() }
-                    lock.withLock { completed = true; ownershipGeneration &+= 1; escalation?.cancel(); escalation = nil }
+                    lock.withLock { completed = true; ownershipGeneration &+= 1 }
                     drained.leave()
                 }
                 do {
                     guard let script = scriptOverride ?? Self.bundledScript else { throw ShaderRequestError.unavailable("Bundled shader request worker is missing.") }
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                    try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("configuration.json"), options: .atomic)
+                    let configurationData = try JSONEncoder().encode(configuration)
+                    guard var workerConfiguration = try JSONSerialization.jsonObject(with:configurationData) as? [String:Any] else { throw ShaderRequestError.unavailable("Worker configuration is invalid.") }
+                    if let operationID { workerConfiguration["workerOperationID"] = operationID.uuidString }
+                    try RequestJournalWriter.write(JSONSerialization.data(withJSONObject:workerConfiguration),to:directory.appendingPathComponent("configuration.json"))
                     process.executableURL = URL(fileURLWithPath: configuration.python)
                     let launchToken = UUID().uuidString
                     process.arguments = ["-I", "-c", Self.bootstrap, launchToken, script.path, mode, directory.appendingPathComponent("configuration.json").path, directory.path]
@@ -604,7 +626,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                        error is RequestWorkerOwnershipError || error is RequestWorkerSupervisionError {
                         continuation.finish(throwing:error)
                     } else {
-                        continuation.finish(throwing:RequestWorkerSupervisionError(message:error.localizedDescription,underlyingError:error))
+                        continuation.finish(throwing:RequestWorkerSupervisionError(message:error.localizedDescription,underlyingError:error,retryable:!(error is POSIXError || error is CocoaError)))
                     }
                 }
             }

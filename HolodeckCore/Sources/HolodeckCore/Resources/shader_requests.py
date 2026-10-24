@@ -1076,6 +1076,7 @@ def main():
                 with contextlib.suppress(Exception):
                     worker.clean(revision=sha)
         emit("failure", message=str(error), failureKind="supervision" if isinstance(error, SupervisionError) else "operational",
+             retryable=isinstance(error, SupervisionError) and error.retryable,
              recoveryRequired=isinstance(error, ProcessRecoveryError))
         sys.exit(1)
 

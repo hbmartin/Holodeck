@@ -501,3 +501,41 @@ Development profiling caught an unnecessary 250 ms wait when context cleanup rep
 Evidence uses `/tmp/holodeck-pr31followup-*`: `accepted{39,315}-{0,1,2}` logs/manifests/results, `accepted-summary.json`, `verified-core.log`, `verified-release.log`, `ui.log`, `tv-summary.json`, `verified-{mac,tv}-package.log`, `package-proof.json`, `evidence-summary.json`, `benchmark{39,315}.json`, `metal.log` and `gpu.log`. The worker SHA-256 is `259fc8da7405c80faff82f30a8a2718f5a478df91344f9fa13d1dd2375908c4b`; the process runtime SHA-256 is `9a7a53ad683985f3093cdeb827100cce62d8df494902be9766c523578ed0b1d3`.
 
 Physical Apple TV, TV UI, live LAN/TLS and live Codex publication were not run. No live installation replacement, request enablement, checker release or library-lock update occurred. A later rollout must drain requests before installing the matching host and worker.
+
+
+## PR #32 follow-up: retained work, bounded retries, and verified launch (2026-10-24)
+
+This follow-up starts at `fbc2dd3`, the merge of PR #32. Supervision faults now preserve unpublished work independently of whether processes settled. Requests, Verify, managed Rebuild, and cleanup share one automatic retry after verified settlement and exact-journal reconciliation. A second supervision fault pauses the operation for manual recovery. Cancellation, unresolved ownership or pipes, invalid evidence, and persistence failures do not trigger an automatic retry.
+
+Worker failure events add optional `failureKind`/`retryable` fields; supervision format 3 also carries an optional retry disposition. Missing fields keep legacy compatibility. Persistence/capacity failures retain their manual-only disposition even when another error was recorded first. The bounded `worker-operation.json` journal records the operation UUID, mode and phase. Its UUID is also retained in the saved worker configuration, so a missing or mismatched retry journal cannot silently replenish the allowance. A pending retry can be resumed after reconciliation; an interrupted running retry requires manual recovery. Explicit manual recovery starts a new operation. The existing recovery format, legacy migration flag, process registry array, and supervision readers remain compatible.
+
+The native Python bootstrap stays gated until the host verifies and durably records its birth identity. Cancelling or failing registration closes the gate before checkout code executes. Worker-root TERM grace uses its actual TERM attempt and is never backdated by a command's older budget. Orphan recovery leaves live commands untouched if their worker root cannot be verified; reuse and Detach remain blocked until ownership is repaired or retirement is verified. Both success and evidence-only retirement now require fresh post-signal observation. Registry and pipe failures retain separate diagnostic causes, and all orphan process operations use the injectable observation/signalling interface.
+
+The supervisor retains partial control frames after unrelated internal errors. The worker's cancellation path preserves cleanup metadata for every BaseException cancellation and attempts command settlement even when supervision metadata cannot be decoded. Failed boot lookups can be retried; successful identities are cached. Idle native signal tasks and the duplicate escalation timer were removed, and failed evidence reads follow the 250 ms observation interval.
+
+Final local validation:
+
+- **117 worker tests passed on Python 3.9.6 and 117 on Python 3.15.0**, with no skips/errors/failures. The three manifests per interpreter contain all 117 unique cases without omissions or duplicates. Runtime hashes stayed unchanged throughout both full runs.
+- **319 Swift core tests executed, six opt-in skips, zero failures**, with real authoring/GPU integration enabled. All 23 local scenes compiled, rendered and animated. The worker profile ran separately in Release; three unrelated catalog profiles, live LAN/TLS and live Codex publication were skipped.
+- **21 Release packaged-resource/native-supervision tests passed**: seven native resource/launch checks and fourteen ownership, worker-mode retry, retry-journal, retirement and profiling checks. Native idle supervision measured **33.8 polls/s and 0.51% of one CPU core**.
+- **Four selected Mac UI tests passed in the final run**. An earlier recovery-path run was interrupted when the Codex window took keyboard focus; explicit activation and a foreground check made the fixture deterministic before final validation. Covered cases include retained-files Detach, queued cancellation, recovery retry, and publication recovery/rebuild.
+- **Both final Release app builds passed**, with signing disabled. Both Mac copies and the tvOS copy of each Python resource match source exactly; neither app contains bytecode caches. The packaged native artifact identity matches the selected library lock without enabling requests.
+- The packaged checker compiled **66 authoring assets plus shader/snippet templates for macOS and tvOS**. The separate Mac GPU run passed **seven profile checks**.
+
+Regressions cover full-worker patch preservation, corrupt supervision during interruption, all cancellation metadata, split control frames, retry exhaustion and restart/manual recovery, all four worker modes, cancellation/Detach before retry launch, missing/malformed retry metadata, gated startup, older peer deadlines, unidentified live workers, injected orphan identities, fresh final observations, combined evidence diagnostics, failed boot lookups, and idle/evidence-read scheduling. Existing late-helper, escaped-pipe, registry-capacity, PID-reuse and more-than-700-identities cases remain in the full suite.
+
+Benchmark reproduction: `python tools/profile_shader_supervision.py --baseline fbc2dd3 --interleave`, separately under each interpreter. Baseline and current sources run unchanged on the same temporary filesystem, alternating across 31 warm short-command samples and five 18-command fixtures. Writes, fsyncs, launches and 15-second idle CPU are measured separately. These local observations were collected during validation; they are not CI timing thresholds or comparisons with earlier machines/runs.
+
+| Measurement | Python 3.9.6: PR #32 → follow-up | Python 3.15.0: PR #32 → follow-up |
+| --- | --- | --- |
+| Short command median (ms) | 140.1 → 140.6 | 72.6 → 73.4 |
+| 18-command fixture median (ms) | 2584.0 → 2574.0 | 1348.8 → 1348.8 |
+| Evidence replacements per command | 5 → 5 | 5 → 5 |
+| Fsync calls per command | 10 → 10 | 10 → 10 |
+| Interpreter launches per command | 2 → 2 | 2 → 2 |
+| Idle reaped-child CPU (%) | 1.006 → 1.046 | 0.649 → 0.667 |
+| Idle parent CPU (%) | 0.045 → 0.042 | 0.041 → 0.051 |
+
+Evidence uses `/tmp/holodeck-pr32-*`: `verified-python{39,315}-{0,1,2}` logs/manifests/results, `verified-python-summary.json`, `verified-core.log`, `verified-release.log`, `verified-ui.log`, `verified-mac-build.log`, `verified-tv-build.log`, `verified-package-proof.json`, `verified-benchmark{39,315}.json`, `verified-metal.log`, `verified-gpu.log`, and `verified-native-summary.json`. Development failures are not counted as passing runs: the dangling-link reader and orphan fixtures were corrected before final core validation, and the keyboard-focus UI failure is recorded above.
+
+The worker SHA-256 is `014724c5b06ee79e98a1dfe7b1b26649535238636827725ea025db577ae0654d`; the runtime SHA-256 is `51457dc2ede3168b2c6751040c6edb27fb1f8519b994e267067482d24f2f6ca1`. No checker artifact or library lock changed. Physical Apple TV, TV UI, live LAN/TLS and live Codex publication were not run. The live installation and request settings were not changed; a later rollout must drain requests before installing the matching native host and bundled worker. Linux CI is unchanged.

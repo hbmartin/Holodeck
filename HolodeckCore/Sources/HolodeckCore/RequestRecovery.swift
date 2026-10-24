@@ -36,8 +36,23 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
         do { try RequestJournalWriter.write(JSONEncoder().encode(self), to: directory.appendingPathComponent(Self.filename)) }
         catch { throw RequestWorkerEvidenceError(cause: "Cannot persist worker retry state: " + error.localizedDescription) }
     }
+    static func expectedID(in directory: URL) throws -> UUID? {
+        let file = directory.appendingPathComponent("configuration.json")
+        guard RequestProcessIdentity.evidenceExists(file) else { return nil }
+        do {
+            let data = try BoundedCatalogReader(root:directory).read("configuration.json",limit:CatalogLimits.headBytes).bytes
+            guard let object = try JSONSerialization.jsonObject(with:data) as? [String:Any] else { throw RequestWorkerOwnershipError() }
+            guard let value = object["workerOperationID"] else { return nil }
+            guard let text = value as? String, let id = UUID(uuidString:text) else { throw RequestWorkerOwnershipError() }
+            return id
+        } catch { throw RequestWorkerEvidenceError(cause:"Worker operation identity is unreadable: " + error.localizedDescription) }
+    }
     static func begin(mode: String, in directory: URL) throws -> Self {
-        if var saved = try read(in: directory), saved.mode == mode, saved.phase != .complete {
+        let saved = try read(in:directory)
+        if let expected = try expectedID(in:directory), expected != saved?.id {
+            throw RequestWorkerEvidenceError(cause:"Worker retry journal is missing or belongs to another operation. Restore its metadata or detach while retaining files; automatic retries remain blocked.")
+        }
+        if var saved, saved.mode == mode, saved.phase != .complete {
             if saved.phase == .retryRunning { saved.phase = .paused; try saved.save(in: directory) }
             guard saved.phase != .paused else {
                 throw RequestWorkerEvidenceError(cause: "The automatic supervision retry was exhausted or interrupted. Retry recovery manually to resume preserved work.")
@@ -48,7 +63,15 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
     }
     static func restartPaused(in directory: URL) throws {
         if let saved = try read(in: directory), saved.phase == .paused {
-            try Self(mode: saved.mode).save(in: directory)
+            let replacement = Self(mode:saved.mode)
+            try replacement.save(in:directory)
+            let file = directory.appendingPathComponent("configuration.json")
+            if RequestProcessIdentity.evidenceExists(file) {
+                let data = try BoundedCatalogReader(root:directory).read("configuration.json",limit:CatalogLimits.headBytes).bytes
+                guard var object = try JSONSerialization.jsonObject(with:data) as? [String:Any] else { throw RequestWorkerEvidenceError(cause:"Worker configuration is unreadable.") }
+                object["workerOperationID"] = replacement.id.uuidString
+                try RequestJournalWriter.write(JSONSerialization.data(withJSONObject:object),to:file)
+            }
         }
     }
 }
@@ -57,7 +80,7 @@ nonisolated enum RequestJournalWriter {
     static func write(_ data: Data, to file: URL) throws {
         let directory = URL(fileURLWithPath: RequestPaths.canonical(file.deletingLastPathComponent()))
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let temporary = directory.appendingPathComponent(".operation-" + UUID().uuidString)
+        let temporary = directory.appendingPathComponent(".journal-" + UUID().uuidString)
         let descriptor = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
         guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)

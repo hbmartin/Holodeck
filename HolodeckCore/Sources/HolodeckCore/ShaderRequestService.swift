@@ -45,6 +45,7 @@ nonisolated struct RequestWorkerEvent: Decodable, Sendable {
     var event: String
     var recoveryRequired: Bool?
     var failureKind: String?
+    var retryable: Bool?
     var stage: String?
     var message: String?
     var question: String?
@@ -842,7 +843,6 @@ public actor ShaderRequestService {
             try persist()
             finishPublication(revision: publication.catalog.publicationRevision)
         } catch {
-            let stoppedError: Error? = nil // runWorker settles every launched attempt before returning.
             if let preparedID { await catalog.discard(preparedID); self.preparedID = nil }
             if execution?.interrupted == true,
                activePublication?.waiters.isEmpty == false || activePublication?.ownsRetry == true {
@@ -856,7 +856,7 @@ public actor ShaderRequestService {
                 }
                 activePublication = nil
                 finishPublication()
-            } else { finishPublication(error: stoppedError ?? (execution?.interrupted == true ? CancellationError() : error)) }
+            } else { finishPublication(error: execution?.interrupted == true ? CancellationError() : error) }
         }
     }
     private func finishPublication(error: Error? = nil, revision: String? = nil) {
@@ -895,7 +895,7 @@ public actor ShaderRequestService {
         let message = event.message ?? "Shader worker failed"
         guard event.recoveryRequired == true else {
             if event.failureKind == "supervision" || event.failureKind == "interrupted" {
-                return RequestWorkerSupervisionError(message: message, retryable: event.failureKind == "supervision")
+                return RequestWorkerSupervisionError(message: message, retryable: event.failureKind == "supervision" && event.retryable != false)
             }
             return ShaderRequestError.unavailable(message)
         }
@@ -922,7 +922,7 @@ public actor ShaderRequestService {
             try checkExecution(operation)
             let process = workerProcess(); activeProcess = process
             do {
-                for try await event in process.run(mode: mode, configuration: configuration, directory: journal) {
+                for try await event in process.run(mode: mode, configuration: configuration, directory: journal, operationID: attempt.id) {
                     try checkExecution(operation)
                     if event.event == "failure" { throw workerFailure(event) }
                     try await receive(event, process)
@@ -967,6 +967,7 @@ public actor ShaderRequestService {
     }
 
     private func checkExecution(_ id: UUID) throws {
+        try Task.checkCancellation()
         guard execution?.id == id, execution?.interrupted == false, !suspended else { throw CancellationError() }
     }
 
