@@ -4,6 +4,7 @@ import Darwin
 
 nonisolated struct RequestWorkerSupervisionError: LocalizedError, Sendable {
     let message: String
+    var underlyingError: (any Error)? = nil
     var retryable = true
     var errorDescription: String? { message }
 }

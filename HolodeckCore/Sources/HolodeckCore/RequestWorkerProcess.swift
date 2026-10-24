@@ -93,12 +93,34 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
     struct Observation {
         var identities: [RequestProcessIdentity]
         var uncertainty: String?
-        var evidenceError: String?
+        var evidenceErrors: [String] = []
+        var evidenceError: String? { evidenceErrors.isEmpty ? nil : evidenceErrors.joined(separator:"; ") }
+        mutating func addEvidenceError(_ message: String) {
+            if !evidenceErrors.contains(message) { evidenceErrors.append(message) }
+        }
         var observationFailure: String?
         var sessions: [RequestProcessIdentity: [RequestProcessIdentity]] = [:]
         var supervisors: Set<RequestProcessIdentity> = []
         var budget: RequestSettlementBudget?
         var deadline: TimeInterval? { budget?.deadline }
+    }
+    static func evidenceExists(_ file: URL) -> Bool {
+        var info = stat()
+        return lstat(file.path, &info) == 0 || errno != ENOENT
+    }
+    static func arguments(_ pid: Int32) throws -> [String] {
+        var maximum: Int32 = 0, size = MemoryLayout<Int32>.size
+        var maximumName: [Int32] = [CTL_KERN, KERN_ARGMAX]
+        guard sysctl(&maximumName, 2, &maximum, &size, nil, 0) == 0,
+              maximum > 0, maximum <= 1_048_576 else { throw RequestWorkerOwnershipError() }
+        var bytes = [UInt8](repeating:0,count:Int(maximum)), name: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        size = bytes.count
+        guard sysctl(&name, 3, &bytes, &size, nil, 0) == 0, size >= 4 else { throw RequestWorkerOwnershipError() }
+        let count = bytes.withUnsafeBytes { $0.loadUnaligned(as:Int32.self) }
+        guard count > 0 else { throw RequestWorkerOwnershipError() }
+        let strings = bytes.prefix(size).dropFirst(4).split(separator:0).map { String(decoding:$0,as:UTF8.self) }
+        guard strings.count >= Int(count) + 1 else { throw RequestWorkerOwnershipError() }
+        return Array(strings.dropFirst().prefix(Int(count))) // executable path precedes argv; never inspect the environment.
     }
     static func observe(in directory: URL, known additional: [Self] = [],
                         group: @escaping (Int32) throws -> [Self] = checkedGroup,
@@ -106,14 +128,14 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
         struct Entry: Decodable { let leader: RequestProcessIdentity; var members: [RequestProcessIdentity] }
         var result = Observation(identities: [])
         let pass = RequestObservationPass(group:group,identity:identity)
-        guard FileManager.default.fileExists(atPath:directory.path) else {
+        guard evidenceExists(directory) else {
             return Observation(identities:additional.filter { pass.current($0) })
         }
         let reader = try BoundedCatalogReader(root: directory)
         let supervision: Supervision?
         do {
             let file = directory.appendingPathComponent("supervision.json")
-            if FileManager.default.fileExists(atPath: file.path) {
+            if Self.evidenceExists(file) {
                 let value = try JSONDecoder().decode(Supervision.self, from: reader.read("supervision.json", limit: CatalogLimits.headBytes).bytes)
                 guard [1, 2, 3].contains(value.formatVersion), value.supervisor.pid > 1, (value.command?.pid ?? 2) > 1,
                       ["starting", "running", "draining", "settled", "failed", "cancelled"].contains(value.state),
@@ -125,13 +147,13 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
             } else { supervision = nil }
         } catch {
             supervision = nil
-            if FileManager.default.fileExists(atPath: directory.appendingPathComponent("supervision.json").path) {
-                result.evidenceError = "Supervision evidence is unreadable: " + error.localizedDescription
+            if Self.evidenceExists(directory.appendingPathComponent("supervision.json")) {
+                result.addEvidenceError("Supervision evidence is unreadable: " + error.localizedDescription)
             }
         }
         var entries: [Entry] = []
         do {
-            if FileManager.default.fileExists(atPath: directory.appendingPathComponent("children.json").path) {
+            if Self.evidenceExists(directory.appendingPathComponent("children.json")) {
                 let values = try JSONDecoder().decode([Entry].self, from: reader.read("children.json", limit: CatalogLimits.headBytes).bytes)
                 guard values.allSatisfy({ $0.leader.pid > 1 && $0.members.allSatisfy { $0.pid > 1 } }) else {
                     throw RequestWorkerEvidenceError(cause: "Invalid validation process identities.")
@@ -139,8 +161,8 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
                 entries = values
             }
         } catch {
-            if FileManager.default.fileExists(atPath: directory.appendingPathComponent("children.json").path) {
-                result.evidenceError = "Validation process registry is unreadable: " + error.localizedDescription
+            if Self.evidenceExists(directory.appendingPathComponent("children.json")) {
+                result.addEvidenceError("Validation process registry is unreadable: " + error.localizedDescription)
             }
         }
         if let supervision {
@@ -152,7 +174,7 @@ nonisolated struct RequestProcessIdentity: Codable, Sendable, Equatable, Hashabl
             else { entries.append(Entry(leader: supervision.supervisor, members: members)) }
             if (supervision.recoveryRequired == true && supervision.failureKind == "pipeDrain") ||
                 (supervision.formatVersion >= 2 && !pass.current(supervision.supervisor) && supervision.pipeDrainComplete != true) {
-                result.evidenceError = supervision.failure ?? "Output pipe completion is unverified."
+                result.addEvidenceError(supervision.failureKind == "pipeDrain" ? (supervision.failure ?? "Output pipe completion is unverified.") : "Output pipe completion is unverified.")
             }
             if supervision.formatVersion == 3, pass.current(supervision.supervisor) { result.budget = supervision.termination }
         }
@@ -260,6 +282,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         var wait: @Sendable (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
         var schedule: @Sendable (DispatchWorkItem) -> Void = { DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: $0) }
         var boot: @Sendable () -> String? = { RequestSettlementBudget.bootIdentity }
+        var arguments: @Sendable (Int32) throws -> [String] = { try RequestProcessIdentity.arguments($0) }
     }
     static let bootstrap = """
     import json,os,runpy,sys
@@ -348,7 +371,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
             do {
                 let result = try RequestProcessIdentity.observe(in:directory,known:observed,group:pass.group,identity:pass.birth)
                 observation.identities = result.identities; observation.sessions = result.sessions; observation.supervisors = result.supervisors; observation.budget = result.budget
-                observation.uncertainty = result.uncertainty ?? observation.uncertainty; observation.evidenceError = result.evidenceError
+                observation.uncertainty = result.uncertainty ?? observation.uncertainty; observation.evidenceErrors = result.evidenceErrors
                 if let detail = result.observationFailure { failure = RequestWorkerTeardownError(cause:detail) }
             } catch { failure = error }
         }
@@ -530,15 +553,17 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     while true {
                         refreshOwned()
                         signalPending()
-                        let outstanding = lock.withLock { () -> Bool in
-                            return registryError != nil || !owned.isEmpty
-                        }
                         let pipesDone = pipes.wait(timeout: .now()) == .success
-                        if pipesDone, !process.isRunning, let failure = lock.withLock({ registryError as? RequestWorkerEvidenceError }),
-                           lock.withLock({ owned.isEmpty }) { throw failure }
-                        if pipesDone && !outstanding {
-                            refreshOwned(force: true)
-                            if lock.withLock({ registryError == nil && owned.isEmpty }) { break }
+                        if pipesDone, !process.isRunning, lock.withLock({ owned.isEmpty }) {
+                            let pendingSignals = DispatchGroup(); pendingSignals.enter()
+                            signalQueue.async { pendingSignals.leave() }
+                            if pendingSignals.wait(timeout:.now() + 0.025) == .success {
+                                refreshOwned(force: true)
+                                if lock.withLock({ owned.isEmpty }) {
+                                    if let failure = lock.withLock({ registryError as? RequestWorkerEvidenceError }) { throw failure }
+                                    if lock.withLock({ registryError == nil }) { break }
+                                }
+                            }
                         }
                         // Permit short natural EOF/registry settlement without declaring cancellation.
                         if lock.withLock({ terminationBudget == nil }), groups.now() - leaderExited >= 0.1 {
@@ -575,7 +600,12 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     }
                     if let evidence = error as? RequestWorkerEvidenceError { lock.withLock { retainedEvidenceError = evidence } }
                     if process.isRunning { stop() }
-                    continuation.finish(throwing: error)
+                    if error is CancellationError || error is RequestWorkerTeardownError || error is RequestWorkerEvidenceError ||
+                       error is RequestWorkerOwnershipError || error is RequestWorkerSupervisionError {
+                        continuation.finish(throwing:error)
+                    } else {
+                        continuation.finish(throwing:RequestWorkerSupervisionError(message:error.localizedDescription,underlyingError:error))
+                    }
                 }
             }
             continuation.onTermination = { [weak self] reason in if case .cancelled = reason { self?.stop() } }
@@ -593,7 +623,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         let file = directory.appendingPathComponent("process.json")
         var root: RequestProcessIdentity?
         var markerError: String?
-        if FileManager.default.fileExists(atPath: file.path) {
+        if RequestProcessIdentity.evidenceExists(file) {
             do {
                 let identity: WorkerIdentity
                 do { identity = try JSONDecoder().decode(WorkerIdentity.self, from: BoundedCatalogReader(root: directory).read("process.json", limit: CatalogLimits.headBytes).bytes) }
@@ -604,11 +634,8 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 if let birth = identity.birth {
                     root = birth // A retired birth still identifies the group whose unfamiliar members must remain unowned.
                 } else if let birth = groups.identity(identity.pid) {
-                    let task = Process(), output = Pipe()
-                    task.executableURL = URL(fileURLWithPath: "/bin/ps"); task.arguments = ["-p", String(identity.pid), "-o", "command="]
-                    task.standardOutput = output; try task.run()
-                    let command = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self); task.waitUntilExit()
-                    if groups.identity(birth.pid) == birth, command.contains(identity.script), command.contains(identity.directory) { root = birth }
+                    let arguments = try groups.arguments(identity.pid)
+                    if groups.identity(birth.pid) == birth, arguments.contains(identity.script), arguments.contains(identity.directory) { root = birth }
                 }
             } catch { markerError = error.localizedDescription }
         }
@@ -635,7 +662,9 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 targets += observation.identities; sessions = observation.sessions; anchors.formUnion(observation.supervisors)
                 if let rootFailure { throw rootFailure }
                 if let detail = observation.observationFailure { throw RequestWorkerTeardownError(cause:detail) }
-                uncertainty = observation.uncertainty ?? uncertainty; evidenceError = observation.evidenceError ?? markerError; failures = 0
+                uncertainty = observation.uncertainty ?? uncertainty
+                let details = [markerError,observation.evidenceError].compactMap{$0}
+                evidenceError = details.isEmpty ? nil : details.joined(separator:"; "); failures = 0
             } catch { failures += 1; uncertainty = error.localizedDescription }
             targets = Array(Set(targets.filter { groups.identity($0.pid) == $0 }))
             if root == nil, !targets.isEmpty { throw RequestWorkerOwnershipError() }
@@ -660,7 +689,9 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                         return current == nil || current == root ? try groups.group(root.pid) : nil
                     } ?? []
                     if final.observationFailure == nil, final.uncertainty == nil, final.identities.isEmpty, rootGroup.isEmpty {
-                        if let detail = final.evidenceError ?? evidenceError { throw RequestWorkerEvidenceError(cause: detail) }
+                        var details = [String]()
+                        for detail in [evidenceError,final.evidenceError].compactMap({$0}) where !details.contains(detail) { details.append(detail) }
+                        if !details.isEmpty { throw RequestWorkerEvidenceError(cause:details.joined(separator:"; ")) }
                         for name in ["process.json", "children.json", "supervision.json"] {
                             try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
                         }

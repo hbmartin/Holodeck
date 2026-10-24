@@ -1607,7 +1607,7 @@ final class ShaderRequestTests: XCTestCase {
             do {
                 for try await _ in worker.run(mode: "run", configuration: .init(repository: root.path), directory: root.appendingPathComponent(failure)) {}
                 XCTFail("Write failure succeeded")
-            } catch { XCTAssertEqual((error as? POSIXError)?.code, .ENOSPC) }
+            } catch { XCTAssertEqual(((error as? RequestWorkerSupervisionError)?.underlyingError as? POSIXError)?.code, .ENOSPC) }
             try await worker.waitForExit()
             XCTAssertLessThan(Date().timeIntervalSince(started), 10)
             XCTAssertFalse(worker.process.isRunning)
@@ -1633,6 +1633,9 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertTrue(child.isRunning, "A reused PID must not be signalled")
         value["seconds"] = birth.seconds
         try JSONSerialization.data(withJSONObject: [["leader": value, "members": [value]]]).write(to: registry)
+        XCTAssertThrowsError(try RequestWorkerProcess.reconcileOrphan(in:job)) { XCTAssertTrue($0 is RequestWorkerOwnershipError) }
+        XCTAssertTrue(child.isRunning)
+        try JSONSerialization.data(withJSONObject:["pid":birth.pid,"birth":value,"script":"fixture","directory":job.path]).write(to:job.appendingPathComponent("process.json"))
         try RequestWorkerProcess.reconcileOrphan(in: job)
         child.waitUntilExit()
         XCTAssertFalse(child.isRunning); XCTAssertFalse(FileManager.default.fileExists(atPath: registry.path))
@@ -1681,6 +1684,7 @@ final class ShaderRequestTests: XCTestCase {
         let leaderValue = try JSONSerialization.jsonObject(with: JSONEncoder().encode(leader))
         let childValue = try JSONSerialization.jsonObject(with: JSONEncoder().encode(child))
         try JSONSerialization.data(withJSONObject: [["leader": leaderValue, "members": [leaderValue]]]).write(to: registry)
+        try JSONSerialization.data(withJSONObject:["pid":leader.pid,"birth":leaderValue,"script":"fixture","directory":root.path]).write(to:root.appendingPathComponent("process.json"))
         try FileManager.default.removeItem(at: gate); parent.waitUntilExit()
         XCTAssertThrowsError(try RequestWorkerProcess.reconcileOrphan(in: root)) { XCTAssertTrue($0 is RequestWorkerTeardownError) }
         XCTAssertTrue(child.isCurrent); XCTAssertTrue(FileManager.default.fileExists(atPath: registry.path))
@@ -2520,6 +2524,92 @@ final class ShaderRequestTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at:marker,withDestinationURL:root.appendingPathComponent("missing"))
         XCTAssertThrowsError(try RequestWorkerOperation.read(in:job))
     }
+
+    func testPipeUncertaintyDoesNotOverwriteRegistryOrInventItsCause() throws {
+        let (root, _) = try recoveryFixture(), job = root.appendingPathComponent("evidence")
+        try FileManager.default.createDirectory(at:job,withIntermediateDirectories:true)
+        try Data("{".utf8).write(to:job.appendingPathComponent("children.json"))
+        let value: [String:Any] = ["formatVersion":2,"sessionID":UUID().uuidString,"revision":1,"clock":"darwin-uptime-raw",
+            "supervisor":["pid":Int32.max,"seconds":1,"microseconds":0],"state":"failed","failureKind":"supervision",
+            "failure":"Unrelated supervisor problem","recoveryRequired":true,"pipeDrainComplete":false,"processesSettled":true]
+        try JSONSerialization.data(withJSONObject:value).write(to:job.appendingPathComponent("supervision.json"))
+        let observation = try RequestProcessIdentity.observe(in:job)
+        XCTAssertEqual(observation.evidenceErrors.count,2)
+        XCTAssertTrue(observation.evidenceError?.contains("registry is unreadable") == true)
+        XCTAssertTrue(observation.evidenceError?.contains("Output pipe completion is unverified") == true)
+        XCTAssertFalse(observation.evidenceError?.contains("Unrelated supervisor problem") == true)
+    }
+
+    func testEvidenceOnlyRetirementPerformsFreshFinalObservation() async throws {
+        let (root, script) = try recoveryFixture(), probe = EmptyObservationProbe()
+        try """
+        from pathlib import Path
+        import sys
+        Path(sys.argv[3]).joinpath('children.json').write_text('{')
+        """.write(to:script,atomically:true,encoding:.utf8)
+        let worker = RequestWorkerProcess(script:script)
+        worker.afterObservationCommit = { identities in if identities.isEmpty { probe.observe() } }
+        do {
+            for try await _ in worker.run(mode:"run",configuration:.init(repository:root.path),directory:root.appendingPathComponent("job")) {}
+            XCTFail("Malformed evidence was removed")
+        } catch { XCTAssertTrue(error is RequestWorkerEvidenceError) }
+        XCTAssertGreaterThanOrEqual(probe.count,2)
+        XCTAssertTrue(FileManager.default.fileExists(atPath:root.appendingPathComponent("job/children.json").path))
+    }
+
+    func testOrphanReconciliationUsesInjectedBirthsAndSignalsThroughout() throws {
+        let (root, _) = try recoveryFixture(), job = root.appendingPathComponent("fake-orphan")
+        try FileManager.default.createDirectory(at:job,withIntermediateDirectories:true)
+        func identity(_ pid: Int32) throws -> RequestProcessIdentity {
+            try JSONDecoder().decode(RequestProcessIdentity.self,from:JSONSerialization.data(withJSONObject:["pid":pid,"seconds":1,"microseconds":0]))
+        }
+        let worker = try identity(Int32.max-1), command = try identity(Int32.max-2), probe = InjectedOwnershipProbe([worker,command])
+        try JSONSerialization.data(withJSONObject:["pid":worker.pid,"birth":["pid":worker.pid,"seconds":1,"microseconds":0],"script":"fixture","directory":job.path]).write(to:job.appendingPathComponent("process.json"))
+        try JSONSerialization.data(withJSONObject:[["leader":["pid":command.pid,"seconds":1,"microseconds":0],"members":[["pid":command.pid,"seconds":1,"microseconds":0]]]]).write(to:job.appendingPathComponent("children.json"))
+        try RequestWorkerProcess.reconcileOrphan(in:job,groups:.init(identity:{probe.identity($0)},signal:{probe.signal($0,$1)},group:{probe.group($0)},now:{probe.now},wait:{probe.wait($0)}))
+        XCTAssertEqual(probe.signalled,[worker.pid,command.pid])
+        XCTAssertFalse(FileManager.default.fileExists(atPath:job.appendingPathComponent("children.json").path))
+    }
+
+    func testCleanupPrelaunchEvidenceErrorEntersDurableRecovery() async throws {
+        let (root, script) = try recoveryFixture(), initial = try await recoveryService(root,script:script)
+        let request = ShaderRequest(prompt:"Cleanup evidence",context:try context())
+        _ = try await initial.control(operation:"requestSubmit",payload:.init(request:request),deviceID:"TV")
+        try await initial.cancelQueued(request.id)
+        let journal = root.appendingPathComponent("journal.json")
+        var records = try XCTUnwrap(JSONSerialization.jsonObject(with:Data(contentsOf:journal)) as? [[String:Any]])
+        records[0]["cleanupPending"] = true
+        try JSONSerialization.data(withJSONObject:records).write(to:journal)
+        let gate = CleanupEvidenceProbe(), job = root.appendingPathComponent(request.id.uuidString)
+        let service = ShaderRequestService(catalog:DirectoryCatalog(directory:root.appendingPathComponent("catalog")),directory:root,workerScript:script,reconcileWorker:{ folder in
+            if folder == job { try await gate.reconcile() }
+            try RequestWorkerProcess.reconcileOrphan(in:folder)
+        })
+        await service.suspend();try await service.initialize(configuration:.init(repository:root.path,enabled:true));await service.resume()
+        try await waitFor { await service.recoveryStatuses().contains{$0.kind == .reconciliation && $0.requestID == request.id} }
+        let store = try JSONDecoder().decode(RequestRecoveryStore.self,from:Data(contentsOf:root.appendingPathComponent("recovery.json")))
+        XCTAssertEqual(store.entries[RequestPaths.canonical(job)]?.disposition,.cleanup)
+        XCTAssertFalse(FileManager.default.fileExists(atPath:job.appendingPathComponent("cleanup-started").path))
+    }
+
+    func testDetachDuringAutomaticRetryPreventsSecondLaunch() async throws {
+        let (root, script) = try recoveryFixture(), gate = RequestPreparationGate()
+        try injectSupervisionFaults(script,mode:"run",count:1)
+        let service = ShaderRequestService(catalog:DirectoryCatalog(directory:root.appendingPathComponent("catalog")),directory:root,workerScript:script,reconcileWorker:{ journal in
+            if (try RequestWorkerOperation.read(in:journal))?.phase == .retryPending { await gate.hold() }
+            try RequestWorkerProcess.reconcileOrphan(in:journal)
+        })
+        await service.suspend();try await service.start(configuration:.init(repository:root.path,enabled:true))
+        let request = ShaderRequest(prompt:"Retain on detach",context:try context())
+        _ = try await service.control(operation:"requestSubmit",payload:.init(request:request),deviceID:"TV")
+        let job = root.appendingPathComponent(request.id.uuidString), patch = job.appendingPathComponent("changes.patch"), bytes = Data([0,255,13,10])
+        try bytes.write(to:patch);await service.resume();try await waitFor { await gate.entered }
+        let detach = Task { try await service.detachCheckout(.request(request.id)) }
+        try await waitFor { await service.recoveryStatuses().contains{$0.disposition == .detach} }
+        await gate.release();try await detach.value
+        XCTAssertEqual(try String(contentsOf:job.appendingPathComponent("supervision-launches"),encoding:.utf8),"1")
+        XCTAssertEqual(try Data(contentsOf:patch),bytes)
+    }
     #endif
 }
 
@@ -2537,6 +2627,25 @@ private actor RequestPreparationGate {
 #endif
 
 #if os(macOS)
+private final class EmptyObservationProbe: @unchecked Sendable {
+    private let lock = NSLock();private var value = 0
+    func observe() { lock.withLock{value += 1} }
+    var count: Int { lock.withLock{value} }
+}
+private final class InjectedOwnershipProbe: @unchecked Sendable {
+    private let lock = NSLock();private var live: [Int32:RequestProcessIdentity];private var clock = 0.0;private var signals: [Int32] = []
+    init(_ identities: [RequestProcessIdentity]) { live = Dictionary(uniqueKeysWithValues:identities.map{($0.pid,$0)}) }
+    func identity(_ pid: Int32) -> RequestProcessIdentity? { lock.withLock{live[pid]} }
+    func group(_ pid: Int32) -> [RequestProcessIdentity] { lock.withLock{live[pid].map{[$0]} ?? []} }
+    func signal(_ pid: Int32, _ signal: Int32) -> Int32 { lock.withLock{signals.append(pid);live[pid] = nil};return 0 }
+    func wait(_ amount: Double) { lock.withLock{clock += amount} }
+    var now: Double { lock.withLock{clock} }
+    var signalled: [Int32] { lock.withLock{signals} }
+}
+private actor CleanupEvidenceProbe {
+    private var calls = 0
+    func reconcile() throws { calls += 1;if calls == 2 { throw RequestWorkerEvidenceError(cause:"Prelaunch cleanup evidence is invalid") } }
+}
 private final class SignalRecordingProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var calls: [(Int32,Int32)] = []
