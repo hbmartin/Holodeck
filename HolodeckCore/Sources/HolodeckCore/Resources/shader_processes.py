@@ -21,6 +21,10 @@ class OperationalError(RuntimeError):
     pass
 
 
+class _ControlProtocolError(OperationalError):
+    pass
+
+
 class SupervisionError(OperationalError):
     """A host lifecycle failure never authorizes discarding unpublished work."""
     def __init__(self, message, retryable=True):
@@ -509,6 +513,8 @@ def supervise(control_fd):
                     except OSError as error:
                         engine.fail(error, 'control'); control_open = False; stop[0] = True; wakeup.forget(control); control.close()
                     while b'\n' in pending:
+                        if pending.index(b'\n') > REGISTRY_LIMIT:
+                            raise _ControlProtocolError('Managed control message exceeds 64 KiB')
                         line, _, pending = pending.partition(b'\n')
                         try:
                             message = json.loads(line)
@@ -523,7 +529,7 @@ def supervise(control_fd):
                             if message.get('action') == 'drained':
                                 status['pipeDrainComplete'] = True; engine.next_sample = 0
                             if message.get('action') == 'pipeFailure': engine.fail(ProcessDrainError(message['message']), 'pipeDrain'); stop[0] = True
-                    if len(pending) > REGISTRY_LIMIT: raise OperationalError('Managed control message exceeds 64 KiB')
+                    if len(pending) > REGISTRY_LIMIT: raise _ControlProtocolError('Managed control message exceeds 64 KiB')
                 rc = command.poll() if command is not None else None
                 if rc is not None and status['commandReturnCode'] is None:
                     status['commandReturnCode'] = rc; engine.termination.begin(); engine.next_sample = 0
@@ -549,6 +555,10 @@ def supervise(control_fd):
                 if engine.termination.expired:
                     report('failed', failure=str(engine.expired_error()), failureKind=engine.failure_kind or 'settlement', recoveryRequired=True)
                     return 2
+            except _ControlProtocolError as error:
+                engine.fail(error, 'control'); stop[0] = True
+                pending.clear(); control_open = False
+                wakeup.forget(control); control.close()
             except BaseException as error:
                 engine.fail(error, 'supervision'); stop[0] = True
             remaining = engine.next_sample - process_clock()

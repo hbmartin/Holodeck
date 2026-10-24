@@ -661,7 +661,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
         if getattr(self, '_checker_identity_key', None) == key: return
         def probe(arguments, label):
             try: result = run([self.config['shaderTool'], 'library', *arguments], self.root, self.env, timeout=30)
-            except ProcessRecoveryError: raise
+            except SupervisionError: raise
             except subprocess.TimeoutExpired as error:
                 raise OperationalError(label + ' timed out after 30 seconds. Retry when the native tool can start normally.') from error
             except (OSError, OperationalError) as error:
