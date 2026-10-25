@@ -580,3 +580,41 @@ HOLODECK_PROFILE_WORKER=1 swift test --package-path HolodeckCore -c release --fi
 /usr/bin/python3 -B tools/profile_shader_supervision.py --baseline 8f2a7a3 --interleave
 python3 -B tools/profile_shader_supervision.py --baseline 8f2a7a3 --interleave
 ```
+
+## PR #35 follow-up: failure preservation and recoverable configuration repair (2026-10-25)
+
+This follow-up starts from `f47afc6`, the merge of PR #35. Parsed worker failures survive reply errors, internal shutdown and stream retirement. Unexplained post-launch exits receive the supervision retry; deterministic startup and explicit operational failures remain terminal. A verified, actively owned retry can accept queued submissions from other TVs while retaining exclusive checkout execution. Unrelated recovery and restarted retries remain blocking.
+
+Cleanup repairs record field-specific old/new configurations and operation IDs before changing bindings. Repository, Python and Git corrections preserve independently newer sibling/preferences values and every unrelated setting. Guided maintenance repair requires intact operation-target evidence and archives damaged bytes or symlinks without following them. Verified initial maintenance operations can be replaced after configuration changes; retry phases retain their stricter recovery rules. Pending Detach and configuration-repair intent survive worker completion.
+
+The recovery store remains format 1 and operation journals remain format 2. Existing journals without the optional repair/diagnostic fields remain readable. Diagnostics keep an 8 KiB primary cause and the last eight distinct 2 KiB secondary causes, with full details appended to no-follow journal-local logs when possible. Encoding checks the entire 2 MiB store, removes optional diagnostic detail first and rejects oversized essential metadata without replacing the last good store. A serial writer performs ordered durable commits outside the service actor, skips unchanged bytes, coalesces progress and waits for critical acknowledgements. Persistence uncertainty blocks ordinary writes while permitting retained recovery evidence.
+
+Frozen-source validation passed **362 Swift core tests with six opt-in skips**, including compilation/rendering/animation of all 23 local scenes. **162 Release tests passed with one opt-in skip**, covering service, persistence and installed-resource behavior. Python **3.9.6 and 3.15.0 each passed all 119 worker tests**, with no skips. The core skips were three unrelated catalog performance probes, the worker profile (run subsequently in Release), live LAN/TLS and live Codex publication; Release skipped only live Codex publication.
+
+New regressions cover parsed-fault/reply races, unexplained exits, queued acceptance during an owned retry, field-specific sibling rebinding, failed/uncertain intent publication, referenced-record deletion, legacy missing participants, corrupt and dangling maintenance configuration, exact target rejection, interrupted binding replay, initial-operation replacement, and Detach intent surviving finalization. Storage regressions hold a recovery write while querying and stopping the service, verify retained patch bytes, assert ordered and unchanged writes, and exercise Unicode diagnostic bounds, capacity rejection and symlink-safe logs.
+
+Release persistence profiling compares the actor source from merged PR #35 with the current service using the same native launch machinery and filesystem. Five samples per interpreter alternate baseline/current order, with 200 worker stage events followed by a clarification result. Counts include `journal.json`, `recovery.json` and `detached-checkouts.json`; unchanged operation/process evidence writes are excluded from both sides. Each metadata replacement fsyncs the file and parent directory. Results are local measurements, with structural write assertions in tests and no CI timing thresholds.
+
+| Child interpreter | Fixture median, baseline → current | Service CPU median, baseline → current | Metadata replacements | Metadata fsyncs |
+| --- | --- | --- | --- | --- |
+| Python 3.9.6 | 412.604 → 205.520 ms | 0.278623 → 0.054610 s | 618 → 4 | 1236 → 8 |
+| Python 3.15.0 | 250.370 → 73.034 ms | 0.213480 → 0.031876 s | 618 → 4 | 1236 → 8 |
+
+The separate Release idle-supervision profile measured **33.48 polls/s** and **0.3623% of one CPU core**.
+
+All **five isolated Mac UI tests passed**, including the new guided-repair case that retains exact corrupt configuration bytes. Both Release app builds passed with signing disabled. Both Mac copies and the tvOS copy of each Python resource match source, neither app contains bytecode caches, and the packaged worker accepted the selected library's checker identity. The packaged checker compiled **66 authoring assets plus shader/snippet templates for macOS and tvOS**; Mac GPU verification passed **seven profile checks** on Apple M2 Pro.
+
+Final evidence is in `/tmp/holodeck-recovery-*`: `python39.log`, `python315.log`, `core-verified.log`, `acceptance-{release,ui,mac-build,tv-build,package,metal,gpu}.log`, `acceptance-{hashes,progress}.json`, and `profile-{39,315}.json`. Runtime/UI source hashes remained unchanged through the final native acceptance run. Development failures and the superseded Release run are excluded from these results.
+
+Physical Apple TV, simulator runtime, live LAN/TLS and real Codex publication were not run. No checker artifact, library lock, Linux CI, live installation or request settings changed. A later rollout must drain requests before replacing the matching native host and bundled worker.
+
+Reproduction commands:
+
+```sh
+/usr/bin/python3 -B tools/test_shader_requests.py
+python3 -B tools/test_shader_requests.py
+HOLODECK_AUTHORING_FIXTURE=/Volumes/Pro2T/HolodeckShaders HOLODECK_GPU_TESTS=1 swift test --package-path HolodeckCore
+HOLODECK_PROFILE_WORKER=1 swift test --package-path HolodeckCore -c release --filter 'ShaderRequestTests|ShaderLibraryToolTests|RequestPersistenceTests'
+python3 -B tools/profile_request_persistence.py --baseline f47afc6 --python /usr/bin/python3
+python3 -B tools/profile_request_persistence.py --baseline f47afc6 --python /opt/homebrew/bin/python3
+```

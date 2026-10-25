@@ -144,6 +144,32 @@ final class HolodeckMacUITests: XCTestCase {
         XCTAssertTrue(element("choose-shader-folder", in: app).isEnabled)
     }
 
+    func testGuidedMaintenanceConfigurationRepairKeepsCorruptEvidence() throws {
+        let f = try managedRecoveryFixture(), app = f.app
+        let directory = f.marker.deletingLastPathComponent().deletingLastPathComponent(), setup = f.marker.deletingLastPathComponent()
+        let operationID = UUID().uuidString, recoveryID = UUID().uuidString, key = setup.resolvingSymlinksInPath().path
+        let operation: [String: Any] = ["formatVersion": 2, "id": operationID, "mode": "preflight", "phase": "initial", "target": ["repository": f.authoring.resolvingSymlinksInPath().path]]
+        try JSONSerialization.data(withJSONObject: operation).write(to: setup.appendingPathComponent("worker-operation.json"))
+        try Data("{".utf8).write(to: setup.appendingPathComponent("configuration.json"))
+        let entry: [String: Any] = ["id": recoveryID, "journal": key, "disposition": "resume", "message": "Maintenance configuration is unreadable"]
+        try JSONSerialization.data(withJSONObject: ["formatVersion": 1, "legacyMigrationComplete": true, "entries": [key: entry]]).write(to: directory.appendingPathComponent("recovery.json"))
+        app.launch(); app.activate(); dismissInitialCatalogFailure(in: app)
+        let settings = element("shader-library-settings", in: app)
+        XCTAssertTrue(settings.waitForExistence(timeout: 15)); settings.click()
+        let repair = element("repair-recovery-configuration", in: app)
+        XCTAssertTrue(repair.waitForExistence(timeout: 10), app.debugDescription)
+        XCTAssertTrue(element("recovery-repository", in: app).exists)
+        try FileManager.default.removeItem(at: f.marker)
+        repair.click()
+        let finished = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: repair)
+        XCTAssertEqual(XCTWaiter.wait(for: [finished], timeout: 20), .completed)
+        let archive = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: setup, includingPropertiesForKeys: nil).first { $0.lastPathComponent.hasPrefix("detached-") })
+        XCTAssertEqual(try Data(contentsOf: archive.appendingPathComponent("configuration.json")), Data("{".utf8))
+        let restored = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: setup.appendingPathComponent("configuration.json"))) as? [String: Any])
+        XCTAssertEqual(restored["repository"] as? String, f.authoring.resolvingSymlinksInPath().path)
+        XCTAssertNotEqual(restored["workerOperationID"] as? String, operationID)
+    }
+
     private func managedRecoveryFixture() throws -> (app: XCUIApplication, authoring: URL, marker: URL, name: String, source: Data) {
         let authoring = try authoringFolderWithInvalidShader()
         let fixtureURL = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "CatalogFixture", withExtension: "json", subdirectory: "TestSupport"))

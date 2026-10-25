@@ -252,6 +252,16 @@ nonisolated enum RequestJournalWriter {
         // Replay also commits moves whose preceding fsync failed after rename.
         guard fsync(archive) == 0, fsync(root) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
     }
+    static func appendDiagnostic(_ detail: String, to file: URL) throws {
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let descriptor = open(file.path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0o600)
+        guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        defer { close(descriptor) }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { throw POSIXError(.EINVAL) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        try handle.write(contentsOf: Data((detail + "\n").utf8))
+    }
     static func write(_ data: Data, to file: URL) throws {
         let directory = URL(fileURLWithPath: RequestPaths.canonical(file.deletingLastPathComponent()))
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -286,6 +296,25 @@ nonisolated struct RequestRecoveryStore: Codable, Sendable {
         var archiveID: UUID?
         var configurationRepair: ConfigurationRepair?
         var maintenanceRepair: MaintenanceRepair?
+        var primaryDiagnostic: String?
+        var secondaryDiagnostics: [String]?
+        static func bounded(_ text: String, bytes: Int) -> String {
+            var result = text
+            if result.utf8.count > bytes {
+                result = String(decoding: result.utf8.prefix(bytes), as: UTF8.self)
+                while result.utf8.count > bytes || result.last == "\u{fffd}" { result.removeLast() }
+            }
+            return result
+        }
+        mutating func appendDiagnostic(_ detail: String) {
+            let primary = Self.bounded(primaryDiagnostic ?? message, bytes: 8192)
+            primaryDiagnostic = primary
+            let bounded = Self.bounded(detail, bytes: 2048)
+            var additional = secondaryDiagnostics ?? []
+            if Self.bounded(detail, bytes: 8192) != primary && !additional.contains(bounded) { additional.append(bounded) }
+            secondaryDiagnostics = Array(additional.suffix(8))
+            message = ([primary] + (secondaryDiagnostics ?? []).map { "Additional recovery error: " + $0 }).joined(separator: "\n")
+        }
     }
     struct ConfigurationRepair: Codable, Sendable {
         var previous: ShaderRequestConfiguration
@@ -320,5 +349,32 @@ nonisolated struct RequestRecoveryStore: Codable, Sendable {
     var formatVersion = 1
     var legacyMigrationComplete = false
     var entries: [String: Entry] = [:]
+    mutating func encoded() throws -> Data {
+        for key in entries.keys {
+            let detail = entries[key]!.primaryDiagnostic ?? entries[key]!.message
+            entries[key]?.appendDiagnostic(detail)
+        }
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        var bytes = try encoder.encode(self)
+        if bytes.count > CatalogLimits.manifestBytes {
+            for key in entries.keys {
+                var entry = entries[key]!
+                entry.secondaryDiagnostics = []; entry.message = entry.primaryDiagnostic ?? "Checkout recovery required"
+                entries[key] = entry
+            }
+            bytes = try encoder.encode(self)
+        }
+        if bytes.count > CatalogLimits.manifestBytes {
+            for key in entries.keys {
+                var entry = entries[key]!
+                entry.message = Entry.bounded(entry.primaryDiagnostic ?? entry.message, bytes: 256)
+                entry.primaryDiagnostic = nil; entry.secondaryDiagnostics = nil
+                entries[key] = entry
+            }
+            bytes = try encoder.encode(self)
+        }
+        guard bytes.count <= CatalogLimits.manifestBytes else { throw RequestWorkerEvidenceError(cause: "Recovery metadata exceeds its 2 MiB capacity. Retain the last good journal and resolve existing recovery entries before accepting work.") }
+        return bytes
+    }
 }
 #endif
