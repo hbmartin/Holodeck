@@ -56,6 +56,30 @@ import XCTest
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("recovery.json").path))
         probe.release(); try await writing.value
     }
+    func testRecoveryOnlyBarrierRetainsJournalProgressAndEncodesOnlySurvivors() async throws {
+        let root = try directory(), probe = PersistenceWriteProbe(), recovery = root.appendingPathComponent("recovery.json"), journal = root.appendingPathComponent("journal.json")
+        let writer = RequestPersistence(recoveryWriter: { try probe.write($0, $1) })
+        probe.hold()
+        let initial = Task { try await writer.commit(.init(revision: 1, files: [.init(url: recovery, bytes: Data("initial".utf8))])) }
+        defer { probe.release(); initial.cancel() }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !probe.entered, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(2)) }
+        XCTAssertTrue(probe.entered)
+        for n in 2...101 {
+            writer.enqueueProgress(.init(revision: UInt64(n), files: [
+                .init(url: recovery, encode: { Data("recovery-\(n)".utf8) }),
+                .init(url: journal, encode: { Data("journal-\(n)".utf8) })])) { _ in XCTFail("Progress failed") }
+        }
+        let critical = Task { try await writer.commit(.init(revision: 102, files: [.init(url: recovery, bytes: Data("critical".utf8))])) }
+        await Task.yield(); probe.release(); try await initial.value; try await critical.value
+        try await writer.write(Data(), to: root.appendingPathComponent("barrier"))
+        XCTAssertEqual(try Data(contentsOf: recovery), Data("critical".utf8))
+        XCTAssertEqual(try Data(contentsOf: journal), Data("journal-101".utf8))
+        let stats = await writer.statistics()
+        XCTAssertLessThanOrEqual(stats["encodings", default: 1000], 4)
+        XCTAssertEqual(stats["journal.json"], 1)
+    }
+
     func testRejectedChangeRestoresAllEarlierWritesButRetainsIndependentRecoveryIntent() async throws {
         let root = try directory(), probe = PersistenceWriteProbe(), writer = RequestPersistence(directory: root, recoveryWriter: { try probe.write($0, $1) })
         let preferences = root.appendingPathComponent("preferences.json"), payload = root.appendingPathComponent("request.json"), recovery = root.appendingPathComponent("recovery.json"), id = UUID()
@@ -75,6 +99,23 @@ import XCTest
         XCTAssertEqual(try Data(contentsOf: preferences), accepted)
         XCTAssertEqual(try Data(contentsOf: recovery), Data("durable Detach intent".utf8))
     }
+    func testRollbackRecognizesEarlierOwnWritesAndReleasesPayloadBytes() async throws {
+        let root = try directory(), probe = PersistenceWriteProbe(), writer = RequestPersistence(directory: root, recoveryWriter: { try probe.write($0, $1) })
+        let file = root.appendingPathComponent("recovery.json"), accepted = Data("accepted".utf8), id = UUID()
+        try accepted.write(to: file)
+        try await writer.begin(id, operation: "multi-write proposal")
+        try await writer.write(Data("intermediate own proposal".utf8), to: file, transaction: id)
+        probe.failBeforePublication()
+        do { try await writer.write(accepted, to: file, transaction: id); XCTFail("Failed restoration write succeeded") } catch {}
+        try await writer.reject(id)
+        XCTAssertEqual(try Data(contentsOf: file), accepted)
+        try await writer.resumeAfterExplicitRecovery()
+        try await writer.commit(.init(revision: 1, files: [.init(url: file, bytes: accepted)]))
+        for n in 0..<20 { try await writer.write(Data(repeating: UInt8(n), count: 65536), to: root.appendingPathComponent("payload-\(n)")) }
+        let stats = await writer.statistics()
+        XCTAssertEqual(stats["retainedBytes"], accepted.count, "Completed payload writes must not retain screenshots or source in the metadata cache")
+    }
+
     func testRestartCannotSilentlyAcceptAnUncertainRejectedChange() async throws {
         let root = try directory(), probe = PersistenceWriteProbe(), file = root.appendingPathComponent("recovery.json")
         let writer = RequestPersistence(directory: root, recoveryWriter: { try probe.write($0, $1) })
@@ -137,16 +178,18 @@ import XCTest
 
 private final class PersistenceWriteProbe: @unchecked Sendable {
     private let lock = NSLock(), gate = DispatchSemaphore(value: 0)
-    private var writes = 0, main = false, fail = false, holding = false, waiting = false
+    private var writes = 0, main = false, fail = false, failBefore = false, holding = false, waiting = false
     var count: Int { lock.withLock { writes } }
     var wroteOnMain: Bool { lock.withLock { main } }
     var entered: Bool { lock.withLock { waiting } }
     func failAfterPublication() { lock.withLock { fail = true } }
+    func failBeforePublication() { lock.withLock { failBefore = true } }
     func hold() { lock.withLock { holding = true } }
     func release() { lock.withLock { holding = false }; gate.signal() }
     func write(_ bytes: Data, _ file: URL) throws {
         let hold = lock.withLock { writes += 1; main = main || Thread.isMainThread; waiting = true; return holding }
         if hold, gate.wait(timeout: .now() + 5) != .success { throw POSIXError(.ETIMEDOUT) }
+        if lock.withLock({ let value = failBefore; failBefore = false; return value }) { throw POSIXError(.ENOSPC) }
         try RequestJournalWriter.write(bytes, to: file)
         if lock.withLock({ let value = fail; fail = false; return value }) { throw POSIXError(.EIO) }
     }

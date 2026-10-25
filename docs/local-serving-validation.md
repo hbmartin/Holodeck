@@ -618,3 +618,51 @@ HOLODECK_PROFILE_WORKER=1 swift test --package-path HolodeckCore -c release --fi
 python3 -B tools/profile_request_persistence.py --baseline f47afc6 --python /usr/bin/python3
 python3 -B tools/profile_request_persistence.py --baseline f47afc6 --python /opt/homebrew/bin/python3
 ```
+
+## PR #36 follow-up: persistence faults and recovery coordination (2026-10-25)
+
+This follow-up starts at `aade843`, the merge of PR #36. Native settlement/evidence errors now take precedence over a parsed ordinary worker failure. The initiating diagnostic remains available separately, and `waitForExit()` preserves unverifiable ownership/evidence rather than permitting ordinary cleanup.
+
+The service and serial writer share a generation-tagged storage fault carrying the initiating operation and affected files. Critical caller mutations retain accepted logical state and in-memory file before-images (including explicit absence), acknowledge only durable writes, and restore rejected submissions, answers and settings. Recovery/Detach intent and confirmed ownership/publication facts are independent of caller rollback. Storage recovery keeps ordinary scheduling blocked until restoration and accepted-state durability checks succeed; older completions cannot clear a newer fault. A bounded `storage-recovery.json` summary retains accepted-state hashes and diagnostics, never rollback bytes. After restart, unverifiable uncertainty requires explicit verification or manual journal repair. This is intentionally not a general durable transaction log.
+
+Storage faults have a separate **Storage Recovery** row with **Retry Recovery** and **Open Recovery Journal**, including when no checkout recovery entry exists. Persistent faults promptly fail pending Rebuild waiters. Temporary critical commits register one deferred scheduling wakeup, without starting background reconciliation merely because initialization wrote metadata. Record deletion commits an optional pending-deletion record before touching its directory; advancing that accepted rollback boundary cannot fail. Physical cleanup and final record removal are idempotent, and a later failure does not reject the accepted deletion.
+
+Explicit cleanup recovery can migrate missing/mismatched format-1 operation bindings only after exact-checkout validation and settlement; ordinary launches and unrelated format-2 mismatches remain strict. Repair replay recognizes only the current app's trusted bundled shader-tool relocation in preferences; captured request tools remain unchanged. Maintenance repair rejects pending Detach and conflicting proposals, and resumes matching saved intent without generating replacement IDs. Public-operation regressions exercise the reported stale-reconciliation concern; no speculative cancellation or paused-retry policy change was made.
+
+Rollback retains hashes of all of a caller's proposed contents, so an earlier write remains recognizable after a later restoration write fails. Only metadata bytes stay cached after acceptance; payload screenshots and sources are released. Fault generations, including failed recovery writes, govern stale-completion filtering and the shared scheduling gate.
+
+Progress snapshots supersede only covered files/revisions. Recovery-only barriers preserve pending journal progress. Immutable snapshots are coalesced before encoding on the serial writer, with unchanged-byte avoidance and existing capacity limits. Maintenance proposals are prepared outside the actor, cached by entry/configuration/binding generation, and revalidated by the repair action. Recovery status generation reads memory only. Release testing exposed an inherited-context assertion in the first wakeup implementation; the final wakeup uses an explicit actor hop and does not inherit a caller mutation token.
+
+Regressions cover the six disposable review reproductions, errors before/after atomic replacement, failed/conflicting rollback, stale fault completion, restart without rollback bytes, rejected answers, durable repair preservation, accepted deletion interrupted during final metadata persistence, scheduling under overlapping commits, trusted relocation, legacy binding boundaries, repeated/conflicting maintenance repair, partial-file supersession, encoding work and responsive cached status under a held proposal read. Existing conservative ownership, interruption, paused-retry, retained-file and unlimited-implementation tests remain in the acceptance run.
+
+The frozen-source Debug run passed **378 Swift core tests with six opt-in skips**, including local scene compilation/rendering/animation. Python **3.9.6 and 3.15.0 each passed all 119 worker tests**, with no failures or skips. The Python 3.15 log includes a subprocess `ResourceWarning`; its named process had exited when checked. No Python worker/checker source or lock changed in this follow-up.
+
+The frozen-source Release run passed **178 service, persistence and packaged-resource tests with one opt-in skip**. The skipped Release case requires explicit credentials and a disposable checkout for real Codex publication. The Debug skips cover unrelated catalog performance probes, the worker profile (run in Release), live LAN/TLS and real Codex publication.
+
+All **six isolated Mac UI tests passed**, including standalone Storage Recovery, guided configuration repair, retained-file Detach, Rebuild recovery and queued cancellation/deletion. Both Release app builds passed with signing disabled. Every packaged Python resource copy matches source, both apps contain no bytecode caches, and the packaged worker accepted the selected library's checker identity. The packaged checker compiled **68 authoring assets plus shader/snippet templates for macOS and tvOS**; Mac GPU verification passed **seven profile checks** on Apple M2 Pro. Runtime/UI/regression-source fingerprints matched before and after all eight native acceptance steps.
+
+The Release idle-supervision profile measured **33.03 polls/s** and **0.4412% of one CPU core**. Slow-storage regressions query and stop the service while a writer is held, keep critical acknowledgements pending, and exercise status requests while a proposal read is held. These are bounded responsiveness checks, with structural encoding/write assertions rather than CI timing thresholds.
+
+Persistence profiling loads both the service and writer from merged PR #36 (`aade843`) and uses the common native launch/settlement machinery. Five warm samples per child interpreter alternate baseline/current order on the same filesystem, with 200 stage events followed by clarification. Baseline encoding counts include payloads encoded before enqueue; current counts include surviving encodes after coalescing. The harness measures metadata replacements and their file/directory fsyncs independently. The earlier PR #35 commands describe that historical harness.
+
+| Child interpreter | Fixture median, baseline → current | Service CPU median, baseline → current | Metadata encodings | Metadata replacements | Metadata fsyncs |
+| --- | --- | --- | --- | --- | --- |
+| Python 3.9.6 | 114.201 → 106.608 ms | 0.032599 → 0.027465 s | 618 → 18 | 4 → 4 | 8 → 8 |
+| Python 3.15.0 | 55.510 → 47.268 ms | 0.028598 → 0.022703 s | 618 → 18 | 4 → 4 | 8 → 8 |
+
+The fixture performs **97.1% fewer metadata encodes**, preserving the existing write/fsync reduction from PR #36. Results are local observations; structural regression tests enforce coalescing and unchanged-write behavior.
+
+Final evidence is in `/tmp/holodeck-pr37-*`: `python39.log`, `python-current.log`, `native-{core,release,ui,mac-build,tv-build,package,metal,gpu}.log`, `native-{hashes,progress}.json`, and `profile{39,315}.json`. All eight final native steps passed with unchanged runtime/UI/regression-source hashes. Development runs, the executor-assertion run and the one-sample profile smoke test are excluded from final results.
+
+Physical Apple TV and tvOS simulator runtime checks, live LAN/TLS and real Codex publication were not run. No live installation, request-enabling preference, checker artifact, library lock, Linux CI, merge or deployment changed. A later rollout must drain requests before replacing the matching native host and bundled worker.
+
+Reproduction commands:
+
+```sh
+/usr/bin/python3 -B tools/test_shader_requests.py
+python3 -B tools/test_shader_requests.py
+HOLODECK_AUTHORING_FIXTURE=/Volumes/Pro2T/HolodeckShaders HOLODECK_GPU_TESTS=1 swift test --package-path HolodeckCore
+HOLODECK_PROFILE_WORKER=1 swift test --package-path HolodeckCore -c release --filter 'ShaderRequestTests|ShaderLibraryToolTests|RequestPersistenceTests'
+python3 -B tools/profile_request_persistence.py --baseline aade843 --samples 5 --stages 200 --python /usr/bin/python3
+python3 -B tools/profile_request_persistence.py --baseline aade843 --samples 5 --stages 200 --python /opt/homebrew/bin/python3
+```

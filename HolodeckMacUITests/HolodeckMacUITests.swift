@@ -235,6 +235,24 @@ final class HolodeckMacUITests: XCTestCase {
             object: app.staticTexts["Unable to Load Scenes"])], timeout: 10), .completed)
     }
 
+    func testStorageRecoveryOffersRetryWithoutCheckoutRecoveryEntry() throws {
+        let f = try managedRecoveryFixture(), app = f.app
+        try FileManager.default.removeItem(at: f.marker)
+        let directory = f.marker.deletingLastPathComponent().deletingLastPathComponent()
+        let fault: [String: Any] = ["id": UUID().uuidString, "generation": 1, "operation": "rejected settings", "paths": [], "primary": "Storage regression fixture", "secondary": [], "expected": [:]]
+        try JSONSerialization.data(withJSONObject: fault).write(to: directory.appendingPathComponent("storage-recovery.json"))
+        app.launch(); app.activate(); dismissInitialCatalogFailure(in: app)
+        let settings = element("shader-library-settings", in: app)
+        XCTAssertTrue(settings.waitForExistence(timeout: 15)); settings.click()
+        XCTAssertTrue(app.staticTexts["Storage Recovery"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.buttons["Open Recovery Journal"].firstMatch.exists)
+        let retry = element("retry-checkout-cleanup", in: app)
+        XCTAssertTrue(retry.waitForExistence(timeout: 10)); XCTAssertTrue(retry.isEnabled); retry.click()
+        waitForTitle(f.name, in: app); waitForLibraryIdle(in: app)
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.staticTexts["Storage Recovery"])], timeout: 10), .completed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("storage-recovery.json").path))
+    }
+
     func testPublicationRecoveryReportsLockContentionAndExplicitRebuildRecovers() throws {
         let f = try managedRecoveryFixture(), app = f.app
         let lease = open(f.authoring.appendingPathComponent(".git/holodeck-requests.lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)

@@ -1038,6 +1038,31 @@ final class ShaderRequestTests: XCTestCase {
         }
     }
 
+    func testMaintenanceStatusUsesPreparedCacheAndRevalidatesStaleBinding() async throws {
+        let (root, script) = try recoveryFixture(); _ = try initializeRecoveryGit(root)
+        let config = ShaderRequestConfiguration(repository: root.path), journal = root.appendingPathComponent("setup"), reader = HeldProposalReader()
+        let operation = try RequestWorkerOperation.begin(mode: "preflight", configuration: config, in: journal)
+        var entry = RequestRecoveryStore.Entry(journal: RequestPaths.canonical(journal), configuration: nil, disposition: .resume, message: "Repair configuration")
+        entry.primaryDiagnostic = entry.message
+        var store = RequestRecoveryStore(); store.entries[entry.journal] = entry
+        try JSONEncoder().encode(store).write(to: root.appendingPathComponent("recovery.json"))
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script, readMaintenanceProposal: { try reader.read($0) })
+        await service.suspend()
+        let startup = Task { try await service.initialize(configuration: config) }
+        defer { reader.release(); startup.cancel() }
+        try await waitFor { reader.entered }
+        let whileReading = await service.recoveryStatuses(); XCTAssertEqual(whileReading.count, 1)
+        let jobs = await service.allJobs(); XCTAssertTrue(jobs.isEmpty)
+        reader.release(); try await startup.value
+        for _ in 0..<100 { let statuses = await service.recoveryStatuses(); XCTAssertNotNil(statuses.first?.repairConfiguration) }
+        XCTAssertEqual(reader.count, 1)
+        var changed = operation; changed.target = .init(ShaderRequestConfiguration(repository: root.appendingPathComponent("wrong").path)); try changed.save(in: journal)
+        do { try await service.repairMaintenanceRecovery(entry.id, configuration: config); XCTFail("Stale proposal changed another checkout") } catch {}
+        try await waitFor { reader.count >= 2 }
+        let fresh = await service.recoveryStatuses(); XCTAssertNotEqual(fresh.first?.repairConfiguration?.repository, config.repository)
+        XCTAssertEqual(try RequestWorkerOperation.read(in: journal)?.id, operation.id)
+    }
+
     func testExplicitLegacyCleanupBindingRepairRequiresRecordedCheckoutAndOptIn() throws {
         let (root, _) = try recoveryFixture(), previous = ShaderRequestConfiguration(repository: root.path)
         var corrected = previous; corrected.python = "/corrected/python"
@@ -1163,6 +1188,17 @@ final class ShaderRequestTests: XCTestCase {
         catch { XCTAssertTrue(error is RequestPersistence.Fault) }
         let jobs = await service.allJobs(); XCTAssertFalse(jobs.contains { $0.id == request.id })
         let recovery = await service.recoveryStatuses(); XCTAssertEqual(recovery.filter { $0.kind == .persistence }.count, 1)
+        var latestFault: RequestPersistence.Fault?
+        do { try await service.retryReconciliation(); XCTFail("Obstructed restoration succeeded") }
+        catch { latestFault = error as? RequestPersistence.Fault; XCTAssertNotNil(latestFault) }
+        let failedRecovery = await service.recoveryStatuses()
+        let currentFaultID = try XCTUnwrap(failedRecovery.first { $0.kind == .persistence }?.id)
+        XCTAssertEqual(currentFaultID, recovery.first { $0.kind == .persistence }?.id, "Storage recovery keeps a stable row identity")
+        do { try await service.disable(); XCTFail("A failed recovery opened the storage gate") }
+        catch {
+            XCTAssertEqual((error as? RequestPersistence.Fault)?.id, latestFault?.id)
+            XCTAssertEqual((error as? RequestPersistence.Fault)?.generation, latestFault?.generation)
+        }
         let finished = expectation(description: "Rebuild fails promptly")
         let rebuilding = Task {
             do { try await service.ensurePublication(force: true); XCTFail("Blocked Rebuild succeeded") }
@@ -1176,6 +1212,56 @@ final class ShaderRequestTests: XCTestCase {
         let after = await service.recoveryStatuses(); XCTAssertFalse(after.contains { $0.kind == .persistence })
         _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
         let accepted = await service.allJobs(); XCTAssertTrue(accepted.contains { $0.id == request.id })
+    }
+
+    func testAcceptedDeletionSurvivesFinalMetadataFailureAndRestart() async throws {
+        let (root, script) = try recoveryFixture()
+        let journal = root.appendingPathComponent("journal.json"), backup = root.appendingPathComponent("accepted-deletion.json")
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script, removeRecordDirectory: { job in
+            try FileManager.default.removeItem(at: job)
+            try FileManager.default.moveItem(at: journal, to: backup)
+            try FileManager.default.createDirectory(at: journal, withIntermediateDirectories: true)
+        })
+        await service.suspend(); try await service.start(configuration: .init(repository: root.path, enabled: true))
+        let request = ShaderRequest(prompt: "Accepted deletion", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        try await service.cancelQueued(request.id)
+        try await service.deleteFinished(request.id) // Durable intent has accepted deletion; physical finalization cannot reject it.
+        let jobs = await service.allJobs(); XCTAssertTrue(jobs.isEmpty)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(root.appendingPathComponent(request.id.uuidString)))
+        let statuses = await service.recoveryStatuses()
+        XCTAssertTrue(statuses.contains { $0.kind == .persistence && $0.message.contains("finish accepted record deletion") && $0.message.contains("journal.json") })
+        let tombstone = try XCTUnwrap((JSONSerialization.jsonObject(with: Data(contentsOf: backup)) as? [[String: Any]])?.first)
+        XCTAssertEqual(tombstone["deletionPending"] as? Bool, true)
+        try FileManager.default.removeItem(at: journal); try FileManager.default.moveItem(at: backup, to: journal)
+        let restarted = try await recoveryService(root, script: script)
+        try await restarted.retryReconciliation()
+        let remaining = await restarted.allJobs(), recoveries = await restarted.recoveryStatuses()
+        XCTAssertTrue(remaining.isEmpty); XCTAssertTrue(recoveries.isEmpty)
+    }
+
+    func testRejectedClarificationAnswerDoesNotReappearAfterStorageRecovery() async throws {
+        let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script)
+        try "import json; print(json.dumps(dict(event='clarification',question='Choose',options=['A','B'])),flush=True)".write(to: script, atomically: true, encoding: .utf8)
+        defer { Task { await service.suspend() } }
+        let request = ShaderRequest(prompt: "Clarify", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        await service.resume()
+        try await waitFor { await service.allJobs().first?.stage == .awaitingClarification }
+        try await waitFor {
+            (try? RequestWorkerOperation.read(in: root.appendingPathComponent(request.id.uuidString))?.phase) == .complete &&
+            !RequestProcessIdentity.evidenceExists(root.appendingPathComponent("active.json"))
+        }
+        await service.suspend()
+        let journal = root.appendingPathComponent("journal.json"), backup = root.appendingPathComponent("accepted-journal.json"), answer = root.appendingPathComponent(request.id.uuidString).appendingPathComponent("answer.json")
+        try FileManager.default.moveItem(at: journal, to: backup); try FileManager.default.createDirectory(at: journal, withIntermediateDirectories: true)
+        do { _ = try await service.control(operation: "requestAnswer", payload: .init(requestID: request.id, answer: "Rejected answer"), deviceID: "TV"); XCTFail("Rejected answer succeeded") } catch { XCTAssertTrue(error is RequestPersistence.Fault) }
+        let rejected = await service.allJobs().first; XCTAssertEqual(rejected?.stage, .awaitingClarification); XCTAssertNotNil(rejected?.clarification)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(answer))
+        try FileManager.default.removeItem(at: journal); try FileManager.default.moveItem(at: backup, to: journal)
+        try await service.retryReconciliation()
+        let recovered = await service.allJobs().first; XCTAssertEqual(recovered?.stage, .awaitingClarification)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(answer))
     }
 
     func testDirectPayloadWriteFaultClosesTheSameServiceGate() async throws {
@@ -3914,6 +4000,21 @@ private final class HeldRecoveryWriter: @unchecked Sendable {
         let block = lock.withLock { let value = armed && (hasEvidence != empty); if value { armed = false; waiting = true }; return value }
         if block, gate.wait(timeout: .now() + 10) != .success { throw POSIXError(.ETIMEDOUT) }
         try RequestJournalWriter.write(bytes, to: file)
+    }
+}
+#endif
+
+#if os(macOS)
+private final class HeldProposalReader: @unchecked Sendable {
+    private let lock = NSLock(), gate = DispatchSemaphore(value: 0)
+    private var calls = 0
+    var entered: Bool { count > 0 }
+    var count: Int { lock.withLock { calls } }
+    func release() { gate.signal() }
+    func read(_ journal: URL) throws -> RequestWorkerOperation? {
+        let first = lock.withLock { calls += 1; return calls == 1 }
+        if first, gate.wait(timeout: .now() + 8) != .success { throw POSIXError(.ETIMEDOUT) }
+        return try RequestWorkerOperation.read(in: journal)
     }
 }
 #endif

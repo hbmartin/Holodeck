@@ -8,7 +8,18 @@ nonisolated enum RequestStorageContext {
 
 /// One ordered disk owner. Before-images are deliberately retained only in this process.
 nonisolated final class RequestPersistence: @unchecked Sendable {
-    struct File: Sendable { let url: URL; let bytes: Data }
+    struct File: Sendable {
+        let url: URL
+        let encode: @Sendable () throws -> Data
+        init(url: URL, bytes: Data) { self.url = url; self.encode = { bytes } }
+        init(url: URL, encode: @escaping @Sendable () throws -> Data) { self.url = url; self.encode = encode }
+        init<T: Encodable & Sendable>(url: URL, value: T) {
+            self.init(url: url) {
+                let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+                return try encoder.encode(value)
+            }
+        }
+    }
     struct Snapshot: Sendable { let revision: UInt64; let files: [File] }
     struct Fault: Codable, Sendable, LocalizedError {
         let id: UUID
@@ -21,6 +32,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         var expected: [String: String] = [:] // SHA-256, or "absent"; never contains rollback bytes.
         var errorDescription: String? {
             "Storage recovery required for " + operation + ": " + primary +
+            (paths.isEmpty ? "" : " Affected files: " + paths.map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: ", ")) +
             (secondary.isEmpty ? "" : " Additional storage errors: " + secondary.joined(separator: "; "))
         }
     }
@@ -29,19 +41,21 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         var bytes: Data? { if case .file(let bytes) = self { return bytes }; return nil }
         var hash: String { bytes.map(CatalogHash.sha256) ?? "absent" }
     }
-    private struct Transaction { let operation: String; var before: [URL: Image] = [:]; var candidates: [URL: Data] = [:] }
+    private struct Transaction { let operation: String; var before: [URL: Image] = [:]; var candidates: [URL: Set<String>] = [:] }
     private let queue = DispatchQueue(label: "Holodeck.request-persistence", qos: .utility)
     private let recoveryWriter: @Sendable (Data, URL) throws -> Void
     private let directory: URL?
     private var committed: [URL: Data] = [:]
     private var failure: Fault?
     private var generation: UInt64 = 0
-    private var undo: [URL: Image] = [:], candidates: [URL: Data] = [:]
+    private var undo: [URL: Image] = [:], candidates: [URL: Set<String>] = [:]
     private var transactions: [UUID: Transaction] = [:]
     private var recoveryAllowed = false
     private var writes: [String: Int] = [:]
-    private var applied: UInt64 = 0
-    private var progress: Snapshot?
+    private var applied: [URL: UInt64] = [:]
+    private var encodings = 0
+    private struct Pending { let revision: UInt64; let file: File }
+    private var progress: [URL: Pending] = [:]
     private var progressScheduled = false
     init(directory: URL? = nil, recoveryWriter: @escaping @Sendable (Data, URL) throws -> Void = { try RequestJournalWriter.write($0, to: $1) }) {
         self.directory = directory; self.recoveryWriter = recoveryWriter
@@ -56,10 +70,19 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         fault.expected = Dictionary(uniqueKeysWithValues: undo.map { ($0.key.path, $0.value.hash) })
         failure = fault
         guard let file = faultFile else { return }
-        do { try RequestJournalWriter.write(JSONEncoder().encode(fault), to: file) }
+        do {
+            var bytes = try JSONEncoder().encode(fault)
+            if bytes.count > 65536 {
+                fault.expected = [:]; fault.paths = Array(fault.paths.prefix(16)).map { RequestRecoveryStore.Entry.bounded($0, bytes: 2048) }
+                fault.secondary = []; fault.manualRepairRequired = true
+                bytes = try JSONEncoder().encode(fault)
+            }
+            guard bytes.count <= 65536 else { return }
+            try RequestJournalWriter.write(bytes, to: file)
+        }
         catch { /* Storage may be unavailable. RAM evidence and the blocking gate remain. */ }
     }
-    private func fail(_ error: Error, operation: String, files: [URL], before: [URL: Image], proposed: [URL: Data]) -> Fault {
+    private func fail(_ error: Error, operation: String, files: [URL], before: [URL: Image], proposed: [URL: Set<String>]) -> Fault {
         if let previous = failure {
             if error is Fault { return previous }
             generation &+= 1
@@ -79,36 +102,51 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         if file.lastPathComponent == "recovery.json" { try recoveryWriter(bytes, file) }
         else { try RequestJournalWriter.write(bytes, to: file) }
         writes[file.lastPathComponent, default: 0] += 1
-        committed[file] = bytes
+        if ["journal.json", "recovery.json", "detached-checkouts.json"].contains(file.lastPathComponent) { committed[file] = bytes }
     }
     private func apply(_ snapshot: Snapshot, transaction: UUID? = nil, retainingEvidence: Bool = false) throws {
         if retainingEvidence, !snapshot.files.allSatisfy({ $0.url.lastPathComponent == "recovery.json" }) { throw RequestWorkerOwnershipError() }
         if let failure, !recoveryAllowed && !retainingEvidence { throw failure }
-        guard snapshot.revision > applied else { return }
-        var before: [URL: Image] = [:], proposed: [URL: Data] = [:]
+        let files = snapshot.files.filter { snapshot.revision > applied[$0.url, default: 0] }
+        var before: [URL: Image] = [:], proposed: [URL: Data] = [:], encoded: [URL: Data] = [:]
         do {
-            for file in snapshot.files where committed[file.url] != file.bytes {
+            for file in files {
+                encodings += 1; encoded[file.url] = try file.encode()
+                guard committed[file.url] != encoded[file.url] else { continue }
                 before[file.url] = try committed[file.url].map(Image.file) ?? image(file.url)
-                proposed[file.url] = file.bytes
+                proposed[file.url] = encoded[file.url]
                 if let transaction, transactions[transaction]?.before[file.url] == nil { transactions[transaction]?.before[file.url] = before[file.url] }
-                if let transaction { transactions[transaction]?.candidates[file.url] = file.bytes }
+                if let transaction, let bytes = encoded[file.url] { transactions[transaction]?.candidates[file.url, default: []].insert(CatalogHash.sha256(bytes)) }
             }
-            for file in snapshot.files where proposed[file.url] != nil { try replace(file.bytes, at: file.url) }
-            applied = snapshot.revision
-            if snapshot.files.allSatisfy({ $0.url.lastPathComponent == "recovery.json" }) {
+            for file in files {
+                if let bytes = proposed[file.url] { try replace(bytes, at: file.url) }
+                applied[file.url] = snapshot.revision
+            }
+            if files.allSatisfy({ $0.url.lastPathComponent == "recovery.json" }) {
                 // Durable recovery/Detach intent is independent of a caller's rejected mutation.
                 for id in transactions.keys {
-                    for file in snapshot.files { transactions[id]?.before[file.url] = .file(file.bytes); transactions[id]?.candidates[file.url] = file.bytes }
+                    for (url, bytes) in encoded { transactions[id]?.before[url] = .file(bytes); transactions[id]?.candidates[url] = [CatalogHash.sha256(bytes)] }
                 }
                 if failure != nil {
-                    for file in snapshot.files { undo[file.url] = .file(file.bytes); candidates[file.url] = file.bytes }
+                    for (url, bytes) in encoded { undo[url] = .file(bytes); candidates[url] = [CatalogHash.sha256(bytes)] }
                     summarize()
                 }
             }
         } catch {
             committed.removeAll()
             let tx = transaction.flatMap { transactions[$0] }
-            throw fail(error, operation: tx?.operation ?? "request metadata", files: snapshot.files.map(\.url), before: tx?.before ?? before, proposed: tx?.candidates ?? proposed)
+            throw fail(error, operation: tx?.operation ?? "request metadata", files: files.map(\.url), before: tx?.before ?? before, proposed: tx?.candidates ?? proposed.mapValues { [CatalogHash.sha256($0)] })
+        }
+    }
+    private func drainProgress() throws {
+        let pending = progress; progress = [:]
+        for revision in Set(pending.values.map(\.revision)).sorted() {
+            let files = pending.values.filter { $0.revision == revision }.map(\.file).sorted {
+                if $0.url.lastPathComponent == "recovery.json" { return true }
+                if $1.url.lastPathComponent == "recovery.json" { return false }
+                return $0.url.path < $1.url.path
+            }
+            try apply(.init(revision: revision, files: files))
         }
     }
     func begin(_ id: UUID, operation: String) async throws {
@@ -119,10 +157,15 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     func accept(_ id: UUID) async {
         await withCheckedContinuation { c in queue.async { [self] in transactions[id] = nil; c.resume() } }
     }
-    private func restore(_ images: [URL: Image], proposed: [URL: Data]) throws {
+    /// The caller has already durably accepted this intent. Advancing its RAM
+    /// rollback boundary cannot reject it, even if a separate fault just arrived.
+    func checkpoint(_ id: UUID, operation: String) async {
+        await withCheckedContinuation { c in queue.async { [self] in transactions[id] = .init(operation: operation); c.resume() } }
+    }
+    private func restore(_ images: [URL: Image], proposed: [URL: Set<String>]) throws {
         for (file, old) in images.sorted(by: { $0.key.path < $1.key.path }) {
             let current = try image(file)
-            guard current.hash == old.hash || current.bytes == proposed[file] || current.bytes == nil else {
+            guard current.hash == old.hash || proposed[file]?.contains(current.hash) == true || current.bytes == nil else {
                 throw RequestWorkerEvidenceError(cause: "Storage file changed outside the rejected operation: " + file.path)
             }
             if current.hash == old.hash { continue }
@@ -148,7 +191,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     }
     func commit(_ snapshot: Snapshot, retainingEvidence: Bool = false, transaction: UUID? = RequestStorageContext.mutation) async throws {
         try await withCheckedThrowingContinuation { c in queue.async { [self] in
-            if let pending = progress, pending.revision <= snapshot.revision { progress = nil }
+            for file in snapshot.files where progress[file.url].map({ $0.revision <= snapshot.revision }) == true { progress[file.url] = nil }
             do { try apply(snapshot, transaction: transaction, retainingEvidence: retainingEvidence); c.resume() }
             catch { c.resume(throwing: error) }
         } }
@@ -156,16 +199,18 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     func enqueueProgress(_ snapshot: Snapshot, failed: @escaping @Sendable (Error) -> Void) {
         queue.async { [self] in
             if let failure { failed(failure); return }
-            if progress == nil || progress!.revision < snapshot.revision { progress = snapshot }
+            for file in snapshot.files where snapshot.revision > applied[file.url, default: 0] && snapshot.revision > (progress[file.url]?.revision ?? 0) {
+                progress[file.url] = Pending(revision: snapshot.revision, file: file)
+            }
             guard !progressScheduled else { return }; progressScheduled = true
             queue.asyncAfter(deadline: .now() + .milliseconds(25)) { [self] in
-                progressScheduled = false; guard let pending = progress else { return }; progress = nil
-                do { try apply(pending) } catch { failed(error) }
+                progressScheduled = false
+                do { try drainProgress() } catch { failed(error) }
             }
         }
     }
     func statistics() async -> [String: Int] {
-        await withCheckedContinuation { c in queue.async { [self] in c.resume(returning: writes) } }
+        await withCheckedContinuation { c in queue.async { [self] in c.resume(returning: writes.merging(["encodings": encodings, "retainedBytes": committed.values.reduce(0) { $0 + $1.count }]) { _, value in value }) } }
     }
     func fault() async -> Fault? {
         await withCheckedContinuation { c in queue.async { [self] in c.resume(returning: failure) } }
@@ -198,8 +243,11 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                         throw RequestWorkerEvidenceError(cause: "In-session rollback data is unavailable. Restore the accepted journal files manually before retrying storage recovery: " + path)
                     }
                 }
-            } else { try restore(undo, proposed: candidates) }
-            recoveryAllowed = true; committed.removeAll(); progress = nil
+            } else {
+                do { try restore(undo, proposed: candidates) }
+                catch { throw fail(error, operation: fault.operation, files: undo.keys.sorted { $0.path < $1.path }, before: undo, proposed: candidates) }
+            }
+            recoveryAllowed = true; committed.removeAll(); progress = [:]
             return fault.id
         }
     }
@@ -207,9 +255,11 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         try await perform { [self] in
             guard failure?.id == expected else { throw RequestWorkerEvidenceError(cause: "Storage recovery was superseded by a newer fault.") }
             if let file = faultFile, RequestProcessIdentity.evidenceExists(file) {
-                try FileManager.default.removeItem(at: file)
-                let fd = open(file.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-                guard fd >= 0 else { throw POSIXError(.EIO) }; defer { close(fd) }; guard fsync(fd) == 0 else { throw POSIXError(.EIO) }
+                do {
+                    try FileManager.default.removeItem(at: file)
+                    let fd = open(file.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+                    guard fd >= 0 else { throw POSIXError(.EIO) }; defer { close(fd) }; guard fsync(fd) == 0 else { throw POSIXError(.EIO) }
+                } catch { throw fail(error, operation: failure?.operation ?? "finish storage recovery", files: [file], before: undo, proposed: candidates) }
             }
             failure = nil; undo = [:]; candidates = [:]; recoveryAllowed = false
         }
@@ -222,14 +272,14 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             if let failure, !recoveryAllowed { c.resume(throwing: failure); return }
             var before: [URL: Image] = [:]
             do {
-                if let pending = progress { progress = nil; try apply(pending) }
+                try drainProgress()
                 before[file] = try committed[file].map(Image.file) ?? image(file)
                 if let transaction, transactions[transaction]?.before[file] == nil { transactions[transaction]?.before[file] = before[file] }
-                if let transaction { transactions[transaction]?.candidates[file] = bytes }
+                if let transaction { transactions[transaction]?.candidates[file, default: []].insert(CatalogHash.sha256(bytes)) }
                 try replace(bytes, at: file); c.resume()
             } catch {
                 let tx = transaction.flatMap { transactions[$0] }
-                c.resume(throwing: fail(error, operation: tx?.operation ?? "write " + file.lastPathComponent, files: [file], before: tx?.before ?? before, proposed: tx?.candidates ?? [file: bytes]))
+                c.resume(throwing: fail(error, operation: tx?.operation ?? "write " + file.lastPathComponent, files: [file], before: tx?.before ?? before, proposed: tx?.candidates ?? [file: [CatalogHash.sha256(bytes)]]))
             }
         } }
     }
