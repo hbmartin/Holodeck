@@ -53,6 +53,15 @@ nonisolated struct RequestWorkerEvent: Decodable, Sendable {
     var requiredPreviewShaderIDs: [String]?
     var checkoutID: String?
     var result: ShaderRequestResult?
+    var failureError: Error? {
+        guard event == "failure" else { return nil }
+        let detail = message ?? "Shader worker failed"
+        if recoveryRequired == true { return RequestWorkerTeardownError(cause: detail) }
+        if failureKind == "supervision" || failureKind == "interrupted" {
+            return RequestWorkerSupervisionError(message: detail, retryable: failureKind == "supervision" && retryable != false)
+        }
+        return ShaderRequestError.unavailable(detail)
+    }
 }
 
 public enum ShaderCheckoutDetachTarget: Sendable {
@@ -74,6 +83,8 @@ public struct ShaderRequestRecoveryStatus: Sendable, Identifiable {
     public var journal: URL? = nil
     public var checkout: ShaderRequestConfiguration? = nil
     public var disposition: ShaderRequestRecoveryDisposition? = nil
+    public var isRetrying = false
+    public var repairConfiguration: ShaderRequestConfiguration? = nil
 }
 
 public struct ShaderRequestPublicationStatus: Sendable {
@@ -133,7 +144,11 @@ public actor ShaderRequestService {
     private var recovery = RequestRecoveryStore()
     private let waitForWorker: @Sendable (RequestWorkerProcess) async throws -> Void
     private let reconcileWorker: @Sendable (URL) async throws -> Void
-    private let recoveryWriter: @Sendable (Data, URL) throws -> Void
+    private let persistence: RequestPersistence
+    private var persistenceRevision: UInt64 = 0
+    private var persistenceEpoch: UInt64 = 0
+    private var pendingCommits = 0
+    private var persistenceFailure: String?
     private let prepareCleanup: @Sendable () async -> Void
     private var configuration = ShaderRequestConfiguration()
     private var records: [UUID: Record] = [:]
@@ -198,6 +213,7 @@ public actor ShaderRequestService {
     private var detachedOwners: [DetachedCheckoutAcknowledgement] = []
     private var suspended = false
     private var loaded = false
+    private var activeRetryJournals: [String: UUID] = [:]
     private var recoveryID: UUID?
     private var setupMessage = "Enable shader requests in Mac Settings."
 
@@ -205,7 +221,7 @@ public actor ShaderRequestService {
         self.catalog = catalog; self.directory = directory; self.workerScript = nil
         self.waitForWorker = { try await $0.waitForExit() }
         self.reconcileWorker = { try RequestWorkerProcess.reconcileOrphan(in: $0) }
-        self.recoveryWriter = { try RequestJournalWriter.write($0, to: $1) }
+        self.persistence = RequestPersistence()
         self.prepareCleanup = {}
     }
     init(catalog: DirectoryCatalog, directory: URL, workerScript: URL,
@@ -214,7 +230,7 @@ public actor ShaderRequestService {
          recoveryWriter: @escaping @Sendable (Data, URL) throws -> Void = { try RequestJournalWriter.write($0, to: $1) },
          prepareCleanup: @escaping @Sendable () async -> Void = {}) {
         self.catalog = catalog; self.directory = directory; self.workerScript = workerScript
-        self.reconcileWorker = reconcileWorker; self.waitForWorker = waitForWorker; self.recoveryWriter = recoveryWriter
+        self.reconcileWorker = reconcileWorker; self.waitForWorker = waitForWorker; self.persistence = RequestPersistence(recoveryWriter: recoveryWriter)
         self.prepareCleanup = prepareCleanup
     }
     private func workerProcess() -> RequestWorkerProcess { RequestWorkerProcess(script: workerScript) }
@@ -246,12 +262,12 @@ public actor ShaderRequestService {
         }
     }
 
-    public func start(configuration: ShaderRequestConfiguration) throws {
-        try initialize(configuration: configuration)
+    public func start(configuration: ShaderRequestConfiguration) async throws {
+        try await initialize(configuration: configuration)
         activateScheduling()
     }
-    public func initialize(configuration: ShaderRequestConfiguration) throws {
-        try load()
+    public func initialize(configuration: ShaderRequestConfiguration) async throws {
+        try await load()
         guard !selectingRepository else { throw ShaderRequestError.unavailable("Wait for the selected folder to finish loading.") }
         let previous = self.configuration
         let preferences = directory.appendingPathComponent("preferences.json")
@@ -270,9 +286,10 @@ public actor ShaderRequestService {
         if !self.configuration.enabled { cancelPublicationRequests() }
         initialized = true
         setupMessage = self.configuration.enabled ? "Ready for shader requests" : "Enable shader requests in Mac Settings."
+        emitUpdates()
     }
     public func activateScheduling() { schedulingActive = true; kick() }
-    private func load() throws {
+    private func load() async throws {
         guard !loaded else { return }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let file = directory.appendingPathComponent("journal.json")
@@ -317,16 +334,14 @@ public actor ShaderRequestService {
                 key == value.journal && URL(fileURLWithPath: key).deletingLastPathComponent().path == RequestPaths.canonical(directory)
             }) else { throw ShaderRequestError.unavailable("Recovery journal is invalid. Retain recovery.json and repair it before reusing this checkout.") }
         }
-        if let entry = recovery.entries.values.first {
-            reconciliationFailure = entry.message; reconciliationJournal = URL(fileURLWithPath: entry.journal)
-            reconciliationConfiguration = entry.configuration
-        }
+        refreshReconciliationFailure()
         loaded = true
-        try persist()
+        try await persist()
     }
     private func folder(_ id: UUID) -> URL { directory.appendingPathComponent(id.uuidString) }
     public func artifacts(for id: UUID) -> URL { folder(id) }
     public func configurationValue() -> ShaderRequestConfiguration { configuration }
+    func persistenceStatistics() async -> [String: Int] { await persistence.statistics() }
     private func requireRepositorySelection() throws {
         guard !configuration.enabled else { throw ShaderRequestError.unavailable("Disable shader requests before selecting another checkout.") }
         guard activeID == nil, !maintenanceBusy, workerTask == nil else { throw ShaderRequestError.unavailable("Wait for active library preparation or checkout work before selecting another folder.") }
@@ -341,7 +356,7 @@ public actor ShaderRequestService {
         if selected.repository != RequestPaths.canonical(URL(fileURLWithPath: configuration.repository)) { selected.checkoutID = nil }
         return selected
     }
-    private func retireMaintenanceOperations(replacing accepted: ShaderRequestConfiguration) throws {
+    private func retireMaintenanceOperations(replacing accepted: ShaderRequestConfiguration) async throws {
         guard !Self.samePublicationCheckout(configuration, accepted) else { return }
         for name in ["setup", "publication"] {
             let journal = directory.appendingPathComponent(name)
@@ -349,9 +364,9 @@ public actor ShaderRequestService {
             do {
                 if let saved = try Self.savedConfiguration(in: journal), Self.samePublicationCheckout(saved, configuration) {
                     target = saved
-                    try RequestWorkerOperation.retire(in: journal)
+                    try await persistence.perform { try RequestWorkerOperation.retire(in: journal) }
                 }
-            } catch { holdForRecovery(journal: journal, configuration: target, error: error); throw error }
+            } catch { await holdForRecovery(journal: journal, configuration: target, error: error); throw error }
         }
     }
     private func acceptRepository(_ accepted: ShaderRequestConfiguration) {
@@ -362,20 +377,20 @@ public actor ShaderRequestService {
         _ = publicationState(.idle)
     }
     @discardableResult public func selectRepository(_ repository: URL) async throws -> ShaderRequestConfiguration {
-        try load()
+        try await load()
         if RequestPaths.canonical(repository) == RequestPaths.canonical(URL(fileURLWithPath: configuration.repository)) { return configuration }
         try requireRepositorySelection()
         try await reconcileWorkers(); try requireRepositorySelection()
         let lease = try beginMaintenance(); defer { endMaintenance(lease) }
         let accepted = selectedConfiguration(repository)
-        try retireMaintenanceOperations(replacing: accepted)
-        try JSONEncoder().encode(accepted).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
+        try await retireMaintenanceOperations(replacing: accepted)
+        try await persistence.write(JSONEncoder().encode(accepted), to: directory.appendingPathComponent("preferences.json"))
         acceptRepository(accepted)
         return accepted
     }
     /// Folder selection, publication and persisted management configuration share one lease.
     public func reloadRepository(_ repository: URL) async throws -> ShaderRepositorySelection {
-        try load(); try requireRepositorySelection()
+        try await load(); try requireRepositorySelection()
         try await reconcileWorkers(); try requireRepositorySelection()
         let lease = try beginMaintenance(); selectingRepository = true
         defer { selectingRepository = false; endMaintenance(lease) }
@@ -383,15 +398,15 @@ public actor ShaderRequestService {
         let prepared = try await catalog.prepare(from: repository)
         do {
             try checkMaintenance(lease)
-            try retireMaintenanceOperations(replacing: accepted)
-            try JSONEncoder().encode(accepted).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
+            try await retireMaintenanceOperations(replacing: accepted)
+            try await persistence.write(JSONEncoder().encode(accepted), to: directory.appendingPathComponent("preferences.json"))
             let publication: CatalogReloadResult
             do { publication = try await catalog.install(prepared.id) }
             catch {
-                do { try JSONEncoder().encode(previous).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic) }
+                do { try await persistence.write(JSONEncoder().encode(previous), to: directory.appendingPathComponent("preferences.json")) }
                 catch {
                     let journal = directory.appendingPathComponent("selection")
-                    holdForRecovery(journal: journal, configuration: previous, error: error, preferencesRollback: previous)
+                    await holdForRecovery(journal: journal, configuration: previous, error: error, preferencesRollback: previous)
                 }
                 throw error
             }
@@ -400,8 +415,18 @@ public actor ShaderRequestService {
         } catch { await catalog.discard(prepared.id); throw error }
     }
     public func hasPendingCleanup() -> Bool { records.values.contains { $0.cleanupPending == true } }
+    private func isActiveRetry(_ key: String) -> Bool {
+        activeRetryJournals[key] == execution?.id && execution?.interrupted == false
+    }
+    private func refreshReconciliationFailure() {
+        if let entry = recovery.entries.values.sorted(by: { $0.journal < $1.journal }).first(where: { !isActiveRetry($0.journal) }) {
+            reconciliationFailure = entry.message; reconciliationJournal = URL(fileURLWithPath: entry.journal)
+            reconciliationConfiguration = entry.configuration
+        } else { reconciliationFailure = nil; reconciliationJournal = nil; reconciliationConfiguration = nil }
+    }
     private var recoveryBlocker: String? {
-        if let entry = recovery.entries.values.first { return "Mac checkout recovery required: " + entry.message }
+        if let persistenceFailure { return "Mac persistence recovery required: " + persistenceFailure }
+        if let entry = recovery.entries.values.sorted(by: { $0.journal < $1.journal }).first(where: { !isActiveRetry($0.journal) }) { return "Mac checkout recovery required: " + entry.message }
         if let reconciliationFailure { return "Mac checkout recovery required: " + reconciliationFailure }
         if let record = records.values.first(where: { $0.cleanupPending == true }) {
             return "Mac checkout recovery required: " + (record.cleanupFailure ?? record.cleanupMessage ?? "Checkout cleanup is pending.")
@@ -482,8 +507,8 @@ public actor ShaderRequestService {
         for entry in recovery.entries.values.sorted(by: { $0.journal < $1.journal }) {
             statuses.append(ShaderRequestRecoveryStatus(id: entry.id, kind: .reconciliation,
                 repository: entry.configuration?.repository ?? "", python: entry.configuration?.python ?? "", git: entry.configuration?.git ?? "",
-                message: entry.message, isRunning: reconciliationTask != nil, requestID: entry.requestID,
-                journal: URL(fileURLWithPath: entry.journal), checkout: entry.configuration, disposition: entry.disposition))
+                message: entry.message, isRunning: reconciliationTask != nil || maintenanceBusy || activeID != nil, requestID: entry.requestID,
+                journal: URL(fileURLWithPath: entry.journal), checkout: entry.configuration, disposition: entry.disposition, isRetrying: isActiveRetry(entry.journal), repairConfiguration: proposedMaintenanceConfiguration(entry)))
         }
         if recovery.entries.isEmpty, let reconciliationFailure {
             statuses.append(ShaderRequestRecoveryStatus(id: Self.reconciliationStatusID, kind: .reconciliation,
@@ -499,8 +524,8 @@ public actor ShaderRequestService {
         let legacyDetachKeys = recovery.entries.filter { $0.value.disposition == .detach && $0.value.archiveID == nil }.map(\.key)
         for key in legacyDetachKeys { recovery.entries[key]?.archiveID = UUID() }
         // A prior failed write may have left a new archive ID only in memory.
-        if recovery.entries.values.contains(where: { $0.disposition == .detach }) { try persistRecovery() }
-        if let entry = recovery.entries.values.first(where: { $0.configurationRepair != nil }) {
+        if recovery.entries.values.contains(where: { $0.disposition == .detach }) { try await persistRecovery() }
+        if let entry = recovery.entries.values.first(where: { $0.configurationRepair != nil || $0.maintenanceRepair != nil }) {
             throw RequestWorkerEvidenceError(cause: "A saved cleanup configuration repair must be completed with Retry Recovery: " + entry.journal)
         }
         if reconciliationTask == nil {
@@ -524,7 +549,7 @@ public actor ShaderRequestService {
                     do { try await reconcile(folder) }
                     catch {
                         let key = RequestPaths.canonical(folder)
-                        if retained[key]?.disposition == .detach, !(error is RequestWorkerTeardownError), !(error is RequestWorkerOwnershipError) { continue }
+                        if retained[key]?.disposition == .detach, !(error is RequestWorkerTeardownError), !(error is RequestWorkerOwnershipError), !(error is CancellationError) { continue }
                         let target = all.first { RequestPaths.canonical($0.2) == key }?.1 ?? retained[key]?.configuration
                             ?? (try? Self.savedConfiguration(in: folder))
                         throw ReconciliationError(journal: folder, configuration: target, underlying: error)
@@ -573,14 +598,14 @@ public actor ShaderRequestService {
                 detachedOwners.removeAll { $0.requestID == acknowledgement.requestID }; detachedOwners.append(acknowledgement)
                 if Self.matchesDetachedCheckout(configuration, acknowledgement: acknowledgement) {
                     configuration.enabled = false
-                    try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
+                    try await persistence.write(JSONEncoder().encode(configuration), to: directory.appendingPathComponent("preferences.json"))
                 }
             }
             // Finalization is idempotent; entries remain durable until record/ack writes finish.
-            for entry in recovery.entries.values where entry.disposition == .detach { try finalizeDetachment(entry) }
+            for entry in recovery.entries.values where entry.disposition == .detach { try await finalizeDetachment(entry) }
             for entry in recovery.entries.values {
                 if let rollback = entry.preferencesRollback {
-                    try JSONEncoder().encode(rollback).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
+                    try await persistence.write(JSONEncoder().encode(rollback), to: directory.appendingPathComponent("preferences.json"))
                     configuration = rollback
                 }
                 guard let id = entry.requestID, records[id]?.detached != true else { continue }
@@ -588,7 +613,7 @@ public actor ShaderRequestService {
                 case .resume:
                     if records[id]?.cleanupPending != true, records[id]?.status.stage != .awaitingClarification,
                        records[id]?.status.stage != .awaitingActivation, records[id]?.status.stage.terminal == false {
-                        recoveryID = id; try update(id, stage: .repairing, message: "Resuming preserved work after process recovery")
+                        recoveryID = id; try await update(id, stage: .repairing, message: "Resuming preserved work after process recovery")
                     }
                 case .cleanup: records[id]?.cleanupFailure = nil
                 case .retainResult, .detach: break
@@ -599,13 +624,15 @@ public actor ShaderRequestService {
                 if let stage = records[owner]?.status.stage, stage.terminal || stage == .awaitingActivation || stage == .awaitingClarification {
                     records[owner]?.cleanupPending = true
                     records[owner]?.cleanupMessage = "Cleaning interrupted owned work; pushed commits are retained"
-                    if !stage.terminal && stage != .awaitingActivation { try update(owner, stage: .failed, message: "Interrupted checkout cleanup is required") }
-                } else if records[owner]?.status.stage != .repairing { try update(owner, stage: .repairing, message: "Recovering interrupted owned work") }
+                    if !stage.terminal && stage != .awaitingActivation { try await update(owner, stage: .failed, message: "Interrupted checkout cleanup is required") }
+                } else if records[owner]?.status.stage != .repairing { try await update(owner, stage: .repairing, message: "Recovering interrupted owned work") }
             }
             recovery.legacyMigrationComplete = true
-            try persist()
-            recovery.entries.removeAll(); try persist()
-            reconciled = true; reconciliationTask = nil; reconciliationFailure = nil; reconciliationJournal = nil; reconciliationConfiguration = nil
+            try await persist()
+            guard reconciliationTask?.id == attempt.id, reconciliationEpoch == attempt.epoch, !detaching else { return }
+            recovery.entries.removeAll(); try await persist()
+            guard reconciliationTask?.id == attempt.id, reconciliationEpoch == attempt.epoch, !detaching else { return }
+            reconciled = true; reconciliationTask = nil; refreshReconciliationFailure()
             emitUpdates()
         } catch {
             if detaching, error is CancellationError { throw error }
@@ -613,9 +640,9 @@ public actor ShaderRequestService {
                 let detail = error as? ReconciliationError
                 reconciliationTask = nil
                 if let detail {
-                    holdForRecovery(journal: detail.journal, configuration: detail.configuration, error: detail.underlying)
+                    await holdForRecovery(journal: detail.journal, configuration: detail.configuration, error: detail.underlying)
                 } else {
-                    holdForRecovery(journal: reconciliationJournal ?? directory.appendingPathComponent("setup"),
+                    await holdForRecovery(journal: reconciliationJournal ?? directory.appendingPathComponent("setup"),
                         configuration: reconciliationConfiguration, error: error)
                 }
                 failPendingPublicationForRecovery(reconciliationFailure ?? error.localizedDescription)
@@ -627,11 +654,30 @@ public actor ShaderRequestService {
     nonisolated private static func hasProcessEvidence(_ journal: URL) -> Bool {
         ["process.json", "children.json", "supervision.json"].contains { RequestProcessIdentity.evidenceExists(journal.appendingPathComponent($0)) }
     }
-    private func persistRecovery() throws {
-        try recoveryWriter(JSONEncoder().encode(recovery), directory.appendingPathComponent("recovery.json"))
+    private func persistRecovery(retainingEvidence: Bool = false) async throws {
+        try await commitFiles([.init(url: directory.appendingPathComponent("recovery.json"), bytes: recovery.encoded())], retainingEvidence: retainingEvidence)
+    }
+    private func commitFiles(_ files: [RequestPersistence.File], retainingEvidence: Bool = false) async throws {
+        persistenceRevision &+= 1
+        let snapshot = RequestPersistence.Snapshot(revision: persistenceRevision, files: files), epoch = persistenceEpoch
+        pendingCommits += 1; defer { pendingCommits -= 1 }
+        do { try await persistence.commit(snapshot, retainingEvidence: retainingEvidence) }
+        catch {
+            if epoch == persistenceEpoch { persistenceFailure = error.localizedDescription }
+            throw error
+        }
+    }
+    private func resetPersistenceFailure() async {
+        persistenceEpoch &+= 1
+        await persistence.resumeAfterExplicitRecovery()
+        persistenceFailure = nil
+    }
+    private func progressPersistenceFailed(_ error: Error, epoch: UInt64) {
+        guard epoch == persistenceEpoch else { return }
+        persistenceFailure = error.localizedDescription; activeProcess?.shutdown(); emitUpdates()
     }
     private func holdForRecovery(journal: URL, configuration target: ShaderRequestConfiguration?, error: Error,
-                                 preferencesRollback: ShaderRequestConfiguration? = nil) {
+                                 preferencesRollback: ShaderRequestConfiguration? = nil) async {
         let key = RequestPaths.canonical(journal), id = records.keys.first { RequestPaths.canonical(folder($0)) == key }
         let disposition: ShaderRequestRecoveryDisposition
         if let id, records[id]?.cleanupPending == true || records[id]?.revoked == true { disposition = .cleanup }
@@ -640,29 +686,34 @@ public actor ShaderRequestService {
         var entry = recovery.entries[key] ?? .init(journal: key, requestID: id, configuration: target, disposition: disposition, message: error.localizedDescription)
         entry.configuration = entry.configuration ?? target
         let detail = error.localizedDescription
-        if !entry.message.contains(detail) { entry.message += " Additional recovery error: " + detail }
+        entry.appendDiagnostic(detail)
         if let preferencesRollback { entry.preferencesRollback = preferencesRollback }
         recovery.entries[key] = entry
         reconciliationFailure = entry.message; reconciliationJournal = URL(fileURLWithPath: key); reconciliationConfiguration = entry.configuration; invalidateJournal(key)
-        do { try persistRecovery(); try persist() }
+        do { try await persistRecovery(retainingEvidence: true); try await persist() }
         catch {
-            entry.message += " Recovery state could not be saved: " + error.localizedDescription
-            recovery.entries[key] = entry; reconciliationFailure = entry.message; emitUpdates()
+            var current = recovery.entries[key] ?? entry
+            current.appendDiagnostic("Recovery state could not be saved: " + error.localizedDescription)
+            recovery.entries[key] = current; refreshReconciliationFailure(); emitUpdates()
         }
+        let log = URL(fileURLWithPath: key).appendingPathComponent("recovery-diagnostic.log")
+        _ = try? await persistence.perform { try RequestJournalWriter.appendDiagnostic(detail, to: log) }
     }
-    private func appendRecoveryFailure(journal: URL, configuration: ShaderRequestConfiguration?, error: Error) {
+    private func appendRecoveryFailure(journal: URL, configuration: ShaderRequestConfiguration?, error: Error) async {
         let key = RequestPaths.canonical(journal)
-        guard var entry = recovery.entries[key] else { holdForRecovery(journal: journal, configuration: configuration, error: error); return }
+        guard var entry = recovery.entries[key] else { await holdForRecovery(journal: journal, configuration: configuration, error: error); return }
         let detail = error.localizedDescription
-        if !entry.message.contains(detail) { entry.message += " Additional recovery error: " + detail }
+        entry.appendDiagnostic(detail)
         recovery.entries[key] = entry; reconciliationFailure = entry.message; invalidateJournal(key)
-        do { try persist() } catch { reconciliationFailure = entry.message + " Recovery state could not be saved: " + error.localizedDescription; emitUpdates() }
+        do { try await persistRecovery(retainingEvidence: true); try await persist() } catch { reconciliationFailure = entry.message + " Recovery state could not be saved: " + error.localizedDescription; emitUpdates() }
+        let log = URL(fileURLWithPath: key).appendingPathComponent("recovery-diagnostic.log")
+        _ = try? await persistence.perform { try RequestJournalWriter.appendDiagnostic(detail, to: log) }
     }
-    private func finalizeDetachment(_ entry: RequestRecoveryStore.Entry) throws {
+    private func finalizeDetachment(_ entry: RequestRecoveryStore.Entry) async throws {
         guard let archiveID = entry.archiveID else {
             throw RequestWorkerEvidenceError(cause: "Detachment archive intent is missing; retry explicit Detach.")
         }
-        try RequestJournalWriter.archive(in: URL(fileURLWithPath: entry.journal), id: archiveID)
+        try await persistence.perform { try RequestJournalWriter.archive(in: URL(fileURLWithPath: entry.journal), id: archiveID) }
         guard let id = entry.requestID, let target = entry.configuration else { return }
         let acknowledgement = Self.acknowledgement(id: id, job: URL(fileURLWithPath: entry.journal), configuration: target)
         detachedOwners.removeAll { $0.requestID == id }; detachedOwners.append(acknowledgement)
@@ -671,7 +722,7 @@ public actor ShaderRequestService {
             records[id]?.detached = true; records[id]?.interrupted = true
             records[id]?.cleanupPending = false; records[id]?.cleanupFailure = nil
             if !wasDetached, records[id]?.status.stage.terminal == false {
-                try update(id, stage: .failed, message: "Checkout detached; unpublished files and evidence were retained")
+                try await update(id, stage: .failed, message: "Checkout detached; unpublished files and evidence were retained")
             }
         }
     }
@@ -688,20 +739,26 @@ public actor ShaderRequestService {
     public func retryReconciliation() async throws {
         guard activeID == nil, !maintenanceBusy else { throw ShaderRequestError.unavailable("Wait for active checkout work to finish.") }
         let lease = try beginMaintenance(); defer { endMaintenance(lease) }
-        try await drainReconciliation(lease: lease)
+        await resetPersistenceFailure(); try await drainReconciliation(lease: lease)
         var failures: [String] = []
         for key in recovery.entries.keys.sorted() {
             guard let entry = recovery.entries[key] else { continue }
             do {
                 let journal = URL(fileURLWithPath: entry.journal)
-                try await reconcileWorker(journal); try checkMaintenance(lease)
-                if let repair = entry.configurationRepair {
+                do { try await reconcileWorker(journal) }
+                catch where entry.disposition == .detach && !(error is RequestWorkerTeardownError) && !(error is RequestWorkerOwnershipError) && !(error is CancellationError) {
+                    // Exact-entry finalization archives unverifiable markers after settlement.
+                }
+                try checkMaintenance(lease)
+                if let repair = entry.maintenanceRepair {
+                    try await completeMaintenanceRepair(key, repair: repair, lease: lease)
+                } else if let repair = entry.configurationRepair {
                     guard let id = entry.requestID else { throw RequestWorkerOwnershipError() }
                     try await Task.detached { try Self.validateRecoveryCheckout(repair.corrected, id: id, job: journal) }.value
                     try checkMaintenance(lease)
-                    try completeConfigurationRepair(key)
+                    try await completeConfigurationRepair(key, lease: lease)
                 } else if entry.disposition == .retainResult {
-                    try RequestWorkerOperation.retire(in: journal)
+                    try await persistence.perform { try RequestWorkerOperation.retire(in: journal) }
                 } else if entry.disposition != .detach, try RequestWorkerOperation.read(in: journal) != nil {
                     guard let target = entry.configuration else { throw RequestWorkerOwnershipError() }
                     let saved = try Self.savedConfiguration(in: journal)
@@ -712,41 +769,136 @@ public actor ShaderRequestService {
                         try await Task.detached { try Self.validateMaintenanceRecoveryCheckout(target) }.value
                     }
                     try checkMaintenance(lease)
-                    try RequestWorkerOperation.restartPaused(in: journal, configuration: target, repairLegacyMismatch: true)
+                    try await persistence.perform { try RequestWorkerOperation.restartPaused(in: journal, configuration: target, repairLegacyMismatch: true) }
                 }
-                try persist()
+                try await persist()
             } catch is CancellationError { throw CancellationError() }
             catch {
                 failures.append(entry.journal + ": " + error.localizedDescription)
-                appendRecoveryFailure(journal: URL(fileURLWithPath: entry.journal), configuration: entry.configuration, error: error)
+                await appendRecoveryFailure(journal: URL(fileURLWithPath: entry.journal), configuration: entry.configuration, error: error)
             }
         }
         if !failures.isEmpty { throw ShaderRequestError.unavailable(failures.joined(separator: "\n")) }
         try await reconcileWorkers(); try checkMaintenance(lease)
-        try persist()
+        try await persist()
     }
 
-    private func completeConfigurationRepair(_ key: String) throws {
-        guard let entry = recovery.entries[key], let repair = entry.configurationRepair else { return }
-        let journal = URL(fileURLWithPath: entry.journal)
-        try RequestWorkerOperation.restartPaused(in: journal, configuration: repair.corrected, repairLegacyMismatch: true)
-        for id in repair.requestIDs {
-            guard let existing = records[id], existing.detached != true,
-                  Self.samePublicationCheckout(existing.configuration, repair.previous) || Self.samePublicationCheckout(existing.configuration, repair.corrected) else {
-                throw RequestWorkerOwnershipError()
+    private func completeConfigurationRepair(_ key: String, lease: UUID) async throws {
+        guard let entry = recovery.entries[key], var repair = entry.configurationRepair else { return }
+        guard repair.version == nil || repair.version == 1 || repair.version == 2 else { throw RequestWorkerEvidenceError(cause: "Unsupported cleanup repair intent version.") }
+        if repair.participants == nil {
+            var participants: [RequestRecoveryStore.ConfigurationRepair.Participant] = []
+            for id in repair.requestIDs {
+                guard let record = records[id] else {
+                    let path = folder(id)
+                    guard !RequestProcessIdentity.evidenceExists(path), try Self.ownerMarker(repair.corrected)?.id != id else { throw RequestWorkerOwnershipError() }
+                    continue // Older versions permitted deleting a terminal participant and its entire folder.
+                }
+                guard record.detached != true, Self.samePublicationCheckout(record.configuration, repair.previous) || Self.samePublicationCheckout(record.configuration, repair.corrected) else { throw RequestWorkerOwnershipError() }
+                let corrected = repair.applying(to: record.configuration, primary: id == entry.requestID)
+                if corrected != record.configuration || id == entry.requestID {
+                    participants.append(.init(requestID: id, change: .init(previous: record.configuration, corrected: corrected),
+                        mode: record.cleanupPending == true ? "discard" : "run", oldID: try RequestWorkerOperation.read(in: folder(id))?.id))
+                }
             }
-            records[id]?.configuration = repair.corrected
+            repair.version = 2; repair.participants = participants; repair.requestIDs = participants.map(\.requestID)
+            if repair.updatePreferences {
+                guard Self.samePublicationCheckout(configuration, repair.previous) || Self.samePublicationCheckout(configuration, repair.corrected) else { throw RequestWorkerOwnershipError() }
+                repair.preferences = .init(previous: configuration, corrected: repair.applying(to: configuration))
+            }
+            recovery.entries[key]?.configurationRepair = repair; try await persistRecovery()
         }
-        try persist() // Intent remains durable while records and preferences converge.
-        if repair.updatePreferences {
-            guard Self.samePublicationCheckout(configuration, repair.previous) || Self.samePublicationCheckout(configuration, repair.corrected) else { throw RequestWorkerOwnershipError() }
-            try RequestJournalWriter.write(JSONEncoder().encode(repair.corrected), to: directory.appendingPathComponent("preferences.json"))
-            configuration = repair.corrected
+        guard repair.version == 2, Set(repair.requestIDs).count == repair.requestIDs.count,
+              Set(repair.participants?.map(\.requestID) ?? []) == Set(repair.requestIDs) else { throw RequestWorkerOwnershipError() }
+        func validChange(_ change: RequestRecoveryStore.ConfigurationRepair.Change) -> Bool {
+            var expected = change.previous
+            expected.repository = change.corrected.repository; expected.python = change.corrected.python; expected.git = change.corrected.git
+            return expected == change.corrected && Self.samePublicationCheckout(change.previous, change.corrected)
         }
-        recovery.entries[key]?.configuration = repair.corrected
+        if let preferences = repair.preferences, !validChange(preferences) { throw RequestWorkerOwnershipError() }
+        for participant in repair.participants ?? [] {
+            guard validChange(participant.change), ["run", "discard"].contains(participant.mode) else { throw RequestWorkerOwnershipError() }
+            try await reconcileWorker(folder(participant.requestID))
+            try checkMaintenance(lease)
+            guard let record = records[participant.requestID], record.detached != true,
+                  record.configuration == participant.change.previous || record.configuration == participant.change.corrected else { throw RequestWorkerOwnershipError() }
+        }
+        for participant in repair.participants ?? [] {
+            let journal = folder(participant.requestID)
+            try await persistence.perform { try RequestWorkerOperation.repair(in: journal, mode: participant.mode,
+                previous: participant.change.previous, corrected: participant.change.corrected, oldID: participant.oldID, newID: participant.newID) }
+            try checkMaintenance(lease)
+        }
+        for participant in repair.participants ?? [] { records[participant.requestID]?.configuration = participant.change.corrected }
+        try await persist() // Retain the intent until bindings, records and preferences converge.
+        try checkMaintenance(lease)
+        if let preferences = repair.preferences {
+            guard configuration == preferences.previous || configuration == preferences.corrected else { throw RequestWorkerOwnershipError() }
+            try await persistence.write(JSONEncoder().encode(preferences.corrected), to: directory.appendingPathComponent("preferences.json"))
+            configuration = preferences.corrected
+        }
+        recovery.entries[key]?.configuration = records[entry.requestID ?? UUID()]?.configuration ?? repair.corrected
         recovery.entries[key]?.configurationRepair = nil
         if let id = entry.requestID { records[id]?.cleanupFailure = nil; recoveryID = id }
-        try persist()
+        try await persist()
+    }
+
+    private func proposedMaintenanceConfiguration(_ entry: RequestRecoveryStore.Entry) -> ShaderRequestConfiguration? {
+        guard entry.requestID == nil, entry.disposition != .detach, entry.maintenanceRepair == nil, let operation = try? RequestWorkerOperation.read(in: URL(fileURLWithPath: entry.journal)),
+              ["preflight", "publication"].contains(operation.mode), let target = operation.target else { return nil }
+        var proposed = operation.binding.flatMap { try? JSONDecoder().decode(ShaderRequestConfiguration.self, from: $0.replacement) } ?? configuration
+        proposed.repository = target.repository; proposed.checkoutID = target.checkoutID
+        return proposed
+    }
+    public func repairMaintenanceRecovery(_ id: UUID, configuration candidate: ShaderRequestConfiguration) async throws {
+        guard activeID == nil, !maintenanceBusy, let entry = recovery.entries.values.first(where: { $0.id == id }),
+              entry.requestID == nil, let original = try RequestWorkerOperation.read(in: URL(fileURLWithPath: entry.journal)),
+              ["preflight", "publication"].contains(original.mode), let target = original.target else { throw RequestWorkerOwnershipError() }
+        let lease = try beginMaintenance(); defer { endMaintenance(lease) }
+        await resetPersistenceFailure(); try await drainReconciliation(lease: lease)
+        var candidate = candidate; candidate.repository = RequestPaths.canonical(URL(fileURLWithPath: candidate.repository)); candidate.checkoutID = target.checkoutID
+        guard RequestWorkerOperation.Target(candidate) == target else { throw RequestWorkerOwnershipError() }
+        try await Task.detached { [candidate] in try Self.validateMaintenanceRecoveryCheckout(candidate) }.value
+        try checkMaintenance(lease); try await reconcileWorker(URL(fileURLWithPath: entry.journal)); try checkMaintenance(lease)
+        let repair = RequestRecoveryStore.MaintenanceRepair(operation: original, configuration: candidate)
+        let prior = recovery.entries[entry.journal]
+        recovery.entries[entry.journal]?.maintenanceRepair = repair
+        try await commitRepairIntent(key: entry.journal, previous: prior)
+        try checkMaintenance(lease)
+        try await completeMaintenanceRepair(entry.journal, repair: repair, lease: lease)
+        try await reconcileWorkers(); try checkMaintenance(lease)
+    }
+    private func commitRepairIntent(key: String, previous: RequestRecoveryStore.Entry?) async throws {
+        let priorBytes = try? BoundedCatalogReader(root: directory).read("recovery.json", limit: CatalogLimits.manifestBytes).bytes
+        do { try await persistRecovery() }
+        catch {
+            // A writer can fail after atomic replacement. Only discard a proposal when
+            // the last committed file is provably unchanged; otherwise keep it pending.
+            if let priorBytes, (try? BoundedCatalogReader(root: directory).read("recovery.json", limit: CatalogLimits.manifestBytes).bytes) == priorBytes {
+                recovery.entries[key] = previous; refreshReconciliationFailure()
+                await resetPersistenceFailure() // The failed proposal was never published.
+            }
+            else { recovery.entries[key]?.appendDiagnostic("Configuration repair persistence is uncertain; Retry Recovery must finish it.") }
+            throw error
+        }
+    }
+    private func completeMaintenanceRepair(_ key: String, repair: RequestRecoveryStore.MaintenanceRepair, lease: UUID) async throws {
+        let journal = URL(fileURLWithPath: key)
+        guard repair.operation.target == RequestWorkerOperation.Target(repair.configuration),
+              ["setup", "publication"].contains(journal.lastPathComponent), journal.deletingLastPathComponent().path == RequestPaths.canonical(directory) else { throw RequestWorkerOwnershipError() }
+        try await Task.detached { try Self.validateMaintenanceRecoveryCheckout(repair.configuration) }.value
+        try checkMaintenance(lease); try await reconcileWorker(journal); try checkMaintenance(lease)
+        let archive = journal.appendingPathComponent("detached-" + repair.archiveID.uuidString)
+        let current = try RequestWorkerOperation.read(in: journal)
+        if current?.id != repair.replacementID {
+            if let current { guard current.id == repair.operation.id, current.target == repair.operation.target else { throw RequestWorkerOwnershipError() } }
+            else { guard try RequestWorkerOperation.read(in: archive)?.id == repair.operation.id else { throw RequestWorkerOwnershipError() } }
+            try await persistence.perform { try RequestJournalWriter.archive(in: journal, id: repair.archiveID) }
+            try checkMaintenance(lease)
+        }
+        try await persistence.perform { try RequestWorkerOperation.createRepaired(in: journal, mode: repair.operation.mode, configuration: repair.configuration, id: repair.replacementID) }
+        recovery.entries[key]?.configuration = repair.configuration; recovery.entries[key]?.maintenanceRepair = nil
+        try await persist()
     }
 
     public func retryCleanup(_ id: UUID, repository: String, python: String, git: String) async throws {
@@ -754,7 +906,7 @@ public actor ShaderRequestService {
             throw ShaderRequestError.unavailable("Wait for active checkout work to finish before retrying cleanup.")
         }
         let lease = try beginMaintenance(); defer { endMaintenance(lease) }
-        try await drainReconciliation(lease: lease)
+        await resetPersistenceFailure(); try await drainReconciliation(lease: lease)
         var corrected = record.configuration
         corrected.repository = RequestPaths.canonical(URL(fileURLWithPath: repository)); corrected.python = python; corrected.git = git
         guard corrected.repository == RequestPaths.canonical(URL(fileURLWithPath: record.configuration.repository)) else {
@@ -771,10 +923,12 @@ public actor ShaderRequestService {
         entry.configurationRepair = .init(previous: record.configuration, corrected: corrected,
             requestIDs: records.values.filter { $0.detached != true && Self.samePublicationCheckout($0.configuration, record.configuration) }.map { $0.status.id },
             updatePreferences: Self.samePublicationCheckout(configuration, record.configuration))
+        let previous = recovery.entries[key]
         recovery.entries[key] = entry
-        try persistRecovery() // No record or preference changes before this intent is durable.
-        do { try completeConfigurationRepair(key) }
-        catch { appendRecoveryFailure(journal: job, configuration: record.configuration, error: error); throw error }
+        try await commitRepairIntent(key: key, previous: previous)
+        try checkMaintenance(lease)
+        do { try await completeConfigurationRepair(key, lease: lease) }
+        catch { await appendRecoveryFailure(journal: job, configuration: record.configuration, error: error); throw error }
         reconciled = false; reconciliationTask = nil; reconciliationKickID = nil
         try await reconcileWorkers(); try checkMaintenance(lease)
     }
@@ -811,7 +965,10 @@ public actor ShaderRequestService {
                 configuration: target.checkout, disposition: .detach, message: "")
             entry.disposition = .detach
             entry.archiveID = entry.archiveID ?? UUID()
+            let original = entry.primaryDiagnostic ?? entry.message
             entry.message = "Detachment is pending until worker processes are confirmed stopped."
+            entry.primaryDiagnostic = entry.message
+            if !original.isEmpty { entry.appendDiagnostic(original) }
             recovery.entries[key] = entry
         }
     }
@@ -844,8 +1001,8 @@ public actor ShaderRequestService {
         var targets = detachmentTargets(for: selected)
         markPendingDetachment(targets)
         configuration.enabled = false; execution?.interrupted = true
-        try persistRecovery(); try persist()
-        try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
+        try await persistRecovery(); try await persist()
+        try await persistence.write(JSONEncoder().encode(configuration), to: directory.appendingPathComponent("preferences.json"))
         cancelPublicationRequests(); activeProcess?.stop()
         if let process = activeProcess {
             do { try await settleProcess(process) }
@@ -867,13 +1024,14 @@ public actor ShaderRequestService {
         // Work can discover an additional recovery journal while it is draining.
         targets.merge(detachmentTargets(for: selected)) { _, current in current }
         markPendingDetachment(targets)
-        try persistRecovery(); try persist()
+        try await persistRecovery(); try await persist()
         for (_, target) in targets.sorted(by: { $0.key < $1.key }) {
             let (journal, _, checkout) = target
             do { try await reconcileWorker(journal) }
             catch {
+                if error is CancellationError { throw error }
                 if error is RequestWorkerTeardownError || error is RequestWorkerOwnershipError {
-                    holdForRecovery(journal: journal, configuration: checkout, error: error); throw error
+                    await holdForRecovery(journal: journal, configuration: checkout, error: error); throw error
                 }
                 // Finalization archives all markers and both binding files under the
                 // already durable archive ID, including dangling symlinks.
@@ -881,18 +1039,15 @@ public actor ShaderRequestService {
             }
         }
         for (journal, _, _) in targets.values {
-            if let entry = recovery.entries[RequestPaths.canonical(journal)] { try finalizeDetachment(entry) }
+            if let entry = recovery.entries[RequestPaths.canonical(journal)] { try await finalizeDetachment(entry) }
         }
-        try persist()
+        try await persist()
         for key in targets.keys { recovery.entries[key] = nil }
         reconciled = false; reconciliationTask = nil; reconciliationKickID = nil
-        if let entry = recovery.entries.values.first {
-            reconciliationFailure = entry.message; reconciliationJournal = URL(fileURLWithPath: entry.journal)
-            reconciliationConfiguration = entry.configuration
-        } else { reconciliationFailure = nil; reconciliationJournal = nil; reconciliationConfiguration = nil }
+        refreshReconciliationFailure()
         resolvePublicationFailure()
         setupMessage = "Requests disabled. Select a checkout and verify setup before enabling requests again."
-        try persist()
+        try await persist()
     }
 
     /// Cache restoration and forced rebuilds share the checkout scheduler with recovery and jobs.
@@ -945,7 +1100,7 @@ public actor ShaderRequestService {
             guard let preparedID, preparedAttemptID == outcome.attemptID else { throw ShaderRequestError.unavailable("Publication rebuild did not complete.") }
             let publication = try await catalog.install(preparedID)
             self.preparedID = nil; published(publication)
-            try persist()
+            try await persist()
             finishPublication(revision: publication.catalog.publicationRevision)
         } catch {
             if let preparedID { await catalog.discard(preparedID); self.preparedID = nil }
@@ -986,27 +1141,22 @@ public actor ShaderRequestService {
     private func settleProcess(_ process: RequestWorkerProcess) async throws {
         do { try await waitForWorker(process) }
         catch {
-            holdForRecovery(journal: process.recoveryTarget?.directory ?? activeID.map(folder) ?? directory.appendingPathComponent("publication"),
+            await holdForRecovery(journal: process.recoveryTarget?.directory ?? activeID.map(folder) ?? directory.appendingPathComponent("publication"),
                 configuration: process.recoveryTarget?.configuration ?? configurationForActiveWorker, error: error)
             throw error
         }
     }
     private func stopAndDrain(_ process: RequestWorkerProcess) async -> Error? {
-        process.stop()
+        process.shutdown()
         do { try await settleProcess(process); return nil } catch { return error }
     }
 
-    private func workerFailure(_ event: RequestWorkerEvent) -> Error {
-        let message = event.message ?? "Shader worker failed"
-        guard event.recoveryRequired == true else {
-            if event.failureKind == "supervision" || event.failureKind == "interrupted" {
-                return RequestWorkerSupervisionError(message: message, retryable: event.failureKind == "supervision" && event.retryable != false)
-            }
-            return ShaderRequestError.unavailable(message)
+    private func workerFailure(_ event: RequestWorkerEvent) async -> Error  {
+        let failure = event.failureError ?? ShaderRequestError.unavailable("Shader worker failed")
+        if event.recoveryRequired == true {
+            await holdForRecovery(journal: activeProcess?.recoveryTarget?.directory ?? activeID.map(folder) ?? directory.appendingPathComponent("publication"),
+                configuration: activeProcess?.recoveryTarget?.configuration ?? configurationForActiveWorker, error: failure)
         }
-        let failure = RequestWorkerTeardownError(cause: message)
-        holdForRecovery(journal: activeProcess?.recoveryTarget?.directory ?? activeID.map(folder) ?? directory.appendingPathComponent("publication"),
-            configuration: activeProcess?.recoveryTarget?.configuration ?? configurationForActiveWorker, error: failure)
         return failure
     }
 
@@ -1014,53 +1164,57 @@ public actor ShaderRequestService {
         let attemptID: UUID
         let completion: RequestWorkerEvent
     }
-    private func finishWorkerOperation(_ attempt: RequestWorkerOperation, journal: URL) throws {
+    private func finishWorkerOperation(_ attempt: RequestWorkerOperation, journal: URL) async throws {
         var finished = attempt; finished.phase = .complete
-        do { try finished.save(in: journal) }
-        catch { appendRecoveryFailure(journal: journal, configuration: activeProcess?.recoveryTarget?.configuration, error: error); throw error }
+        do { let snapshot = finished; try await persistence.perform { try snapshot.save(in: journal) } }
+        catch { await appendRecoveryFailure(journal: journal, configuration: activeProcess?.recoveryTarget?.configuration, error: error); throw error }
         let key = RequestPaths.canonical(journal), retained = recovery.entries[key]
-        recovery.entries[key] = nil
-        do { try persist() }
+        if retained?.disposition != .detach, retained?.configurationRepair == nil, retained?.maintenanceRepair == nil { recovery.entries[key] = nil }
+        do { try await persist() }
         catch {
-            recovery.entries[key] = retained
+            if recovery.entries[key] == nil { recovery.entries[key] = retained }
             let failure = RequestWorkerEvidenceError(cause: "Cannot finalize worker recovery: " + error.localizedDescription)
-            appendRecoveryFailure(journal: journal, configuration: retained?.configuration, error: failure)
+            await appendRecoveryFailure(journal: journal, configuration: retained?.configuration, error: failure)
             throw failure
         }
         dirtyJournals.remove(key) // Process settlement and the exact-journal retry were verified under this execution lease.
-        if reconciliationJournal.map({ RequestPaths.canonical($0) }) == key {
-            if let next = recovery.entries.values.first {
-                reconciliationFailure = next.message; reconciliationJournal = URL(fileURLWithPath: next.journal); reconciliationConfiguration = next.configuration
-            } else { reconciliationFailure = nil; reconciliationJournal = nil; reconciliationConfiguration = nil }
-        }
+        refreshReconciliationFailure()
+    }
+    private func saveOperation(_ operation: RequestWorkerOperation, in journal: URL) async throws {
+        try await persistence.perform { try operation.save(in: journal) }
     }
     @discardableResult
-    private func runWorker(mode: String, configuration: ShaderRequestConfiguration, journal: URL, operation: UUID, resetPaused: Bool = false,
+    private func runWorker(mode: String, configuration: ShaderRequestConfiguration, journal: URL, operation: UUID,
                            receive: (RequestWorkerEvent, RequestWorkerProcess, UUID) async throws -> Void) async throws -> WorkerOutcome {
+        let journalKey = RequestPaths.canonical(journal)
+        defer { activeRetryJournals[journalKey] = nil; refreshReconciliationFailure() }
         var attempt: RequestWorkerOperation
         do {
             try checkExecution(operation)
             try await reconcileWorker(journal)
             try checkExecution(operation)
-            if resetPaused { try RequestWorkerOperation.restartPaused(in: journal) }
-            attempt = try RequestWorkerOperation.begin(mode: mode, configuration: configuration, in: journal)
-            if attempt.phase == .retryPending { attempt.phase = .retryRunning; try attempt.save(in: journal) }
+            attempt = try await persistence.perform { try RequestWorkerOperation.begin(mode: mode, configuration: configuration, in: journal, replacingInitialMaintenance: true) }
+            if attempt.phase == .retryPending { attempt.phase = .retryRunning; try await saveOperation(attempt, in: journal) }
         } catch {
             if !(error is CancellationError) {
                 let target = (try? Self.savedConfiguration(in: journal)) ?? (RequestProcessIdentity.evidenceExists(journal.appendingPathComponent("configuration.json")) ? nil : configuration)
-                holdForRecovery(journal: journal, configuration: target, error: error)
+                await holdForRecovery(journal: journal, configuration: target, error: error)
             }
             throw error
         }
         while true {
-            try checkExecution(operation)
+            do { try checkExecution(operation) }
+            catch {
+                if attempt.phase == .initial, ["preflight", "publication"].contains(mode) { try await finishWorkerOperation(attempt, journal: journal) }
+                throw error
+            }
             let process = workerProcess(); activeProcess = process
             let attemptID = UUID()
             var completion: RequestWorkerEvent?
             do {
                 for try await event in process.run(mode: mode, configuration: configuration, directory: journal, operationID: attempt.id) {
                     try checkExecution(operation)
-                    if event.event == "failure" { throw workerFailure(event) }
+                    if event.event == "failure" { throw await workerFailure(event) }
                     try await receive(event, process, attemptID)
                     let terminal: Bool
                     switch mode {
@@ -1074,45 +1228,49 @@ public actor ShaderRequestService {
                 try await settleProcess(process)
                 try checkExecution(operation)
                 guard let completion else { throw ShaderRequestError.unavailable("Worker ended without the required " + mode + " completion event for this attempt.") }
-                try finishWorkerOperation(attempt, journal: journal)
+                try await finishWorkerOperation(attempt, journal: journal)
                 return WorkerOutcome(attemptID: attemptID, completion: completion)
             } catch {
+                let recorded = process.recordedFailure
+                let hostFault = recorded is RequestWorkerSupervisionError || recorded is RequestWorkerEvidenceError || recorded is RequestWorkerOwnershipError || recorded is RequestWorkerTeardownError
+                let error = error is CancellationError || (error is ShaderRequestError && hostFault) ? (recorded ?? error) : error
                 let settlementError = await stopAndDrain(process)
                 if let fault = error as? RequestWorkerSupervisionError {
-                    appendRecoveryFailure(journal: journal, configuration: configuration, error: fault)
+                    await appendRecoveryFailure(journal: journal, configuration: configuration, error: fault)
                 }
                 if let settlementError { throw settlementError }
                 if error is CancellationError, attempt.phase == .initial,
                    mode == "preflight" || mode == "publication" {
                     // Settled maintenance cancellation must not bind the next attempt to this configuration.
-                    try finishWorkerOperation(attempt, journal: journal)
+                    try await finishWorkerOperation(attempt, journal: journal)
                 }
                 try checkExecution(operation)
                 guard let fault = error as? RequestWorkerSupervisionError else {
                     if !(error is RequestWorkerEvidenceError || error is RequestWorkerOwnershipError || error is RequestWorkerTeardownError) {
-                        try finishWorkerOperation(attempt, journal: journal)
+                        try await finishWorkerOperation(attempt, journal: journal)
                     }
                     throw error
                 }
                 do {
-                    try persistRecovery() // A failed recovery write must prevent automatic relaunch.
+                    try await persistRecovery() // A failed recovery write must prevent automatic relaunch.
                     guard fault.retryable, attempt.phase == .initial else {
-                        attempt.phase = .paused; try attempt.save(in: journal); throw fault
+                        attempt.phase = .paused; try await saveOperation(attempt, in: journal); throw fault
                     }
-                    attempt.phase = .retryPending; try attempt.save(in: journal)
+                    attempt.phase = .retryPending; try await saveOperation(attempt, in: journal)
                     if let preparedID { await catalog.discard(preparedID); self.preparedID = nil }
                     try checkExecution(operation)
                     try await reconcileWorker(journal)
                     try checkExecution(operation)
-                    attempt.phase = .retryRunning; try attempt.save(in: journal)
+                    attempt.phase = .retryRunning; try await saveOperation(attempt, in: journal)
+                    activeRetryJournals[journalKey] = operation; refreshReconciliationFailure()
                     // Keep the original recovery diagnostic until this attempt completes.
-                    try persist()
+                    try await persist()
                     if mode == "run", let id = activeID, records[id]?.status.stage.terminal == false,
                        records[id]?.status.stage != .awaitingActivation, records[id]?.status.stage != .awaitingClarification {
-                        try update(id, stage: .repairing, message: "Retrying preserved work after a supervision failure")
+                        try await update(id, stage: .repairing, message: "Retrying preserved work after a supervision failure")
                     }
                 } catch {
-                    if !(error is CancellationError) { appendRecoveryFailure(journal: journal, configuration: configuration, error: error) }
+                    if !(error is CancellationError) { await appendRecoveryFailure(journal: journal, configuration: configuration, error: error) }
                     throw error
                 }
             }
@@ -1121,6 +1279,7 @@ public actor ShaderRequestService {
 
     private func checkExecution(_ id: UUID) throws {
         try Task.checkCancellation()
+        if let persistenceFailure { throw RequestWorkerEvidenceError(cause: persistenceFailure) }
         guard execution?.id == id, execution?.interrupted == false, !suspended else { throw CancellationError() }
     }
 
@@ -1161,20 +1320,28 @@ public actor ShaderRequestService {
         }
     }
     private func removeObserver(_ id: UUID) { observers[id] = nil }
-    private func persist() throws {
-        try RequestJournalWriter.write(JSONEncoder().encode(detachedOwners), to: directory.appendingPathComponent("detached-checkouts.json"))
-        try RequestJournalWriter.write(JSONEncoder().encode(Array(records.values)), to: directory.appendingPathComponent("journal.json"))
-        try persistRecovery()
+    private func persist(progress: Bool = false) async throws {
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        let files: [RequestPersistence.File] = [
+            .init(url: directory.appendingPathComponent("detached-checkouts.json"), bytes: try encoder.encode(detachedOwners)),
+            .init(url: directory.appendingPathComponent("journal.json"), bytes: try encoder.encode(records.values.sorted { $0.status.id.uuidString < $1.status.id.uuidString })),
+            .init(url: directory.appendingPathComponent("recovery.json"), bytes: try recovery.encoded())]
+        if progress {
+            persistenceRevision &+= 1; let epoch = persistenceEpoch
+            persistence.enqueueProgress(.init(revision: persistenceRevision, files: files)) { [weak self] error in
+                Task { await self?.progressPersistenceFailed(error, epoch: epoch) }
+            }
+        } else { try await commitFiles(files) }
         emitUpdates()
     }
     private func emitUpdates() { for observer in observers.values { observer.yield(allJobs()) } }
-    private func update(_ id: UUID, stage: ShaderRequestStatus.Stage, message: String) throws {
+    private func update(_ id: UUID, stage: ShaderRequestStatus.Stage, message: String, progress: Bool = false) async throws {
         records[id]?.status.stage = stage; records[id]?.status.message = message
         records[id]?.status.updatedAt = Date(); records[id]?.status.sequence &+= 1
-        try persist()
+        try await persist(progress: progress)
     }
     public func verify(configuration candidate: ShaderRequestConfiguration) async throws {
-        try load()
+        try await load()
         guard activeID == nil, !maintenanceBusy, !records.values.contains(where: { !$0.status.stage.terminal || $0.cleanupPending == true }) else {
             throw ShaderRequestError.unavailable("Finish or cancel queued requests before changing setup.")
         }
@@ -1195,63 +1362,64 @@ public actor ShaderRequestService {
         candidate.detachedOwner = try await Task.detached { try Self.detachedOwner(for: checkout, acknowledgements: acknowledgements) }.value
         candidate.checkoutID = nil
         try checkExecution(operation.id)
-        let outcome = try await runWorker(mode: "preflight", configuration: candidate, journal: directory.appendingPathComponent("setup"), operation: operation.id, resetPaused: true) { _, _, _ in
+        let outcome = try await runWorker(mode: "preflight", configuration: candidate, journal: directory.appendingPathComponent("setup"), operation: operation.id) { _, _, _ in
             try checkExecution(operation.id)
         }
         try checkExecution(operation.id)
         candidate.checkoutID = outcome.completion.checkoutID
         candidate.detachedOwner = nil
-        try retireMaintenanceOperations(replacing: candidate)
+        try await retireMaintenanceOperations(replacing: candidate)
         if !Self.samePublicationCheckout(configuration, candidate) { cancelPublicationRequests() }
         configuration = candidate; configuration.enabled = true
         let paths = Self.canonicalRepositories([candidate.repository] + detachedOwners.map(\.repository))
         detachedOwners.removeAll { Self.matchesDetachedCheckout(candidate, acknowledgement: $0, paths: paths) }
         if !initialized { initialized = true; schedulingActive = true }
-        try persist()
-        try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
+        try await persist()
+        try await persistence.write(JSONEncoder().encode(configuration), to: directory.appendingPathComponent("preferences.json"))
         setupMessage = "Ready for shader requests"
         resolvePublicationFailure()
-        try persist(); kick()
+        try await persist(); kick()
     }
     public func canDisableRequests() -> Bool {
-        activeID == nil && !maintenanceBusy && !records.values.contains(where: { !$0.status.stage.terminal || $0.cleanupPending == true })
+        initialized && pendingCommits == 0 && activeID == nil && !maintenanceBusy && !records.values.contains(where: { !$0.status.stage.terminal || $0.cleanupPending == true })
     }
-    public func disable() throws {
+    public func disable() async throws {
         guard canDisableRequests() else {
             throw ShaderRequestError.unavailable("Requests are still in progress.")
         }
         configuration.enabled = false; setupMessage = "Shader requests are disabled."
         cancelPublicationRequests()
-        try JSONEncoder().encode(configuration).write(to: directory.appendingPathComponent("preferences.json"), options: .atomic)
-        try persist()
+        try await persistence.write(JSONEncoder().encode(configuration), to: directory.appendingPathComponent("preferences.json"))
+        try await persist()
     }
-    public func cancelQueued(_ id: UUID) throws {
+    public func cancelQueued(_ id: UUID) async throws {
         guard records[id]?.status.stage == .queued, activeID != id else {
             throw ShaderRequestError.unavailable("Only queued requests can be cancelled.")
         }
-        try update(id, stage: .cancelled, message: "Cancelled on the Mac")
+        try await update(id, stage: .cancelled, message: "Cancelled on the Mac")
         kick()
     }
-    public func deleteFinished(_ id: UUID) throws {
+    public func deleteFinished(_ id: UUID) async throws {
+        guard !recovery.entries.values.contains(where: { $0.configurationRepair?.requestIDs.contains(id) == true }) else { throw ShaderRequestError.unavailable("Finish the pending configuration repair before deleting this record.") }
         guard !recovery.entries.values.contains(where: { $0.requestID == id }), !Self.hasProcessEvidence(folder(id)), records[id]?.status.stage.terminal == true, records[id]?.cleanupPending != true, activeID != id else { throw ShaderRequestError.invalidRequest }
-        try FileManager.default.removeItem(at: folder(id)); records[id] = nil; try persist()
+        try FileManager.default.removeItem(at: folder(id)); records[id] = nil; try await persist()
     }
-    public func revoke(_ deviceID: String) throws {
+    public func revoke(_ deviceID: String) async throws {
         for id in records.keys where records[id]?.status.deviceID == deviceID && records[id]?.status.stage.terminal == false {
             records[id]?.revoked = true
             if records[id]?.status.stage == .queued, activeID != id {
-                try update(id, stage: .cancelled, message: "TV access was revoked")
+                try await update(id, stage: .cancelled, message: "TV access was revoked")
             } else if activeID != id {
                 records[id]?.cleanupPending = true
                 records[id]?.cleanupMessage = "TV access was revoked; any pushed commit remains"
-                try update(id, stage: .failed, message: "TV access was revoked; checkout cleanup is pending")
+                try await update(id, stage: .failed, message: "TV access was revoked; checkout cleanup is pending")
             }
         }
-        try persist(); kick()
+        try await persist(); kick()
     }
 
     public func control(operation: String, payload: ShaderRequestControl, deviceID: String) async throws -> ShaderRequestControlReply {
-        try load()
+        try await load()
         if operation == "requestSubmit" {
             guard configuration.enabled else { throw ShaderRequestError.unavailable(setupMessage) }
             if let blocker = recoveryBlocker { throw ShaderRequestError.unavailable(blocker) }
@@ -1272,11 +1440,11 @@ public actor ShaderRequestService {
             }) { throw ShaderRequestError.unavailable("This TV already has a manual request in progress.") }
             let job = folder(request.id)
             try FileManager.default.createDirectory(at: job, withIntermediateDirectories: true)
-            try JSONEncoder().encode(request).write(to: job.appendingPathComponent("request.json"), options: .atomic)
+            try await persistence.write(JSONEncoder().encode(request), to: job.appendingPathComponent("request.json"))
             var lightweight = request
             lightweight.context.source = ""; lightweight.context.screenshot = Data()
             records[request.id] = Record(status: ShaderRequestStatus(request: lightweight, deviceID: deviceID), configuration: configuration)
-            try persist() // Acknowledgement follows durable acceptance.
+            try await persist() // Acknowledgement follows durable acceptance.
             kick()
             return try await reply(deviceID: deviceID, requestID: request.id)
         }
@@ -1288,7 +1456,7 @@ public actor ShaderRequestService {
                 guard let nonce = payload.answer, UUID(uuidString: nonce) != nil else { throw ShaderRequestError.invalidRequest }
                 if record.status.stage == .awaitingActivation, record.deliveryNonce != nonce {
                     records[id]?.deliveryNonce = nonce
-                    try update(id, stage: .queued, message: "Refreshing latest committed result for this TV")
+                    try await update(id, stage: .queued, message: "Refreshing latest committed result for this TV")
                     kick()
                 }
             } else if operation == "requestAnswer" {
@@ -1296,16 +1464,16 @@ public actor ShaderRequestService {
                       !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, answer.utf8.count <= 16_384 else {
                     throw ShaderRequestError.invalidRequest
                 }
-                try JSONEncoder().encode(answer).write(to: folder(id).appendingPathComponent("answer.json"), options: .atomic)
+                try await persistence.write(JSONEncoder().encode(answer), to: folder(id).appendingPathComponent("answer.json"))
                 records[id]?.status.clarification = nil
-                try update(id, stage: .queued, message: "Ready to continue after clarification")
+                try await update(id, stage: .queued, message: "Ready to continue after clarification")
                 kick()
             } else if record.status.stage == .awaitingActivation {
                 if let diagnostic = payload.diagnostic {
                     guard diagnostic.utf8.count <= 16_384 else { throw ShaderRequestError.invalidRequest }
                     try JSONEncoder().encode(["attemptID": UUID().uuidString, "shaderID": record.status.result?.shaderID ?? "", "diagnostic": diagnostic])
                         .write(to: folder(id).appendingPathComponent("repair.json"), options: .atomic)
-                    try update(id, stage: .repairing, message: "Repairing the TV activation error")
+                    try await update(id, stage: .repairing, message: "Repairing the TV activation error")
                     kick()
                 } else {
                     guard (record.status.request.purpose == .performance && payload.sourceHash == nil) ||
@@ -1313,7 +1481,7 @@ public actor ShaderRequestService {
                         throw ShaderRequestError.invalidRequest
                     }
                     records[id]?.status.result?.deliveredSourceHash = payload.sourceHash
-                    try update(id, stage: .completed, message: record.status.result?.summary ?? "Request completed")
+                    try await update(id, stage: .completed, message: record.status.result?.summary ?? "Request completed")
                 }
             }
         }
@@ -1327,7 +1495,7 @@ public actor ShaderRequestService {
                                         publicationRevision: await catalog.publicationRevisionValue())
     }
     private func kick() {
-        guard loaded, initialized, !suspended, !maintenanceBusy, activeID == nil, workerTask == nil else { return }
+        guard loaded, initialized, !suspended, !maintenanceBusy, pendingCommits == 0, persistenceFailure == nil, activeID == nil, workerTask == nil else { return }
         if !reconciled {
             guard reconciliationKickID == nil, reconciliationTask == nil else { return }
             if let reconciliationFailure { failPendingPublicationForRecovery(reconciliationFailure); return }
@@ -1383,24 +1551,28 @@ public actor ShaderRequestService {
         }
         let id: UUID
         switch work { case .execute(let job), .cleanup(let job): id = job; case .publication: return }
-        do {
-            try JSONEncoder().encode(id).write(to: directory.appendingPathComponent("active.json"), options: .atomic)
-            records[id]?.executionID = operation.id; records[id]?.interrupted = false
-            if case .execute = work { try update(id, stage: .implementing, message: "Preparing the managed checkout") }
-            else { try persist() }
-        } catch {
-            execution = nil; try? update(id, stage: .failed, message: error.localizedDescription)
-            return
-        }
         activeID = id
-        workerTask = Task { [weak self] in
+        workerTask = Task { [weak self] in await self?.runScheduledWork(id: id, operation: operation.id, work: work) }
+    }
+    private func runScheduledWork(id: UUID, operation: UUID, work: ScheduledWork) async {
+        do {
+            try checkExecution(operation)
+            try await persistence.write(JSONEncoder().encode(id), to: directory.appendingPathComponent("active.json"))
+            records[id]?.executionID = operation; records[id]?.interrupted = false
+            if case .execute = work { try await update(id, stage: .implementing, message: "Preparing the managed checkout") }
+            else { try await persist() }
+            try checkExecution(operation)
             switch work {
-            case .cleanup(let id): await self?.cleanup(id, operation: operation.id)
-            case .execute(let id): await self?.execute(id, operation: operation.id)
+            case .cleanup(let id): await cleanup(id, operation: operation)
+            case .execute(let id): await execute(id, operation: operation)
             case .publication: break
             }
+        } catch {
+            if !(error is CancellationError) { await holdForRecovery(journal: folder(id), configuration: records[id]?.configuration, error: error) }
+            finishWorker(id)
         }
     }
+
     private func cleanup(_ id: UUID, operation: UUID) async {
         guard let record = records[id] else { finishWorker(id); return }
         await prepareCleanup()
@@ -1413,16 +1585,16 @@ public actor ShaderRequestService {
             try checkExecution(operation)
             records[id]?.cleanupPending = false; records[id]?.cleanupFailure = nil
             if record.status.result != nil, record.status.stage == .awaitingActivation || record.status.stage == .completed {
-                try update(id, stage: record.status.stage, message: record.status.message)
-            } else { try update(id, stage: .failed, message: record.cleanupMessage ?? "Owned checkout cleanup completed; see the retained request diagnostic") }
+                try await update(id, stage: record.status.stage, message: record.status.message)
+            } else { try await update(id, stage: .failed, message: record.cleanupMessage ?? "Owned checkout cleanup completed; see the retained request diagnostic") }
         } catch {
             if error is RequestWorkerEvidenceError || error is RequestWorkerOwnershipError || error is RequestWorkerTeardownError || error is RequestWorkerSupervisionError {
-                holdForRecovery(journal: folder(id), configuration: record.configuration, error: error)
+                await holdForRecovery(journal: folder(id), configuration: record.configuration, error: error)
             }
             if execution?.interrupted == false, records[id]?.detached != true {
                 records[id]?.cleanupFailure = error.localizedDescription
                 setupMessage = "Checkout recovery is required. Correct the saved folder/tool paths and retry cleanup, or detach the checkout."
-                try? update(id, stage: .failed, message: "Cleanup failed: \(error.localizedDescription). \(setupMessage)")
+                try? await update(id, stage: .failed, message: "Cleanup failed: \(error.localizedDescription). \(setupMessage)")
             }
         }
         finishWorker(id)
@@ -1451,7 +1623,7 @@ public actor ShaderRequestService {
                 switch event.event {
                 case "stage":
                     if let value = event.stage, let stage = ShaderRequestStatus.Stage(rawValue: value) {
-                        try update(id, stage: stage, message: event.message ?? value)
+                        try await update(id, stage: stage, message: event.message ?? value, progress: true)
                     }
                 case "preparePublication":
                     try await preparePublication(event, process: process, operation: operation, attempt: attempt)
@@ -1463,7 +1635,7 @@ public actor ShaderRequestService {
                         records[id]?.cleanupMessage = "TV access was revoked; any pushed commit remains"
                     }
                     records[id]?.status.clarification = ShaderClarification(question: event.question ?? "Please clarify the request", options: event.options ?? [])
-                    try update(id, stage: records[id]?.revoked == true ? .failed : .awaitingClarification,
+                    try await update(id, stage: records[id]?.revoked == true ? .failed : .awaitingClarification,
                                message: records[id]?.revoked == true ? "Discarding revoked unpublished work" : "Waiting for a TV answer")
                 case "result":
                     if let result = event.result, let commit = result.commitSHA, deliveredCommits.contains(commit),
@@ -1474,24 +1646,24 @@ public actor ShaderRequestService {
                     guard let result = event.result, ShaderRequest.validID(result.shaderID), let preparedID, preparedAttemptID == attempt else {
                         throw ShaderRequestError.invalidRequest
                     }
-                    try update(id, stage: .publishing, message: "Installing the committed library")
+                    try await update(id, stage: .publishing, message: "Installing the committed library")
                     let publication = try await catalog.install(preparedID)
                     self.preparedID = nil
                     published(publication)
                     records[id]?.status.result = result
                     if let commit = result.commitSHA { deliveredCommits.insert(commit) }
                     if records[id]?.revoked == true {
-                        try update(id, stage: .failed, message: "Pushed successfully; TV access was revoked")
+                        try await update(id, stage: .failed, message: "Pushed successfully; TV access was revoked")
                         return
                     }
                     guard let output = publication.catalog.shaders.first(where: { $0.id == result.shaderID }) else {
                         try JSONEncoder().encode(["attemptID": UUID().uuidString, "shaderID": result.shaderID, "diagnostic": "The committed output was removed before TV delivery. Recreate it under a fresh unused ID."])
                             .write(to: job.appendingPathComponent("repair.json"), options: .atomic)
-                        try update(id, stage: .repairing, message: "Recreating the output removed before delivery")
+                        try await update(id, stage: .repairing, message: "Recreating the output removed before delivery")
                         return
                     }
                     records[id]?.status.result?.deliveredSourceHash = output.sourceHash
-                    try update(id, stage: records[id]?.revoked == true ? .failed : .awaitingActivation,
+                    try await update(id, stage: records[id]?.revoked == true ? .failed : .awaitingActivation,
                                message: records[id]?.revoked == true ? "Pushed successfully; TV access was revoked" : "Waiting for the TV to play the result")
                 default: break
                 }
@@ -1499,28 +1671,28 @@ public actor ShaderRequestService {
             try checkExecution(operation)
         } catch {
             if error is RequestWorkerTeardownError || error is RequestWorkerOwnershipError || error is RequestWorkerEvidenceError || error is RequestWorkerSupervisionError {
-                holdForRecovery(journal: folder(id), configuration: record.configuration, error: error)
+                await holdForRecovery(journal: folder(id), configuration: record.configuration, error: error)
             } else if execution?.interrupted == false, records[id]?.detached != true {
                 records[id]?.cleanupPending = true
                 records[id]?.cleanupMessage = error.localizedDescription
-                try? update(id, stage: .failed, message: error.localizedDescription)
+                try? await update(id, stage: .failed, message: error.localizedDescription)
             }
         }
         if records[id]?.revoked == true, records[id]?.status.stage.terminal == false, records[id]?.detached != true {
             records[id]?.cleanupPending = true
             records[id]?.cleanupMessage = "TV access was revoked; any pushed commit remains"
-            try? update(id, stage: .failed, message: "TV access was revoked; checkout cleanup is pending")
+            try? await update(id, stage: .failed, message: "TV access was revoked; checkout cleanup is pending")
         }
         if let preparedID { await catalog.discard(preparedID); self.preparedID = nil }
         finishWorker(id)
     }
-    public func suspend() {
-        suspended = true; execution?.interrupted = true
+    public func suspend() async {
+        suspended = true; execution?.interrupted = true; activeProcess?.stop()
         if let id = activeID {
             records[id]?.interrupted = true
             if records[id]?.status.stage.terminal == false {
-                try? update(id, stage: .repairing, message: "Waiting for the Mac to resume")
-            } else { try? persist() }
+                try? await update(id, stage: .repairing, message: "Waiting for the Mac to resume")
+            } else { try? await persist() }
         }
         activeProcess?.stop()
     }

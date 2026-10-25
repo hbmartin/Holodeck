@@ -205,6 +205,14 @@ final class MacRequestsModel {
             catch { self.error = error.localizedDescription }
         }
     }
+    func repairMaintenance(_ id: UUID, configuration: ShaderRequestConfiguration) {
+        checking = true; error = nil
+        Task {
+            defer { checking = false }
+            do { try await service.repairMaintenanceRecovery(id, configuration: configuration) }
+            catch { self.error = error.localizedDescription }
+        }
+    }
     func retryReconciliation() {
         checking = true; error = nil
         Task {

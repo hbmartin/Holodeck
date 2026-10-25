@@ -101,9 +101,9 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
         self.binding = nil
         try save(in: directory, writer: writer)
     }
-    private static func rotate(mode: String, configuration: ShaderRequestConfiguration, in directory: URL, writer: Writer) throws -> Self {
+    private static func rotate(mode: String, configuration: ShaderRequestConfiguration, in directory: URL, id: UUID = UUID(), writer: Writer) throws -> Self {
         let previous = try configurationBytes(in: directory)
-        var value = Self(mode: mode, target: Target(configuration))
+        var value = Self(id: id, mode: mode, target: Target(configuration))
         value.binding = Binding(predecessor: try previous.map { operationID(try configurationObject($0)) } ?? nil,
                                 previous: previous, replacement: try encodedConfiguration(configuration, id: value.id))
         try value.save(in: directory, writer: writer)
@@ -111,16 +111,20 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
         return value
     }
     static func begin(mode: String, configuration: ShaderRequestConfiguration, in directory: URL,
-                      writer: Writer = RequestJournalWriter.write) throws -> Self {
+                      replacingInitialMaintenance: Bool = false, writer: Writer = RequestJournalWriter.write) throws -> Self {
         var saved = try read(in: directory)
         if var pending = saved, pending.binding != nil {
-            guard pending.target == Target(configuration) else { throw RequestWorkerEvidenceError(cause: "Pending operation belongs to another checkout.") }
+            guard pending.target == Target(configuration) || (replacingInitialMaintenance && pending.phase == .initial && ["preflight", "publication"].contains(pending.mode)) else { throw RequestWorkerEvidenceError(cause: "Pending operation belongs to another checkout.") }
             try pending.finishBinding(in: directory, writer: writer); saved = pending
         }
         if let expected = try expectedID(in: directory), expected != saved?.id {
             throw RequestWorkerEvidenceError(cause: "Worker retry journal is missing or belongs to another operation. Use explicit Retry Recovery or detach while retaining files; automatic retries remain blocked.")
         }
         if var saved, saved.mode == mode, saved.phase != .complete {
+            if replacingInitialMaintenance, saved.phase == .initial, ["preflight", "publication"].contains(mode),
+               let bytes = try configurationBytes(in: directory), try !matches(bytes, configuration: configuration, id: saved.id) {
+                return try rotate(mode: mode, configuration: configuration, in: directory, writer: writer)
+            }
             guard saved.target == nil || saved.target == Target(configuration) else {
                 throw RequestWorkerEvidenceError(cause: "Worker operation belongs to another checkout; retire it before replacement.")
             }
@@ -131,8 +135,7 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
             // Legacy bound configurations can differ in JSON encoding, but not in content.
             let existing = try configurationBytes(in: directory)
             if let existing {
-                let canonical = try JSONSerialization.data(withJSONObject: configurationObject(existing), options: .sortedKeys)
-                guard canonical == (try encodedConfiguration(configuration, id: saved.id)) else {
+                guard try matches(existing, configuration: configuration, id: saved.id) else {
                     throw RequestWorkerEvidenceError(cause: "Worker configuration changed during an unfinished operation. Retry recovery explicitly.")
                 }
             } else {
@@ -159,7 +162,7 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
         if let configuration, let bytes {
             let original = try JSONDecoder().decode(ShaderRequestConfiguration.self, from: bytes)
             guard Target(original) == Target(configuration) else { throw RequestWorkerEvidenceError(cause: "Recovery configuration belongs to another checkout.") }
-            configurationChanged = try JSONSerialization.data(withJSONObject: configurationObject(bytes), options: .sortedKeys) != encodedConfiguration(configuration, id: saved.id)
+            configurationChanged = try !matches(bytes, configuration: configuration, id: saved.id)
         }
         guard saved.phase == .paused || saved.phase == .retryRunning || mismatch || configurationChanged else { return }
         let replacement: ShaderRequestConfiguration
@@ -167,6 +170,44 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
         else if let bytes { replacement = try JSONDecoder().decode(ShaderRequestConfiguration.self, from: bytes) }
         else { throw RequestWorkerEvidenceError(cause: "Saved checkout configuration is required to restart this operation.") }
         _ = try rotate(mode: saved.mode, configuration: replacement, in: directory, writer: writer)
+    }
+    static func matches(_ bytes: Data, configuration: ShaderRequestConfiguration, id: UUID?) throws -> Bool {
+        try JSONSerialization.data(withJSONObject: configurationObject(bytes), options: .sortedKeys) == encodedConfiguration(configuration, id: id)
+    }
+    /// Explicit, settled recovery: replay exactly the recorded binding replacement.
+    static func repair(in directory: URL, mode: String, previous: ShaderRequestConfiguration,
+                       corrected: ShaderRequestConfiguration, oldID: UUID?, newID: UUID) throws {
+        if var saved = try read(in: directory) {
+            if saved.id == newID {
+                try saved.finishBinding(in: directory, writer: RequestJournalWriter.write)
+                guard let bytes = try configurationBytes(in: directory), try matches(bytes, configuration: corrected, id: newID) else {
+                    throw RequestWorkerEvidenceError(cause: "Repaired configuration conflicts with its durable intent.")
+                }
+                return
+            }
+            guard saved.id == oldID else { throw RequestWorkerOwnershipError() }
+            try saved.finishBinding(in: directory, writer: RequestJournalWriter.write)
+            guard try expectedID(in: directory) == saved.id,
+                  let bytes = try configurationBytes(in: directory), try matches(bytes, configuration: previous, id: saved.id) else {
+                throw RequestWorkerEvidenceError(cause: "Configuration repair no longer matches its recorded predecessor.")
+            }
+        } else {
+            guard oldID == nil, try expectedID(in: directory) == nil else { throw RequestWorkerOwnershipError() }
+            if let bytes = try configurationBytes(in: directory), try !matches(bytes, configuration: previous, id: nil) {
+                throw RequestWorkerOwnershipError()
+            }
+        }
+        _ = try rotate(mode: mode, configuration: corrected, in: directory, id: newID, writer: RequestJournalWriter.write)
+    }
+    static func createRepaired(in directory: URL, mode: String, configuration: ShaderRequestConfiguration, id: UUID) throws {
+        if var current = try read(in: directory) {
+            guard current.id == id else { throw RequestWorkerOwnershipError() }
+            try current.finishBinding(in: directory, writer: RequestJournalWriter.write)
+            guard let bytes = try configurationBytes(in: directory), try matches(bytes, configuration: configuration, id: id) else { throw RequestWorkerOwnershipError() }
+        } else {
+            guard try configurationBytes(in: directory) == nil else { throw RequestWorkerOwnershipError() }
+            _ = try rotate(mode: mode, configuration: configuration, in: directory, id: id, writer: RequestJournalWriter.write)
+        }
     }
     static func retire(in directory: URL) throws {
         guard var saved = try read(in: directory) else { return }
@@ -179,7 +220,7 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
               saved.phase == .initial || saved.phase == .retryRunning,
               try expectedID(in: directory) == id,
               let bytes = try configurationBytes(in: directory),
-              try JSONSerialization.data(withJSONObject: configurationObject(bytes), options: .sortedKeys) == encodedConfiguration(configuration, id: id) else {
+              try matches(bytes, configuration: configuration, id: id) else {
             throw RequestWorkerEvidenceError(cause: "Worker launch does not have a committed configuration binding.")
         }
     }
@@ -210,6 +251,16 @@ nonisolated enum RequestJournalWriter {
         }
         // Replay also commits moves whose preceding fsync failed after rename.
         guard fsync(archive) == 0, fsync(root) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+    }
+    static func appendDiagnostic(_ detail: String, to file: URL) throws {
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let descriptor = open(file.path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0o600)
+        guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        defer { close(descriptor) }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { throw POSIXError(.EINVAL) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        try handle.write(contentsOf: Data((detail + "\n").utf8))
     }
     static func write(_ data: Data, to file: URL) throws {
         let directory = URL(fileURLWithPath: RequestPaths.canonical(file.deletingLastPathComponent()))
@@ -244,15 +295,86 @@ nonisolated struct RequestRecoveryStore: Codable, Sendable {
         var preferencesRollback: ShaderRequestConfiguration?
         var archiveID: UUID?
         var configurationRepair: ConfigurationRepair?
+        var maintenanceRepair: MaintenanceRepair?
+        var primaryDiagnostic: String?
+        var secondaryDiagnostics: [String]?
+        static func bounded(_ text: String, bytes: Int) -> String {
+            var result = text
+            if result.utf8.count > bytes {
+                result = String(decoding: result.utf8.prefix(bytes), as: UTF8.self)
+                while result.utf8.count > bytes || result.last == "\u{fffd}" { result.removeLast() }
+            }
+            return result
+        }
+        mutating func appendDiagnostic(_ detail: String) {
+            let primary = Self.bounded(primaryDiagnostic ?? message, bytes: 8192)
+            primaryDiagnostic = primary
+            let bounded = Self.bounded(detail, bytes: 2048)
+            var additional = secondaryDiagnostics ?? []
+            if Self.bounded(detail, bytes: 8192) != primary && !additional.contains(bounded) { additional.append(bounded) }
+            secondaryDiagnostics = Array(additional.suffix(8))
+            message = ([primary] + (secondaryDiagnostics ?? []).map { "Additional recovery error: " + $0 }).joined(separator: "\n")
+        }
     }
     struct ConfigurationRepair: Codable, Sendable {
         var previous: ShaderRequestConfiguration
         var corrected: ShaderRequestConfiguration
         var requestIDs: [UUID]
         var updatePreferences: Bool
+        var version: Int? = nil
+        var participants: [Participant]? = nil
+        var preferences: Change? = nil
+        struct Change: Codable, Sendable { var previous: ShaderRequestConfiguration; var corrected: ShaderRequestConfiguration }
+        struct Participant: Codable, Sendable {
+            var requestID: UUID
+            var change: Change
+            var mode: String
+            var oldID: UUID?
+            var newID = UUID()
+        }
+        func applying(to current: ShaderRequestConfiguration, primary: Bool = false) -> ShaderRequestConfiguration {
+            var result = current
+            if primary || RequestPaths.canonical(URL(fileURLWithPath: current.repository)) == RequestPaths.canonical(URL(fileURLWithPath: previous.repository)) { result.repository = corrected.repository }
+            if primary || current.python == previous.python { result.python = corrected.python }
+            if primary || current.git == previous.git { result.git = corrected.git }
+            return result
+        }
+    }
+    struct MaintenanceRepair: Codable, Sendable {
+        var operation: RequestWorkerOperation
+        var configuration: ShaderRequestConfiguration
+        var archiveID = UUID()
+        var replacementID = UUID()
     }
     var formatVersion = 1
     var legacyMigrationComplete = false
     var entries: [String: Entry] = [:]
+    mutating func encoded() throws -> Data {
+        for key in entries.keys {
+            let detail = entries[key]!.primaryDiagnostic ?? entries[key]!.message
+            entries[key]?.appendDiagnostic(detail)
+        }
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        var bytes = try encoder.encode(self)
+        if bytes.count > CatalogLimits.manifestBytes {
+            for key in entries.keys {
+                var entry = entries[key]!
+                entry.secondaryDiagnostics = []; entry.message = entry.primaryDiagnostic ?? "Checkout recovery required"
+                entries[key] = entry
+            }
+            bytes = try encoder.encode(self)
+        }
+        if bytes.count > CatalogLimits.manifestBytes {
+            for key in entries.keys {
+                var entry = entries[key]!
+                entry.message = Entry.bounded(entry.primaryDiagnostic ?? entry.message, bytes: 256)
+                entry.primaryDiagnostic = nil; entry.secondaryDiagnostics = nil
+                entries[key] = entry
+            }
+            bytes = try encoder.encode(self)
+        }
+        guard bytes.count <= CatalogLimits.manifestBytes else { throw RequestWorkerEvidenceError(cause: "Recovery metadata exceeds its 2 MiB capacity. Retain the last good journal and resolve existing recovery entries before accepting work.") }
+        return bytes
+    }
 }
 #endif

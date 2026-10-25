@@ -267,11 +267,11 @@ nonisolated private final class RequestPipeDrain: @unchecked Sendable {
 
 nonisolated private final class RequestEventParser: @unchecked Sendable {
     private var pending = Data()
-    func receive(_ bytes: Data, continuation: AsyncThrowingStream<RequestWorkerEvent, Error>.Continuation) {
+    func receive(_ bytes: Data, continuation: AsyncThrowingStream<RequestWorkerEvent, Error>.Continuation, observe: (RequestWorkerEvent) -> Void) {
         pending.append(bytes)
         while let newline = pending.firstIndex(of: 10) {
             let line = Data(pending[..<newline]); pending.removeSubrange(...newline)
-            if let event = try? JSONDecoder().decode(RequestWorkerEvent.self, from: line) { continuation.yield(event) }
+            if let event = try? JSONDecoder().decode(RequestWorkerEvent.self, from: line) { observe(event); continuation.yield(event) }
         }
     }
 }
@@ -316,6 +316,13 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     private var supervisorAnchors: Set<RequestProcessIdentity> = []
     private var journal: URL?
     private var workerConfiguration: ShaderRequestConfiguration?
+    private var initiatingFailure: Error?
+    private var parsedFailure: Error?
+    private static func supervisionFailure(_ error: Error) -> Error {
+        if error is RequestWorkerSupervisionError || error is RequestWorkerTeardownError || error is RequestWorkerEvidenceError || error is RequestWorkerOwnershipError || error is ShaderRequestError { return error }
+        return RequestWorkerSupervisionError(message: error.localizedDescription, underlyingError: error, retryable: !(error is POSIXError || error is CocoaError))
+    }
+    var recordedFailure: Error? { lock.withLock { initiatingFailure ?? firstError.map(Self.supervisionFailure) ?? parsedFailure } }
     private var firstError: Error?
     private var logFailed = false
     private var nextObservation: TimeInterval = 0
@@ -343,12 +350,17 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         }
     }
 
+    private func unavailableReply() -> Error {
+        if let failure = initiatingFailure ?? firstError.map(Self.supervisionFailure) ?? parsedFailure { return failure }
+        if cancelRequested { return CancellationError() }
+        return RequestWorkerSupervisionError(message: "Worker stopped before accepting its reply. See its retained log.")
+    }
     func reply(_ accepted: Bool, message: String? = nil) throws {
         struct Reply: Encodable { let ok: Bool; let message: String? }
-        try lock.withLock { guard started, gateReleased, !stopping, process.isRunning else { throw CancellationError() } }
+        try lock.withLock { guard started, gateReleased, !stopping, process.isRunning else { throw unavailableReply() } }
         beforeReplyWrite?()
         try lock.withLock {
-            guard started, gateReleased, !stopping, process.isRunning else { throw CancellationError() }
+            guard started, gateReleased, !stopping, process.isRunning else { throw unavailableReply() }
             var bytes = try JSONEncoder().encode(Reply(ok: accepted, message: message)); bytes.append(10)
             try input.fileHandleForWriting.write(contentsOf: bytes)
         }
@@ -396,6 +408,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                 if observationFailures >= 3 {
                     let detail = (failure as? RequestWorkerTeardownError)?.cause ?? failure.localizedDescription
                     firstError = firstError ?? RequestWorkerSupervisionError(message: "Repeated process observation failure: " + detail)
+                    initiatingFailure = initiatingFailure ?? firstError.map(Self.supervisionFailure)
                     return true
                 }
                 return false
@@ -471,6 +484,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         }
     }
     func stop() { beginTeardown(cancelled: true) }
+    func shutdown() { beginTeardown(cancelled: false) }
     private func beginTeardown(cancelled: Bool) {
         let boot = groups.boot()
         lock.withLock {
@@ -485,7 +499,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         signalPending()
     }
     private func record(_ error: Error) {
-        lock.withLock { firstError = firstError ?? error }
+        lock.withLock { firstError = firstError ?? error; initiatingFailure = initiatingFailure ?? Self.supervisionFailure(error) }
         beginTeardown(cancelled: false)
     }
 
@@ -524,7 +538,9 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                                 do { try self.beforeLogWrite?(); try log.write(contentsOf: bytes) }
                                 catch { self.lock.withLock { self.logFailed = true }; self.record(error) }
                             }
-                            if parsesEvents { parser.receive(bytes, continuation: continuation) }
+                            if parsesEvents { parser.receive(bytes, continuation: continuation) { event in
+                                if let failure = event.failureError { self.lock.withLock { self.parsedFailure = self.parsedFailure ?? failure; self.initiatingFailure = self.initiatingFailure ?? failure } }
+                            } }
                         })
                     }
                     try lock.withLock {
@@ -611,10 +627,12 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     if process.terminationReason == .uncaughtSignal {
                         throw RequestWorkerSupervisionError(message: "Worker terminated by signal \(process.terminationStatus) after launch. See its retained log.")
                     }
-                    if process.terminationStatus != 0 { throw ShaderRequestError.unavailable("Worker exited \(process.terminationStatus). See its retained log.") }
+                    if process.terminationStatus != 0 {
+                        throw recordedFailure ?? RequestWorkerSupervisionError(message: "Worker exited \(process.terminationStatus) after launch without a failure event. See its retained log.")
+                    }
                     continuation.finish()
                 } catch {
-                    let error = lock.withLock { firstError } ?? error
+                    let error = recordedFailure ?? error
                     if lock.withLock({ started && !gateReleased }) {
                         beginTeardown(cancelled: false)
                         while process.isRunning || pipes.wait(timeout:.now()) != .success {
@@ -629,7 +647,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                         continuation.finish(throwing:RequestWorkerTeardownError(cause:error.localizedDescription)); return
                     }
                     if let evidence = error as? RequestWorkerEvidenceError { lock.withLock { retainedEvidenceError = evidence } }
-                    if process.isRunning { stop() }
+                    if process.isRunning { shutdown() }
                     if error is CancellationError || error is RequestWorkerTeardownError || error is RequestWorkerEvidenceError ||
                        error is RequestWorkerOwnershipError || error is RequestWorkerSupervisionError || error is ShaderRequestError {
                         continuation.finish(throwing:error)
