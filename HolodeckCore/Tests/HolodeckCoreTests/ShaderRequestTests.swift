@@ -1038,6 +1038,27 @@ final class ShaderRequestTests: XCTestCase {
         }
     }
 
+    func testOrdinaryFailureCannotMaskUnverifiableSettlementEvidence() async throws {
+        let (root, script) = try recoveryFixture(), job = root.appendingPathComponent("job")
+        try """
+        import json,sys
+        from pathlib import Path
+        job=Path(sys.argv[3])
+        (job/'children.json').write_text('{')
+        (job/'owned-patch').write_bytes(bytes([0,255,13,10]))
+        print(json.dumps(dict(event='failure',message='Original ordinary failure')),flush=True)
+        raise SystemExit(1)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let worker = RequestWorkerProcess(script: script)
+        do { for try await _ in worker.run(mode: "run", configuration: .init(repository: root.path), directory: job) {}; XCTFail("Evidence failure succeeded") }
+        catch { XCTAssertTrue(error is RequestWorkerEvidenceError); XCTAssertTrue(error.localizedDescription.contains("Original ordinary failure")) }
+        do { try await worker.waitForExit(); XCTFail("Unverified evidence reported clean settlement") }
+        catch { XCTAssertTrue(error is RequestWorkerEvidenceError) }
+        XCTAssertTrue(worker.recordedFailure is ShaderRequestError)
+        XCTAssertEqual(try Data(contentsOf: job.appendingPathComponent("owned-patch")), Data([0,255,13,10]))
+        XCTAssertTrue(RequestProcessIdentity.evidenceExists(job.appendingPathComponent("children.json")))
+    }
+
     func testNativeStorageFaultPrecedesBufferedOrdinaryFailure() async throws {
         let (root, script) = try recoveryFixture(), worker = RequestWorkerProcess(script: script)
         try "print('{\"event\":\"failure\",\"message\":\"ordinary failure\"}',flush=True)\nraise SystemExit(1)".write(to: script, atomically: true, encoding: .utf8)
