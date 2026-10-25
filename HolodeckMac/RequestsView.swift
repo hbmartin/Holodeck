@@ -115,7 +115,7 @@ private struct CheckoutRecoveryView: View {
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Checkout Recovery").bold()
+            Text(recovery.isRetrying ? "Retrying Preserved Work" : "Checkout Recovery").bold()
             Text(recovery.message).textSelection(.enabled)
             if recovery.kind == .cleanup {
                 TextField("Owned checkout folder", text: $repository).accessibilityIdentifier("recovery-repository")

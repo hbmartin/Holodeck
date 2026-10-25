@@ -832,6 +832,101 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: setup.appendingPathComponent("process.json").path))
     }
 
+    func testRecordedFailureSurvivesReplyAfterWorkerRetirement() async throws {
+        let (root, script) = try recoveryFixture(), worker = RequestWorkerProcess(script: script)
+        try """
+        print('{"event":"failure","failureKind":"supervision","message":"Original supervision fault"}',flush=True)
+        raise SystemExit(7)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        var events = worker.run(mode: "run", configuration: .init(repository: root.path), directory: root.appendingPathComponent("job")).makeAsyncIterator()
+        _ = try await events.next(); try await worker.waitForExit()
+        XCTAssertThrowsError(try worker.reply(true)) {
+            XCTAssertTrue($0 is RequestWorkerSupervisionError)
+            XCTAssertEqual($0.localizedDescription, "Original supervision fault")
+        }
+        do { _ = try await events.next(); XCTFail("Failed worker succeeded") }
+        catch { XCTAssertTrue(error is RequestWorkerSupervisionError) }
+    }
+
+    func testRecordedFaultDuringPublicationPreparationRetainsPatchAndRetries() async throws {
+        let gate = RequestPreparationGate(), f = try await publicationRecoveryFixture(gate: gate)
+        let original = try String(contentsOf: f.script, encoding: .utf8)
+        try """
+        import json,sys,time
+        from pathlib import Path
+        job=Path(sys.argv[3])
+        if sys.argv[1]=='run':
+            counter=job/'attempts';n=int(counter.read_text())+1 if counter.exists() else 1;counter.write_text(str(n))
+            (job/'owned-patch').write_bytes(b'keep exact unpublished bytes\\r\\n')
+            if n==1:
+                print(json.dumps(dict(event='preparePublication',requiredPreviewShaderIDs=[])),flush=True)
+                while not (job/'send-fault').exists():time.sleep(.005)
+                print(json.dumps(dict(event='failure',failureKind='supervision',message='Recorded fault during preparation')),flush=True)
+                raise SystemExit(7)
+            print(json.dumps(dict(event='clarification',question='Choose output',options=['A','B'])),flush=True)
+            raise SystemExit(0)
+        \(original)
+        """.write(to: f.script, atomically: true, encoding: .utf8)
+        let request = ShaderRequest(prompt: "Keep work", context: try context())
+        _ = try await f.service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        let job = f.root.appendingPathComponent(request.id.uuidString)
+        await f.service.activateScheduling(); await f.service.resume(); try await waitFor { await gate.entered }
+        try Data().write(to: job.appendingPathComponent("send-fault"))
+        try await waitFor { !RequestProcessIdentity.evidenceExists(job.appendingPathComponent("process.json")) }
+        await gate.release()
+        try await waitFor { await f.service.allJobs().first?.stage == .awaitingClarification }
+        XCTAssertEqual(try String(contentsOf: job.appendingPathComponent("attempts"), encoding: .utf8), "2")
+        XCTAssertEqual(try Data(contentsOf: job.appendingPathComponent("owned-patch")), Data("keep exact unpublished bytes\r\n".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: job.appendingPathComponent("cleanup-started").path))
+        await f.service.suspend()
+    }
+
+    func testUnexplainedPostLaunchExitRetriesOnceWithoutDiscard() async throws {
+        let (root, script) = try recoveryFixture()
+        try """
+        import sys
+        from pathlib import Path
+        job=Path(sys.argv[3])
+        if sys.argv[1]=='discard':(job/'cleanup-started').touch();raise SystemExit(0)
+        counter=job/'attempts';counter.write_text(str(int(counter.read_text())+1 if counter.exists() else 1))
+        (job/'owned-patch').write_bytes(b'keep patch')
+        raise SystemExit(7)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let service = try await recoveryService(root, script: script)
+        let request = ShaderRequest(prompt: "Preserve unexpected exit", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        let job = root.appendingPathComponent(request.id.uuidString)
+        await service.resume(); try await waitFor { (try? RequestWorkerOperation.read(in: job)?.phase) == .paused }
+        XCTAssertEqual(try String(contentsOf: job.appendingPathComponent("attempts"), encoding: .utf8), "2")
+        XCTAssertEqual(try Data(contentsOf: job.appendingPathComponent("owned-patch")), Data("keep patch".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: job.appendingPathComponent("cleanup-started").path))
+        await service.suspend()
+    }
+
+    func testHealthyAutomaticRetryAcceptsQueuedRequestWithoutLaunchingIt() async throws {
+        let (root, script) = try recoveryFixture()
+        try """
+        import json,sys,time
+        from pathlib import Path
+        job=Path(sys.argv[3]);counter=job/'attempts';n=int(counter.read_text())+1 if counter.exists() else 1;counter.write_text(str(n))
+        if n==1:
+            print(json.dumps(dict(event='failure',failureKind='supervision',message='Original fault')),flush=True);raise SystemExit(1)
+        (job/'retry-started').touch()
+        while not (job/'release').exists():time.sleep(.005)
+        print(json.dumps(dict(event='clarification',question='Choose output',options=['A','B'])),flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let service = try await recoveryService(root, script: script)
+        let first = ShaderRequest(prompt: "Retry", context: try context()), second = ShaderRequest(prompt: "Queue", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: first), deviceID: "A")
+        let job = root.appendingPathComponent(first.id.uuidString)
+        await service.resume(); try await waitFor { FileManager.default.fileExists(atPath: job.appendingPathComponent("retry-started").path) }
+        let reply = try await service.control(operation: "requestSubmit", payload: .init(request: second), deviceID: "B")
+        XCTAssertTrue(reply.enabled); XCTAssertEqual(reply.jobs.first?.stage, .queued)
+        let recoveries = await service.recoveryStatuses(); XCTAssertTrue(recoveries.contains { $0.isRetrying && $0.isRunning })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(second.id.uuidString + "/attempts").path))
+        await service.suspend(); try Data().write(to: job.appendingPathComponent("release"))
+    }
+
     func testCancelledInitialVerifyAllowsChangedRepositoryOrPython() async throws {
         for changeRepository in [true, false] {
             let (root, script) = try recoveryFixture(), gate = RequestPreparationGate()

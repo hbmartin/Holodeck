@@ -53,6 +53,15 @@ nonisolated struct RequestWorkerEvent: Decodable, Sendable {
     var requiredPreviewShaderIDs: [String]?
     var checkoutID: String?
     var result: ShaderRequestResult?
+    var failureError: Error? {
+        guard event == "failure" else { return nil }
+        let detail = message ?? "Shader worker failed"
+        if recoveryRequired == true { return RequestWorkerTeardownError(cause: detail) }
+        if failureKind == "supervision" || failureKind == "interrupted" {
+            return RequestWorkerSupervisionError(message: detail, retryable: failureKind == "supervision" && retryable != false)
+        }
+        return ShaderRequestError.unavailable(detail)
+    }
 }
 
 public enum ShaderCheckoutDetachTarget: Sendable {
@@ -74,6 +83,7 @@ public struct ShaderRequestRecoveryStatus: Sendable, Identifiable {
     public var journal: URL? = nil
     public var checkout: ShaderRequestConfiguration? = nil
     public var disposition: ShaderRequestRecoveryDisposition? = nil
+    public var isRetrying = false
 }
 
 public struct ShaderRequestPublicationStatus: Sendable {
@@ -198,6 +208,7 @@ public actor ShaderRequestService {
     private var detachedOwners: [DetachedCheckoutAcknowledgement] = []
     private var suspended = false
     private var loaded = false
+    private var activeRetryJournals: [String: UUID] = [:]
     private var recoveryID: UUID?
     private var setupMessage = "Enable shader requests in Mac Settings."
 
@@ -400,8 +411,17 @@ public actor ShaderRequestService {
         } catch { await catalog.discard(prepared.id); throw error }
     }
     public func hasPendingCleanup() -> Bool { records.values.contains { $0.cleanupPending == true } }
+    private func isActiveRetry(_ key: String) -> Bool {
+        activeRetryJournals[key] == execution?.id && execution?.interrupted == false
+    }
+    private func refreshReconciliationFailure() {
+        if let entry = recovery.entries.values.sorted(by: { $0.journal < $1.journal }).first(where: { !isActiveRetry($0.journal) }) {
+            reconciliationFailure = entry.message; reconciliationJournal = URL(fileURLWithPath: entry.journal)
+            reconciliationConfiguration = entry.configuration
+        } else { reconciliationFailure = nil; reconciliationJournal = nil; reconciliationConfiguration = nil }
+    }
     private var recoveryBlocker: String? {
-        if let entry = recovery.entries.values.first { return "Mac checkout recovery required: " + entry.message }
+        if let entry = recovery.entries.values.sorted(by: { $0.journal < $1.journal }).first(where: { !isActiveRetry($0.journal) }) { return "Mac checkout recovery required: " + entry.message }
         if let reconciliationFailure { return "Mac checkout recovery required: " + reconciliationFailure }
         if let record = records.values.first(where: { $0.cleanupPending == true }) {
             return "Mac checkout recovery required: " + (record.cleanupFailure ?? record.cleanupMessage ?? "Checkout cleanup is pending.")
@@ -482,8 +502,8 @@ public actor ShaderRequestService {
         for entry in recovery.entries.values.sorted(by: { $0.journal < $1.journal }) {
             statuses.append(ShaderRequestRecoveryStatus(id: entry.id, kind: .reconciliation,
                 repository: entry.configuration?.repository ?? "", python: entry.configuration?.python ?? "", git: entry.configuration?.git ?? "",
-                message: entry.message, isRunning: reconciliationTask != nil, requestID: entry.requestID,
-                journal: URL(fileURLWithPath: entry.journal), checkout: entry.configuration, disposition: entry.disposition))
+                message: entry.message, isRunning: reconciliationTask != nil || isActiveRetry(entry.journal), requestID: entry.requestID,
+                journal: URL(fileURLWithPath: entry.journal), checkout: entry.configuration, disposition: entry.disposition, isRetrying: isActiveRetry(entry.journal)))
         }
         if recovery.entries.isEmpty, let reconciliationFailure {
             statuses.append(ShaderRequestRecoveryStatus(id: Self.reconciliationStatusID, kind: .reconciliation,
@@ -992,21 +1012,16 @@ public actor ShaderRequestService {
         }
     }
     private func stopAndDrain(_ process: RequestWorkerProcess) async -> Error? {
-        process.stop()
+        process.shutdown()
         do { try await settleProcess(process); return nil } catch { return error }
     }
 
     private func workerFailure(_ event: RequestWorkerEvent) -> Error {
-        let message = event.message ?? "Shader worker failed"
-        guard event.recoveryRequired == true else {
-            if event.failureKind == "supervision" || event.failureKind == "interrupted" {
-                return RequestWorkerSupervisionError(message: message, retryable: event.failureKind == "supervision" && event.retryable != false)
-            }
-            return ShaderRequestError.unavailable(message)
+        let failure = event.failureError ?? ShaderRequestError.unavailable("Shader worker failed")
+        if event.recoveryRequired == true {
+            holdForRecovery(journal: activeProcess?.recoveryTarget?.directory ?? activeID.map(folder) ?? directory.appendingPathComponent("publication"),
+                configuration: activeProcess?.recoveryTarget?.configuration ?? configurationForActiveWorker, error: failure)
         }
-        let failure = RequestWorkerTeardownError(cause: message)
-        holdForRecovery(journal: activeProcess?.recoveryTarget?.directory ?? activeID.map(folder) ?? directory.appendingPathComponent("publication"),
-            configuration: activeProcess?.recoveryTarget?.configuration ?? configurationForActiveWorker, error: failure)
         return failure
     }
 
@@ -1019,7 +1034,7 @@ public actor ShaderRequestService {
         do { try finished.save(in: journal) }
         catch { appendRecoveryFailure(journal: journal, configuration: activeProcess?.recoveryTarget?.configuration, error: error); throw error }
         let key = RequestPaths.canonical(journal), retained = recovery.entries[key]
-        recovery.entries[key] = nil
+        if retained?.disposition != .detach, retained?.configurationRepair == nil { recovery.entries[key] = nil }
         do { try persist() }
         catch {
             recovery.entries[key] = retained
@@ -1028,15 +1043,13 @@ public actor ShaderRequestService {
             throw failure
         }
         dirtyJournals.remove(key) // Process settlement and the exact-journal retry were verified under this execution lease.
-        if reconciliationJournal.map({ RequestPaths.canonical($0) }) == key {
-            if let next = recovery.entries.values.first {
-                reconciliationFailure = next.message; reconciliationJournal = URL(fileURLWithPath: next.journal); reconciliationConfiguration = next.configuration
-            } else { reconciliationFailure = nil; reconciliationJournal = nil; reconciliationConfiguration = nil }
-        }
+        refreshReconciliationFailure()
     }
     @discardableResult
     private func runWorker(mode: String, configuration: ShaderRequestConfiguration, journal: URL, operation: UUID, resetPaused: Bool = false,
                            receive: (RequestWorkerEvent, RequestWorkerProcess, UUID) async throws -> Void) async throws -> WorkerOutcome {
+        let journalKey = RequestPaths.canonical(journal)
+        defer { activeRetryJournals[journalKey] = nil; refreshReconciliationFailure() }
         var attempt: RequestWorkerOperation
         do {
             try checkExecution(operation)
@@ -1077,6 +1090,7 @@ public actor ShaderRequestService {
                 try finishWorkerOperation(attempt, journal: journal)
                 return WorkerOutcome(attemptID: attemptID, completion: completion)
             } catch {
+                let error = error is CancellationError ? (process.recordedFailure ?? error) : error
                 let settlementError = await stopAndDrain(process)
                 if let fault = error as? RequestWorkerSupervisionError {
                     appendRecoveryFailure(journal: journal, configuration: configuration, error: fault)
@@ -1105,6 +1119,7 @@ public actor ShaderRequestService {
                     try await reconcileWorker(journal)
                     try checkExecution(operation)
                     attempt.phase = .retryRunning; try attempt.save(in: journal)
+                    activeRetryJournals[journalKey] = operation; refreshReconciliationFailure()
                     // Keep the original recovery diagnostic until this attempt completes.
                     try persist()
                     if mode == "run", let id = activeID, records[id]?.status.stage.terminal == false,
