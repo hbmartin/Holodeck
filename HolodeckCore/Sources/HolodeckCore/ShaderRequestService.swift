@@ -545,7 +545,7 @@ public actor ShaderRequestService {
                     do { try await reconcile(folder) }
                     catch {
                         let key = RequestPaths.canonical(folder)
-                        if retained[key]?.disposition == .detach, !(error is RequestWorkerTeardownError), !(error is RequestWorkerOwnershipError) { continue }
+                        if retained[key]?.disposition == .detach, !(error is RequestWorkerTeardownError), !(error is RequestWorkerOwnershipError), !(error is CancellationError) { continue }
                         let target = all.first { RequestPaths.canonical($0.2) == key }?.1 ?? retained[key]?.configuration
                             ?? (try? Self.savedConfiguration(in: folder))
                         throw ReconciliationError(journal: folder, configuration: target, underlying: error)
@@ -715,7 +715,11 @@ public actor ShaderRequestService {
             guard let entry = recovery.entries[key] else { continue }
             do {
                 let journal = URL(fileURLWithPath: entry.journal)
-                try await reconcileWorker(journal); try checkMaintenance(lease)
+                do { try await reconcileWorker(journal) }
+                catch where entry.disposition == .detach && !(error is RequestWorkerTeardownError) && !(error is RequestWorkerOwnershipError) && !(error is CancellationError) {
+                    // Exact-entry finalization archives unverifiable markers after settlement.
+                }
+                try checkMaintenance(lease)
                 if let repair = entry.maintenanceRepair {
                     try await completeMaintenanceRepair(key, repair: repair, lease: lease)
                 } else if let repair = entry.configurationRepair {
@@ -982,6 +986,7 @@ public actor ShaderRequestService {
             let (journal, _, checkout) = target
             do { try await reconcileWorker(journal) }
             catch {
+                if error is CancellationError { throw error }
                 if error is RequestWorkerTeardownError || error is RequestWorkerOwnershipError {
                     holdForRecovery(journal: journal, configuration: checkout, error: error); throw error
                 }
@@ -1136,7 +1141,7 @@ public actor ShaderRequestService {
         refreshReconciliationFailure()
     }
     @discardableResult
-    private func runWorker(mode: String, configuration: ShaderRequestConfiguration, journal: URL, operation: UUID, resetPaused: Bool = false,
+    private func runWorker(mode: String, configuration: ShaderRequestConfiguration, journal: URL, operation: UUID,
                            receive: (RequestWorkerEvent, RequestWorkerProcess, UUID) async throws -> Void) async throws -> WorkerOutcome {
         let journalKey = RequestPaths.canonical(journal)
         defer { activeRetryJournals[journalKey] = nil; refreshReconciliationFailure() }
@@ -1145,8 +1150,7 @@ public actor ShaderRequestService {
             try checkExecution(operation)
             try await reconcileWorker(journal)
             try checkExecution(operation)
-            if resetPaused { try RequestWorkerOperation.restartPaused(in: journal) }
-            attempt = try RequestWorkerOperation.begin(mode: mode, configuration: configuration, in: journal)
+            attempt = try RequestWorkerOperation.begin(mode: mode, configuration: configuration, in: journal, replacingInitialMaintenance: true)
             if attempt.phase == .retryPending { attempt.phase = .retryRunning; try attempt.save(in: journal) }
         } catch {
             if !(error is CancellationError) {
@@ -1300,7 +1304,7 @@ public actor ShaderRequestService {
         candidate.detachedOwner = try await Task.detached { try Self.detachedOwner(for: checkout, acknowledgements: acknowledgements) }.value
         candidate.checkoutID = nil
         try checkExecution(operation.id)
-        let outcome = try await runWorker(mode: "preflight", configuration: candidate, journal: directory.appendingPathComponent("setup"), operation: operation.id, resetPaused: true) { _, _, _ in
+        let outcome = try await runWorker(mode: "preflight", configuration: candidate, journal: directory.appendingPathComponent("setup"), operation: operation.id) { _, _, _ in
             try checkExecution(operation.id)
         }
         try checkExecution(operation.id)

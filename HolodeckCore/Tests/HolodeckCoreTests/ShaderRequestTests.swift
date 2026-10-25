@@ -832,6 +832,69 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: setup.appendingPathComponent("process.json").path))
     }
 
+    func testCrashLeftInitialMaintenanceCanBeReplacedAfterSettlement() async throws {
+        for pendingBinding in [false, true] {
+            let (root, script) = try recoveryFixture(), setup = root.appendingPathComponent("setup")
+            let original = ShaderRequestConfiguration(repository: root.path)
+            var abandoned = try RequestWorkerOperation.begin(mode: "preflight", configuration: original, in: setup)
+            if pendingBinding {
+                try FileManager.default.removeItem(at: setup.appendingPathComponent("configuration.json"))
+                abandoned.binding = .init(predecessor: nil, previous: nil, replacement: try RequestWorkerOperation.encodedConfiguration(original, id: abandoned.id))
+                try abandoned.save(in: setup)
+            }
+            let service = try await recoveryService(root, script: script, enabled: false); await service.resume()
+            let other = root.appendingPathComponent("other"); try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+            var replacement = original; replacement.repository = other.path; replacement.model = "changed model"
+            try await service.verify(configuration: replacement)
+            XCTAssertNotEqual(try RequestWorkerOperation.read(in: setup)?.id, abandoned.id)
+            XCTAssertEqual(try RequestWorkerOperation.read(in: setup)?.phase, .complete)
+            let accepted = await service.configurationValue(); XCTAssertEqual(accepted.repository, RequestPaths.canonical(other)); XCTAssertEqual(accepted.model, replacement.model)
+        }
+    }
+
+    func testInitialMaintenanceReplacementDoesNotBypassRetryOrCreativeBindings() throws {
+        let (root, _) = try recoveryFixture(), old = ShaderRequestConfiguration(repository: root.path)
+        var changed = old; changed.model = "new model"
+        for mode in ["preflight", "publication", "run", "discard"] {
+            for phase in [RequestWorkerOperation.Phase.initial, .retryPending, .retryRunning, .paused] {
+                if phase == .initial && ["preflight", "publication"].contains(mode) { continue }
+                let job = root.appendingPathComponent(mode + phase.rawValue)
+                var value = try RequestWorkerOperation.begin(mode: mode, configuration: old, in: job)
+                value.phase = phase; try value.save(in: job)
+                XCTAssertThrowsError(try RequestWorkerOperation.begin(mode: mode, configuration: changed, in: job, replacingInitialMaintenance: true))
+                XCTAssertEqual(try RequestWorkerOperation.read(in: job)?.id, value.id)
+            }
+        }
+    }
+
+    func testRetryRecoveryFinishesPendingDetachWithUnverifiableMarkers() async throws {
+        let (root, script) = try recoveryFixture(), job = root.appendingPathComponent("publication"), config = ShaderRequestConfiguration(repository: root.path)
+        _ = try RequestWorkerOperation.begin(mode: "publication", configuration: config, in: job)
+        try FileManager.default.createSymbolicLink(at: job.appendingPathComponent("supervision.json"), withDestinationURL: job.appendingPathComponent("missing"))
+        let key = RequestPaths.canonical(job)
+        var store = RequestRecoveryStore(); store.entries[key] = .init(journal: key, requestID: nil, configuration: config, disposition: .detach, message: "Pending detach", archiveID: UUID())
+        try JSONEncoder().encode(store).write(to: root.appendingPathComponent("recovery.json"))
+        let service = try await recoveryService(root, script: script, enabled: false)
+        try await service.retryReconciliation()
+        let remaining = await service.recoveryStatuses(); XCTAssertTrue(remaining.isEmpty)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(job.appendingPathComponent("supervision.json")))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: job.path).contains { $0.hasPrefix("detached-") })
+    }
+
+    func testCompletingCancelledPublicationNeverRemovesPendingDetachIntent() async throws {
+        let gate = RequestPreparationGate(), probe = PendingDetachWriteProbe()
+        let f = try await publicationRecoveryFixture(gate: gate, recoveryWriter: { bytes, file in
+            probe.observe(bytes, file: file); try RequestJournalWriter.write(bytes, to: file)
+        })
+        let publication = Task { try await f.service.ensurePublication(force: true) }
+        await f.service.resume(); try await waitFor { await gate.entered }
+        let detach = Task { try await f.service.detachCheckout(.selectedCheckout) }
+        try await waitFor { await f.service.recoveryStatuses().contains { $0.disposition == .detach } }
+        await gate.release(); try await detach.value
+        do { try await publication.value; XCTFail("Detached publication succeeded") } catch is CancellationError {}
+        XCTAssertFalse(probe.lostIntent)
+    }
+
     func testCleanupPatchChangesOnlyMatchingToolFields() {
         let previous = ShaderRequestConfiguration(repository: "/tmp/owned", codex: "/old/codex", python: "/old/python", git: "/old/git", model: "old")
         var corrected = previous; corrected.python = "/fixed/python"; corrected.git = "/fixed/git"
@@ -1276,7 +1339,8 @@ final class ShaderRequestTests: XCTestCase {
     }
 
     private func publicationRecoveryFixture(gate: RequestPreparationGate? = nil,
-        reconcile: @escaping @Sendable (URL) async throws -> Void = { try RequestWorkerProcess.reconcileOrphan(in: $0) }
+        reconcile: @escaping @Sendable (URL) async throws -> Void = { try RequestWorkerProcess.reconcileOrphan(in: $0) },
+        recoveryWriter: @escaping @Sendable (Data, URL) throws -> Void = { try RequestJournalWriter.write($0, to: $1) }
     ) async throws -> (root: URL, script: URL, authoring: URL, catalog: DirectoryCatalog, service: ShaderRequestService) {
         let (root, script) = try recoveryFixture()
         let authoring = try requestAuthoringFixture(root.appendingPathComponent("authoring"))
@@ -1305,7 +1369,7 @@ final class ShaderRequestTests: XCTestCase {
             return try ShaderPNG.gradient(colors: [[0,0,0],[1,1,1]])
         }
         let catalog = DirectoryCatalog(directory: root.appendingPathComponent("catalog"), previewGenerator: previews)
-        let service = ShaderRequestService(catalog: catalog, directory: root, workerScript: script, reconcileWorker: reconcile)
+        let service = ShaderRequestService(catalog: catalog, directory: root, workerScript: script, reconcileWorker: reconcile, recoveryWriter: recoveryWriter)
         await service.suspend()
         try await service.initialize(configuration: .init(repository: authoring.path, shaderTool: NativeShaderToolFixture.executable.path, enabled: true))
         return (root, script, authoring, catalog, service)
@@ -3571,6 +3635,23 @@ private final class PublishedRepairFailure: @unchecked Sendable {
     func write(_ bytes: Data, _ file: URL) throws {
         try RequestJournalWriter.write(bytes, to: file)
         if lock.withLock({ let value = armed; armed = false; return value }) { throw POSIXError(.EIO) }
+    }
+}
+#endif
+
+#if os(macOS)
+private final class PendingDetachWriteProbe: @unchecked Sendable {
+    private let lock = NSLock(); private var observed = false; private var lost = false
+    var lostIntent: Bool { lock.withLock { lost } }
+    func observe(_ bytes: Data, file: URL) {
+        guard let store = try? JSONDecoder().decode(RequestRecoveryStore.self, from: bytes) else { return }
+        lock.withLock {
+            if store.entries.values.contains(where: { $0.disposition == .detach }) { observed = true }
+            else if observed {
+                let folder = file.deletingLastPathComponent().appendingPathComponent("publication")
+                if (try? FileManager.default.contentsOfDirectory(atPath: folder.path).contains { $0.hasPrefix("detached-") }) != true { lost = true }
+            }
+        }
     }
 }
 #endif

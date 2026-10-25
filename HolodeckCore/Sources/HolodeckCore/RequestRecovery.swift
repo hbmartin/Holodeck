@@ -111,16 +111,20 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
         return value
     }
     static func begin(mode: String, configuration: ShaderRequestConfiguration, in directory: URL,
-                      writer: Writer = RequestJournalWriter.write) throws -> Self {
+                      replacingInitialMaintenance: Bool = false, writer: Writer = RequestJournalWriter.write) throws -> Self {
         var saved = try read(in: directory)
         if var pending = saved, pending.binding != nil {
-            guard pending.target == Target(configuration) else { throw RequestWorkerEvidenceError(cause: "Pending operation belongs to another checkout.") }
+            guard pending.target == Target(configuration) || (replacingInitialMaintenance && pending.phase == .initial && ["preflight", "publication"].contains(pending.mode)) else { throw RequestWorkerEvidenceError(cause: "Pending operation belongs to another checkout.") }
             try pending.finishBinding(in: directory, writer: writer); saved = pending
         }
         if let expected = try expectedID(in: directory), expected != saved?.id {
             throw RequestWorkerEvidenceError(cause: "Worker retry journal is missing or belongs to another operation. Use explicit Retry Recovery or detach while retaining files; automatic retries remain blocked.")
         }
         if var saved, saved.mode == mode, saved.phase != .complete {
+            if replacingInitialMaintenance, saved.phase == .initial, ["preflight", "publication"].contains(mode),
+               let bytes = try configurationBytes(in: directory), try !matches(bytes, configuration: configuration, id: saved.id) {
+                return try rotate(mode: mode, configuration: configuration, in: directory, writer: writer)
+            }
             guard saved.target == nil || saved.target == Target(configuration) else {
                 throw RequestWorkerEvidenceError(cause: "Worker operation belongs to another checkout; retire it before replacement.")
             }
@@ -131,8 +135,7 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
             // Legacy bound configurations can differ in JSON encoding, but not in content.
             let existing = try configurationBytes(in: directory)
             if let existing {
-                let canonical = try JSONSerialization.data(withJSONObject: configurationObject(existing), options: .sortedKeys)
-                guard canonical == (try encodedConfiguration(configuration, id: saved.id)) else {
+                guard try matches(existing, configuration: configuration, id: saved.id) else {
                     throw RequestWorkerEvidenceError(cause: "Worker configuration changed during an unfinished operation. Retry recovery explicitly.")
                 }
             } else {
@@ -159,7 +162,7 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
         if let configuration, let bytes {
             let original = try JSONDecoder().decode(ShaderRequestConfiguration.self, from: bytes)
             guard Target(original) == Target(configuration) else { throw RequestWorkerEvidenceError(cause: "Recovery configuration belongs to another checkout.") }
-            configurationChanged = try JSONSerialization.data(withJSONObject: configurationObject(bytes), options: .sortedKeys) != encodedConfiguration(configuration, id: saved.id)
+            configurationChanged = try !matches(bytes, configuration: configuration, id: saved.id)
         }
         guard saved.phase == .paused || saved.phase == .retryRunning || mismatch || configurationChanged else { return }
         let replacement: ShaderRequestConfiguration
@@ -217,7 +220,7 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
               saved.phase == .initial || saved.phase == .retryRunning,
               try expectedID(in: directory) == id,
               let bytes = try configurationBytes(in: directory),
-              try JSONSerialization.data(withJSONObject: configurationObject(bytes), options: .sortedKeys) == encodedConfiguration(configuration, id: id) else {
+              try matches(bytes, configuration: configuration, id: id) else {
             throw RequestWorkerEvidenceError(cause: "Worker launch does not have a committed configuration binding.")
         }
     }
