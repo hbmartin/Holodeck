@@ -1038,6 +1038,89 @@ final class ShaderRequestTests: XCTestCase {
         }
     }
 
+    func testExplicitLegacyCleanupBindingRepairRequiresRecordedCheckoutAndOptIn() throws {
+        let (root, _) = try recoveryFixture(), previous = ShaderRequestConfiguration(repository: root.path)
+        var corrected = previous; corrected.python = "/corrected/python"
+        for expected in [UUID?.none, UUID?.some(UUID())] {
+            let job = root.appendingPathComponent(UUID().uuidString)
+            var legacy = try RequestWorkerOperation.begin(mode: "discard", configuration: previous, in: job)
+            legacy.formatVersion = 1; legacy.target = nil; try legacy.save(in: job)
+            try RequestWorkerOperation.encodedConfiguration(previous, id: expected).write(to: job.appendingPathComponent("configuration.json"))
+            let replacement = UUID()
+            XCTAssertThrowsError(try RequestWorkerOperation.repair(in: job, mode: "discard", previous: previous, corrected: corrected, oldID: legacy.id, newID: replacement))
+            try RequestWorkerOperation.repair(in: job, mode: "discard", previous: previous, corrected: corrected, oldID: legacy.id, newID: replacement, repairLegacyMismatch: true)
+            try RequestWorkerOperation.validateLaunch(id: replacement, configuration: corrected, in: job)
+        }
+        let job = root.appendingPathComponent("modern")
+        let modern = try RequestWorkerOperation.begin(mode: "discard", configuration: previous, in: job)
+        try RequestWorkerOperation.encodedConfiguration(previous, id: UUID()).write(to: job.appendingPathComponent("configuration.json"))
+        XCTAssertThrowsError(try RequestWorkerOperation.repair(in: job, mode: "discard", previous: previous, corrected: corrected, oldID: modern.id, newID: UUID(), repairLegacyMismatch: true))
+    }
+
+    func testMaintenanceRepairResumesItsExactIntentAndRejectsDetachAndConflicts() async throws {
+        for detach in [false, true] {
+            let (root, script) = try recoveryFixture(); _ = try initializeRecoveryGit(root)
+            let config = ShaderRequestConfiguration(repository: root.path), journal = root.appendingPathComponent("setup")
+            let operation = try RequestWorkerOperation.begin(mode: "preflight", configuration: config, in: journal)
+            try Data("corrupt".utf8).write(to: journal.appendingPathComponent("configuration.json"))
+            let repair = RequestRecoveryStore.MaintenanceRepair(operation: operation, configuration: config)
+            var entry = RequestRecoveryStore.Entry(journal: RequestPaths.canonical(journal), configuration: config, disposition: detach ? .detach : .resume, message: "Repair fixture")
+            entry.maintenanceRepair = repair; entry.archiveID = detach ? UUID() : nil
+            var store = RequestRecoveryStore(); store.entries[entry.journal] = entry
+            try JSONEncoder().encode(store).write(to: root.appendingPathComponent("recovery.json"))
+            let service = try await recoveryService(root, script: script, enabled: false)
+            var changed = config; changed.model = "conflicting proposal"
+            do { try await service.repairMaintenanceRecovery(entry.id, configuration: changed); XCTFail("Conflicting repair accepted") } catch {}
+            let stillPending = try JSONDecoder().decode(RequestRecoveryStore.self, from: Data(contentsOf: root.appendingPathComponent("recovery.json")))
+            XCTAssertEqual(stillPending.entries[entry.journal]?.maintenanceRepair?.replacementID, repair.replacementID)
+            XCTAssertEqual(stillPending.entries[entry.journal]?.maintenanceRepair?.archiveID, repair.archiveID)
+            if detach {
+                do { try await service.repairMaintenanceRecovery(entry.id, configuration: config); XCTFail("Pending Detach was replaced") } catch {}
+                XCTAssertEqual(try Data(contentsOf: journal.appendingPathComponent("configuration.json")), Data("corrupt".utf8))
+            } else {
+                try await service.repairMaintenanceRecovery(entry.id, configuration: config)
+                XCTAssertEqual(try RequestWorkerOperation.read(in: journal)?.id, repair.replacementID)
+                XCTAssertEqual(try Data(contentsOf: journal.appendingPathComponent("detached-" + repair.archiveID.uuidString).appendingPathComponent("configuration.json")), Data("corrupt".utf8))
+            }
+        }
+    }
+
+    func testRepairReplayAcceptsOnlyTrustedPreferenceToolRelocation() async throws {
+        for trusted in [true, false] {
+            let (root, script) = try recoveryFixture(), gitdir = try initializeRecoveryGit(root), seed = try await recoveryService(root, script: script)
+            let request = ShaderRequest(prompt: "Repair retained configuration", context: try context())
+            _ = try await seed.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+            try await seed.cancelQueued(request.id)
+            let file = root.appendingPathComponent("journal.json"), job = root.appendingPathComponent(request.id.uuidString)
+            var rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [[String: Any]])
+            let old = try JSONDecoder().decode(ShaderRequestConfiguration.self, from: JSONSerialization.data(withJSONObject: rows[0]["configuration"]!))
+            rows[0]["cleanupPending"] = true; try JSONSerialization.data(withJSONObject: rows).write(to: file)
+            try JSONSerialization.data(withJSONObject: ["id": request.id.uuidString, "directory": RequestPaths.canonical(job)]).write(to: gitdir.appendingPathComponent("holodeck-request-owner.json"))
+            let operation = try RequestWorkerOperation.begin(mode: "discard", configuration: old, in: job)
+            let python = root.appendingPathComponent("python3"); try FileManager.default.createSymbolicLink(atPath: python.path, withDestinationPath: old.python)
+            var corrected = old; corrected.python = python.path
+            var repair = RequestRecoveryStore.ConfigurationRepair(previous: old, corrected: corrected, requestIDs: [request.id], updatePreferences: true)
+            repair.version = 2; repair.preferences = .init(previous: old, corrected: corrected)
+            repair.participants = [.init(requestID: request.id, change: .init(previous: old, corrected: corrected), mode: "discard", oldID: operation.id)]
+            var entry = RequestRecoveryStore.Entry(journal: RequestPaths.canonical(job), requestID: request.id, configuration: old, disposition: .cleanup, message: "Replay repair")
+            entry.configurationRepair = repair
+            var store = RequestRecoveryStore(); store.entries[entry.journal] = entry
+            try JSONEncoder().encode(store).write(to: root.appendingPathComponent("recovery.json")); try JSONEncoder().encode(old).write(to: root.appendingPathComponent("preferences.json"))
+            var startup = old; startup.shaderTool = "/current/app/Tools/holodeck-shader-tool"
+            let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script, bundledShaderTool: trusted ? startup.shaderTool : "/another/tool")
+            await service.suspend(); try await service.initialize(configuration: startup)
+            if trusted {
+                try await service.retryReconciliation()
+                let accepted = await service.configurationValue(); XCTAssertEqual(accepted.shaderTool, startup.shaderTool); XCTAssertEqual(accepted.python, corrected.python)
+                let captured = try JSONDecoder().decode(ShaderRequestConfiguration.self, from: Data(contentsOf: job.appendingPathComponent("configuration.json")))
+                XCTAssertEqual(captured.shaderTool, old.shaderTool)
+            } else {
+                do { try await service.retryReconciliation(); XCTFail("Untrusted tool relocation accepted") } catch {}
+                let accepted = await service.configurationValue(); XCTAssertEqual(accepted.python, old.python)
+            }
+        }
+    }
+
     func testFinalCommitWakeupStartsQueuedWorkAfterOverlappingDeletion() async throws {
         let (root, script) = try recoveryFixture(), gate = HeldRecoveryWriter(empty: true)
         try """
@@ -3556,7 +3639,8 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: job.appendingPathComponent("configuration.json")), binding)
         XCTAssertEqual(try RequestWorkerOperation.read(in: job)?.id, operation.id)
         XCTAssertEqual(try RequestWorkerOperation.read(in: job)?.phase, .paused)
-        try await service.revoke("unrelated device")
+        do { try await service.revoke("unrelated device"); XCTFail("Unrelated persistence bypassed storage recovery") }
+        catch { XCTAssertTrue(error is RequestPersistence.Fault) }
         let durable = try JSONDecoder().decode(RequestRecoveryStore.self, from: Data(contentsOf: root.appendingPathComponent("recovery.json")))
         XCTAssertFalse(durable.entries.values.contains { $0.configurationRepair != nil })
     }

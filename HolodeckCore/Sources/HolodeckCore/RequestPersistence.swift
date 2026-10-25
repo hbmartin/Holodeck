@@ -233,6 +233,18 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             }
         } }
     }
+    /// Binding/archival coordinators retain their own durable intent; never roll those
+    /// ownership transitions back as a side effect of rejecting caller preferences.
+    func journal<T: Sendable>(_ operation: String, files: [URL], _ body: @escaping @Sendable () throws -> T) async throws -> T {
+        try await perform { [self] in
+            do { return try body() }
+            catch {
+                let value = error as NSError
+                guard error is POSIXError || value.domain == NSCocoaErrorDomain else { throw error }
+                throw fail(error, operation: operation, files: files, before: [:], proposed: [:])
+            }
+        }
+    }
     func perform<T: Sendable>(_ operation: @escaping @Sendable () throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { c in queue.async {
             do { c.resume(returning: try operation()) } catch { c.resume(throwing: error) }
