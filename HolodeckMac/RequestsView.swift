@@ -109,15 +109,15 @@ private struct CheckoutRecoveryView: View {
     @State private var confirmsDetach = false
     init(model: MacRequestsModel, recovery: ShaderRequestRecoveryStatus) {
         self.model = model; self.recovery = recovery
-        _repository = State(initialValue: recovery.repository)
-        _python = State(initialValue: recovery.python)
-        _git = State(initialValue: recovery.git)
+        _repository = State(initialValue: recovery.repairConfiguration?.repository ?? recovery.repository)
+        _python = State(initialValue: recovery.repairConfiguration?.python ?? recovery.python)
+        _git = State(initialValue: recovery.repairConfiguration?.git ?? recovery.git)
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(recovery.isRetrying ? "Retrying Preserved Work" : "Checkout Recovery").bold()
             Text(recovery.message).textSelection(.enabled)
-            if recovery.kind == .cleanup {
+            if recovery.kind == .cleanup || recovery.repairConfiguration != nil {
                 TextField("Owned checkout folder", text: $repository).accessibilityIdentifier("recovery-repository")
                 TextField("Python executable", text: $python).accessibilityIdentifier("recovery-python")
                 TextField("Git executable", text: $git).accessibilityIdentifier("recovery-git")
@@ -128,6 +128,13 @@ private struct CheckoutRecoveryView: View {
                     else { model.retryReconciliation() }
                 }
                     .disabled(model.checking || recovery.isRunning).accessibilityIdentifier("retry-checkout-cleanup")
+                if let proposal = recovery.repairConfiguration {
+                    Button("Repair Configuration") {
+                        var candidate = proposal
+                        candidate.repository = repository; candidate.python = python; candidate.git = git
+                        model.repairMaintenance(recovery.id, configuration: candidate)
+                    }.disabled(model.checking || recovery.isRunning).accessibilityIdentifier("repair-recovery-configuration")
+                }
                 if recovery.checkout == nil, let journal = recovery.journal {
                     Button("Open Recovery Journal") { NSWorkspace.shared.open(journal) }
                 }

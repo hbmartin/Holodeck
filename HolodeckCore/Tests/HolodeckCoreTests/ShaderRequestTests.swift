@@ -832,6 +832,120 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: setup.appendingPathComponent("process.json").path))
     }
 
+    func testCleanupPatchChangesOnlyMatchingToolFields() {
+        let previous = ShaderRequestConfiguration(repository: "/tmp/owned", codex: "/old/codex", python: "/old/python", git: "/old/git", model: "old")
+        var corrected = previous; corrected.python = "/fixed/python"; corrected.git = "/fixed/git"
+        let repair = RequestRecoveryStore.ConfigurationRepair(previous: previous, corrected: corrected, requestIDs: [], updatePreferences: true)
+        var newer = previous; newer.model = "new"; newer.codex = "/new/codex"; newer.shaderTool = "/new/tool"; newer.git = "/new/git"; newer.enabled = true
+        var expected = newer; expected.python = corrected.python
+        XCTAssertEqual(repair.applying(to: newer), expected)
+    }
+
+    func testPendingRepairProtectsSiblingsAndLegacyDeletedParticipantCanRetire() async throws {
+        let (root, script) = try recoveryFixture(), gitdir = try initializeRecoveryGit(root), seed = try await recoveryService(root, script: script)
+        let first = ShaderRequest(prompt: "Cleanup", context: try context()), second = ShaderRequest(prompt: "Sibling", context: try context())
+        for request in [first, second] {
+            _ = try await seed.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+            try await seed.cancelQueued(request.id)
+        }
+        let file = root.appendingPathComponent("journal.json"), job = root.appendingPathComponent(first.id.uuidString)
+        var rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [[String: Any]])
+        let index = try XCTUnwrap(rows.firstIndex { (($0["status"] as? [String: Any])?["id"] as? String)?.lowercased() == first.id.uuidString.lowercased() })
+        rows[index]["cleanupPending"] = true
+        try JSONSerialization.data(withJSONObject: rows).write(to: file)
+        let old = try JSONDecoder().decode(ShaderRequestConfiguration.self, from: JSONSerialization.data(withJSONObject: rows[index]["configuration"]!))
+        try JSONSerialization.data(withJSONObject: ["id": first.id.uuidString, "directory": RequestPaths.canonical(job)]).write(to: gitdir.appendingPathComponent("holodeck-request-owner.json"))
+        let writer = PublishedRepairFailure()
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script, recoveryWriter: { try writer.write($0, $1) })
+        await service.suspend(); try await service.initialize(configuration: old); writer.arm()
+        do { try await service.retryCleanup(first.id, repository: root.path, python: "/fixed/python", git: old.git); XCTFail("Uncertain persistence succeeded") } catch {}
+        do { try await service.deleteFinished(second.id); XCTFail("Deleted a pending participant") } catch {}
+        // Reproduce a terminal participant deleted by a previous app version.
+        try FileManager.default.removeItem(at: root.appendingPathComponent(second.id.uuidString))
+        rows.removeAll { (($0["status"] as? [String: Any])?["id"] as? String)?.lowercased() == second.id.uuidString.lowercased() }
+        try JSONSerialization.data(withJSONObject: rows).write(to: file)
+        let restarted = try await recoveryService(root, script: script)
+        try await restarted.retryReconciliation()
+        let remaining = await restarted.recoveryStatuses(); XCTAssertFalse(remaining.contains { $0.kind == .reconciliation })
+    }
+
+    func testCleanupPatchPreservesNewSettingsAndRebindsSibling() async throws {
+        let (root, script) = try recoveryFixture(), gitdir = try initializeRecoveryGit(root)
+        let initial = try await recoveryService(root, script: script)
+        let first = ShaderRequest(prompt: "Cleanup", context: try context()), second = ShaderRequest(prompt: "Sibling", context: try context())
+        for request in [first, second] {
+            _ = try await initial.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+            try await initial.cancelQueued(request.id)
+        }
+        let file = root.appendingPathComponent("journal.json")
+        var rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [[String: Any]])
+        let firstIndex = try XCTUnwrap(rows.firstIndex { (($0["status"] as? [String: Any])?["id"] as? String)?.lowercased() == first.id.uuidString.lowercased() })
+        let old = try JSONDecoder().decode(ShaderRequestConfiguration.self, from: JSONSerialization.data(withJSONObject: rows[firstIndex]["configuration"]!))
+        rows[firstIndex]["cleanupPending"] = true
+        try JSONSerialization.data(withJSONObject: rows).write(to: file)
+        let job = root.appendingPathComponent(first.id.uuidString), sibling = root.appendingPathComponent(second.id.uuidString)
+        try JSONSerialization.data(withJSONObject: ["id": first.id.uuidString, "directory": RequestPaths.canonical(job)]).write(to: gitdir.appendingPathComponent("holodeck-request-owner.json"))
+        _ = try RequestWorkerOperation.begin(mode: "discard", configuration: old, in: job)
+        _ = try RequestWorkerOperation.begin(mode: "run", configuration: old, in: sibling)
+        var latest = old; latest.model = "new model"; latest.codex = "/new/codex"; latest.shaderTool = "/new/tool"
+        try JSONEncoder().encode(latest).write(to: root.appendingPathComponent("preferences.json"))
+        let service = try await recoveryService(root, script: script)
+        let python = root.appendingPathComponent("python3")
+        try FileManager.default.createSymbolicLink(atPath: python.path, withDestinationPath: old.python)
+        try await service.retryCleanup(first.id, repository: root.path, python: python.path, git: old.git)
+        let actual = await service.configurationValue()
+        XCTAssertEqual(actual.model, latest.model); XCTAssertEqual(actual.codex, latest.codex); XCTAssertEqual(actual.shaderTool, latest.shaderTool)
+        XCTAssertEqual(actual.python, python.path)
+        var corrected = old; corrected.python = python.path
+        let operation = try RequestWorkerOperation.begin(mode: "run", configuration: corrected, in: sibling)
+        try RequestWorkerOperation.validateLaunch(id: operation.id, configuration: corrected, in: sibling)
+    }
+
+    func testGuidedMaintenanceRepairArchivesCorruptConfigurationAndRetainsTarget() async throws {
+        for dangling in [false, true] {
+            let (root, script) = try recoveryFixture(); _ = try initializeRecoveryGit(root)
+            let original = ShaderRequestConfiguration(repository: root.path)
+            let job = root.appendingPathComponent("setup"), file = job.appendingPathComponent("configuration.json")
+            let old = try RequestWorkerOperation.begin(mode: "preflight", configuration: original, in: job)
+            try FileManager.default.removeItem(at: file)
+            if dangling { try FileManager.default.createSymbolicLink(at: file, withDestinationURL: root.appendingPathComponent("missing")) }
+            else { try Data("{".utf8).write(to: file) }
+            let key = RequestPaths.canonical(job), entry = RequestRecoveryStore.Entry(journal: key, requestID: nil, configuration: nil, disposition: .resume, message: "Configuration is unreadable")
+            var store = RequestRecoveryStore(); store.entries[key] = entry
+            try JSONEncoder().encode(store).write(to: root.appendingPathComponent("recovery.json"))
+            let service = try await recoveryService(root, script: script, enabled: false)
+            let statuses = await service.recoveryStatuses(); XCTAssertNotNil(statuses.first?.repairConfiguration)
+            var wrong = original; wrong.repository = root.appendingPathComponent("other").path
+            do { try await service.repairMaintenanceRecovery(entry.id, configuration: wrong); XCTFail("Wrong checkout was accepted") } catch is RequestWorkerOwnershipError {}
+            try await service.repairMaintenanceRecovery(entry.id, configuration: original)
+            let repaired = try XCTUnwrap(RequestWorkerOperation.read(in: job)); XCTAssertNotEqual(repaired.id, old.id)
+            let archived = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: job, includingPropertiesForKeys: nil).first { $0.lastPathComponent.hasPrefix("detached-") })
+            if dangling { XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: archived.appendingPathComponent("configuration.json").path), root.appendingPathComponent("missing").path) }
+            else { XCTAssertEqual(try Data(contentsOf: archived.appendingPathComponent("configuration.json")), Data("{".utf8)) }
+            await service.resume(); try await service.verify(configuration: original)
+            let recoveries = await service.recoveryStatuses(); XCTAssertTrue(recoveries.isEmpty)
+        }
+    }
+
+    func testRepairBindingReplaysEveryDurableBoundary() throws {
+        let (root, _) = try recoveryFixture(), old = ShaderRequestConfiguration(repository: root.path)
+        var corrected = old; corrected.python = "/new/python"
+        for phase in 1...3 {
+            let job = root.appendingPathComponent("binding-\(phase)")
+            let previous = try RequestWorkerOperation.begin(mode: "run", configuration: old, in: job), replacement = UUID()
+            // The ordinary binding coordinator covers the same pending/configuration/commit boundaries;
+            // the repair API must subsequently accept exactly that replacement and reject other IDs.
+            var next = RequestWorkerOperation(id: replacement, mode: "run", target: .init(corrected))
+            next.binding = .init(predecessor: previous.id, previous: try RequestWorkerOperation.encodedConfiguration(old, id: previous.id), replacement: try RequestWorkerOperation.encodedConfiguration(corrected, id: replacement))
+            try next.save(in: job)
+            if phase >= 2 { try RequestWorkerOperation.encodedConfiguration(corrected, id: replacement).write(to: job.appendingPathComponent("configuration.json")) }
+            if phase == 3 { next.binding = nil; try next.save(in: job) }
+            try RequestWorkerOperation.repair(in: job, mode: "run", previous: old, corrected: corrected, oldID: previous.id, newID: replacement)
+            try RequestWorkerOperation.validateLaunch(id: replacement, configuration: corrected, in: job)
+            XCTAssertThrowsError(try RequestWorkerOperation.repair(in: job, mode: "run", previous: old, corrected: corrected, oldID: previous.id, newID: UUID()))
+        }
+    }
+
     func testRecordedFailureSurvivesReplyAfterWorkerRetirement() async throws {
         let (root, script) = try recoveryFixture(), worker = RequestWorkerProcess(script: script)
         try """
@@ -3218,6 +3332,9 @@ final class ShaderRequestTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: job.appendingPathComponent("configuration.json")), binding)
         XCTAssertEqual(try RequestWorkerOperation.read(in: job)?.id, operation.id)
         XCTAssertEqual(try RequestWorkerOperation.read(in: job)?.phase, .paused)
+        try await service.revoke("unrelated device")
+        let durable = try JSONDecoder().decode(RequestRecoveryStore.self, from: Data(contentsOf: root.appendingPathComponent("recovery.json")))
+        XCTAssertFalse(durable.entries.values.contains { $0.configurationRepair != nil })
     }
 
     func testVerifyExposesLegacyMismatchRecoveryAndExplicitRecoveryRepairsIt() async throws {
@@ -3443,6 +3560,17 @@ private final class PausedIdentityProbe: @unchecked Sendable {
         while held { condition.wait() }
         condition.unlock()
         return RequestProcessIdentity(pid:pid)
+    }
+}
+#endif
+
+#if os(macOS)
+private final class PublishedRepairFailure: @unchecked Sendable {
+    private let lock = NSLock(); private var armed = false
+    func arm() { lock.withLock { armed = true } }
+    func write(_ bytes: Data, _ file: URL) throws {
+        try RequestJournalWriter.write(bytes, to: file)
+        if lock.withLock({ let value = armed; armed = false; return value }) { throw POSIXError(.EIO) }
     }
 }
 #endif

@@ -101,9 +101,9 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
         self.binding = nil
         try save(in: directory, writer: writer)
     }
-    private static func rotate(mode: String, configuration: ShaderRequestConfiguration, in directory: URL, writer: Writer) throws -> Self {
+    private static func rotate(mode: String, configuration: ShaderRequestConfiguration, in directory: URL, id: UUID = UUID(), writer: Writer) throws -> Self {
         let previous = try configurationBytes(in: directory)
-        var value = Self(mode: mode, target: Target(configuration))
+        var value = Self(id: id, mode: mode, target: Target(configuration))
         value.binding = Binding(predecessor: try previous.map { operationID(try configurationObject($0)) } ?? nil,
                                 previous: previous, replacement: try encodedConfiguration(configuration, id: value.id))
         try value.save(in: directory, writer: writer)
@@ -167,6 +167,44 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
         else if let bytes { replacement = try JSONDecoder().decode(ShaderRequestConfiguration.self, from: bytes) }
         else { throw RequestWorkerEvidenceError(cause: "Saved checkout configuration is required to restart this operation.") }
         _ = try rotate(mode: saved.mode, configuration: replacement, in: directory, writer: writer)
+    }
+    static func matches(_ bytes: Data, configuration: ShaderRequestConfiguration, id: UUID?) throws -> Bool {
+        try JSONSerialization.data(withJSONObject: configurationObject(bytes), options: .sortedKeys) == encodedConfiguration(configuration, id: id)
+    }
+    /// Explicit, settled recovery: replay exactly the recorded binding replacement.
+    static func repair(in directory: URL, mode: String, previous: ShaderRequestConfiguration,
+                       corrected: ShaderRequestConfiguration, oldID: UUID?, newID: UUID) throws {
+        if var saved = try read(in: directory) {
+            if saved.id == newID {
+                try saved.finishBinding(in: directory, writer: RequestJournalWriter.write)
+                guard let bytes = try configurationBytes(in: directory), try matches(bytes, configuration: corrected, id: newID) else {
+                    throw RequestWorkerEvidenceError(cause: "Repaired configuration conflicts with its durable intent.")
+                }
+                return
+            }
+            guard saved.id == oldID else { throw RequestWorkerOwnershipError() }
+            try saved.finishBinding(in: directory, writer: RequestJournalWriter.write)
+            guard try expectedID(in: directory) == saved.id,
+                  let bytes = try configurationBytes(in: directory), try matches(bytes, configuration: previous, id: saved.id) else {
+                throw RequestWorkerEvidenceError(cause: "Configuration repair no longer matches its recorded predecessor.")
+            }
+        } else {
+            guard oldID == nil, try expectedID(in: directory) == nil else { throw RequestWorkerOwnershipError() }
+            if let bytes = try configurationBytes(in: directory), try !matches(bytes, configuration: previous, id: nil) {
+                throw RequestWorkerOwnershipError()
+            }
+        }
+        _ = try rotate(mode: mode, configuration: corrected, in: directory, id: newID, writer: RequestJournalWriter.write)
+    }
+    static func createRepaired(in directory: URL, mode: String, configuration: ShaderRequestConfiguration, id: UUID) throws {
+        if var current = try read(in: directory) {
+            guard current.id == id else { throw RequestWorkerOwnershipError() }
+            try current.finishBinding(in: directory, writer: RequestJournalWriter.write)
+            guard let bytes = try configurationBytes(in: directory), try matches(bytes, configuration: configuration, id: id) else { throw RequestWorkerOwnershipError() }
+        } else {
+            guard try configurationBytes(in: directory) == nil else { throw RequestWorkerOwnershipError() }
+            _ = try rotate(mode: mode, configuration: configuration, in: directory, id: id, writer: RequestJournalWriter.write)
+        }
     }
     static func retire(in directory: URL) throws {
         guard var saved = try read(in: directory) else { return }
@@ -244,12 +282,37 @@ nonisolated struct RequestRecoveryStore: Codable, Sendable {
         var preferencesRollback: ShaderRequestConfiguration?
         var archiveID: UUID?
         var configurationRepair: ConfigurationRepair?
+        var maintenanceRepair: MaintenanceRepair?
     }
     struct ConfigurationRepair: Codable, Sendable {
         var previous: ShaderRequestConfiguration
         var corrected: ShaderRequestConfiguration
         var requestIDs: [UUID]
         var updatePreferences: Bool
+        var version: Int? = nil
+        var participants: [Participant]? = nil
+        var preferences: Change? = nil
+        struct Change: Codable, Sendable { var previous: ShaderRequestConfiguration; var corrected: ShaderRequestConfiguration }
+        struct Participant: Codable, Sendable {
+            var requestID: UUID
+            var change: Change
+            var mode: String
+            var oldID: UUID?
+            var newID = UUID()
+        }
+        func applying(to current: ShaderRequestConfiguration, primary: Bool = false) -> ShaderRequestConfiguration {
+            var result = current
+            if primary || RequestPaths.canonical(URL(fileURLWithPath: current.repository)) == RequestPaths.canonical(URL(fileURLWithPath: previous.repository)) { result.repository = corrected.repository }
+            if primary || current.python == previous.python { result.python = corrected.python }
+            if primary || current.git == previous.git { result.git = corrected.git }
+            return result
+        }
+    }
+    struct MaintenanceRepair: Codable, Sendable {
+        var operation: RequestWorkerOperation
+        var configuration: ShaderRequestConfiguration
+        var archiveID = UUID()
+        var replacementID = UUID()
     }
     var formatVersion = 1
     var legacyMigrationComplete = false

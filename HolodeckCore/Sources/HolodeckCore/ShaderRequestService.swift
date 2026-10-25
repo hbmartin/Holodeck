@@ -84,6 +84,7 @@ public struct ShaderRequestRecoveryStatus: Sendable, Identifiable {
     public var checkout: ShaderRequestConfiguration? = nil
     public var disposition: ShaderRequestRecoveryDisposition? = nil
     public var isRetrying = false
+    public var repairConfiguration: ShaderRequestConfiguration? = nil
 }
 
 public struct ShaderRequestPublicationStatus: Sendable {
@@ -503,7 +504,7 @@ public actor ShaderRequestService {
             statuses.append(ShaderRequestRecoveryStatus(id: entry.id, kind: .reconciliation,
                 repository: entry.configuration?.repository ?? "", python: entry.configuration?.python ?? "", git: entry.configuration?.git ?? "",
                 message: entry.message, isRunning: reconciliationTask != nil || isActiveRetry(entry.journal), requestID: entry.requestID,
-                journal: URL(fileURLWithPath: entry.journal), checkout: entry.configuration, disposition: entry.disposition, isRetrying: isActiveRetry(entry.journal)))
+                journal: URL(fileURLWithPath: entry.journal), checkout: entry.configuration, disposition: entry.disposition, isRetrying: isActiveRetry(entry.journal), repairConfiguration: proposedMaintenanceConfiguration(entry)))
         }
         if recovery.entries.isEmpty, let reconciliationFailure {
             statuses.append(ShaderRequestRecoveryStatus(id: Self.reconciliationStatusID, kind: .reconciliation,
@@ -520,7 +521,7 @@ public actor ShaderRequestService {
         for key in legacyDetachKeys { recovery.entries[key]?.archiveID = UUID() }
         // A prior failed write may have left a new archive ID only in memory.
         if recovery.entries.values.contains(where: { $0.disposition == .detach }) { try persistRecovery() }
-        if let entry = recovery.entries.values.first(where: { $0.configurationRepair != nil }) {
+        if let entry = recovery.entries.values.first(where: { $0.configurationRepair != nil || $0.maintenanceRepair != nil }) {
             throw RequestWorkerEvidenceError(cause: "A saved cleanup configuration repair must be completed with Retry Recovery: " + entry.journal)
         }
         if reconciliationTask == nil {
@@ -715,11 +716,13 @@ public actor ShaderRequestService {
             do {
                 let journal = URL(fileURLWithPath: entry.journal)
                 try await reconcileWorker(journal); try checkMaintenance(lease)
-                if let repair = entry.configurationRepair {
+                if let repair = entry.maintenanceRepair {
+                    try await completeMaintenanceRepair(key, repair: repair, lease: lease)
+                } else if let repair = entry.configurationRepair {
                     guard let id = entry.requestID else { throw RequestWorkerOwnershipError() }
                     try await Task.detached { try Self.validateRecoveryCheckout(repair.corrected, id: id, job: journal) }.value
                     try checkMaintenance(lease)
-                    try completeConfigurationRepair(key)
+                    try await completeConfigurationRepair(key, lease: lease)
                 } else if entry.disposition == .retainResult {
                     try RequestWorkerOperation.retire(in: journal)
                 } else if entry.disposition != .detach, try RequestWorkerOperation.read(in: journal) != nil {
@@ -746,26 +749,112 @@ public actor ShaderRequestService {
         try persist()
     }
 
-    private func completeConfigurationRepair(_ key: String) throws {
-        guard let entry = recovery.entries[key], let repair = entry.configurationRepair else { return }
-        let journal = URL(fileURLWithPath: entry.journal)
-        try RequestWorkerOperation.restartPaused(in: journal, configuration: repair.corrected, repairLegacyMismatch: true)
-        for id in repair.requestIDs {
-            guard let existing = records[id], existing.detached != true,
-                  Self.samePublicationCheckout(existing.configuration, repair.previous) || Self.samePublicationCheckout(existing.configuration, repair.corrected) else {
-                throw RequestWorkerOwnershipError()
+    private func completeConfigurationRepair(_ key: String, lease: UUID) async throws {
+        guard let entry = recovery.entries[key], var repair = entry.configurationRepair else { return }
+        if repair.participants == nil {
+            var participants: [RequestRecoveryStore.ConfigurationRepair.Participant] = []
+            for id in repair.requestIDs {
+                guard let record = records[id] else {
+                    let path = folder(id)
+                    guard !RequestProcessIdentity.evidenceExists(path), try Self.ownerMarker(repair.corrected)?.id != id else { throw RequestWorkerOwnershipError() }
+                    continue // Older versions permitted deleting a terminal participant and its entire folder.
+                }
+                guard record.detached != true, Self.samePublicationCheckout(record.configuration, repair.previous) || Self.samePublicationCheckout(record.configuration, repair.corrected) else { throw RequestWorkerOwnershipError() }
+                let corrected = repair.applying(to: record.configuration, primary: id == entry.requestID)
+                if corrected != record.configuration || id == entry.requestID {
+                    participants.append(.init(requestID: id, change: .init(previous: record.configuration, corrected: corrected),
+                        mode: record.cleanupPending == true ? "discard" : "run", oldID: try RequestWorkerOperation.read(in: folder(id))?.id))
+                }
             }
-            records[id]?.configuration = repair.corrected
+            repair.version = 2; repair.participants = participants; repair.requestIDs = participants.map(\.requestID)
+            if repair.updatePreferences {
+                guard Self.samePublicationCheckout(configuration, repair.previous) || Self.samePublicationCheckout(configuration, repair.corrected) else { throw RequestWorkerOwnershipError() }
+                repair.preferences = .init(previous: configuration, corrected: repair.applying(to: configuration))
+            }
+            recovery.entries[key]?.configurationRepair = repair; try persistRecovery()
         }
-        try persist() // Intent remains durable while records and preferences converge.
-        if repair.updatePreferences {
-            guard Self.samePublicationCheckout(configuration, repair.previous) || Self.samePublicationCheckout(configuration, repair.corrected) else { throw RequestWorkerOwnershipError() }
-            try RequestJournalWriter.write(JSONEncoder().encode(repair.corrected), to: directory.appendingPathComponent("preferences.json"))
-            configuration = repair.corrected
+        guard repair.version == 2, Set(repair.requestIDs).count == repair.requestIDs.count,
+              Set(repair.participants?.map(\.requestID) ?? []) == Set(repair.requestIDs) else { throw RequestWorkerOwnershipError() }
+        func validChange(_ change: RequestRecoveryStore.ConfigurationRepair.Change) -> Bool {
+            var expected = change.previous
+            expected.repository = change.corrected.repository; expected.python = change.corrected.python; expected.git = change.corrected.git
+            return expected == change.corrected && Self.samePublicationCheckout(change.previous, change.corrected)
         }
-        recovery.entries[key]?.configuration = repair.corrected
+        if let preferences = repair.preferences, !validChange(preferences) { throw RequestWorkerOwnershipError() }
+        for participant in repair.participants ?? [] {
+            guard validChange(participant.change), ["run", "discard"].contains(participant.mode) else { throw RequestWorkerOwnershipError() }
+            try await reconcileWorker(folder(participant.requestID))
+            try checkMaintenance(lease)
+            guard let record = records[participant.requestID], record.detached != true,
+                  record.configuration == participant.change.previous || record.configuration == participant.change.corrected else { throw RequestWorkerOwnershipError() }
+        }
+        for participant in repair.participants ?? [] {
+            try RequestWorkerOperation.repair(in: folder(participant.requestID), mode: participant.mode,
+                previous: participant.change.previous, corrected: participant.change.corrected, oldID: participant.oldID, newID: participant.newID)
+        }
+        for participant in repair.participants ?? [] { records[participant.requestID]?.configuration = participant.change.corrected }
+        try persist() // Retain the intent until bindings, records and preferences converge.
+        if let preferences = repair.preferences {
+            guard configuration == preferences.previous || configuration == preferences.corrected else { throw RequestWorkerOwnershipError() }
+            try RequestJournalWriter.write(JSONEncoder().encode(preferences.corrected), to: directory.appendingPathComponent("preferences.json"))
+            configuration = preferences.corrected
+        }
+        recovery.entries[key]?.configuration = records[entry.requestID ?? UUID()]?.configuration ?? repair.corrected
         recovery.entries[key]?.configurationRepair = nil
         if let id = entry.requestID { records[id]?.cleanupFailure = nil; recoveryID = id }
+        try persist()
+    }
+
+    private func proposedMaintenanceConfiguration(_ entry: RequestRecoveryStore.Entry) -> ShaderRequestConfiguration? {
+        guard entry.requestID == nil, entry.disposition != .detach, entry.maintenanceRepair == nil, let operation = try? RequestWorkerOperation.read(in: URL(fileURLWithPath: entry.journal)),
+              ["preflight", "publication"].contains(operation.mode), let target = operation.target else { return nil }
+        var proposed = operation.binding.flatMap { try? JSONDecoder().decode(ShaderRequestConfiguration.self, from: $0.replacement) } ?? configuration
+        proposed.repository = target.repository; proposed.checkoutID = target.checkoutID
+        return proposed
+    }
+    public func repairMaintenanceRecovery(_ id: UUID, configuration candidate: ShaderRequestConfiguration) async throws {
+        guard activeID == nil, !maintenanceBusy, let entry = recovery.entries.values.first(where: { $0.id == id }),
+              entry.requestID == nil, let original = try RequestWorkerOperation.read(in: URL(fileURLWithPath: entry.journal)),
+              ["preflight", "publication"].contains(original.mode), let target = original.target else { throw RequestWorkerOwnershipError() }
+        let lease = try beginMaintenance(); defer { endMaintenance(lease) }
+        try await drainReconciliation(lease: lease)
+        var candidate = candidate; candidate.repository = RequestPaths.canonical(URL(fileURLWithPath: candidate.repository)); candidate.checkoutID = target.checkoutID
+        guard RequestWorkerOperation.Target(candidate) == target else { throw RequestWorkerOwnershipError() }
+        try await Task.detached { [candidate] in try Self.validateMaintenanceRecoveryCheckout(candidate) }.value
+        try checkMaintenance(lease); try await reconcileWorker(URL(fileURLWithPath: entry.journal)); try checkMaintenance(lease)
+        let repair = RequestRecoveryStore.MaintenanceRepair(operation: original, configuration: candidate)
+        let prior = recovery.entries[entry.journal]
+        recovery.entries[entry.journal]?.maintenanceRepair = repair
+        try commitRepairIntent(key: entry.journal, previous: prior)
+        try await completeMaintenanceRepair(entry.journal, repair: repair, lease: lease)
+        try await reconcileWorkers(); try checkMaintenance(lease)
+    }
+    private func commitRepairIntent(key: String, previous: RequestRecoveryStore.Entry?) throws {
+        let priorBytes = try? BoundedCatalogReader(root: directory).read("recovery.json", limit: CatalogLimits.manifestBytes).bytes
+        do { try persistRecovery() }
+        catch {
+            // A writer can fail after atomic replacement. Only discard a proposal when
+            // the last committed file is provably unchanged; otherwise keep it pending.
+            if let priorBytes, (try? BoundedCatalogReader(root: directory).read("recovery.json", limit: CatalogLimits.manifestBytes).bytes) == priorBytes { recovery.entries[key] = previous; refreshReconciliationFailure() }
+            else { recovery.entries[key]?.message += " Configuration repair persistence is uncertain; Retry Recovery must finish it." }
+            throw error
+        }
+    }
+    private func completeMaintenanceRepair(_ key: String, repair: RequestRecoveryStore.MaintenanceRepair, lease: UUID) async throws {
+        let journal = URL(fileURLWithPath: key)
+        guard repair.operation.target == RequestWorkerOperation.Target(repair.configuration),
+              ["setup", "publication"].contains(journal.lastPathComponent), journal.deletingLastPathComponent().path == RequestPaths.canonical(directory) else { throw RequestWorkerOwnershipError() }
+        try await Task.detached { try Self.validateMaintenanceRecoveryCheckout(repair.configuration) }.value
+        try checkMaintenance(lease); try await reconcileWorker(journal); try checkMaintenance(lease)
+        let archive = journal.appendingPathComponent("detached-" + repair.archiveID.uuidString)
+        let current = try RequestWorkerOperation.read(in: journal)
+        if current?.id != repair.replacementID {
+            if let current { guard current.id == repair.operation.id, current.target == repair.operation.target else { throw RequestWorkerOwnershipError() } }
+            else { guard try RequestWorkerOperation.read(in: archive)?.id == repair.operation.id else { throw RequestWorkerOwnershipError() } }
+            try RequestJournalWriter.archive(in: journal, id: repair.archiveID)
+        }
+        try RequestWorkerOperation.createRepaired(in: journal, mode: repair.operation.mode, configuration: repair.configuration, id: repair.replacementID)
+        recovery.entries[key]?.configuration = repair.configuration; recovery.entries[key]?.maintenanceRepair = nil
         try persist()
     }
 
@@ -791,9 +880,10 @@ public actor ShaderRequestService {
         entry.configurationRepair = .init(previous: record.configuration, corrected: corrected,
             requestIDs: records.values.filter { $0.detached != true && Self.samePublicationCheckout($0.configuration, record.configuration) }.map { $0.status.id },
             updatePreferences: Self.samePublicationCheckout(configuration, record.configuration))
+        let previous = recovery.entries[key]
         recovery.entries[key] = entry
-        try persistRecovery() // No record or preference changes before this intent is durable.
-        do { try completeConfigurationRepair(key) }
+        try commitRepairIntent(key: key, previous: previous)
+        do { try await completeConfigurationRepair(key, lease: lease) }
         catch { appendRecoveryFailure(journal: job, configuration: record.configuration, error: error); throw error }
         reconciled = false; reconciliationTask = nil; reconciliationKickID = nil
         try await reconcileWorkers(); try checkMaintenance(lease)
@@ -1034,7 +1124,7 @@ public actor ShaderRequestService {
         do { try finished.save(in: journal) }
         catch { appendRecoveryFailure(journal: journal, configuration: activeProcess?.recoveryTarget?.configuration, error: error); throw error }
         let key = RequestPaths.canonical(journal), retained = recovery.entries[key]
-        if retained?.disposition != .detach, retained?.configurationRepair == nil { recovery.entries[key] = nil }
+        if retained?.disposition != .detach, retained?.configurationRepair == nil, retained?.maintenanceRepair == nil { recovery.entries[key] = nil }
         do { try persist() }
         catch {
             recovery.entries[key] = retained
@@ -1248,6 +1338,7 @@ public actor ShaderRequestService {
         kick()
     }
     public func deleteFinished(_ id: UUID) throws {
+        guard !recovery.entries.values.contains(where: { $0.configurationRepair?.requestIDs.contains(id) == true }) else { throw ShaderRequestError.unavailable("Finish the pending configuration repair before deleting this record.") }
         guard !recovery.entries.values.contains(where: { $0.requestID == id }), !Self.hasProcessEvidence(folder(id)), records[id]?.status.stage.terminal == true, records[id]?.cleanupPending != true, activeID != id else { throw ShaderRequestError.invalidRequest }
         try FileManager.default.removeItem(at: folder(id)); records[id] = nil; try persist()
     }
