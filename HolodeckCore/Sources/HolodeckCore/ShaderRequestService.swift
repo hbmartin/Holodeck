@@ -1082,6 +1082,11 @@ public actor ShaderRequestService {
                     appendRecoveryFailure(journal: journal, configuration: configuration, error: fault)
                 }
                 if let settlementError { throw settlementError }
+                if error is CancellationError, attempt.phase == .initial,
+                   mode == "preflight" || mode == "publication" {
+                    // Settled maintenance cancellation must not bind the next attempt to this configuration.
+                    try finishWorkerOperation(attempt, journal: journal)
+                }
                 try checkExecution(operation)
                 guard let fault = error as? RequestWorkerSupervisionError else {
                     if !(error is RequestWorkerEvidenceError || error is RequestWorkerOwnershipError || error is RequestWorkerTeardownError) {
