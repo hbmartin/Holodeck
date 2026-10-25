@@ -455,12 +455,15 @@ final class ShaderRequestTests: XCTestCase {
         try Data("retained".utf8).write(to: job.appendingPathComponent("owned-patch"))
         await service.resume()
         try await waitFor { FileManager.default.fileExists(atPath: job.appendingPathComponent("worker-started").path) }
+        let operation = try XCTUnwrap(RequestWorkerOperation.read(in: job))
         await service.suspend()
         try await waitFor { FileManager.default.fileExists(atPath: job.appendingPathComponent("stopping").path) }
         await service.resume()
         XCTAssertFalse(FileManager.default.fileExists(atPath: job.appendingPathComponent("cleanup-started").path))
         try FileManager.default.removeItem(at: job.appendingPathComponent("hold-exit"))
         try await waitFor { (try? String(contentsOf: job.appendingPathComponent("worker-count"), encoding: .utf8)) == "2" }
+        XCTAssertEqual(try RequestWorkerOperation.read(in: job)?.id, operation.id)
+        XCTAssertEqual(try RequestWorkerOperation.read(in: job)?.phase, .initial)
         let jobs = await service.allJobs()
         XCTAssertFalse(jobs.first!.stage.terminal)
         XCTAssertFalse(FileManager.default.fileExists(atPath: job.appendingPathComponent("cleanup-started").path))
@@ -827,6 +830,49 @@ final class ShaderRequestTests: XCTestCase {
         let configuration = await service.configurationValue()
         XCTAssertFalse(configuration.enabled)
         XCTAssertFalse(FileManager.default.fileExists(atPath: setup.appendingPathComponent("process.json").path))
+    }
+
+    func testCancelledInitialVerifyAllowsChangedRepositoryOrPython() async throws {
+        for changeRepository in [true, false] {
+            let (root, script) = try recoveryFixture(), gate = RequestPreparationGate()
+            let setup = root.appendingPathComponent("setup")
+            let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")),
+                directory: root, workerScript: script, waitForWorker: { process in
+                    try await process.waitForExit()
+                    await gate.hold()
+                })
+            let original = ShaderRequestConfiguration(repository: root.path)
+            try await service.initialize(configuration: original)
+            let verifying = Task { try await service.verify(configuration: original) }
+            defer { verifying.cancel(); Task { await gate.release() } }
+            try await waitFor { await gate.entered }
+            let cancelled = try XCTUnwrap(RequestWorkerOperation.read(in: setup))
+            XCTAssertEqual(cancelled.phase, .initial)
+            verifying.cancel(); await gate.release()
+            do { try await verifying.value; XCTFail("Cancelled Verify succeeded") } catch is CancellationError {}
+            XCTAssertEqual(try RequestWorkerOperation.read(in: setup)?.phase, .complete)
+            let acceptedBeforeRetry = await service.configurationValue()
+            XCTAssertEqual(acceptedBeforeRetry, original)
+
+            var replacement = original
+            if changeRepository {
+                let folder = root.appendingPathComponent("other")
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                replacement.repository = folder.path
+            } else {
+                let python = root.appendingPathComponent("python3")
+                try FileManager.default.createSymbolicLink(atPath: python.path, withDestinationPath: original.python)
+                replacement.python = python.path
+            }
+            try await service.verify(configuration: replacement)
+            let accepted = await service.configurationValue()
+            XCTAssertEqual(accepted.repository, RequestPaths.canonical(URL(fileURLWithPath: replacement.repository)))
+            XCTAssertEqual(accepted.python, replacement.python); XCTAssertTrue(accepted.enabled)
+            let completed = try XCTUnwrap(RequestWorkerOperation.read(in: setup))
+            XCTAssertEqual(completed.phase, .complete); XCTAssertNotEqual(completed.id, cancelled.id)
+            XCTAssertEqual(try RequestWorkerOperation.expectedID(in: setup), completed.id)
+            let recoveries = await service.recoveryStatuses(); XCTAssertTrue(recoveries.isEmpty)
+        }
     }
 
     func testDetachedAcknowledgementSurvivesDeletionAndReverificationAcrossAliases() async throws {
@@ -1789,6 +1835,7 @@ final class ShaderRequestTests: XCTestCase {
             try await waitFor { await f.service.publicationOperationStatus().phase == .idle }
             let operation = await f.service.publicationOperationStatus(), jobs = await f.service.allJobs()
             XCTAssertNil(operation.failure); XCTAssertEqual(jobs.first?.stage, .queued)
+            XCTAssertEqual(try RequestWorkerOperation.read(in: f.root.appendingPathComponent("publication"))?.phase, .complete)
         }
     }
 
