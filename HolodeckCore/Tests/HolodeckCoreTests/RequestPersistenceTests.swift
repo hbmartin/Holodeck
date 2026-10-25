@@ -37,7 +37,7 @@ import XCTest
         XCTAssertEqual(try Data(contentsOf: file), Data("pending intent".utf8))
         try await writer.commit(snapshot(3, "retained recovery"), retainingEvidence: true)
         do { try await writer.commit(snapshot(4, "still blocked")); XCTFail("Evidence write cleared the failure") } catch {}
-        await writer.resumeAfterExplicitRecovery()
+        try await writer.resumeAfterExplicitRecovery()
         try await writer.commit(snapshot(5, "explicitly recovered"))
         XCTAssertEqual(try Data(contentsOf: file), Data("explicitly recovered".utf8))
     }
@@ -55,6 +55,54 @@ import XCTest
         await fulfillment(of: [responsive], timeout: 1)
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("recovery.json").path))
         probe.release(); try await writing.value
+    }
+    func testRejectedChangeRestoresAllEarlierWritesButRetainsIndependentRecoveryIntent() async throws {
+        let root = try directory(), probe = PersistenceWriteProbe(), writer = RequestPersistence(directory: root, recoveryWriter: { try probe.write($0, $1) })
+        let preferences = root.appendingPathComponent("preferences.json"), payload = root.appendingPathComponent("request.json"), recovery = root.appendingPathComponent("recovery.json"), id = UUID()
+        let accepted = Data("accepted settings".utf8); try accepted.write(to: preferences)
+        try await writer.begin(id, operation: "rejected proposal")
+        try await writer.write(Data("rejected settings".utf8), to: preferences, transaction: id)
+        try await writer.write(Data("rejected payload".utf8), to: payload, transaction: id)
+        probe.failAfterPublication()
+        do { try await writer.commit(.init(revision: 1, files: [.init(url: recovery, bytes: Data("proposal".utf8))]), transaction: id); XCTFail("Uncertain commit succeeded") } catch {}
+        try await writer.commit(.init(revision: 2, files: [.init(url: recovery, bytes: Data("durable Detach intent".utf8))]), retainingEvidence: true)
+        try await writer.reject(id)
+        XCTAssertEqual(try Data(contentsOf: preferences), accepted)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(payload))
+        XCTAssertEqual(try Data(contentsOf: recovery), Data("durable Detach intent".utf8))
+        let fault = await writer.fault(); XCTAssertEqual(fault?.operation, "rejected proposal")
+        try await writer.resumeAfterExplicitRecovery()
+        XCTAssertEqual(try Data(contentsOf: preferences), accepted)
+        XCTAssertEqual(try Data(contentsOf: recovery), Data("durable Detach intent".utf8))
+    }
+    func testRestartCannotSilentlyAcceptAnUncertainRejectedChange() async throws {
+        let root = try directory(), probe = PersistenceWriteProbe(), file = root.appendingPathComponent("recovery.json")
+        let writer = RequestPersistence(directory: root, recoveryWriter: { try probe.write($0, $1) })
+        try Data("accepted".utf8).write(to: file); probe.failAfterPublication()
+        do { try await writer.write(Data("rejected".utf8), to: file); XCTFail("Uncertain replacement succeeded") } catch {}
+        let restarted = RequestPersistence(directory: root)
+        let fault = try await restarted.loadFault(); XCTAssertNotNil(fault)
+        do { try await restarted.resumeAfterExplicitRecovery(); XCTFail("Lost rollback bytes were silently accepted") } catch {}
+        XCTAssertEqual(try Data(contentsOf: file), Data("rejected".utf8))
+        try Data("accepted".utf8).write(to: file)
+        try await restarted.resumeAfterExplicitRecovery()
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(root.appendingPathComponent("storage-recovery.json")))
+    }
+    func testFailedRestorationStaysBlockedAndNewerFaultCannotBeCleared() async throws {
+        let root = try directory(), probe = PersistenceWriteProbe(), file = root.appendingPathComponent("recovery.json")
+        let writer = RequestPersistence(directory: root, recoveryWriter: { try probe.write($0, $1) }), id = UUID()
+        try Data("accepted".utf8).write(to: file)
+        try await writer.begin(id, operation: "first proposal"); probe.failAfterPublication()
+        do { try await writer.write(Data("rejected".utf8), to: file, transaction: id) } catch {}
+        let first = await writer.fault()
+        try FileManager.default.removeItem(at: file); try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
+        do { try await writer.reject(id); XCTFail("Obstructed rollback succeeded") } catch {}
+        let second = await writer.fault(); XCTAssertGreaterThan(second!.generation, first!.generation)
+        XCTAssertEqual(second?.operation, first?.operation)
+        do { try await writer.finishRecovery(first?.id); XCTFail("Stale recovery cleared a new failure") } catch {}
+        do { try await writer.write(Data("unrelated".utf8), to: root.appendingPathComponent("other")); XCTFail("Unrelated work bypassed failed restoration") } catch {}
+        try FileManager.default.removeItem(at: file); try Data("accepted".utf8).write(to: file)
+        try await writer.resumeAfterExplicitRecovery()
     }
     func testRecoveryDiagnosticsAreBoundedDeduplicatedAndReadable() throws {
         let root = try directory(), key = root.appendingPathComponent("setup").path
