@@ -176,7 +176,7 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
     }
     /// Explicit, settled recovery: replay exactly the recorded binding replacement.
     static func repair(in directory: URL, mode: String, previous: ShaderRequestConfiguration,
-                       corrected: ShaderRequestConfiguration, oldID: UUID?, newID: UUID) throws {
+                       corrected: ShaderRequestConfiguration, oldID: UUID?, newID: UUID, repairLegacyMismatch: Bool = false) throws {
         if var saved = try read(in: directory) {
             if saved.id == newID {
                 try saved.finishBinding(in: directory, writer: RequestJournalWriter.write)
@@ -187,8 +187,10 @@ nonisolated struct RequestWorkerOperation: Codable, Sendable {
             }
             guard saved.id == oldID else { throw RequestWorkerOwnershipError() }
             try saved.finishBinding(in: directory, writer: RequestJournalWriter.write)
-            guard try expectedID(in: directory) == saved.id,
-                  let bytes = try configurationBytes(in: directory), try matches(bytes, configuration: previous, id: saved.id) else {
+            let expected = try expectedID(in: directory)
+            guard (expected == saved.id || (repairLegacyMismatch && saved.formatVersion == 1)),
+                  let bytes = try configurationBytes(in: directory), try matches(bytes, configuration: previous, id: expected),
+                  saved.target == nil || saved.target == Target(previous), Target(previous) == Target(corrected) else {
                 throw RequestWorkerEvidenceError(cause: "Configuration repair no longer matches its recorded predecessor.")
             }
         } else {

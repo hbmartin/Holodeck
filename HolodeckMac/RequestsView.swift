@@ -115,7 +115,7 @@ private struct CheckoutRecoveryView: View {
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(recovery.isRetrying ? "Retrying Preserved Work" : "Checkout Recovery").bold()
+            Text(recovery.kind == .persistence ? "Storage Recovery" : (recovery.isRetrying ? "Retrying Preserved Work" : "Checkout Recovery")).bold()
             Text(recovery.message).textSelection(.enabled)
             if recovery.kind == .cleanup || recovery.repairConfiguration != nil {
                 TextField("Owned checkout folder", text: $repository).accessibilityIdentifier("recovery-repository")
@@ -139,7 +139,7 @@ private struct CheckoutRecoveryView: View {
                     Button("Open Recovery Journal") { NSWorkspace.shared.open(journal) }
                 }
                 Button("Detach Checkout…", role: .destructive) { confirmsDetach = true }
-                    .disabled(model.checking || (recovery.kind == .reconciliation && recovery.checkout == nil)).accessibilityIdentifier("detach-checkout")
+                    .disabled(model.checking || (recovery.kind != .cleanup && recovery.checkout == nil)).accessibilityIdentifier("detach-checkout")
             }
         }.confirmationDialog("Detach this checkout and disable shader requests?", isPresented: $confirmsDetach) {
             Button("Detach and Keep Files", role: .destructive) { model.detach(recovery.kind == .cleanup ? .request(recovery.id) : .recovery(recovery.id)) }

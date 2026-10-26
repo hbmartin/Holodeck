@@ -35,18 +35,20 @@ final class Counter: @unchecked Sendable {
     """.write(to:script,atomically:true,encoding:.utf8)
     let config=ShaderRequestConfiguration(repository:root.path,python:python,enabled:true)
     let request=ShaderRequest(prompt:"Persistence fixture",context:context),job=root.appendingPathComponent(request.id.uuidString)
-    let began:TimeInterval, cpu:clock_t, replacements:Int
+    let began:TimeInterval, cpu:clock_t, replacements:Int, encodings:Int
     if baseline {
      let service=BaselineShaderRequestService(catalog:DirectoryCatalog(directory:root.appendingPathComponent("catalog")),directory:root,workerScript:script,recoveryWriter:{try counter.write($0,$1)})
      await service.suspend();try await service.start(configuration:config)
-     let before=counter.count;began=ProcessInfo.processInfo.systemUptime;cpu=clock()
+     let before=await service.persistenceStatistics();began=ProcessInfo.processInfo.systemUptime;cpu=clock()
      _=try await service.control(operation:"requestSubmit",payload:.init(request:request),deviceID:"fixture")
      await service.resume()
      while (try? RequestWorkerOperation.read(in:job)?.phase) != .complete || fm.fileExists(atPath:root.appendingPathComponent("active.json").path) {
       guard ProcessInfo.processInfo.systemUptime-began<30 else {await service.suspend();throw CocoaError(.userCancelled)}
       try await Task.sleep(for:.milliseconds(2))
      }
-     replacements=(counter.count-before)*3;await service.suspend()
+     let after=await service.persistenceStatistics()
+     replacements=["journal.json","recovery.json","detached-checkouts.json"].reduce(0){$0+(after[$1,default:0]-before[$1,default:0])}
+     encodings=after["encodings",default:0]-before["encodings",default:0];await service.suspend()
     } else {
      let service=ShaderRequestService(catalog:DirectoryCatalog(directory:root.appendingPathComponent("catalog")),directory:root,workerScript:script,recoveryWriter:{try counter.write($0,$1)})
      await service.suspend();try await service.start(configuration:config)
@@ -59,10 +61,10 @@ final class Counter: @unchecked Sendable {
      }
      let after=await service.persistenceStatistics()
      replacements=["journal.json","recovery.json","detached-checkouts.json"].reduce(0){$0+(after[$1,default:0]-before[$1,default:0])}
-     await service.suspend()
+     encodings=after["encodings",default:0]-before["encodings",default:0];await service.suspend()
     }
     let elapsed=ProcessInfo.processInfo.systemUptime-began,used=Double(clock()-cpu)/Double(CLOCKS_PER_SEC)
-    results.append(["baseline":baseline,"iteration":iteration,"milliseconds":elapsed*1000,"cpu_seconds":used,"metadata_replacements":replacements,"metadata_fsyncs":replacements*2])
+    results.append(["baseline":baseline,"iteration":iteration,"milliseconds":elapsed*1000,"cpu_seconds":used,"metadata_replacements":replacements,"metadata_fsyncs":replacements*2,"metadata_encodings":encodings])
     try fm.removeItem(at:root)
    }
   }
@@ -74,7 +76,7 @@ final class Counter: @unchecked Sendable {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--baseline', default='f47afc6')
+    parser.add_argument('--baseline', default='aade843')
     parser.add_argument('--samples', type=int, default=5)
     parser.add_argument('--stages', type=int, default=200)
     parser.add_argument('--python', default='/usr/bin/python3')
@@ -86,16 +88,22 @@ def main():
         parser.error('Build and test HolodeckCore in Release first')
     original = subprocess.check_output(['git', 'show', args.baseline + ':HolodeckCore/Sources/HolodeckCore/ShaderRequestService.swift'], cwd=ROOT, text=True)
     actor = original[original.index('public actor ShaderRequestService {'):]
-    actor = actor.replace('public actor ShaderRequestService {', 'public actor BaselineShaderRequestService {', 1)
+    actor = actor.replace('public actor ShaderRequestService {', 'public actor BaselineShaderRequestService {', 1).replace('RequestPersistence', 'BaselineRequestPersistence')
+    persistence = subprocess.check_output(['git', 'show', args.baseline + ':HolodeckCore/Sources/HolodeckCore/RequestPersistence.swift'], cwd=ROOT, text=True).replace('RequestPersistence', 'BaselineRequestPersistence')
+    # Count already-encoded payloads at both enqueue APIs; no baseline behavior changes.
+    persistence = persistence.replace('private var applied:', 'private var encodings = 0\n    private var applied:')
+    persistence = persistence.replace('let retainedFailure = failure', 'encodings += snapshot.files.count\n                let retainedFailure = failure')
+    persistence = persistence.replace('if progress == nil ||', 'encodings += snapshot.files.count\n            if progress == nil ||')
+    persistence = persistence.replace('returning: writes)', 'returning: writes.merging(["encodings": encodings]) { _, value in value })')
     with tempfile.TemporaryDirectory(prefix='holodeck-persistence-profile-') as temporary:
         folder = Path(temporary)
         baseline = folder / 'baseline.swift'
-        baseline.write_text('#if os(macOS)\nimport Foundation\nimport Darwin\n@testable import HolodeckCore\n' + actor)
+        baseline.write_text('#if os(macOS)\nimport Foundation\nimport Darwin\n@testable import HolodeckCore\n' + actor + '\n' + persistence)
         driver = folder / 'profile.swift'; driver.write_text(DRIVER)
         executable = folder / 'profile'
         subprocess.run(['xcrun', 'swiftc', '-parse-as-library', '-O', '-target', 'arm64-apple-macos15.0', '-I', str(product), '-L', str(product), '-lHolodeckCore', str(baseline), str(driver), '-o', str(executable)], cwd=ROOT, check=True, timeout=120)
         result = subprocess.run([str(executable), str(args.samples), str(args.stages), args.python, str(ROOT)], cwd=ROOT, check=True, text=True, capture_output=True, timeout=args.samples*65+30)
-        print(json.dumps(dict(baseline=args.baseline, python=args.python, stages=args.stages, metadataFiles=['journal.json','recovery.json','detached-checkouts.json'], fsyncAccounting='Each successful metadata replacement synchronizes the file and its parent directory; operation/process evidence writes are excluded equally.', samples=json.loads(result.stdout)), indent=2))
+        print(json.dumps(dict(baseline=args.baseline, python=args.python, stages=args.stages, metadataFiles=['journal.json','recovery.json','detached-checkouts.json'], fsyncAccounting='Each successful metadata replacement synchronizes the file and its parent directory; operation/process evidence writes are excluded equally. Metadata encodings count surviving lazy encodes in current and all pre-coalescing payload encodes in baseline.', samples=json.loads(result.stdout)), indent=2))
 
 
 if __name__ == '__main__':

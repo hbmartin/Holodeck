@@ -8,7 +8,8 @@ nonisolated struct RequestWorkerTeardownError: LocalizedError, Sendable {
 }
 
 nonisolated struct RequestWorkerOwnershipError: LocalizedError, Sendable {
-    var errorDescription: String? { "Worker ownership cannot be verified. Registered commands were left untouched; repair the worker marker and retry recovery before reusing or detaching the checkout." }
+    var cause: String? = nil
+    var errorDescription: String? { "Worker ownership cannot be verified. Registered commands were left untouched; repair the worker marker and retry recovery before reusing or detaching the checkout." + (cause.map { " Original error: " + $0 } ?? "") }
 }
 
 nonisolated struct RequestWorkerEvidenceError: LocalizedError, Sendable {
@@ -332,7 +333,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
     private var gateReleased = false
     private var rootTermSentAt: TimeInterval?
     private var teardownFailed = false
-    private var retainedEvidenceError: RequestWorkerEvidenceError?
+    private var retainedRecoveryError: Error?
     private var signalPassPending = false
     private var nextSignalPass: TimeInterval = 0
     var beforeReplyWrite: (() -> Void)?
@@ -632,7 +633,21 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     }
                     continuation.finish()
                 } catch {
-                    let error = recordedFailure ?? error
+                    // Diagnostic priority and recovery classification are independent.
+                    // A worker's ordinary failure cannot certify damaged ownership evidence.
+                    let caught = error
+                    let original = recordedFailure
+                    let detail = original.map { $0.localizedDescription }
+                    let error: Error
+                    switch caught {
+                    case let failure as RequestWorkerEvidenceError:
+                        error = RequestWorkerEvidenceError(cause: failure.cause + (detail.map { " Original worker error: " + $0 } ?? ""))
+                    case let failure as RequestWorkerOwnershipError:
+                        error = RequestWorkerOwnershipError(cause: [failure.cause, detail].compactMap { $0 }.joined(separator: "; "))
+                    case let failure as RequestWorkerTeardownError:
+                        error = RequestWorkerTeardownError(cause: [failure.cause, detail].compactMap { $0 }.joined(separator: "; "))
+                    default: error = original ?? caught
+                    }
                     if lock.withLock({ started && !gateReleased }) {
                         beginTeardown(cancelled: false)
                         while process.isRunning || pipes.wait(timeout:.now()) != .success {
@@ -646,7 +661,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     if lock.withLock({ teardownFailed }) {
                         continuation.finish(throwing:RequestWorkerTeardownError(cause:error.localizedDescription)); return
                     }
-                    if let evidence = error as? RequestWorkerEvidenceError { lock.withLock { retainedEvidenceError = evidence } }
+                    if error is RequestWorkerEvidenceError || error is RequestWorkerOwnershipError { lock.withLock { retainedRecoveryError = error } }
                     if process.isRunning { shutdown() }
                     if error is CancellationError || error is RequestWorkerTeardownError || error is RequestWorkerEvidenceError ||
                        error is RequestWorkerOwnershipError || error is RequestWorkerSupervisionError || error is ShaderRequestError {
@@ -668,7 +683,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
             DispatchQueue.global().async { [self] in continuation.resume(returning: drained.wait(timeout: .now() + 11) == .success) }
         }
         guard finished, !lock.withLock({ teardownFailed }) else { stop(); throw RequestWorkerTeardownError(cause: lock.withLock { firstError?.localizedDescription }) }
-        if let error = lock.withLock({ retainedEvidenceError }) { throw error }
+        if let error = lock.withLock({ retainedRecoveryError }) { throw error }
     }
     private struct WorkerIdentity: Codable { let pid: Int32; let script: String; let directory: String; var birth: RequestProcessIdentity? }
     static func reconcileOrphan(in directory: URL, groups: GroupOperations = .init()) throws {
