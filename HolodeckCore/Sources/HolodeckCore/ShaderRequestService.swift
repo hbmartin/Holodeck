@@ -354,19 +354,23 @@ public actor ShaderRequestService {
         if let persistenceFault { throw persistenceFault }
         let id = UUID(); storageCommit = id
         defer { releaseStorageCommit() }
-        let proposal = try build(self), base = records
-        var rows = records
-        proposal.records.forEach { rows[$0.key] = $0.value }
-        let acknowledgements = proposal.acknowledgements ?? detachedOwners
-        var files = proposal.files
-        if !proposal.records.isEmpty || proposal.acknowledgements != nil {
-            files += metadataFiles(rows: rows, acknowledgements: acknowledgements, store: recovery)
-        }
         try await persistence.begin(id, operation: operation)
+        let proposal: StorageProposal, base: [UUID: Record]
         do {
+            // Revalidate after writer registration: independent facts can arrive
+            // while that queue is busy, even though this caller owns the short gate.
+            proposal = try build(self); base = records
+            var rows = records
+            proposal.records.forEach { rows[$0.key] = $0.value }
+            let acknowledgements = proposal.acknowledgements ?? detachedOwners
+            var files = proposal.files
+            if !proposal.records.isEmpty || proposal.acknowledgements != nil {
+                files += metadataFiles(rows: rows, acknowledgements: acknowledgements, store: recovery)
+            }
             try await commitFiles(files, transaction: id)
             await persistence.accept(id)
         } catch {
+            if error is CancellationError { persistence.abandon(id); throw error }
             let original = error
             do { try await persistence.reject(id) } catch { publishStorageFault(error) }
             publishStorageFault(original); throw original
@@ -756,16 +760,23 @@ public actor ShaderRequestService {
             for acknowledgement in result.acknowledgements {
                 detachedOwners.removeAll { $0.requestID == acknowledgement.requestID }; detachedOwners.append(acknowledgement)
                 if Self.matchesDetachedCheckout(configuration, acknowledgement: acknowledgement) {
-                    configuration.enabled = false
-                    try await writeFile(to: directory.appendingPathComponent("preferences.json")) { service in try JSONEncoder().encode(service.configuration) }
+                    try await writeFile(to: directory.appendingPathComponent("preferences.json")) { service in
+                        if Self.matchesDetachedCheckout(service.configuration, acknowledgement: acknowledgement) { service.configuration.enabled = false }
+                        return try JSONEncoder().encode(service.configuration)
+                    }
                 }
             }
             // Finalization is idempotent; entries remain durable until record/ack writes finish.
             for entry in recovery.entries.values where entry.disposition == .detach { try await finalizeDetachment(entry) }
             for entry in recovery.entries.values {
                 if let rollback = entry.preferencesRollback {
-                    try await writeFile(to: directory.appendingPathComponent("preferences.json")) { service in try JSONEncoder().encode(rollback) }
-                    configuration = rollback
+                    var applied = false
+                    try await writeFile(to: directory.appendingPathComponent("preferences.json")) { service in
+                        guard service.recovery.entries[entry.journal]?.preferencesRollback == rollback else { return try JSONEncoder().encode(service.configuration) }
+                        applied = true
+                        return try JSONEncoder().encode(rollback)
+                    }
+                    if applied { configuration = rollback; if detaching { configuration.enabled = false } }
                 }
                 guard let id = entry.requestID, records[id]?.detached != true else { continue }
                 switch entry.disposition {
@@ -860,7 +871,12 @@ public actor ShaderRequestService {
         detachedOwners = accepted.acknowledgements; recovery = accepted.recovery
         if let id = recoveryID, records[id] == nil { recoveryID = nil }
         maintenanceProposals.removeAll()
-        if let configuration = accepted.configuration { self.configuration = configuration }
+        if var restored = accepted.configuration {
+            // Initialization's trusted app relocation is launch context, not a
+            // rejected preference edit. Captured request configurations stay exact.
+            if let bundledShaderTool, configuration.shaderTool == bundledShaderTool { restored.shaderTool = bundledShaderTool }
+            configuration = restored
+        }
         reconciled = false; refreshReconciliationFailure()
     }
     private func resetPersistenceFailure() async throws {
@@ -1049,7 +1065,11 @@ public actor ShaderRequestService {
         try checkMaintenance(lease)
         if let preferences = repair.preferences {
             guard configuration == preferences.previous || configuration == preferences.corrected else { throw RequestWorkerOwnershipError() }
-            try await writeFile(to: directory.appendingPathComponent("preferences.json")) { service in try JSONEncoder().encode(preferences.corrected) }
+            try await writeFile(to: directory.appendingPathComponent("preferences.json")) { service in
+                try service.checkMaintenance(lease)
+                guard service.configuration == preferences.previous || service.configuration == preferences.corrected else { throw RequestWorkerOwnershipError() }
+                return try JSONEncoder().encode(preferences.corrected)
+            }
             configuration = preferences.corrected
         }
         recovery.entries[key]?.configuration = records[entry.requestID ?? UUID()]?.configuration ?? repair.corrected
@@ -1981,7 +2001,9 @@ public actor ShaderRequestService {
                         return
                     }
                     guard let output = publication.catalog.shaders.first(where: { $0.id == result.shaderID }) else {
-                        try await writeFile(to: job.appendingPathComponent("repair.json")) { service in try JSONEncoder().encode(["attemptID": UUID().uuidString, "shaderID": result.shaderID, "diagnostic": "The committed output was removed before TV delivery. Recreate it under a fresh unused ID."]) }
+                        try await writeFile(to: job.appendingPathComponent("repair.json")) { service in
+                            try service.checkExecution(operation)
+                            return try JSONEncoder().encode(["attemptID": UUID().uuidString, "shaderID": result.shaderID, "diagnostic": "The committed output was removed before TV delivery. Recreate it under a fresh unused ID."]) }
                         try await update(id, stage: .repairing, message: "Recreating the output removed before delivery")
                         return
                     }

@@ -348,6 +348,7 @@ final class ShaderRequestTests: XCTestCase {
         try await service.cancelQueued(second.id)
         try FileManager.default.removeItem(at: job.appendingPathComponent("hold-cleanup"))
         try await waitFor { !(await service.hasPendingCleanup()) }
+        try await waitFor { await service.canDisableRequests() }
         try await service.disable()
     }
     func testCleanupFailureBlocksReadinessAndRestartRetriesIt() async throws {
@@ -511,6 +512,7 @@ final class ShaderRequestTests: XCTestCase {
         let statuses = await service.allJobs()
         XCTAssertEqual(statuses.first?.stage, .failed)
         XCTAssertEqual(try String(contentsOf: moved.appendingPathComponent("unrelated"), encoding: .utf8), "preserved")
+        try await waitFor { await service.canDisableRequests() }
         try await service.disable()
     }
 
@@ -3268,6 +3270,10 @@ final class ShaderRequestTests: XCTestCase {
         })
         await service.suspend();try await service.initialize(configuration:.init(repository:root.path,enabled:true));await service.resume()
         try await waitFor { await service.recoveryStatuses().contains{$0.kind == .reconciliation && $0.requestID == request.id} }
+        try await waitFor {
+            let saved = try? JSONDecoder().decode(RequestRecoveryStore.self, from: Data(contentsOf: root.appendingPathComponent("recovery.json")))
+            return saved?.entries[RequestPaths.canonical(job)]?.disposition == .cleanup
+        }
         let store = try JSONDecoder().decode(RequestRecoveryStore.self,from:Data(contentsOf:root.appendingPathComponent("recovery.json")))
         XCTAssertEqual(store.entries[RequestPaths.canonical(job)]?.disposition,.cleanup)
         XCTAssertFalse(FileManager.default.fileExists(atPath:job.appendingPathComponent("cleanup-started").path))
@@ -4127,6 +4133,8 @@ extension ShaderRequestTests {
 private final class DraftReplacementGate: @unchecked Sendable {
     private let lock = NSLock(), gate = DispatchSemaphore(value: 0)
     private var target: String?, waiting = false
+    private let failAfterRelease: Bool
+    init(failAfterRelease: Bool = true) { self.failAfterRelease = failAfterRelease }
     var entered: Bool { lock.withLock { waiting } }
     func arm(_ url: URL) { lock.withLock { target = url.path; waiting = false } }
     func release() { gate.signal() }
@@ -4134,7 +4142,7 @@ private final class DraftReplacementGate: @unchecked Sendable {
         let pause = lock.withLock { if target == file.path { target = nil; waiting = true; return true }; return false }
         if pause {
             guard gate.wait(timeout: .now() + 8) == .success else { throw POSIXError(.ETIMEDOUT) }
-            throw POSIXError(.ENOSPC)
+            if failAfterRelease { throw POSIXError(.ENOSPC) }
         }
     }
 }
@@ -4206,6 +4214,69 @@ extension ShaderRequestTests {
         XCTAssertFalse(RequestWorkerOwnershipError(cause: cause).localizedDescription.contains("Original error:"))
         XCTAssertFalse(RequestWorkerTeardownError(cause: cause).localizedDescription.contains("Original error:"))
         XCTAssertEqual(RequestWorkerDiagnostic.combined("Primary", nil, "Secondary"), "Primary; Secondary")
+    }
+}
+#endif
+
+#if os(macOS)
+extension ShaderRequestTests {
+    func testProposalRevalidatesRecoveryFactsAfterWriterRegistrationWait() async throws {
+        let (root, script) = try recoveryFixture(), gate = DraftReplacementGate(failAfterRelease: false)
+        try """
+        import contextlib,json,os,signal,sys,time
+        from pathlib import Path
+        with contextlib.suppress(PermissionError):os.setsid()
+        job=Path(sys.argv[3])
+        def stop(*args):(job/'stopped').touch();sys.exit(130)
+        signal.signal(signal.SIGTERM,stop)
+        (job/'worker-started').touch()
+        while not (job/'progress').exists():time.sleep(.005)
+        print(json.dumps(dict(event='stage',stage='implementing',message='Progress before recovery')),flush=True)
+        while not (job/'fault').exists():time.sleep(.005)
+        print(json.dumps(dict(event='failure',message='New ownership evidence',recoveryRequired=True)),flush=True)
+        while True:time.sleep(.005)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script,
+            beforePersistenceReplacement: { try gate.before($0) })
+        await service.suspend(); try await service.start(configuration: .init(repository: root.path, enabled: true))
+        let first = ShaderRequest(prompt: "Active owned work", context: try context()), second = ShaderRequest(prompt: "Revalidate queued proposal", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: first), deviceID: "TV1")
+        await service.resume()
+        let job = root.appendingPathComponent(first.id.uuidString)
+        try await waitFor { RequestProcessIdentity.evidenceExists(job.appendingPathComponent("worker-started")) }
+        gate.arm(root.appendingPathComponent("journal.json")); defer { gate.release() }
+        try Data().write(to: job.appendingPathComponent("progress")); try await waitFor { gate.entered }
+        let submission = Task { try await service.control(operation: "requestSubmit", payload: .init(request: second), deviceID: "TV2") }
+        try await waitFor { await service.hasPendingStorageChange }
+        try Data().write(to: job.appendingPathComponent("fault"))
+        try await waitFor { await service.recoveryStatuses().contains { $0.message.contains("New ownership evidence") } }
+        gate.release()
+        do { _ = try await submission.value; XCTFail("Proposal accepted using stale recovery facts") } catch { XCTAssertTrue(error.localizedDescription.contains("New ownership evidence")) }
+        let jobs = await service.allJobs(); XCTAssertFalse(jobs.contains { $0.id == second.id })
+        let saved = try JSONDecoder().decode(RequestRecoveryStore.self, from: Data(contentsOf: root.appendingPathComponent("recovery.json")))
+        XCTAssertTrue(saved.entries.values.contains { $0.message.contains("New ownership evidence") })
+        await service.suspend()
+        try await waitFor { RequestProcessIdentity.evidenceExists(job.appendingPathComponent("stopped")) }
+    }
+}
+#endif
+
+#if os(macOS)
+extension ShaderRequestTests {
+    func testRestartStorageRecoveryPreservesTrustedBundledToolRelocation() async throws {
+        let (root, script) = try recoveryFixture(), trusted = "/current/Holodeck.app/Contents/Resources/Tools/holodeck-shader-tool"
+        let saved = ShaderRequestConfiguration(repository: root.path, enabled: true)
+        try JSONEncoder().encode(saved).write(to: root.appendingPathComponent("preferences.json"))
+        let fault = RequestPersistence.Fault(id: UUID(), generation: 9, operation: "restart", paths: [], primary: "Uncertain metadata")
+        try JSONEncoder().encode(fault).write(to: root.appendingPathComponent("storage-recovery.json"))
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script, bundledShaderTool: trusted)
+        var incoming = saved; incoming.shaderTool = trusted
+        await service.suspend(); try await service.start(configuration: incoming)
+        try await service.retryReconciliation()
+        let accepted = await service.configurationValue(); XCTAssertEqual(accepted.shaderTool, trusted)
+        XCTAssertEqual(accepted.repository, saved.repository)
+        let persisted = try JSONDecoder().decode(ShaderRequestConfiguration.self, from: Data(contentsOf: root.appendingPathComponent("preferences.json")))
+        XCTAssertEqual(persisted, saved, "Launch relocation must not rewrite manually restored accepted settings")
     }
 }
 #endif

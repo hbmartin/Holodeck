@@ -666,3 +666,51 @@ HOLODECK_PROFILE_WORKER=1 swift test --package-path HolodeckCore -c release --fi
 python3 -B tools/profile_request_persistence.py --baseline aade843 --samples 5 --stages 200 --python /usr/bin/python3
 python3 -B tools/profile_request_persistence.py --baseline aade843 --samples 5 --stages 200 --python /opt/homebrew/bin/python3
 ```
+
+## PR #37 follow-up: staged acceptance and storage recovery (2026-10-30)
+
+This follow-up starts from `650cfa21799df56733c8df1b3b32f3fac38a3d91`, the merge of PR #37. Caller proposals are built from accepted state after acquiring the short metadata gate and registering with the writer. They publish only after durable acceptance. Preflight, reconciliation and catalog preparation/install keep the maintenance lease without holding that gate. Observer streams and polling share the same accepted records. Rejected proposals cannot restore earlier Detach, revocation, recovery or confirmed publication state. Canonical same-folder selection remains a no-op during maintenance.
+
+Commit tickets remove cancelled waiters and reject cancelled preparation before the first filesystem replacement. Once replacement starts, cancellation cannot hide the actual commit/recovery result. Independent operation finalization completes even when its initiating task was cancelled. Dispatch stage and `active.json` share one staged batch; a rejected batch leaves the accepted request queued, preserves unresolved evidence and resumes through one scheduling wakeup after Storage Recovery.
+
+The serial writer merges every fault's paths, accepted images and attempted hashes before releasing transaction evidence. Recovery convergence advances accepted images, and a later failure retains its own attempted bytes. Writer-issued fault/generation/attempt tokens prevent stale completion from clearing new faults. Recovery retries interrupted restoration and marker-removal syncs even when the desired bytes or absence are already visible. Restart recovery verifies accepted metadata before reloading it, retaining the trusted bundled-tool launch relocation without changing captured request tools. Rollback bytes remain in memory; no durable before-image store or general transaction log was added.
+
+Encoding and essential-metadata capacity errors are typed validation failures before replacement. Normalized recovery stores return with a generation receipt and update actor state only when still current. Critical snapshots supersede only their covered progress after successful acceptance. Known metadata images avoid redundant reads; fingerprints are lazy, and payload before-images leave the cache after acceptance. Empty worker causes normalize to `nil`.
+
+Regressions cover Detach rollback divergence, failed dispatch, queued and encoding-time cancellation, noncancellable replacement, observer leakage, same-folder selection, complete concurrent revocation, proposal freshness after writer registration, secondary rollback faults, repeated convergence faults, stale recovery tokens/callbacks, encoding-only failures, normalization races, capacity/Unicode bounds, external modifications, restart restoration, trusted tool relocation, partial-file supersession, cache retention and empty diagnostics. Two older cleanup tests now wait for durable recovery or the service's retirement predicate rather than assuming that an in-memory stage change completed disk persistence; both passed ten repeated runs. The restoration-sync regression was observed failing before its fix.
+
+The frozen-source Debug run passed **403 Swift core tests with six opt-in skips**, including all **25 local scenes**. Python **3.9.6 and 3.15.0 each passed all 119 worker tests** with no skips. Both Python logs contain a subprocess `ResourceWarning`; both named PIDs had exited when checked. Debug skips cover three unrelated catalog performance probes, the worker profile (run in Release), live LAN/TLS and real Codex publication.
+
+Both Release apps built successfully with signing disabled. Both Mac copies and the tvOS copy of each packaged Python/checker resource matched source; neither app contained `.pyc` files. Native `artifact-info` and the packaged worker accepted the unchanged library checker lock. The packaged checker compiled **68 authoring assets plus shader/snippet templates for macOS and tvOS**, and Mac GPU verification passed **seven profiles**, including the 196,000-case seed oracle on Apple M2 Pro.
+
+Local validation used macOS 27.0.1 and Xcode 27.2 (27B52). This installation required an explicit SDK libc++ include path for SwiftPM/app compilation. Xcode's default Metal resolver reported a missing matching component. A temporary `/tmp/pr38-metal-tools/xcrun` shim used the already-mounted Metal 27.1 toolchain (`metalfe-32023.921.6`) with the Xcode 27.2 SDKROOT. Separate IR probes confirmed `air64` macOS and tvOS 27.2 targets. No system toolchain, checker bytes or library configuration changed.
+
+All **six selected isolated Mac UI tests passed together**, with no failures or skips: queued cancellation/retained records, Detach evidence, reconciliation retry, publication recovery, guided configuration repair and standalone Storage Recovery. The user dismissed the unrelated Comet permission dialog before the final checks. The resumed run exposed a malformed hand-written guided-repair fixture: Foundation preserved `/var` while real operation targets use `realpath`'s `/private/var`. The fixture now writes the verified canonical target and includes journal diagnostics on failure; production ownership checks are unchanged. Earlier diagnostics also exposed the trusted-tool reload issue, covered by the passing restart regression. Runtime/core-regression sources stayed unchanged from the 403/203-test acceptance runs, and the corrected UI-source fingerprints matched before and after the final six-test run. Physical Apple TV, tvOS simulator runtime, live LAN/TLS and real Codex publication checks were not run.
+
+The final frozen-source Release run passed **203 service, persistence and packaged-resource tests with one opt-in skip** (real Codex publication). The idle-supervision profile measured **31.41 polls/s** and **0.4694% of one CPU core**. Runtime/regression-source hashes matched before and after the final Debug/Release runs and all three persistence profiles.
+
+Release persistence profiling compares both actor and writer from merged PR #37 with this tree on the same filesystem. Five samples alternate baseline/current order, using 200 stage events followed by clarification. The slow-storage fixture injects five milliseconds before every replacement on both sides. The harness counts metadata encodes separately from newly staged payloads. Metadata replacements account for file and parent-directory fsyncs; operation/process evidence is excluded equally.
+
+| Child interpreter / storage | Fixture median, baseline → current | Service CPU median, baseline → current | Maximum sampled actor reply, baseline → current |
+| --- | --- | --- | --- |
+| Python 3.9.6 / normal | 137.000 → 163.904 ms | 0.039965 → 0.040350 s | 0.537 → 0.306 ms |
+| Python 3.15.0 / normal | 59.128 → 57.743 ms | 0.031041 → 0.030187 s | 0.100 → 0.140 ms |
+| Python 3.9.6 / 5 ms replacement delay | 244.459 → 305.629 ms | 0.046906 → 0.049636 s | 0.159 → 0.625 ms |
+
+All three fixtures retain **18 metadata encodes, four metadata replacements and eight metadata fsyncs**. Persistence byte reads are **0 → 0** in these warm metadata fixtures; dedicated regressions verify that repeated preferences writes reuse known images and that payload bytes are released. Persistence hash calls are **2 → 4**, reflecting staged dispatch/payload rollback evidence. The Python 3.9 fixture is slower; the evidence does not establish a general latency improvement. These measurements have no CI timing threshold. Structural assertions cover coalescing, unchanged writes, cached reads, cancellation and slow-writer responsiveness.
+
+Final logs are `/tmp/pr38-{python39,python-current,core-final,release-final,mac-build-final,tv-build-final,package-final,metal-final,gpu-final}.log`. Fingerprints/progress are `/tmp/pr38-{frozen-hashes,native-progress,profile-progress}.json`; benchmark samples are `/tmp/pr38-{profile39,profile315,profile-slow}.json`. Final UI evidence is `/tmp/pr38-ui-complete.log`, with `ui-complete-state.json` and `ui-complete-hashes.json` under the same `/tmp/pr38-` prefix. Earlier UI attempts and fixture diagnostics remain in `/tmp/pr38-ui-{final,diagnosis,unblocked,guided-diagnostic,guided-fixed}.log`. Superseded development failures, the pre-fix restoration regression and the profile smoke run are excluded from passing acceptance totals.
+
+Linux CI, checker artifacts, library locks and the live installation/request settings are unchanged. No merge or deployment occurred. A later rollout must drain requests before replacing the matching native host and bundled worker.
+
+Reproduction commands (the explicit libc++ include is local to this Xcode installation):
+
+```sh
+/usr/bin/python3 -B tools/test_shader_requests.py
+/opt/homebrew/bin/python3 -B tools/test_shader_requests.py
+HOLODECK_AUTHORING_FIXTURE=/Volumes/Pro2T/HolodeckShaders HOLODECK_GPU_TESTS=1 swift test --package-path HolodeckCore -Xcxx -isystem -Xcxx /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.2.sdk/usr/include/c++/v1
+HOLODECK_PROFILE_WORKER=1 swift test --package-path HolodeckCore -c release --filter 'ShaderRequestTests|ShaderLibraryToolTests|RequestPersistenceTests' -Xcxx -isystem -Xcxx /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.2.sdk/usr/include/c++/v1
+/usr/bin/python3 -B tools/profile_request_persistence.py --baseline 650cfa2 --samples 5 --stages 200 --python /usr/bin/python3
+/usr/bin/python3 -B tools/profile_request_persistence.py --baseline 650cfa2 --samples 5 --stages 200 --python /opt/homebrew/bin/python3
+/usr/bin/python3 -B tools/profile_request_persistence.py --baseline 650cfa2 --samples 5 --stages 200 --python /usr/bin/python3 --slow-ms 5
+```
