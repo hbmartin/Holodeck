@@ -2,6 +2,13 @@
 import Foundation
 import Darwin
 
+nonisolated enum RequestWorkerDiagnostic {
+    static func combined(_ causes: String?...) -> String? {
+        let value = causes.compactMap { $0 }.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.joined(separator: "; ")
+        return value.isEmpty ? nil : value
+    }
+}
+
 nonisolated struct RequestWorkerTeardownError: LocalizedError, Sendable {
     var cause: String? = nil
     var errorDescription: String? { "Worker processes did not exit within ten seconds. Checkout recovery is required; process evidence was retained." + (cause.map { " Original error: " + $0 } ?? "") }
@@ -643,9 +650,9 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     case let failure as RequestWorkerEvidenceError:
                         error = RequestWorkerEvidenceError(cause: failure.cause + (detail.map { " Original worker error: " + $0 } ?? ""))
                     case let failure as RequestWorkerOwnershipError:
-                        error = RequestWorkerOwnershipError(cause: [failure.cause, detail].compactMap { $0 }.joined(separator: "; "))
+                        error = RequestWorkerOwnershipError(cause: RequestWorkerDiagnostic.combined(failure.cause, detail))
                     case let failure as RequestWorkerTeardownError:
-                        error = RequestWorkerTeardownError(cause: [failure.cause, detail].compactMap { $0 }.joined(separator: "; "))
+                        error = RequestWorkerTeardownError(cause: RequestWorkerDiagnostic.combined(failure.cause, detail))
                     default: error = original ?? caught
                     }
                     if lock.withLock({ started && !gateReleased }) {

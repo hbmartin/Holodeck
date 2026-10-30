@@ -42,6 +42,11 @@ final class HolodeckMacUITests: XCTestCase {
     private func element(_ id: String, in app: XCUIApplication) -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: id).firstMatch
     }
+    private func canonicalPath(_ url: URL) throws -> String {
+        let path = try XCTUnwrap(realpath(url.path, nil))
+        defer { free(path) }
+        return String(cString: path)
+    }
 
     func testShaderRequestSettingsWindowQueuedCancellationAndRetainedRecord() throws {
         let suite = "HolodeckMacUITests-" + UUID().uuidString
@@ -147,8 +152,10 @@ final class HolodeckMacUITests: XCTestCase {
     func testGuidedMaintenanceConfigurationRepairKeepsCorruptEvidence() throws {
         let f = try managedRecoveryFixture(), app = f.app
         let directory = f.marker.deletingLastPathComponent().deletingLastPathComponent(), setup = f.marker.deletingLastPathComponent()
-        let operationID = UUID().uuidString, recoveryID = UUID().uuidString, key = setup.resolvingSymlinksInPath().path
-        let operation: [String: Any] = ["formatVersion": 2, "id": operationID, "mode": "preflight", "phase": "initial", "target": ["repository": f.authoring.resolvingSymlinksInPath().path]]
+        let operationID = UUID().uuidString, recoveryID = UUID().uuidString, key = try canonicalPath(setup), checkout = try canonicalPath(f.authoring)
+        // Operation targets use realpath. Foundation preserves the /var alias on
+        // this macOS release, so resolvingSymlinksInPath does not create a valid target.
+        let operation: [String: Any] = ["formatVersion": 2, "id": operationID, "mode": "preflight", "phase": "initial", "target": ["repository": checkout]]
         try JSONSerialization.data(withJSONObject: operation).write(to: setup.appendingPathComponent("worker-operation.json"))
         try Data("{".utf8).write(to: setup.appendingPathComponent("configuration.json"))
         let entry: [String: Any] = ["id": recoveryID, "journal": key, "disposition": "resume", "message": "Maintenance configuration is unreadable"]
@@ -162,11 +169,20 @@ final class HolodeckMacUITests: XCTestCase {
         try FileManager.default.removeItem(at: f.marker)
         repair.click()
         let finished = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: repair)
-        XCTAssertEqual(XCTWaiter.wait(for: [finished], timeout: 20), .completed)
+        let result = XCTWaiter.wait(for: [finished], timeout: 20)
+        var diagnostics = ""
+        if result != .completed {
+            for file in [directory.appendingPathComponent("recovery.json"), setup.appendingPathComponent("worker-operation.json"), setup.appendingPathComponent("configuration.json")] {
+                diagnostics += "\n\(file.lastPathComponent): " + ((try? String(contentsOf: file, encoding: .utf8)) ?? "unreadable")
+            }
+            diagnostics += "\nSetup files: " + ((try? FileManager.default.contentsOfDirectory(atPath: setup.path).joined(separator: ", ")) ?? "unreadable")
+            diagnostics += "\nAlert: " + app.sheets.staticTexts.allElementsBoundByIndex.map { $0.label }.joined(separator: "; ")
+        }
+        XCTAssertEqual(result, .completed, diagnostics + "\n" + app.debugDescription)
         let archive = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: setup, includingPropertiesForKeys: nil).first { $0.lastPathComponent.hasPrefix("detached-") })
         XCTAssertEqual(try Data(contentsOf: archive.appendingPathComponent("configuration.json")), Data("{".utf8))
         let restored = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: setup.appendingPathComponent("configuration.json"))) as? [String: Any])
-        XCTAssertEqual(restored["repository"] as? String, f.authoring.resolvingSymlinksInPath().path)
+        XCTAssertEqual(restored["repository"] as? String, checkout)
         XCTAssertNotEqual(restored["workerOperationID"] as? String, operationID)
     }
 
@@ -671,7 +687,7 @@ final class HolodeckMacUITests: XCTestCase {
     }
     private func waitForTitle(_ title: String, in app: XCUIApplication) {
         let label = element("active-scene-title", in: app)
-        XCTAssertTrue(label.waitForExistence(timeout: 15))
+        XCTAssertTrue(label.waitForExistence(timeout: 15), app.debugDescription)
         let changed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@ OR label == %@", title, title), object: label)
         XCTAssertEqual(XCTWaiter.wait(for: [changed], timeout: 15), .completed)
     }

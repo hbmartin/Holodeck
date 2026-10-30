@@ -264,6 +264,16 @@ nonisolated enum RequestJournalWriter {
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
         try handle.write(contentsOf: Data((detail + "\n").utf8))
     }
+    /// Also fsync an already-absent file's parent to finish an interrupted removal.
+    static func remove(_ file: URL) throws {
+        if unlink(file.path) != 0, errno != ENOENT { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        var directory = file.deletingLastPathComponent()
+        while !RequestProcessIdentity.evidenceExists(directory), directory.deletingLastPathComponent() != directory { directory.deleteLastPathComponent() }
+        let parent = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard parent >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        defer { close(parent) }
+        guard fsync(parent) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+    }
     static func write(_ data: Data, to file: URL) throws {
         let directory = URL(fileURLWithPath: RequestPaths.canonical(file.deletingLastPathComponent()))
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
