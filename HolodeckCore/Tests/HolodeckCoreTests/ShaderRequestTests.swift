@@ -4018,3 +4018,113 @@ private final class HeldProposalReader: @unchecked Sendable {
     }
 }
 #endif
+
+#if os(macOS)
+extension ShaderRequestTests {
+    func testFailedVerifyPreservesIndependentDetachFinalization() async throws {
+        let (root, script) = try recoveryFixture(), original = try await recoveryService(root, script: script)
+        let request = ShaderRequest(prompt: "Detach before rejected Verify", context: try context())
+        _ = try await original.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        try await original.cancelQueued(request.id)
+        let job = root.appendingPathComponent(request.id.uuidString), target = await original.configurationValue()
+        var store = RequestRecoveryStore(); store.legacyMigrationComplete = true
+        var entry = RequestRecoveryStore.Entry(journal: RequestPaths.canonical(job), requestID: request.id, configuration: target, disposition: .detach, message: "Pending detach")
+        entry.archiveID = UUID(); store.entries[entry.journal] = entry
+        try store.encoded().write(to: root.appendingPathComponent("recovery.json"))
+        try "import json;print(json.dumps(dict(event='failure',message='Ordinary preflight failure')),flush=True);raise SystemExit(1)".write(to: script, atomically: true, encoding: .utf8)
+        let service = try await recoveryService(root, script: script); await service.resume()
+        do { try await service.verify(configuration: target); XCTFail("Failing preflight succeeded") } catch {}
+        let memory = await service.recoveryStatuses()
+        let disk = try JSONDecoder().decode(RequestRecoveryStore.self, from: Data(contentsOf: root.appendingPathComponent("recovery.json")))
+        XCTAssertTrue(memory.isEmpty); XCTAssertTrue(disk.entries.isEmpty)
+        let acknowledgements = try JSONDecoder().decode([DetachedCheckoutAcknowledgement].self, from: Data(contentsOf: root.appendingPathComponent("detached-checkouts.json")))
+        XCTAssertEqual(acknowledgements.map(\.requestID), [request.id])
+        let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("journal.json"))) as? [[String: Any]])
+        XCTAssertEqual(rows.first?["detached"] as? Bool, true)
+    }
+    func testRejectedDraftNeverAppearsInObserverStream() async throws {
+        let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script)
+        let request = ShaderRequest(prompt: "Invisible rejected draft", context: try context()), recorder = DraftObservationRecorder()
+        let updates = await service.updates()
+        let observer = Task { for await jobs in updates { await recorder.record(jobs) } }
+        defer { observer.cancel() }
+        let file = root.appendingPathComponent("journal.json")
+        try FileManager.default.removeItem(at: file); try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
+        do { _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV"); XCTFail("Obstructed proposal succeeded") } catch {}
+        // A round trip through the actor ensures its already-enqueued stream values are consumed.
+        try await Task.sleep(for: .milliseconds(30))
+        let seen = await recorder.ids
+        XCTAssertFalse(seen.contains(request.id)); let jobs = await service.allJobs(); XCTAssertTrue(jobs.isEmpty)
+    }
+    func testSameFolderSelectionSucceedsDuringVerifyWithoutChangingLease() async throws {
+        let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script, enabled: false)
+        try """
+        import json,sys,time
+        from pathlib import Path
+        job=Path(sys.argv[3]);(job/'entered').touch()
+        while (job/'hold').exists():time.sleep(.005)
+        print(json.dumps(dict(event='preflight')),flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let setup = root.appendingPathComponent("setup"); try FileManager.default.createDirectory(at: setup, withIntermediateDirectories: true)
+        try Data().write(to: setup.appendingPathComponent("hold")); await service.resume()
+        let config = await service.configurationValue(), verifying = Task { try await service.verify(configuration: config) }
+        defer { try? FileManager.default.removeItem(at: setup.appendingPathComponent("hold")); verifying.cancel() }
+        try await waitFor { FileManager.default.fileExists(atPath: setup.appendingPathComponent("entered").path) }
+        let same = try await service.selectRepository(root); XCTAssertEqual(same, config)
+        let cancelled = Task { try await service.disable() }; cancelled.cancel()
+        do { try await cancelled.value; XCTFail("Cancelled action succeeded") } catch { XCTAssertTrue(error is CancellationError) }
+        try FileManager.default.removeItem(at: setup.appendingPathComponent("hold")); try await verifying.value
+        let accepted = await service.configurationValue(); XCTAssertTrue(accepted.enabled)
+    }
+}
+private actor DraftObservationRecorder {
+    var ids: Set<UUID> = []
+    func record(_ jobs: [ShaderRequestStatus]) { ids.formUnion(jobs.map(\.id)) }
+}
+#endif
+
+#if os(macOS)
+extension ShaderRequestTests {
+    func testRejectedAnswerPreservesConcurrentRevocationTransition() async throws {
+        let (root, script) = try recoveryFixture(), gate = DraftReplacementGate()
+        try "import json; print(json.dumps(dict(event='clarification',question='Choose',options=['A','B'])),flush=True)".write(to: script, atomically: true, encoding: .utf8)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script,
+            beforePersistenceReplacement: { try gate.before($0) })
+        await service.suspend(); try await service.start(configuration: .init(repository: root.path, enabled: true))
+        let request = ShaderRequest(prompt: "Revoke while rejecting answer", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        await service.resume()
+        try await waitFor { await service.allJobs().first?.stage == .awaitingClarification }
+        try await waitFor { !RequestProcessIdentity.evidenceExists(root.appendingPathComponent("active.json")) }
+        await service.suspend()
+        gate.arm(root.appendingPathComponent("journal.json")); defer { gate.release() }
+        let answer = Task { try await service.control(operation: "requestAnswer", payload: .init(requestID: request.id, answer: "Rejected"), deviceID: "TV") }
+        try await waitFor { gate.entered }
+        let revocation = Task { try await service.revoke("TV") }
+        try await waitFor { await service.allJobs().first?.stage == .failed }
+        gate.release()
+        do { _ = try await answer.value; XCTFail("Rejected answer succeeded") } catch {}
+        _ = try? await revocation.value
+        let before = await service.allJobs().first; XCTAssertEqual(before?.stage, .failed)
+        let pending = await service.hasPendingCleanup(); XCTAssertTrue(pending)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(root.appendingPathComponent(request.id.uuidString).appendingPathComponent("answer.json")))
+        try await service.retryReconciliation()
+        let after = await service.allJobs().first; XCTAssertEqual(after?.stage, .failed)
+        let stillPending = await service.hasPendingCleanup(); XCTAssertTrue(stillPending)
+    }
+}
+private final class DraftReplacementGate: @unchecked Sendable {
+    private let lock = NSLock(), gate = DispatchSemaphore(value: 0)
+    private var target: String?, waiting = false
+    var entered: Bool { lock.withLock { waiting } }
+    func arm(_ url: URL) { lock.withLock { target = url.path; waiting = false } }
+    func release() { gate.signal() }
+    func before(_ file: URL) throws {
+        let pause = lock.withLock { if target == file.path { target = nil; waiting = true; return true }; return false }
+        if pause {
+            guard gate.wait(timeout: .now() + 8) == .success else { throw POSIXError(.ETIMEDOUT) }
+            throw POSIXError(.ENOSPC)
+        }
+    }
+}
+#endif

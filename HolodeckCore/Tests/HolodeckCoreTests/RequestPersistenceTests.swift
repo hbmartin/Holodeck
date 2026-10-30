@@ -145,6 +145,36 @@ import XCTest
         try FileManager.default.removeItem(at: file); try Data("accepted".utf8).write(to: file)
         try await writer.resumeAfterExplicitRecovery()
     }
+    func testQueuedCommitCancellationReturnsBeforeTheWriterIsAvailable() async throws {
+        let root = try directory(), probe = PersistenceWriteProbe(), writer = RequestPersistence(recoveryWriter: { try probe.write($0, $1) })
+        let held = root.appendingPathComponent("recovery.json"), cancelled = root.appendingPathComponent("cancelled")
+        probe.hold()
+        let first = Task { try await writer.commit(.init(revision: 1, files: [.init(url: held, bytes: Data("first".utf8))])) }
+        defer { probe.release(); first.cancel() }
+        while !probe.entered { try await Task.sleep(for: .milliseconds(2)) }
+        let finished = expectation(description: "Queued cancellation is prompt")
+        let second = Task {
+            do { try await writer.commit(.init(revision: 2, files: [.init(url: cancelled, bytes: Data("never".utf8))])); XCTFail("Cancelled commit succeeded") }
+            catch { XCTAssertTrue(error is CancellationError) }
+            finished.fulfill()
+        }
+        await Task.yield(); second.cancel()
+        await fulfillment(of: [finished], timeout: 1)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(cancelled))
+        probe.release(); try await first.value
+        let fault = await writer.fault(); XCTAssertNil(fault)
+    }
+    func testCancellationAfterReplacementStartsReportsAcceptedOutcome() async throws {
+        let root = try directory(), probe = PersistenceWriteProbe(), file = root.appendingPathComponent("recovery.json")
+        let writer = RequestPersistence(recoveryWriter: { try probe.write($0, $1) })
+        probe.hold()
+        let commit = Task { try await writer.commit(.init(revision: 1, files: [.init(url: file, bytes: Data("accepted".utf8))])) }
+        defer { probe.release(); commit.cancel() }
+        while !probe.entered { try await Task.sleep(for: .milliseconds(2)) }
+        commit.cancel(); probe.release(); try await commit.value
+        XCTAssertEqual(try Data(contentsOf: file), Data("accepted".utf8))
+        let fault = await writer.fault(); XCTAssertNil(fault)
+    }
     func testRecoveryDiagnosticsAreBoundedDeduplicatedAndReadable() throws {
         let root = try directory(), key = root.appendingPathComponent("setup").path
         var entry = RequestRecoveryStore.Entry(journal: key, configuration: nil, disposition: .resume, message: String(repeating: "🐟", count: 10000))
