@@ -283,3 +283,46 @@ private final class RecoveryRemovalProbe: @unchecked Sendable {
     }
 }
 #endif
+
+#if os(macOS)
+extension RequestPersistenceTests {
+    func testEncodingFailureDoesNotCreateStorageFaultOrReplaceAnyFile() async throws {
+        let root = try directory(), file = root.appendingPathComponent("recovery.json"), other = root.appendingPathComponent("journal.json"), writer = RequestPersistence(directory: root)
+        try Data("accepted".utf8).write(to: file)
+        do {
+            try await writer.commit(.init(revision: 1, files: [
+                .init(url: other, bytes: Data("unpublished".utf8)),
+                .init(url: file, encode: { throw RequestWorkerEvidenceError(cause: "Invalid metadata") })]))
+            XCTFail("Invalid encoding succeeded")
+        } catch { XCTAssertTrue(error is RequestPersistence.ValidationError) }
+        let fault = await writer.fault(); XCTAssertNil(fault)
+        XCTAssertEqual(try Data(contentsOf: file), Data("accepted".utf8)); XCTAssertFalse(RequestProcessIdentity.evidenceExists(other))
+        try await writer.commit(.init(revision: 2, files: [.init(url: file, bytes: Data("valid".utf8))]))
+    }
+    func testRecoveryReceiptReturnsCapacityTrimmingAndCapturedGeneration() async throws {
+        let root = try directory(), file = root.appendingPathComponent("recovery.json"), writer = RequestPersistence()
+        var store = RequestRecoveryStore()
+        for n in 0..<96 {
+            let key = root.appendingPathComponent("journal-\(n)").path
+            var entry = RequestRecoveryStore.Entry(journal: key, disposition: .resume, message: String(repeating: "p", count: 8192))
+            for i in 0..<8 { entry.appendDiagnostic("detail \(i) " + String(repeating: "é", count: 1000)) }
+            store.entries[key] = entry
+        }
+        let receipt = try await writer.commit(.init(revision: 1, files: [.init(url: file, recovery: store, generation: 42)]))
+        let normalized = try XCTUnwrap(receipt.recovery[file])
+        XCTAssertEqual(normalized.generation, 42); XCTAssertEqual(normalized.store.entries.count, 96)
+        XCTAssertTrue(normalized.store.entries.values.allSatisfy { $0.secondaryDiagnostics?.isEmpty == true })
+        XCTAssertLessThanOrEqual(try Data(contentsOf: file).count, CatalogLimits.manifestBytes)
+        XCTAssertTrue(store.entries.values.allSatisfy { $0.secondaryDiagnostics?.count == 8 }, "Snapshot input remains immutable")
+    }
+    func testEssentialRecoveryCapacityFailureIsValidationNotStickyIOFailure() async throws {
+        let root = try directory(), file = root.appendingPathComponent("recovery.json"), writer = RequestPersistence(directory: root)
+        let good = Data("accepted".utf8); try good.write(to: file)
+        var configuration = ShaderRequestConfiguration(repository: root.path); configuration.model = String(repeating: "m", count: CatalogLimits.manifestBytes)
+        var store = RequestRecoveryStore(); store.entries[root.path] = .init(journal: root.path, configuration: configuration, disposition: .resume, message: "Essential metadata")
+        do { try await writer.commit(.init(revision: 1, files: [.init(url: file, recovery: store, generation: 1)])); XCTFail("Oversized ownership data succeeded") }
+        catch { XCTAssertTrue(error is RequestPersistence.ValidationError) }
+        let fault = await writer.fault(); XCTAssertNil(fault); XCTAssertEqual(try Data(contentsOf: file), good)
+    }
+}
+#endif

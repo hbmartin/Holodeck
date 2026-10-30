@@ -33,9 +33,19 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             c?.resume(with: result)
         }
     }
+    struct ValidationError: LocalizedError, Sendable {
+        let message: String
+        var errorDescription: String? { message }
+    }
+    struct NormalizedRecovery: Sendable { let store: RequestRecoveryStore; let generation: UInt64 }
+    struct CommitReceipt: Sendable {
+        let revision: UInt64
+        var recovery: [URL: NormalizedRecovery] = [:]
+    }
     struct File: Sendable {
         let url: URL
         let encode: @Sendable () throws -> Data
+        var recovery: NormalizedRecovery?
         init(url: URL, bytes: Data) { self.url = url; self.encode = { bytes } }
         init(url: URL, encode: @escaping @Sendable () throws -> Data) { self.url = url; self.encode = encode }
         init<T: Encodable & Sendable>(url: URL, value: T) {
@@ -44,8 +54,13 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                 return try encoder.encode(value)
             }
         }
+        init(url: URL, recovery: RequestRecoveryStore, generation: UInt64) {
+            self.init(url: url, encode: { var copy = recovery; return try copy.encoded() })
+            self.recovery = NormalizedRecovery(store: recovery, generation: generation)
+        }
     }
-    struct Snapshot: Sendable { let revision: UInt64; let files: [File] }
+    // A recovery value is normalized once on the writer, and returned with its captured generation.
+    struct Snapshot: Sendable { let revision: UInt64; let files: [File]; var operation = "request metadata" }
     struct RecoveryToken: Sendable, Equatable {
         let faultID: UUID
         let generation: UInt64
@@ -90,7 +105,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     private var writes: [String: Int] = [:]
     private var applied: [URL: UInt64] = [:]
     private var encodings = 0
-    private struct Pending { let revision: UInt64; let file: File }
+    private struct Pending { let revision: UInt64; let file: File; let completed: @Sendable (CommitReceipt) -> Void }
     private var progress: [URL: Pending] = [:]
     private var progressScheduled = false
     init(directory: URL? = nil, recoveryWriter: @escaping @Sendable (Data, URL) throws -> Void = { try RequestJournalWriter.write($0, to: $1) }, beforeReplacement: @escaping @Sendable (URL) throws -> Void = { _ in }, removeFile: @escaping @Sendable (URL) throws -> Void = RequestJournalWriter.remove) {
@@ -146,14 +161,23 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         writes[file.lastPathComponent, default: 0] += 1
         if ["journal.json", "recovery.json", "detached-checkouts.json"].contains(file.lastPathComponent) { committed[file] = bytes }
     }
-    private func apply(_ snapshot: Snapshot, transaction: UUID? = nil, retainingEvidence: Bool = false, ticket: CommitTicket<Void>? = nil) throws {
+    private func apply(_ snapshot: Snapshot, transaction: UUID? = nil, retainingEvidence: Bool = false, ticket: CommitTicket<CommitReceipt>? = nil) throws -> CommitReceipt {
         if retainingEvidence, !snapshot.files.allSatisfy({ $0.url.lastPathComponent == "recovery.json" }) { throw RequestWorkerOwnershipError() }
         if let failure, !recoveryAllowed && !retainingEvidence { throw failure }
         let files = snapshot.files.filter { snapshot.revision > applied[$0.url, default: 0] }
         var before: [URL: Image] = [:], proposed: [URL: Data] = [:], encoded: [URL: Data] = [:]
         try ticket?.check()
         // Validation is completed before any filesystem mutation and is not an I/O fault.
-        for file in files { encodings += 1; encoded[file.url] = try file.encode() }
+        var receipt = CommitReceipt(revision: snapshot.revision)
+        do {
+            for file in files {
+                encodings += 1
+                if let value = file.recovery {
+                    var normalized = value.store; encoded[file.url] = try normalized.encoded()
+                    receipt.recovery[file.url] = NormalizedRecovery(store: normalized, generation: value.generation)
+                } else { encoded[file.url] = try file.encode() }
+            }
+        } catch { throw ValidationError(message: error.localizedDescription) }
         do {
             for file in files {
                 guard committed[file.url] != encoded[file.url] else { continue }
@@ -181,11 +205,12 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                     summarize()
                 }
             }
+            return receipt
         } catch is CancellationError { throw CancellationError() }
         catch {
             committed.removeAll()
             let tx = transaction.flatMap { transactions[$0] }
-            throw fail(error, operation: tx?.operation ?? "request metadata", files: files.map(\.url), before: tx?.before ?? before, proposed: tx?.candidates ?? proposed.mapValues { [CatalogHash.sha256($0)] })
+            throw fail(error, operation: tx?.operation ?? snapshot.operation, files: files.map(\.url), before: tx?.before ?? before, proposed: tx?.candidates ?? proposed.mapValues { [CatalogHash.sha256($0)] })
         }
     }
     private func drainProgress() throws {
@@ -196,7 +221,8 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                 if $1.url.lastPathComponent == "recovery.json" { return false }
                 return $0.url.path < $1.url.path
             }
-            try apply(.init(revision: revision, files: files))
+            let receipt = try apply(.init(revision: revision, files: files))
+            pending.values.first { $0.revision == revision }?.completed(receipt)
         }
     }
     func begin(_ id: UUID, operation: String) async throws {
@@ -246,27 +272,30 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             }
         } }
     }
-    func commit(_ snapshot: Snapshot, retainingEvidence: Bool = false, transaction: UUID? = RequestStorageContext.mutation) async throws {
-        let ticket = CommitTicket<Void>()
-        try await withTaskCancellationHandler {
+    @discardableResult func commit(_ snapshot: Snapshot, retainingEvidence: Bool = false, transaction: UUID? = RequestStorageContext.mutation) async throws -> CommitReceipt {
+        let ticket = CommitTicket<CommitReceipt>()
+        return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { c in
                 ticket.attach(c)
                 queue.async { [self] in
                     do {
                         try ticket.check()
                         for file in snapshot.files where progress[file.url].map({ $0.revision <= snapshot.revision }) == true { progress[file.url] = nil }
-                        try apply(snapshot, transaction: transaction, retainingEvidence: retainingEvidence, ticket: ticket)
-                        ticket.complete(.success(()))
+                        let receipt = try apply(snapshot, transaction: transaction, retainingEvidence: retainingEvidence, ticket: ticket)
+                        ticket.complete(.success(receipt))
                     } catch { ticket.complete(.failure(error)) }
                 }
             }
         } onCancel: { ticket.cancel() }
     }
     func enqueueProgress(_ snapshot: Snapshot, failed: @escaping @Sendable (Error) -> Void) {
+        enqueueProgress(snapshot, completed: { _ in }, failed: failed)
+    }
+    func enqueueProgress(_ snapshot: Snapshot, completed: @escaping @Sendable (CommitReceipt) -> Void, failed: @escaping @Sendable (Error) -> Void) {
         queue.async { [self] in
             if let failure { failed(failure); return }
             for file in snapshot.files where snapshot.revision > applied[file.url, default: 0] && snapshot.revision > (progress[file.url]?.revision ?? 0) {
-                progress[file.url] = Pending(revision: snapshot.revision, file: file)
+                progress[file.url] = Pending(revision: snapshot.revision, file: file, completed: completed)
             }
             guard !progressScheduled else { return }; progressScheduled = true
             queue.asyncAfter(deadline: .now() + .milliseconds(25)) { [self] in
