@@ -46,6 +46,13 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         }
     }
     struct Snapshot: Sendable { let revision: UInt64; let files: [File] }
+    struct RecoveryToken: Sendable, Equatable {
+        let faultID: UUID
+        let generation: UInt64
+        let attemptID: UUID
+        let reloadAccepted: Bool
+    }
+    struct RecoveryReceipt: Sendable { let clearedGeneration: UInt64 }
     struct Fault: Codable, Sendable, LocalizedError {
         let id: UUID
         let generation: UInt64
@@ -69,6 +76,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     private struct Transaction { let operation: String; var before: [URL: Image] = [:]; var candidates: [URL: Set<String>] = [:] }
     private let queue = DispatchQueue(label: "Holodeck.request-persistence", qos: .utility)
     private let recoveryWriter: @Sendable (Data, URL) throws -> Void
+    private let removeFile: @Sendable (URL) throws -> Void
     private let beforeReplacement: @Sendable (URL) throws -> Void
     private let directory: URL?
     private var committed: [URL: Data] = [:]
@@ -77,14 +85,16 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     private var undo: [URL: Image] = [:], candidates: [URL: Set<String>] = [:]
     private var transactions: [UUID: Transaction] = [:]
     private var recoveryAllowed = false
+    private var recoveryAttempt: UUID?
+    private var loadedFromDisk = false
     private var writes: [String: Int] = [:]
     private var applied: [URL: UInt64] = [:]
     private var encodings = 0
     private struct Pending { let revision: UInt64; let file: File }
     private var progress: [URL: Pending] = [:]
     private var progressScheduled = false
-    init(directory: URL? = nil, recoveryWriter: @escaping @Sendable (Data, URL) throws -> Void = { try RequestJournalWriter.write($0, to: $1) }, beforeReplacement: @escaping @Sendable (URL) throws -> Void = { _ in }) {
-        self.directory = directory; self.recoveryWriter = recoveryWriter; self.beforeReplacement = beforeReplacement
+    init(directory: URL? = nil, recoveryWriter: @escaping @Sendable (Data, URL) throws -> Void = { try RequestJournalWriter.write($0, to: $1) }, beforeReplacement: @escaping @Sendable (URL) throws -> Void = { _ in }, removeFile: @escaping @Sendable (URL) throws -> Void = RequestJournalWriter.remove) {
+        self.directory = directory; self.recoveryWriter = recoveryWriter; self.beforeReplacement = beforeReplacement; self.removeFile = removeFile
     }
     private var faultFile: URL? { directory?.appendingPathComponent("storage-recovery.json") }
     private func image(_ file: URL) throws -> Image {
@@ -109,18 +119,23 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         catch { /* Storage may be unavailable. RAM evidence and the blocking gate remain. */ }
     }
     private func fail(_ error: Error, operation: String, files: [URL], before: [URL: Image], proposed: [URL: Set<String>]) -> Fault {
+        // Capture every affected file before releasing any transaction, including
+        // failures during rollback and a later recovery phase.
+        for (file, image) in before where undo[file] == nil { undo[file] = image }
+        for (file, hashes) in proposed { candidates[file, default: []].formUnion(hashes) }
         if let previous = failure {
-            if error is Fault { return previous }
+            if error is Fault { summarize(); return failure! }
             generation &+= 1
             var next = Fault(id: UUID(), generation: generation, operation: previous.operation,
                 paths: Array(Set(previous.paths + files.map(\.path))).sorted(), primary: previous.primary)
             next.secondary = Array((previous.secondary + [RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 2048)]).suffix(8))
-            failure = next; recoveryAllowed = false; summarize(); return failure!
+            next.manualRepairRequired = previous.manualRepairRequired
+            failure = next; recoveryAllowed = false; recoveryAttempt = nil; summarize(); return failure!
         }
         generation &+= 1
         failure = Fault(id: UUID(), generation: generation, operation: operation, paths: files.map(\.path).sorted(),
             primary: RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 8192))
-        undo = before; candidates = proposed; recoveryAllowed = false
+        recoveryAllowed = false; recoveryAttempt = nil
         summarize()
         return failure!
     }
@@ -151,6 +166,10 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             for file in files {
                 if let bytes = proposed[file.url] { try replace(bytes, at: file.url) }
                 applied[file.url] = snapshot.revision
+            }
+            if recoveryAllowed, transaction == nil {
+                for (file, bytes) in encoded { undo[file] = .file(bytes); candidates[file] = [CatalogHash.sha256(bytes)] }
+                summarize()
             }
             if files.allSatisfy({ $0.url.lastPathComponent == "recovery.json" }) {
                 // Durable recovery/Detach intent is independent of a caller's rejected mutation.
@@ -213,10 +232,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             if current.hash == old.hash { continue }
             if let bytes = old.bytes { try replace(bytes, at: file) }
             else {
-                try FileManager.default.removeItem(at: file)
-                let fd = open(file.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-                guard fd >= 0 else { throw POSIXError(.EIO) }; defer { close(fd) }
-                guard fsync(fd) == 0 else { throw POSIXError(.EIO) }; committed[file] = nil
+                try removeFile(file); committed[file] = nil
             }
         }
     }
@@ -225,8 +241,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             guard let tx = transactions.removeValue(forKey: id) else { c.resume(); return }
             do { try restore(tx.before, proposed: tx.candidates); c.resume() }
             catch {
-                if failure == nil { _ = fail(error, operation: tx.operation, files: Array(tx.before.keys), before: tx.before, proposed: tx.candidates) }
-                else { _ = fail(error, operation: tx.operation, files: Array(tx.before.keys), before: tx.before, proposed: tx.candidates) }
+                _ = fail(error, operation: tx.operation, files: Array(tx.before.keys), before: tx.before, proposed: tx.candidates)
                 c.resume(throwing: failure!)
             }
         } }
@@ -275,12 +290,12 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                     failure = Fault(id: UUID(), generation: generation + 1, operation: "read storage recovery evidence", paths: [file.path],
                         primary: "Storage recovery evidence is unreadable. Retain it and repair the journal manually: " + error.localizedDescription, manualRepairRequired: true)
                 }
-                generation = failure!.generation
+                generation = failure!.generation; loadedFromDisk = true
             }
             return failure
         }
     }
-    func restoreForRecovery() async throws -> UUID? {
+    func restoreForRecovery() async throws -> RecoveryToken? {
         try await perform { [self] in
             guard let fault = failure else { return nil }
             guard fault.manualRepairRequired != true else { throw RequestWorkerEvidenceError(cause: fault.localizedDescription) }
@@ -298,21 +313,24 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                 do { try restore(undo, proposed: candidates) }
                 catch { throw fail(error, operation: fault.operation, files: undo.keys.sorted { $0.path < $1.path }, before: undo, proposed: candidates) }
             }
+            let attempt = UUID(); recoveryAttempt = attempt
             recoveryAllowed = true; committed.removeAll(); progress = [:]
-            return fault.id
+            return RecoveryToken(faultID: fault.id, generation: fault.generation, attemptID: attempt, reloadAccepted: loadedFromDisk)
         }
     }
-    func finishRecovery(_ expected: UUID?) async throws {
+    @discardableResult func finishRecovery(_ expected: RecoveryToken?) async throws -> RecoveryReceipt {
         try await perform { [self] in
-            guard failure?.id == expected else { throw RequestWorkerEvidenceError(cause: "Storage recovery was superseded by a newer fault.") }
-            if let file = faultFile, RequestProcessIdentity.evidenceExists(file) {
-                do {
-                    try FileManager.default.removeItem(at: file)
-                    let fd = open(file.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-                    guard fd >= 0 else { throw POSIXError(.EIO) }; defer { close(fd) }; guard fsync(fd) == 0 else { throw POSIXError(.EIO) }
-                } catch { throw fail(error, operation: failure?.operation ?? "finish storage recovery", files: [file], before: undo, proposed: candidates) }
+            guard failure?.id == expected?.faultID,
+                  failure?.generation == expected?.generation, recoveryAttempt == expected?.attemptID else {
+                throw RequestWorkerEvidenceError(cause: "Storage recovery was superseded by a newer fault.")
             }
-            failure = nil; undo = [:]; candidates = [:]; recoveryAllowed = false
+            if let file = faultFile {
+                do { try removeFile(file) }
+                catch { throw fail(error, operation: failure?.operation ?? "finish storage recovery", files: [file], before: [:], proposed: [:]) }
+            }
+            let receipt = RecoveryReceipt(clearedGeneration: generation)
+            failure = nil; undo = [:]; candidates = [:]; recoveryAllowed = false; recoveryAttempt = nil; loadedFromDisk = false
+            return receipt
         }
     }
     func resumeAfterExplicitRecovery() async throws {
@@ -333,7 +351,9 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                         if let transaction, transactions[transaction]?.before[file] == nil { transactions[transaction]?.before[file] = before[file] }
                         if let transaction { transactions[transaction]?.candidates[file, default: []].insert(CatalogHash.sha256(bytes)) }
                         try ticket.beginMutation()
-                        try replace(bytes, at: file); ticket.complete(.success(()))
+                        try replace(bytes, at: file)
+                        if recoveryAllowed, transaction == nil { undo[file] = .file(bytes); candidates[file] = [CatalogHash.sha256(bytes)]; summarize() }
+                        ticket.complete(.success(()))
                     } catch is CancellationError { ticket.complete(.failure(CancellationError())) }
                     catch {
                         let tx = transaction.flatMap { transactions[$0] }

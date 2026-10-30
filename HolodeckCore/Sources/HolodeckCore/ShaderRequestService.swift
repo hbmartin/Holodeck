@@ -818,19 +818,44 @@ public actor ShaderRequestService {
             throw error
         }
     }
-    private func resetPersistenceFailure() async throws {
-        let expected = persistenceFault?.id
-        do {
-            let id = try await persistence.restoreForRecovery()
-            try await persist()
-            try await persistence.finishRecovery(id)
-            guard persistenceFault?.id == expected else { throw RequestWorkerEvidenceError(cause: "A newer storage failure superseded recovery.") }
-            resolvedPersistenceGeneration = max(resolvedPersistenceGeneration, persistenceFault?.generation ?? 0)
-            persistenceFault = nil; emitUpdates(); if schedulingDeferred { scheduleWakeup() }
-        } catch {
-            publishStorageFault(error)
-            throw error
+    private struct AcceptedMetadata: Sendable {
+        let records: [Record]
+        let acknowledgements: [DetachedCheckoutAcknowledgement]
+        let recovery: RequestRecoveryStore
+        let configuration: ShaderRequestConfiguration?
+    }
+    private func reloadAcceptedMetadata() async throws {
+        let root = directory
+        let accepted = try await persistence.perform {
+            let reader = try BoundedCatalogReader(root: root)
+            func read<T: Decodable>(_ name: String, as: T.Type, limit: Int = CatalogLimits.manifestBytes) throws -> T? {
+                guard RequestProcessIdentity.evidenceExists(root.appendingPathComponent(name)) else { return nil }
+                return try JSONDecoder().decode(T.self, from: reader.read(name, limit: limit).bytes)
+            }
+            let store = try read("recovery.json", as: RequestRecoveryStore.self) ?? RequestRecoveryStore()
+            guard store.formatVersion == 1, store.entries.allSatisfy({ $0.key == $0.value.journal && URL(fileURLWithPath: $0.key).deletingLastPathComponent().path == RequestPaths.canonical(root) }) else { throw RequestWorkerOwnershipError() }
+            return AcceptedMetadata(records: try read("journal.json", as: [Record].self, limit: 128 * 1024 * 1024) ?? [],
+                acknowledgements: try read("detached-checkouts.json", as: [DetachedCheckoutAcknowledgement].self) ?? [],
+                recovery: store, configuration: try read("preferences.json", as: ShaderRequestConfiguration.self, limit: CatalogLimits.headBytes))
         }
+        guard Set(accepted.records.map { $0.status.id }).count == accepted.records.count else { throw RequestWorkerOwnershipError() }
+        records = Dictionary(uniqueKeysWithValues: accepted.records.map { ($0.status.id, $0) })
+        detachedOwners = accepted.acknowledgements; recovery = accepted.recovery
+        if let id = recoveryID, records[id] == nil { recoveryID = nil }
+        maintenanceProposals.removeAll()
+        if let configuration = accepted.configuration { self.configuration = configuration }
+        reconciled = false; refreshReconciliationFailure()
+    }
+    private func resetPersistenceFailure() async throws {
+        do {
+            let token = try await persistence.restoreForRecovery()
+            if token?.reloadAccepted == true { try await reloadAcceptedMetadata() }
+            try await persist()
+            let receipt = try await persistence.finishRecovery(token)
+            resolvedPersistenceGeneration = max(resolvedPersistenceGeneration, receipt.clearedGeneration)
+            if persistenceFault?.generation ?? 0 <= receipt.clearedGeneration { persistenceFault = nil }
+            emitUpdates(); if schedulingDeferred { scheduleWakeup() }
+        } catch { publishStorageFault(error); throw error }
     }
     private func progressPersistenceFailed(_ error: Error) { publishStorageFault(error) }
     private func holdForRecovery(journal: URL, configuration target: ShaderRequestConfiguration?, error: Error,

@@ -4128,3 +4128,23 @@ private final class DraftReplacementGate: @unchecked Sendable {
     }
 }
 #endif
+
+#if os(macOS)
+extension ShaderRequestTests {
+    func testRestartRecoveryReloadsManuallyRestoredAcceptedMetadata() async throws {
+        let (root, script) = try recoveryFixture(), original = try await recoveryService(root, script: script)
+        let journal = root.appendingPathComponent("journal.json"), accepted = try Data(contentsOf: journal)
+        let request = ShaderRequest(prompt: "Uncertain bytes must not resurrect", context: try context())
+        _ = try await original.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        let fault = RequestPersistence.Fault(id: UUID(), generation: 17, operation: "uncertain requestSubmit", paths: [journal.path], primary: "Replacement uncertain", expected: [journal.path: CatalogHash.sha256(accepted)])
+        try JSONEncoder().encode(fault).write(to: root.appendingPathComponent("storage-recovery.json"))
+        let service = try await recoveryService(root, script: script)
+        let uncertain = await service.allJobs(); XCTAssertTrue(uncertain.contains { $0.id == request.id })
+        try accepted.write(to: journal)
+        try await service.retryReconciliation()
+        let restored = await service.allJobs(); XCTAssertTrue(restored.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: journal), accepted)
+        let status = await service.recoveryStatuses(); XCTAssertFalse(status.contains { $0.kind == .persistence })
+    }
+}
+#endif

@@ -140,7 +140,7 @@ import XCTest
         do { try await writer.reject(id); XCTFail("Obstructed rollback succeeded") } catch {}
         let second = await writer.fault(); XCTAssertGreaterThan(second!.generation, first!.generation)
         XCTAssertEqual(second?.operation, first?.operation)
-        do { try await writer.finishRecovery(first?.id); XCTFail("Stale recovery cleared a new failure") } catch {}
+        do { try await writer.finishRecovery(.init(faultID: first!.id, generation: first!.generation, attemptID: UUID(), reloadAccepted: false)); XCTFail("Stale recovery cleared a new failure") } catch {}
         do { try await writer.write(Data("unrelated".utf8), to: root.appendingPathComponent("other")); XCTFail("Unrelated work bypassed failed restoration") } catch {}
         try FileManager.default.removeItem(at: file); try Data("accepted".utf8).write(to: file)
         try await writer.resumeAfterExplicitRecovery()
@@ -222,6 +222,64 @@ private final class PersistenceWriteProbe: @unchecked Sendable {
         if lock.withLock({ let value = failBefore; failBefore = false; return value }) { throw POSIXError(.ENOSPC) }
         try RequestJournalWriter.write(bytes, to: file)
         if lock.withLock({ let value = fail; fail = false; return value }) { throw POSIXError(.EIO) }
+    }
+}
+#endif
+
+#if os(macOS)
+extension RequestPersistenceTests {
+    func testSecondaryFaultRetainsRejectedTransactionRollbackImages() async throws {
+        let root = try directory(), probe = PersistenceWriteProbe(), participant = root.appendingPathComponent("participant/recovery.json"), other = root.appendingPathComponent("recovery.json")
+        let writer = RequestPersistence(directory: root, recoveryWriter: { try probe.write($0, $1) }), id = UUID()
+        try FileManager.default.createDirectory(at: participant.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("accepted participant".utf8).write(to: participant); try Data("accepted other".utf8).write(to: other)
+        try await writer.begin(id, operation: "participant proposal")
+        try await writer.write(Data("rejected participant".utf8), to: participant, transaction: id)
+        probe.failBeforePublication()
+        do { try await writer.write(Data("rejected other".utf8), to: other, transaction: nil); XCTFail("Fault succeeded") } catch {}
+        probe.failBeforePublication()
+        do { try await writer.reject(id); XCTFail("Rollback fault succeeded") } catch {}
+        try await writer.resumeAfterExplicitRecovery()
+        XCTAssertEqual(try Data(contentsOf: participant), Data("accepted participant".utf8))
+        XCTAssertEqual(try Data(contentsOf: other), Data("accepted other".utf8))
+    }
+    func testRepeatedRecoveryRecognizesItsFailedConvergenceWrite() async throws {
+        let root = try directory(), file = root.appendingPathComponent("recovery.json"), probe = PersistenceWriteProbe()
+        let writer = RequestPersistence(directory: root, recoveryWriter: { try probe.write($0, $1) })
+        try Data("accepted".utf8).write(to: file); probe.failAfterPublication()
+        do { try await writer.write(Data("rejected".utf8), to: file) } catch {}
+        let first = try await writer.restoreForRecovery(); probe.failAfterPublication()
+        do { try await writer.write(Data("converged".utf8), to: file); XCTFail("Convergence fault succeeded") } catch {}
+        let second = try await writer.restoreForRecovery()
+        XCTAssertGreaterThan(second!.generation, first!.generation)
+        try await writer.write(Data("converged".utf8), to: file)
+        let receipt = try await writer.finishRecovery(second)
+        XCTAssertEqual(receipt.clearedGeneration, second?.generation)
+        XCTAssertEqual(try Data(contentsOf: file), Data("converged".utf8))
+    }
+    func testFailedRecoveryMarkerRemovalKeepsConvergedBaselineAndRejectsStaleToken() async throws {
+        let root = try directory(), file = root.appendingPathComponent("recovery.json"), probe = PersistenceWriteProbe(), removal = RecoveryRemovalProbe()
+        let writer = RequestPersistence(directory: root, recoveryWriter: { try probe.write($0, $1) }, removeFile: { try removal.remove($0) })
+        try Data("accepted".utf8).write(to: file); probe.failAfterPublication()
+        do { try await writer.write(Data("rejected".utf8), to: file) } catch {}
+        let first = try await writer.restoreForRecovery()
+        try await writer.write(Data("converged".utf8), to: file)
+        removal.arm()
+        do { try await writer.finishRecovery(first); XCTFail("Failed removal succeeded") } catch {}
+        do { try await writer.finishRecovery(first); XCTFail("Stale token cleared a new fault") } catch {}
+        let second = try await writer.restoreForRecovery()
+        XCTAssertEqual(try Data(contentsOf: file), Data("converged".utf8))
+        let receipt = try await writer.finishRecovery(second)
+        XCTAssertGreaterThan(receipt.clearedGeneration, first!.generation)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(root.appendingPathComponent("storage-recovery.json")))
+    }
+}
+private final class RecoveryRemovalProbe: @unchecked Sendable {
+    private let lock = NSLock(); private var fail = false
+    func arm() { lock.withLock { fail = true } }
+    func remove(_ file: URL) throws {
+        if lock.withLock({ let value = fail; fail = false; return value }) { throw POSIXError(.EIO) }
+        try RequestJournalWriter.remove(file)
     }
 }
 #endif
