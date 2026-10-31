@@ -272,7 +272,14 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         }
     }
     private func drainProgress() throws {
-        let pending = progress; progress = [:]
+        let captured = progress; progress = [:]
+        // A tentative successor cannot consume progress, but progress cannot
+        // overwrite that successor while its caller is awaiting acceptance either.
+        var pending: [URL: Pending] = [:]
+        for (url, value) in captured {
+            let tentative = transactions.values.contains { ($0.revisions[url] ?? 0) >= value.revision }
+            if tentative { progress[url] = value } else { pending[url] = value }
+        }
         for revision in Set(pending.values.map(\.revision)).sorted() {
             let files = pending.values.filter { $0.revision == revision }.map(\.file).sorted {
                 if $0.url.lastPathComponent == "recovery.json" { return true }
@@ -353,8 +360,9 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             } onCancel: { self.ticket.cancel() }
         }
     }
-    func submit(_ snapshot: Snapshot, retainingEvidence: Bool = false, transaction: UUID? = nil, recovery: RecoveryToken? = nil) -> Submission {
+    func submit(_ snapshot: Snapshot, retainingEvidence: Bool = false, transaction: UUID? = nil, recovery: RecoveryToken? = nil, cancellable: Bool = true) -> Submission {
         let ticket = CommitTicket<CommitReceipt>()
+        if cancellable, Task.isCancelled { ticket.cancel() }
         queue.async { [self] in
             do {
                 try ticket.check()

@@ -77,6 +77,20 @@ import XCTest
         do { try await direct.value; XCTFail("Invalid pending progress was ignored") } catch { XCTAssertTrue(error is RequestPersistence.ValidationError) }
         let fault = await writer.fault(); XCTAssertNil(fault)
     }
+    func testProgressCannotOverwriteTentativeSuccessorOrDisappearOnRejection() async throws {
+        for accepted in [false, true] {
+            let root = try directory(), file = root.appendingPathComponent("journal.json"), writer = RequestPersistence(), id = UUID()
+            try Data("baseline".utf8).write(to: file)
+            try await writer.begin(id, operation: "pending caller")
+            try await writer.commit(.init(revision: 2, files: [.init(url: file, bytes: Data("proposal".utf8))]), transaction: id)
+            writer.enqueueProgress(.init(revision: 1, files: [.init(url: file, bytes: Data("accepted progress".utf8))])) { _ in XCTFail("Progress failed") }
+            try await writer.write(Data(), to: root.appendingPathComponent("drain"))
+            XCTAssertEqual(try Data(contentsOf: file), Data("proposal".utf8))
+            if accepted { await writer.accept(id) } else { try await writer.reject(id) }
+            try await writer.write(Data(), to: root.appendingPathComponent("drain-again"))
+            XCTAssertEqual(try Data(contentsOf: file), Data((accepted ? "proposal" : "accepted progress").utf8))
+        }
+    }
     func testCriticalCommitSkipsUnchangedFilesAndSupersedesProgress() async throws {
         let root = try directory(), probe = PersistenceWriteProbe()
         let writer = RequestPersistence(recoveryWriter: { try probe.write($0, $1) }), file = root.appendingPathComponent("recovery.json")

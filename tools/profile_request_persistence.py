@@ -108,7 +108,7 @@ final class Counter: @unchecked Sendable {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--baseline', default='650cfa2')
+    parser.add_argument('--baseline', default='104ad2e')
     parser.add_argument('--samples', type=int, default=5)
     parser.add_argument('--stages', type=int, default=200)
     parser.add_argument('--python', default='/usr/bin/python3')
@@ -125,10 +125,13 @@ def main():
     actor = actor.replace('ShaderRequestService', 'BaselineShaderRequestService').replace('RequestPersistence', 'BaselineRequestPersistence')
     persistence = subprocess.check_output(['git', 'show', baseline_sha + ':HolodeckCore/Sources/HolodeckCore/RequestPersistence.swift'], cwd=ROOT, text=True).replace('RequestPersistence', 'BaselineRequestPersistence')
     # Instrument the reviewed writer without changing its read/write decisions.
-    persistence = persistence.replace('private var encodings = 0', 'private var encodings = 0; private var reads = 0')
-    persistence = persistence.replace('return .file(try BoundedCatalogReader', 'reads += 1; return .file(try BoundedCatalogReader')
-    persistence = persistence.replace('CatalogHash.sha256(', 'BaselineHashCounter.hash(')
-    persistence = persistence.replace('"encodings": encodings', '"encodings": encodings, "metadataEncodings": encodings, "reads": reads, "hashes": BaselineHashCounter.count')
+    if 'private let metrics' not in persistence:
+        persistence = persistence.replace('private var encodings = 0', 'private var encodings = 0; private var reads = 0')
+        persistence = persistence.replace('return .file(try BoundedCatalogReader', 'reads += 1; return .file(try BoundedCatalogReader')
+        persistence = persistence.replace('CatalogHash.sha256(', 'BaselineHashCounter.hash(')
+        persistence = persistence.replace('"encodings": encodings', '"encodings": encodings, "reads": reads, "hashes": BaselineHashCounter.count')
+    if '"metadataEncodings": metadataEncodings' not in persistence:
+        persistence = persistence.replace('"encodings": encodings', '"encodings": encodings, "metadataEncodings": encodings')
     persistence = persistence.replace('private func replace(_ bytes: Data, at file: URL) throws {', 'private func replace(_ bytes: Data, at file: URL) throws { ProfileDelay.pause()')
     with tempfile.TemporaryDirectory(prefix='holodeck-persistence-profile-') as temporary:
         folder = Path(temporary)

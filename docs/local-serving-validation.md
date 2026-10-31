@@ -714,3 +714,40 @@ HOLODECK_PROFILE_WORKER=1 swift test --package-path HolodeckCore -c release --fi
 /usr/bin/python3 -B tools/profile_request_persistence.py --baseline 650cfa2 --samples 5 --stages 200 --python /opt/homebrew/bin/python3
 /usr/bin/python3 -B tools/profile_request_persistence.py --baseline 650cfa2 --samples 5 --stages 200 --python /usr/bin/python3 --slow-ms 5
 ```
+
+
+## PR #38 follow-up — ordered acceptance and recovery authorization (2026-10-30)
+
+Metadata snapshots enter the serial writer synchronously before callers await their receipts. Tentative revisions cannot supersede accepted progress; progress also waits while a newer caller proposal is awaiting acceptance. Accept and reject resolve that barrier without dropping independent recovery intent. Record changes arriving during a caller commit are replayed as transitions against the accepted result. Terminal cancellation and deletion guards prevent revival; the original public-path resurrection allegation remains unproven, and the gated deletion regression establishes the invariant without claiming a reproduction.
+
+Reload remains cancellable during preparation and completes acceptance once installation starts. Detach drains that boundary before finalization. Preferences-write failure retains the confirmed catalog, prior accepted configuration and storage blocker. Recovery authorization belongs to a matching writer token; decoding, validation and cancellation failures close it. Blocked writes add no candidate hashes or summary writes. Recovery removal supports the same root aliases as writes, and a no-fault completion removes nothing.
+
+Background encoding/capacity failures expose explicit Storage Recovery while preserving the last durable metadata and pending facts. Caller-only validation rejects the proposal without inventing an I/O fault. A successful convergence receipt supplies the validation callback floor. Startup and accepted-state reload share normalization, including detached disabling. Optional dispatch metadata distinguishes prepared work and verified retirement. Unlaunched faults remain eligible without checkout-recovery entries; interrupted implementation resumes as repairing with exact patch bytes retained. Retirement is resumable across storage blockers and restart. Manual Recovery invalidates and drains the old observer before storage restoration can suspend; the observer-drain regression passed ten consecutive isolated runs before the final suites.
+
+No-op delivery, duplicate UUID submissions and accepted performance duplicates with new UUIDs bypass metadata admission. A held unrelated commit does not delay them. Ten delivery polls plus ten duplicate submissions perform zero metadata encodes, reads, hashes or replacements in the structural regression. New submissions still wait for durable acceptance. Empty worker failure details do not add an empty original-error label.
+
+Final validation used macOS 27.0.1, Xcode 27.2 (27B52), Swift 6.4.2, Python 3.9.6 and Python 3.15.0:
+
+- Python worker coverage: **119 tests passed on each interpreter**.
+- Full core/native coverage: **423 tests, 6 opt-in skips, zero failures**, including local scene and GPU regressions.
+- Release worker/core/packaging coverage with supervision profiling enabled: **223 tests, 1 opt-in skip, zero failures**.
+- Isolated Mac UI coverage: **6 tests, 0 skips, zero failures**; queued cancellation/retention, Detach, reconciliation, guided repair, Storage Recovery and publication recovery.
+- Both unsigned Release app builds passed. Existing `/tmp/HolodeckPR38Validation` derived data was rebuilt from this tree; it is a build cache, not the live installation.
+- Packaged resource checks passed for both apps, with exact source checksums and no packaged bytecode caches. The packaged native identity matched its bundled lock and the selected library; the packaged worker accepted that identity.
+- The packaged checker compiled **68 assets plus shader/snippet templates for macOS and tvOS**. Mac GPU verification passed **seven profile checks** on Apple M2 Pro.
+
+The local Metal resolver still lacks its matching component. The temporary `/tmp/pr38-metal-tools/xcrun` wrapper reused the already-mounted Metal 27.1 component with each Xcode 27.2 SDKROOT, as in the previous validation; no compiler installation or checker bytes changed. Physical Apple TV, tvOS simulator runtime, live LAN/TLS and real Codex publication checks were not run.
+
+Release profiling compares the actor and writer from merged PR #38 (`104ad2e`) on the same filesystem, alternating baseline/current order for five samples per fixture, with 200 stage events followed by clarification. Wall and CPU columns are medians; reply latency is the maximum observed per fixture. Count ranges retain sample variation. Metadata fsync accounting includes each file and parent-directory sync and excludes operation/process evidence equally. The Release supervision fixture measured 29.86 polls/s and 0.396% CPU. These local measurements do not impose CI timing thresholds.
+
+| Fixture | Wall ms, baseline → current | CPU ms | Metadata encodes | Replacements | Fsyncs | Byte reads | Hashes | Peak actor reply ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Python 3.9 | 111.63 → 110.74 | 31.65 → 31.52 | 18 → 24 | 4 → 6 | 8 → 12 | 0 → 0 | 4 → 8 | 0.21 → 0.07 |
+| Python 3.15 | 52.09 → 53.02 | 24.98 → 25.34 | 18 → 24 | 4 → 6 | 8 → 12 | 0 → 0 | 4 → 8 | 0.07 → 0.06 |
+| Python 3.9, 5 ms storage delay | 221.02 → 260.17 | 36.08 → 37.13 | 18 → 21–24 | 4 → 5–6 | 8 → 10–12 | 0 → 0 | 4 → 7–8 | 0.09 → 0.15 |
+
+Additional per-job metadata records the dispatch binding and verified retirement; the table reports its cost alongside the no-op and coalescing improvements. Structural tests enforce unchanged-write avoidance, held-commit responsiveness, payload release, progress barriers and recovery provenance.
+
+Final evidence is `/tmp/pr39-{python39,python-current,core-final,release-final,mac-build,tv-build,package,metal,gpu,ui,profile39,profile315,profile-slow}.log`, `/tmp/pr39-native-progress.json`, `/tmp/pr39-frozen-hashes.json` and `/tmp/pr39-ui.xcresult`. Runtime, UI, regression and profiling source hashes matched before and after all eleven native steps. Earlier development failures and interrupted acceptance attempts are excluded from these totals; `/tmp/pr39-core-observer-race.log` retains the observer-race reproduction, and `/tmp/pr39-drain-stress.log` records the isolated repetitions.
+
+Linux CI, checker artifacts, library locks, network contracts and the live installation/request settings are unchanged. No merge or deployment occurred.

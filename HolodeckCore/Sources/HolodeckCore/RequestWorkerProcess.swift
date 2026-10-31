@@ -330,6 +330,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
         if error is RequestWorkerSupervisionError || error is RequestWorkerTeardownError || error is RequestWorkerEvidenceError || error is RequestWorkerOwnershipError || error is ShaderRequestError { return error }
         return RequestWorkerSupervisionError(message: error.localizedDescription, underlyingError: error, retryable: !(error is POSIXError || error is CocoaError))
     }
+    var checkoutLaunched: Bool { lock.withLock { gateReleased } }
     var recordedFailure: Error? { lock.withLock { initiatingFailure ?? firstError.map(Self.supervisionFailure) ?? parsedFailure } }
     private var firstError: Error?
     private var logFailed = false
@@ -648,7 +649,7 @@ nonisolated final class RequestWorkerProcess: @unchecked Sendable {
                     let error: Error
                     switch caught {
                     case let failure as RequestWorkerEvidenceError:
-                        error = RequestWorkerEvidenceError(cause: failure.cause + (detail.map { " Original worker error: " + $0 } ?? ""))
+                        error = RequestWorkerEvidenceError(cause: RequestWorkerDiagnostic.combined(failure.cause, detail) ?? "Process ownership evidence could not be verified.")
                     case let failure as RequestWorkerOwnershipError:
                         error = RequestWorkerOwnershipError(cause: RequestWorkerDiagnostic.combined(failure.cause, detail))
                     case let failure as RequestWorkerTeardownError:
