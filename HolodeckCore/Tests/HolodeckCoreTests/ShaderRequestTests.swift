@@ -4210,6 +4210,88 @@ private final class DraftReplacementGate: @unchecked Sendable {
 
 #if os(macOS)
 extension ShaderRequestTests {
+    func testVerifiedRetirementSurvivesValidationBlockerAndRestart() async throws {
+        let (root, script) = try recoveryFixture(), fault = RetirementValidationFault()
+        try "import json; print(json.dumps(dict(event='clarification',question='Choose',options=['A','B'])),flush=True)".write(to: script, atomically: true, encoding: .utf8)
+        let catalog = DirectoryCatalog(directory: root.appendingPathComponent("catalog"))
+        let service = ShaderRequestService(catalog: catalog, directory: root, workerScript: script,
+            waitForWorker: { try await $0.waitForExit(); await fault.fire() })
+        await fault.install(service)
+        await service.suspend(); try await service.start(configuration: .init(repository: root.path, enabled: true))
+        let first = ShaderRequest(prompt: "Completed attempt", context: try context()), second = ShaderRequest(prompt: "Next queued request", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: first), deviceID: "TV1")
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: second), deviceID: "TV2")
+        await service.resume()
+        try await waitFor { await service.recoveryStatuses().contains { $0.kind == .persistence && !$0.isRunning } }
+        await service.suspend(); _ = await service.persistenceStatistics()
+        XCTAssertTrue(RequestProcessIdentity.evidenceExists(root.appendingPathComponent("active.json")))
+        let restarted = ShaderRequestService(catalog: catalog, directory: root, workerScript: script)
+        await restarted.suspend(); try await restarted.start(configuration: .init(repository: root.path, enabled: true))
+        try await restarted.retryReconciliation()
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(root.appendingPathComponent("active.json")))
+        let jobs = await restarted.allJobs()
+        XCTAssertEqual(jobs.first { $0.id == first.id }?.stage, .awaitingClarification)
+        XCTAssertEqual(ShaderRequestScheduling.next(in: jobs), second.id)
+        let recovery = await restarted.recoveryStatuses(); XCTAssertTrue(recovery.isEmpty)
+    }
+    func testStorageRecoveryKeepsInterruptedNormalizationAndDetachedConfiguration() async throws {
+        let (root, script) = try recoveryFixture()
+        let config = ShaderRequestConfiguration(repository: root.path, enabled: true)
+        let request = ShaderRequest(prompt: "Interrupted saved state", context: try context())
+        var status = ShaderRequestStatus(request: request, deviceID: "TV"); status.stage = .implementing
+        func object<T: Encodable>(_ value: T) throws -> Any { try JSONSerialization.jsonObject(with: JSONEncoder().encode(value)) }
+        try FileManager.default.createDirectory(at: root.appendingPathComponent(request.id.uuidString), withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: [["status": try object(status), "configuration": try object(config), "revoked": false]]).write(to: root.appendingPathComponent("journal.json"))
+        try JSONEncoder().encode(request.id).write(to: root.appendingPathComponent("active.json"))
+        let ack = DetachedCheckoutAcknowledgement(requestID: UUID(), directory: root.appendingPathComponent("old").path, repository: RequestPaths.canonical(root), checkoutID: nil)
+        try JSONEncoder().encode([ack]).write(to: root.appendingPathComponent("detached-checkouts.json"))
+        try JSONEncoder().encode(config).write(to: root.appendingPathComponent("preferences.json"))
+        try JSONEncoder().encode(RequestPersistence.Fault(id: UUID(), generation: 1, operation: "restart fixture", paths: [], primary: "uncertain write")).write(to: root.appendingPathComponent("storage-recovery.json"))
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script)
+        await service.suspend(); try await service.start(configuration: config)
+        try await service.retryReconciliation()
+        let jobs = await service.allJobs(), accepted = await service.configurationValue()
+        XCTAssertEqual(jobs.first?.stage, .repairing); XCTAssertFalse(accepted.enabled)
+        do { _ = try await service.control(operation: "requestSubmit", payload: .init(request: ShaderRequest(prompt: "Detached", context: context())), deviceID: "TV"); XCTFail("Detached checkout accepted work") } catch {}
+    }
+    func testFailedRecoveryReloadCannotAuthorizeLaterOrdinaryWrites() async throws {
+        let (root, script) = try recoveryFixture(), journal = root.appendingPathComponent("journal.json")
+        try Data("[]".utf8).write(to: journal)
+        try JSONEncoder().encode(RequestPersistence.Fault(id: UUID(), generation: 1, operation: "restart fixture", paths: [], primary: "uncertain write")).write(to: root.appendingPathComponent("storage-recovery.json"))
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script)
+        await service.suspend(); try await service.start(configuration: .init(repository: root.path, enabled: true))
+        let manual = Data("{".utf8); try manual.write(to: journal)
+        do { try await service.retryReconciliation(); XCTFail("Malformed restored metadata accepted") } catch {}
+        do { try await service.revoke("unrelated"); XCTFail("Ordinary write bypassed recovery") } catch {}
+        XCTAssertEqual(try Data(contentsOf: journal), manual)
+    }
+    func testBackgroundValidationRequiresExplicitRecoveryAndIgnoresDelayedCallback() async throws {
+        let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script)
+        await service.progressPersistenceFailed(RequestPersistence.ValidationError(message: "capacity"), revision: 900)
+        var statuses = await service.recoveryStatuses(); XCTAssertTrue(statuses.contains { $0.kind == .persistence && $0.message.contains("validation") })
+        do { try await service.ensurePublication(force: true); XCTFail("Rebuild waited despite validation blocker") } catch {}
+        try await service.retryReconciliation()
+        await service.progressPersistenceFailed(RequestPersistence.ValidationError(message: "delayed"), revision: 900)
+        statuses = await service.recoveryStatuses(); XCTAssertFalse(statuses.contains { $0.kind == .persistence })
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(root.appendingPathComponent("metadata-validation.json")))
+    }
+    func testValidationBetweenDispatchCommitAndLaunchCreatesNoCheckoutRecovery() async throws {
+        let (root, script) = try recoveryFixture(), writing = DraftReplacementGate(failAfterRelease: false)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script, beforePersistenceReplacement: { try writing.before($0) })
+        await service.suspend(); try await service.start(configuration: .init(repository: root.path, enabled: true))
+        let request = ShaderRequest(prompt: "Never launched", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        writing.arm(root.appendingPathComponent("journal.json")); defer { writing.release() }
+        await service.resume(); try await waitFor { writing.entered }
+        await service.progressPersistenceFailed(RequestPersistence.ValidationError(message: "capacity"))
+        writing.release()
+        try await waitFor { await service.allJobs().first?.stage == .queued }
+        await service.suspend()
+        let recovery = await service.recoveryStatuses(); XCTAssertFalse(recovery.contains { $0.kind == .reconciliation })
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(root.appendingPathComponent(request.id.uuidString).appendingPathComponent("process.json")))
+        try await service.retryReconciliation()
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(root.appendingPathComponent("active.json")))
+    }
     func testRestartRecoveryReloadsManuallyRestoredAcceptedMetadata() async throws {
         let (root, script) = try recoveryFixture(), original = try await recoveryService(root, script: script)
         let journal = root.appendingPathComponent("journal.json"), accepted = try Data(contentsOf: journal)
@@ -4347,5 +4429,16 @@ private final class ReloadCancellationSlot: @unchecked Sendable {
     private var action: (@Sendable () -> Void)?
     func install(_ action: @escaping @Sendable () -> Void) { lock.withLock { self.action = action } }
     func cancel() { let action = lock.withLock { let value = action; action = nil; return value }; action?() }
+}
+#endif
+
+#if os(macOS)
+private actor RetirementValidationFault {
+    private var service: ShaderRequestService?
+    func install(_ service: ShaderRequestService) { self.service = service }
+    func fire() async {
+        let current = service; service = nil
+        await current?.progressPersistenceFailed(RequestPersistence.ValidationError(message: "retirement capacity fixture"))
+    }
 }
 #endif

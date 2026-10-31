@@ -37,7 +37,34 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     }
     struct ValidationError: LocalizedError, Sendable {
         let message: String
+        var operation: String? = nil
+        var paths: [String] = []
         var errorDescription: String? { message }
+    }
+    struct ValidationBlocker: Codable, Sendable {
+        let revision: UInt64
+        let message: String
+    }
+    private var validationBlocker: ValidationBlocker?
+    func recordValidation(_ value: ValidationBlocker, failed: @escaping @Sendable (Error) -> Void) {
+        queue.async { [self] in
+            guard validationBlocker == nil || value.revision > validationBlocker!.revision else { return }
+            validationBlocker = value
+            guard let directory else { return }
+            do { try RequestJournalWriter.write(JSONEncoder().encode(value), to: directory.appendingPathComponent("metadata-validation.json")) }
+            catch { failed(fail(error, operation: "retain metadata validation diagnostic", files: [directory.appendingPathComponent("metadata-validation.json")], before: [:], proposed: [:])) }
+        }
+    }
+    func clearValidation(through revision: UInt64) async throws {
+        try await perform { [self] in
+            guard validationBlocker == nil || validationBlocker!.revision <= revision else { return }
+            if let directory, RequestProcessIdentity.evidenceExists(directory.appendingPathComponent("metadata-validation.json")) {
+                let file = directory.appendingPathComponent("metadata-validation.json")
+                do { try RequestJournalWriter.remove(file) }
+                catch { throw fail(error, operation: "clear metadata validation diagnostic", files: [file], before: [:], proposed: [:]) }
+            }
+            validationBlocker = nil
+        }
     }
     struct NormalizedRecovery: Sendable { let store: RequestRecoveryStore; let generation: UInt64 }
     struct CommitReceipt: Sendable {
@@ -203,7 +230,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                     receipt.recovery[file.url] = NormalizedRecovery(store: normalized, generation: value.generation)
                 } else { encoded[file.url] = try file.encode() }
             }
-        } catch { throw ValidationError(message: error.localizedDescription) }
+        } catch { throw ValidationError(message: error.localizedDescription, operation: snapshot.operation, paths: files.map { $0.url.path }) }
         do {
             for file in files {
                 guard committed[file.url] != encoded[file.url] else { continue }
@@ -252,8 +279,13 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                 if $1.url.lastPathComponent == "recovery.json" { return false }
                 return $0.url.path < $1.url.path
             }
-            let receipt = try apply(.init(revision: revision, files: files))
-            pending.values.first { $0.revision == revision }?.completed(receipt)
+            do {
+                let receipt = try apply(.init(revision: revision, files: files, operation: "background request progress"))
+                pending.values.first { $0.revision == revision }?.completed(receipt)
+            } catch {
+                for (url, value) in pending where value.revision >= revision && (progress[url]?.revision ?? 0) < value.revision { progress[url] = value }
+                throw error
+            }
         }
     }
     func begin(_ id: UUID, operation: String, cancellable: Bool = true) async throws {

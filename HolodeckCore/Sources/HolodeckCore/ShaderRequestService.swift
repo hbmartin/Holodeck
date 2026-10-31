@@ -126,6 +126,13 @@ public struct ShaderRepositorySelection: Sendable {
 }
 
 public actor ShaderRequestService {
+    private struct DispatchState: Codable, Sendable, Equatable {
+        let executionID: UUID
+        var workerOperationID: UUID?
+        var launched = false
+        var retirementPending = false
+        let priorStage: ShaderRequestStatus.Stage
+    }
     private struct Record: Codable, Sendable, Equatable {
         var status: ShaderRequestStatus
         var configuration: ShaderRequestConfiguration
@@ -139,6 +146,7 @@ public actor ShaderRequestService {
         var detached: Bool?
         var deletionPending: Bool?
         var deletionFailure: String?
+        var dispatch: DispatchState?
     }
     private let directory: URL
     private let catalog: DirectoryCatalog
@@ -161,7 +169,15 @@ public actor ShaderRequestService {
     private var resolvedPersistenceGeneration: UInt64 = 0
     private var pendingCommits = 0
     private var persistenceFault: RequestPersistence.Fault?
-    private var persistenceFailure: String? { persistenceFault?.localizedDescription }
+    private var validationBlocker: RequestPersistence.ValidationBlocker?
+    private var resolvedValidationRevision: UInt64 = 0
+    private var persistenceFailure: String? { persistenceFault?.localizedDescription ?? validationBlocker?.message }
+    private struct MetadataUnavailable: LocalizedError { let message: String; var errorDescription: String? { message } }
+    private var settledExecutions: Set<UUID> = []
+    private var pendingRetirements: [UUID: UUID] = [:]
+    private var verifiedRetirements: Set<UUID> = []
+    private var retirementTask: Task<Void, Never>?
+
     private var schedulingWakeupPending = false
     private var schedulingDeferred = false
     /// Caller drafts never enter accepted state while the writer is suspended.
@@ -325,6 +341,17 @@ public actor ShaderRequestService {
         failPendingPublicationForRecovery(fault.localizedDescription)
         emitUpdates()
     }
+    private func publishValidation(_ error: Error, revision: UInt64) {
+        guard let validation = error as? RequestPersistence.ValidationError, revision > resolvedValidationRevision,
+              validationBlocker == nil || revision >= validationBlocker!.revision else { return }
+        let origin = validation.operation ?? "background request metadata"
+        let detail = "Metadata validation recovery required for " + RequestRecoveryStore.Entry.bounded(origin, bytes: 1024) + ": " + RequestRecoveryStore.Entry.bounded(validation.message, bytes: 8192)
+        let value = RequestPersistence.ValidationBlocker(revision: revision, message: detail)
+        validationBlocker = value; persistenceRevision = max(persistenceRevision, revision); activeProcess?.shutdown()
+        failPendingPublicationForRecovery(detail)
+        persistence.recordValidation(value) { [weak self] error in Task { await self?.progressPersistenceFailed(error) } }
+        emitUpdates()
+    }
     private func writeFile(to file: URL, bytes: (isolated ShaderRequestService) throws -> Data) async throws {
         try await waitForStorageChange(cancellable: false)
         let id = UUID(); storageCommit = id
@@ -343,7 +370,7 @@ public actor ShaderRequestService {
     }
     private func commitProposal(_ operation: String, cancellable: Bool = true, build: (isolated ShaderRequestService) throws -> StorageProposal) async throws {
         try await waitForStorageChange(cancellable: cancellable)
-        if let persistenceFault { throw persistenceFault }
+        if let persistenceFailure { throw persistenceFault as Error? ?? MetadataUnavailable(message: persistenceFailure) }
         let id = UUID(); storageCommit = id
         defer { releaseStorageCommit() }
         try await persistence.begin(id, operation: operation, cancellable: cancellable)
@@ -409,7 +436,11 @@ public actor ShaderRequestService {
         guard !selectingRepository else { throw ShaderRequestError.unavailable("Wait for the selected folder to finish loading.") }
         let previous = self.configuration
         let preferences = directory.appendingPathComponent("preferences.json")
-        self.configuration = (try? Data(contentsOf: preferences)).flatMap { try? JSONDecoder().decode(ShaderRequestConfiguration.self, from: $0) } ?? configuration
+        self.configuration = try await persistence.perform {
+            guard RequestProcessIdentity.evidenceExists(preferences) else { return configuration }
+            return try JSONDecoder().decode(ShaderRequestConfiguration.self,
+                from: BoundedCatalogReader(root: preferences.deletingLastPathComponent()).read(preferences.lastPathComponent, limit: CatalogLimits.headBytes).bytes)
+        }
         if !configuration.shaderTool.isEmpty { self.configuration.shaderTool = configuration.shaderTool }
         let paths = Self.canonicalRepositories([previous.repository, self.configuration.repository] + detachedOwners.map(\.repository))
         if detachedOwners.contains(where: {
@@ -430,54 +461,14 @@ public actor ShaderRequestService {
     public func activateScheduling() { schedulingActive = true; kick() }
     private func load() async throws {
         guard !loaded else { return }
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let file = directory.appendingPathComponent("journal.json")
-        let acknowledgements = directory.appendingPathComponent("detached-checkouts.json")
-        let hasAcknowledgements = FileManager.default.fileExists(atPath: acknowledgements.path)
-        if hasAcknowledgements { detachedOwners = try JSONDecoder().decode([DetachedCheckoutAcknowledgement].self, from: Data(contentsOf: acknowledgements)) }
-        if FileManager.default.fileExists(atPath: file.path) {
-            let saved = try JSONDecoder().decode([Record].self, from: Data(contentsOf: file))
-            records = Dictionary(uniqueKeysWithValues: saved.map { ($0.status.id, $0) })
-            let active = directory.appendingPathComponent("active.json")
-            if let bytes = try? Data(contentsOf: active), let id = try? JSONDecoder().decode(UUID.self, from: bytes),
-               let stage = records[id]?.status.stage, (!stage.terminal || records[id]?.cleanupPending == true), stage != .awaitingActivation, stage != .awaitingClarification {
-                recoveryID = id
-                if !stage.terminal {
-                    records[id]?.status.stage = .repairing
-                    records[id]?.status.message = "Recovering interrupted request"
-                }
-            }
-        }
-        for id in records.keys {
-            if detachedOwners.contains(where: { $0.requestID == id }) {
-                records[id]?.detached = true; records[id]?.cleanupPending = false
-                if records[id]?.status.stage.terminal == false {
-                    records[id]?.status.stage = .failed
-                    records[id]?.status.message = "Checkout detached; unpublished files and evidence were retained"
-                }
-            }
-            if records[id]?.revoked == true, records[id]?.status.stage.terminal == false, records[id]?.detached != true {
-                records[id]?.cleanupPending = true
-                records[id]?.cleanupMessage = "TV access was revoked; any pushed commit remains"
-                records[id]?.status.stage = .failed
-                records[id]?.status.message = "TV access was revoked; checkout cleanup is pending"
-            }
-            // A restart makes one new recovery attempt after the operator can repair the host.
-            records[id]?.cleanupFailure = nil
-        }
-        let sidecar = directory.appendingPathComponent("recovery.json")
-        if FileManager.default.fileExists(atPath: sidecar.path) {
-            recovery = try JSONDecoder().decode(RequestRecoveryStore.self,
-                from: BoundedCatalogReader(root: directory).read("recovery.json", limit: CatalogLimits.manifestBytes).bytes)
-            guard recovery.formatVersion == 1, recovery.entries.allSatisfy({ key, value in
-                key == value.journal && URL(fileURLWithPath: key).deletingLastPathComponent().path == RequestPaths.canonical(directory)
-            }) else { throw ShaderRequestError.unavailable("Recovery journal is invalid. Retain recovery.json and repair it before reusing this checkout.") }
-        }
-        refreshReconciliationFailure()
+        let root = directory
+        try await persistence.perform { try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true) }
+        try await reloadAcceptedMetadata()
         persistenceFault = try await persistence.loadFault()
         loaded = true
-        if persistenceFault == nil {
+        if persistenceFailure == nil {
             try await persist()
+            try await retirePendingWorkers()
             for id in records.keys where records[id]?.deletionPending == true { await finishDeletion(id) }
         }
     }
@@ -616,7 +607,7 @@ public actor ShaderRequestService {
         return failure
     }
     private func failPendingPublicationForRecovery(_ message: String) {
-        guard !suspended || persistenceFault != nil, let request = pendingPublication else { return }
+        guard !suspended || persistenceFailure != nil, let request = pendingPublication else { return }
         pendingPublication = nil
         retryPublicationForce = (retryPublicationForce ?? false) || request.force
         let failure = publicationState(.failed, message: "Library preparation needs checkout recovery: " + message,
@@ -661,12 +652,12 @@ public actor ShaderRequestService {
                 message: reconciliationFailure, isRunning: reconciliationTask != nil,
                 requestID: records.keys.first { folder($0) == reconciliationJournal }, journal: reconciliationJournal, checkout: reconciliationConfiguration))
         }
-        if let persistenceFault {
+        if let persistenceFailure {
             statuses.append(ShaderRequestRecoveryStatus(id: Self.persistenceStatusID, kind: .persistence,
-                repository: "", python: "", git: "", message: persistenceFault.localizedDescription,
+                repository: "", python: "", git: "", message: persistenceFailure,
                 isRunning: maintenanceBusy || activeID != nil, journal: directory))
         }
-        for record in records.values where record.deletionPending == true && record.deletionFailure != nil && persistenceFault == nil {
+        for record in records.values where record.deletionPending == true && record.deletionFailure != nil && persistenceFailure == nil {
             statuses.append(ShaderRequestRecoveryStatus(id: record.status.id, kind: .persistence,
                 repository: "", python: "", git: "", message: "Record deletion is pending: " + (record.deletionFailure ?? ""),
                 isRunning: maintenanceBusy, journal: folder(record.status.id)))
@@ -834,6 +825,7 @@ public actor ShaderRequestService {
         }
         catch {
             publishStorageFault(error)
+            if transaction == nil { publishValidation(error, revision: snapshot.revision) }
             throw error
         }
     }
@@ -842,6 +834,10 @@ public actor ShaderRequestService {
         let acknowledgements: [DetachedCheckoutAcknowledgement]
         let recovery: RequestRecoveryStore
         let configuration: ShaderRequestConfiguration?
+        let active: UUID?
+        let operations: [UUID: RequestWorkerOperation]
+        let validation: RequestPersistence.ValidationBlocker?
+        let paths: [String: String]
     }
     private func reloadAcceptedMetadata() async throws {
         let root = directory
@@ -853,11 +849,22 @@ public actor ShaderRequestService {
             }
             let store = try read("recovery.json", as: RequestRecoveryStore.self) ?? RequestRecoveryStore()
             guard store.formatVersion == 1, store.entries.allSatisfy({ $0.key == $0.value.journal && URL(fileURLWithPath: $0.key).deletingLastPathComponent().path == RequestPaths.canonical(root) }) else { throw RequestWorkerOwnershipError() }
-            return AcceptedMetadata(records: try read("journal.json", as: [Record].self, limit: 128 * 1024 * 1024) ?? [],
-                acknowledgements: try read("detached-checkouts.json", as: [DetachedCheckoutAcknowledgement].self) ?? [],
-                recovery: store, configuration: try read("preferences.json", as: ShaderRequestConfiguration.self, limit: CatalogLimits.headBytes))
+            let rows = try read("journal.json", as: [Record].self, limit: 128 * 1024 * 1024) ?? []
+            let acknowledgements = try read("detached-checkouts.json", as: [DetachedCheckoutAcknowledgement].self) ?? []
+            let configuration = try read("preferences.json", as: ShaderRequestConfiguration.self, limit: CatalogLimits.headBytes)
+            var operations: [UUID: RequestWorkerOperation] = [:]
+            for row in rows where row.dispatch != nil {
+                let journal = root.appendingPathComponent(row.status.id.uuidString)
+                if let operation = try? RequestWorkerOperation.read(in: journal) { operations[row.status.id] = operation }
+            }
+            return AcceptedMetadata(records: rows, acknowledgements: acknowledgements,
+                recovery: store, configuration: configuration,
+                active: try read("active.json", as: UUID.self), operations: operations,
+                validation: try read("metadata-validation.json", as: RequestPersistence.ValidationBlocker.self, limit: 65536),
+                paths: Self.canonicalRepositories((configuration.map { [$0.repository] } ?? []) + acknowledgements.map(\.repository)))
         }
         guard Set(accepted.records.map { $0.status.id }).count == accepted.records.count else { throw RequestWorkerOwnershipError() }
+        try await waitForStorageChange(cancellable: false)
         records = Dictionary(uniqueKeysWithValues: accepted.records.map { ($0.status.id, $0) })
         detachedOwners = accepted.acknowledgements; recovery = accepted.recovery
         if let id = recoveryID, records[id] == nil { recoveryID = nil }
@@ -868,18 +875,57 @@ public actor ShaderRequestService {
             if let bundledShaderTool, configuration.shaderTool == bundledShaderTool { restored.shaderTool = bundledShaderTool }
             configuration = restored
         }
+        if validationBlocker == nil { validationBlocker = accepted.validation }
+        if let validationBlocker { persistenceRevision = max(persistenceRevision, validationBlocker.revision) }
+        normalizeAcceptedMetadata(active: accepted.active, operations: accepted.operations, paths: accepted.paths)
         reconciled = false; refreshReconciliationFailure()
+    }
+    private func normalizeAcceptedMetadata(active: UUID?, operations: [UUID: RequestWorkerOperation], paths: [String: String]) {
+        recoveryID = nil
+        for id in records.keys {
+            guard var record = records[id] else { continue }
+            if let dispatch = record.dispatch {
+                if !dispatch.launched {
+                    if !record.status.stage.terminal { record.status.stage = dispatch.priorStage }
+                    pendingRetirements[id] = dispatch.executionID
+                } else if dispatch.retirementPending || (operations[id]?.id == dispatch.workerOperationID && operations[id]?.phase == .complete) {
+                    pendingRetirements[id] = dispatch.executionID
+                    if !record.status.stage.terminal && ![.awaitingActivation, .awaitingClarification].contains(record.status.stage) {
+                        record.status.stage = .failed; record.status.message = "Worker settled before metadata recovery; inspect its retained log."
+                    }
+                } else if active == id, !record.status.stage.terminal { recoveryID = id; record.status.stage = .repairing }
+            } else if active == id, (!record.status.stage.terminal || record.cleanupPending == true), ![.awaitingActivation, .awaitingClarification].contains(record.status.stage) {
+                recoveryID = id
+                if !record.status.stage.terminal { record.status.stage = .repairing; record.status.message = "Recovering interrupted request" }
+            }
+            if detachedOwners.contains(where: { $0.requestID == id }) {
+                record.detached = true; record.cleanupPending = false
+                if !record.status.stage.terminal { record.status.stage = .failed; record.status.message = "Checkout detached; unpublished files and evidence were retained" }
+            }
+            if record.revoked, !record.status.stage.terminal, record.detached != true {
+                record.cleanupPending = true; record.cleanupMessage = "TV access was revoked; any pushed commit remains"
+                record.status.stage = .failed; record.status.message = "TV access was revoked; checkout cleanup is pending"
+            }
+            record.cleanupFailure = nil; records[id] = record
+        }
+        if detachedOwners.contains(where: { Self.matchesDetachedCheckout(configuration, acknowledgement: $0, paths: paths) }) { configuration.enabled = false }
     }
     private func resetPersistenceFailure() async throws {
         var token: RequestPersistence.RecoveryToken?
         do {
+            if let retirementTask { await retirementTask.value }
             token = try await persistence.restoreForRecovery()
             if token?.reloadAccepted == true { try await reloadAcceptedMetadata() }
             try await persist(recoveryToken: token)
+            try await retirePendingWorkers(recoveryToken: token)
+            let validationRevision = validationBlocker?.revision ?? resolvedValidationRevision
+            try await persistence.clearValidation(through: validationRevision)
             let receipt = try await persistence.finishRecovery(token)
             resolvedPersistenceGeneration = max(resolvedPersistenceGeneration, receipt.clearedGeneration)
             if let fault = persistenceFault, fault.generation > receipt.clearedGeneration { throw fault }
             persistenceFault = nil
+            resolvedValidationRevision = max(resolvedValidationRevision, validationRevision)
+            if (validationBlocker?.revision ?? 0) <= validationRevision { validationBlocker = nil }
             emitUpdates(); if schedulingDeferred { scheduleWakeup() }
         } catch {
             await persistence.abortRecovery(token)
@@ -891,7 +937,10 @@ public actor ShaderRequestService {
             recovery = value.store
         }
     }
-    func progressPersistenceFailed(_ error: Error) { publishStorageFault(error) }
+    func progressPersistenceFailed(_ error: Error, revision: UInt64? = nil) {
+        publishStorageFault(error)
+        if error is RequestPersistence.ValidationError { publishValidation(error, revision: revision ?? (persistenceRevision + 1)) }
+    }
     private func holdForRecovery(journal: URL, configuration target: ShaderRequestConfiguration?, error: Error,
                                  preferencesRollback: ShaderRequestConfiguration? = nil) async {
         let key = RequestPaths.canonical(journal), id = records.keys.first { RequestPaths.canonical(folder($0)) == key }
@@ -1432,7 +1481,7 @@ public actor ShaderRequestService {
     }
 
     private func settleProcess(_ process: RequestWorkerProcess) async throws {
-        do { try await waitForWorker(process) }
+        do { try await waitForWorker(process); if activeID != nil, let id = execution?.id { settledExecutions.insert(id) } }
         catch {
             await holdForRecovery(journal: process.recoveryTarget?.directory ?? activeID.map(folder) ?? directory.appendingPathComponent("publication"),
                 configuration: process.recoveryTarget?.configuration ?? configurationForActiveWorker, error: error)
@@ -1489,7 +1538,7 @@ public actor ShaderRequestService {
             attempt = try await journalChange("bind worker operation", in: journal) { try RequestWorkerOperation.begin(mode: mode, configuration: configuration, in: journal, replacingInitialMaintenance: true) }
             if attempt.phase == .retryPending { attempt.phase = .retryRunning; try await saveOperation(attempt, in: journal) }
         } catch {
-            if !(error is CancellationError) {
+            if !(error is CancellationError || error is MetadataUnavailable || error is RequestPersistence.Fault || error is RequestPersistence.ValidationError) {
                 let target = (try? Self.savedConfiguration(in: journal)) ?? (RequestProcessIdentity.evidenceExists(journal.appendingPathComponent("configuration.json")) ? nil : configuration)
                 await holdForRecovery(journal: journal, configuration: target, error: error)
             }
@@ -1502,6 +1551,10 @@ public actor ShaderRequestService {
                 throw error
             }
             let process = workerProcess(); activeProcess = process
+            if let id = activeID {
+                transitionRecord(id) { $0.dispatch?.workerOperationID = attempt.id; $0.dispatch?.launched = true }
+                try await persist()
+            }
             let attemptID = UUID()
             var completion: RequestWorkerEvent?
             do {
@@ -1519,6 +1572,12 @@ public actor ShaderRequestService {
                     if terminal { completion = event }
                 }
                 try await settleProcess(process)
+                if completion != nil, let persistenceFailure {
+                    var finished = attempt; finished.phase = .complete
+                    let snapshot = finished
+                    try await journalChange("retain settled worker completion", in: journal) { try snapshot.save(in: journal) }
+                    throw MetadataUnavailable(message: persistenceFailure)
+                }
                 try checkExecution(operation)
                 guard let completion else { throw ShaderRequestError.unavailable("Worker ended without the required " + mode + " completion event for this attempt.") }
                 try await finishWorkerOperation(attempt, journal: journal)
@@ -1572,7 +1631,7 @@ public actor ShaderRequestService {
 
     private func checkExecution(_ id: UUID) throws {
         try Task.checkCancellation()
-        if let persistenceFailure { throw RequestWorkerEvidenceError(cause: persistenceFailure) }
+        if let persistenceFailure { throw MetadataUnavailable(message: persistenceFailure) }
         guard execution?.id == id, execution?.interrupted == false, !suspended else { throw CancellationError() }
     }
 
@@ -1630,7 +1689,8 @@ public actor ShaderRequestService {
         let files = metadataFiles(rows: records, acknowledgements: detachedOwners, store: recovery)
         if progress {
             persistenceRevision &+= 1
-            persistence.enqueueProgress(.init(revision: persistenceRevision, files: files), completed: { [weak self] receipt in
+            let revision = persistenceRevision
+            persistence.enqueueProgress(.init(revision: revision, files: files), completed: { [weak self] receipt in
                 Task { await self?.applyPersistenceReceipt(receipt) }
             }, failed: { [weak self] error in
                 Task { await self?.progressPersistenceFailed(error) }
@@ -1839,7 +1899,7 @@ public actor ShaderRequestService {
     private func kick() {
         if let persistenceFailure { failPendingPublicationForRecovery(persistenceFailure); return }
         guard loaded, initialized, !suspended, !maintenanceBusy, activeID == nil, workerTask == nil else { return }
-        if storageCommit != nil || pendingCommits != 0 { schedulingDeferred = true; return }
+        if storageCommit != nil || pendingCommits != 0 || !pendingRetirements.isEmpty || retirementTask != nil { schedulingDeferred = true; return }
         if !reconciled {
             guard reconciliationKickID == nil, reconciliationTask == nil else { return }
             if let reconciliationFailure { failPendingPublicationForRecovery(reconciliationFailure); return }
@@ -1905,6 +1965,7 @@ public actor ShaderRequestService {
                 try service.checkExecution(operation)
                 guard var record = service.records[id] else { throw ShaderRequestError.notFound }
                 record.executionID = operation; record.interrupted = false
+                record.dispatch = DispatchState(executionID: operation, priorStage: record.status.stage)
                 if case .execute = work { Self.setStatus(&record, stage: .implementing, message: "Preparing the managed checkout") }
                 return StorageProposal(records: [id: record], files: [.init(url: service.directory.appendingPathComponent("active.json"), value: id)])
             }
@@ -1915,7 +1976,7 @@ public actor ShaderRequestService {
             case .publication: break
             }
         } catch {
-            if !(error is CancellationError) && !(error is RequestPersistence.Fault) {
+            if !(error is CancellationError) && !(error is RequestPersistence.Fault) && !(error is MetadataUnavailable) && !(error is RequestPersistence.ValidationError) {
                 await holdForRecovery(journal: folder(id), configuration: records[id]?.configuration, error: error)
             }
             finishWorker(id)
@@ -1949,16 +2010,51 @@ public actor ShaderRequestService {
         finishWorker(id)
     }
     private func finishWorker(_ id: UUID) {
-        let interrupted = execution?.interrupted == true
+        let interrupted = execution?.interrupted == true, operation = execution?.id
         activeProcess = nil; activeID = nil; workerTask = nil; execution = nil
         emitUpdates()
         if records[id]?.detached != true, records[id]?.cleanupPending == true || (interrupted && records[id]?.status.stage.terminal == false) {
             recoveryID = id
-            if !suspended { kick() }
-        } else if persistenceFault == nil {
-            try? FileManager.default.removeItem(at: directory.appendingPathComponent("active.json"))
+            if records[id]?.dispatch?.launched == true { if let operation { settledExecutions.remove(operation) }; if !suspended { kick() }; return }
+        }
+        if records[id]?.dispatch?.launched == false, let stage = records[id]?.dispatch?.priorStage {
+            transitionRecord(id) { if !$0.status.stage.terminal { $0.status.stage = stage } }
+        }
+        if let operation, settledExecutions.remove(operation) != nil || records[id]?.dispatch?.launched != true {
+            pendingRetirements[id] = operation
+            verifiedRetirements.insert(operation)
+            transitionRecord(id) { $0.dispatch?.retirementPending = true }
+        }
+        if persistenceFailure == nil, retirementTask == nil {
+            retirementTask = Task { [weak self] in
+                guard let self else { return }
+                do { try await self.retirePendingWorkers() } catch { await self.progressPersistenceFailed(error) }
+                await self.finishRetirementTask()
+            }
+        }
+    }
+    private func finishRetirementTask() { retirementTask = nil; emitUpdates(); kick() }
+    private func retirePendingWorkers(recoveryToken: RequestPersistence.RecoveryToken? = nil) async throws {
+        for (id, operation) in pendingRetirements.sorted(by: { $0.key.uuidString < $1.key.uuidString }) {
+            guard records[id]?.dispatch?.executionID == operation || records[id]?.dispatch == nil else { continue }
+            let job = folder(id)
+            if !verifiedRetirements.contains(operation) {
+                do { try await reconcileWorker(job); verifiedRetirements.insert(operation) }
+                catch { await holdForRecovery(journal: job, configuration: records[id]?.configuration, error: error); throw error }
+            }
+            // The bound complete operation (or a prepared, never-launched dispatch)
+            // already supplies durable restart evidence before marker retirement.
+            let marker = directory.appendingPathComponent("active.json")
+            try await persistence.journal("retire settled worker", files: [marker]) {
+                if RequestProcessIdentity.evidenceExists(marker) {
+                    let bytes = try BoundedCatalogReader(root: marker.deletingLastPathComponent()).read(marker.lastPathComponent, limit: 4096).bytes
+                    if try JSONDecoder().decode(UUID.self, from: bytes) == id { try RequestJournalWriter.remove(marker) }
+                }
+            }
+            transitionRecord(id) { $0.dispatch = nil }
+            try await persist(recoveryToken: recoveryToken)
+            pendingRetirements[id] = nil; verifiedRetirements.remove(operation)
             if recoveryID == id { recoveryID = nil }
-            kick()
         }
     }
     private func execute(_ id: UUID, operation: UUID) async {
@@ -2021,7 +2117,7 @@ public actor ShaderRequestService {
         } catch {
             if error is RequestWorkerTeardownError || error is RequestWorkerOwnershipError || error is RequestWorkerEvidenceError || error is RequestWorkerSupervisionError || error is RequestPersistence.Fault {
                 await holdForRecovery(journal: folder(id), configuration: record.configuration, error: error)
-            } else if execution?.interrupted == false, records[id]?.detached != true {
+            } else if !(error is MetadataUnavailable || error is RequestPersistence.ValidationError), execution?.interrupted == false, records[id]?.detached != true {
                 transitionRecord(id) { $0.cleanupPending = true; $0.cleanupMessage = error.localizedDescription }
                 try? await update(id, stage: .failed, message: error.localizedDescription)
             }
