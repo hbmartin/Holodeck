@@ -120,8 +120,10 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     private var generation: UInt64 = 0
     private var undo: [URL: Image] = [:], candidates: [URL: Set<String>] = [:]
     private var transactions: [UUID: Transaction] = [:]
-    private var recoveryAllowed = false
-    private var recoveryAttempt: UUID?
+    private var recoveryAttempt: RecoveryToken?
+    private func authorizes(_ token: RecoveryToken?) -> Bool {
+        token != nil && token == recoveryAttempt && token?.faultID == failure?.id && token?.generation == failure?.generation
+    }
     private var loadedFromDisk = false
     private var writes: [String: Int] = [:]
     private var applied: [URL: UInt64] = [:]
@@ -158,38 +160,37 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         catch { /* Storage may be unavailable. RAM evidence and the blocking gate remain. */ }
     }
     private func fail(_ error: Error, operation: String, files: [URL], before: [URL: Image], proposed: [URL: Set<String>]) -> Fault {
+        if let failure, error is Fault { return failure }
         // Capture every affected file before releasing any transaction, including
         // failures during rollback and a later recovery phase.
         for (file, image) in before where undo[file] == nil { undo[file] = image }
         for (file, hashes) in proposed { candidates[file, default: []].formUnion(hashes) }
         if let previous = failure {
-            if error is Fault { summarize(); return failure! }
             generation &+= 1
             var next = Fault(id: UUID(), generation: generation, operation: previous.operation,
                 paths: Array(Set(previous.paths + files.map(\.path))).sorted(), primary: previous.primary)
             next.secondary = Array((previous.secondary + [RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 2048)]).suffix(8))
             next.manualRepairRequired = previous.manualRepairRequired
-            failure = next; recoveryAllowed = false; recoveryAttempt = nil; summarize(); return failure!
+            failure = next; recoveryAttempt = nil; summarize(); return failure!
         }
         generation &+= 1
         failure = Fault(id: UUID(), generation: generation, operation: operation, paths: files.map(\.path).sorted(),
             primary: RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 8192))
-        recoveryAllowed = false; recoveryAttempt = nil
+        recoveryAttempt = nil
         summarize()
         return failure!
     }
     private func replace(_ bytes: Data, at file: URL) throws {
-        try beforeReplacement(file)
         if file.lastPathComponent == "recovery.json" { try recoveryWriter(bytes, file) }
         else { try RequestJournalWriter.write(bytes, to: file) }
         writes[file.lastPathComponent, default: 0] += 1
         if ["journal.json", "recovery.json", "detached-checkouts.json", "preferences.json"].contains(file.lastPathComponent) { committed[file] = bytes }
     }
-    private func apply(_ snapshot: Snapshot, transaction: UUID? = nil, retainingEvidence: Bool = false, ticket: CommitTicket<CommitReceipt>? = nil) throws -> CommitReceipt {
+    private func apply(_ snapshot: Snapshot, transaction: UUID? = nil, retainingEvidence: Bool = false, ticket: CommitTicket<CommitReceipt>? = nil, recovery token: RecoveryToken? = nil) throws -> CommitReceipt {
         if retainingEvidence, !snapshot.files.allSatisfy({ $0.url.lastPathComponent == "recovery.json" }) { throw RequestWorkerOwnershipError() }
-        if let failure, !recoveryAllowed && !retainingEvidence { throw failure }
+        if let failure, !authorizes(token) && !retainingEvidence { throw failure }
         let files = snapshot.files.filter { snapshot.revision > applied[$0.url, default: 0] }
-        var before: [URL: Image] = [:], proposed: [URL: Data] = [:], encoded: [URL: Data] = [:]
+        var before: [URL: Image] = [:], proposed: [URL: Data] = [:], encoded: [URL: Data] = [:], attempted: [URL: Set<String>] = [:]
         try ticket?.check()
         // Validation is completed before any filesystem mutation and is not an I/O fault.
         var receipt = CommitReceipt(revision: snapshot.revision)
@@ -209,15 +210,19 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                 before[file.url] = try committed[file.url].map(fileImage) ?? image(file.url)
                 proposed[file.url] = encoded[file.url]
                 if let transaction, transactions[transaction]?.before[file.url] == nil { transactions[transaction]?.before[file.url] = before[file.url] }
-                if let transaction, let bytes = encoded[file.url] { transactions[transaction]?.candidates[file.url, default: []].insert(hash(bytes)) }
             }
             try ticket?.beginMutation()
             for file in files {
-                if let bytes = proposed[file.url] { try replace(bytes, at: file.url) }
+                if let bytes = proposed[file.url] {
+                    try beforeReplacement(file.url)
+                    let fingerprint = hash(bytes); attempted[file.url, default: []].insert(fingerprint)
+                    if let transaction { transactions[transaction]?.candidates[file.url, default: []].insert(fingerprint) }
+                    try replace(bytes, at: file.url)
+                }
                 if let transaction { transactions[transaction]?.revisions[file.url] = snapshot.revision }
                 else { applied[file.url] = snapshot.revision }
             }
-            if recoveryAllowed, transaction == nil {
+            if authorizes(token), transaction == nil {
                 for (file, bytes) in encoded { let accepted = fileImage(bytes); undo[file] = accepted; candidates[file] = [accepted.hash] }
                 summarize()
             }
@@ -236,7 +241,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         catch {
             committed.removeAll()
             let tx = transaction.flatMap { transactions[$0] }
-            throw fail(error, operation: tx?.operation ?? snapshot.operation, files: files.map(\.url), before: tx?.before ?? before, proposed: tx?.candidates ?? proposed.mapValues { [hash($0)] })
+            throw fail(error, operation: tx?.operation ?? snapshot.operation, files: files.map(\.url), before: tx?.before ?? before, proposed: tx?.candidates ?? attempted)
         }
     }
     private func drainProgress() throws {
@@ -316,12 +321,12 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             } onCancel: { self.ticket.cancel() }
         }
     }
-    func submit(_ snapshot: Snapshot, retainingEvidence: Bool = false, transaction: UUID? = nil) -> Submission {
+    func submit(_ snapshot: Snapshot, retainingEvidence: Bool = false, transaction: UUID? = nil, recovery: RecoveryToken? = nil) -> Submission {
         let ticket = CommitTicket<CommitReceipt>()
         queue.async { [self] in
             do {
                 try ticket.check()
-                let receipt = try apply(snapshot, transaction: transaction, retainingEvidence: retainingEvidence, ticket: ticket)
+                let receipt = try apply(snapshot, transaction: transaction, retainingEvidence: retainingEvidence, ticket: ticket, recovery: recovery)
                 if transaction == nil { supersedeProgress(snapshot) }
                 ticket.complete(.success(receipt))
             } catch { ticket.complete(.failure(error)) }
@@ -331,8 +336,8 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     private func supersedeProgress(_ snapshot: Snapshot) {
         for file in snapshot.files where progress[file.url].map({ $0.revision <= snapshot.revision }) == true { progress[file.url] = nil }
     }
-    @discardableResult func commit(_ snapshot: Snapshot, retainingEvidence: Bool = false, transaction: UUID? = nil) async throws -> CommitReceipt {
-        try await submit(snapshot, retainingEvidence: retainingEvidence, transaction: transaction).value()
+    @discardableResult func commit(_ snapshot: Snapshot, retainingEvidence: Bool = false, transaction: UUID? = nil, recovery: RecoveryToken? = nil) async throws -> CommitReceipt {
+        try await submit(snapshot, retainingEvidence: retainingEvidence, transaction: transaction, recovery: recovery).value()
     }
     func enqueueProgress(_ snapshot: Snapshot, failed: @escaping @Sendable (Error) -> Void) {
         enqueueProgress(snapshot, completed: { _ in }, failed: failed)
@@ -388,15 +393,18 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                 do { try restore(undo, proposed: candidates) }
                 catch { throw fail(error, operation: fault.operation, files: undo.keys.sorted { $0.path < $1.path }, before: undo, proposed: candidates) }
             }
-            let attempt = UUID(); recoveryAttempt = attempt
-            recoveryAllowed = true; committed.removeAll(); progress = [:]
-            return RecoveryToken(faultID: fault.id, generation: fault.generation, attemptID: attempt, reloadAccepted: loadedFromDisk)
+            let token = RecoveryToken(faultID: fault.id, generation: fault.generation, attemptID: UUID(), reloadAccepted: loadedFromDisk)
+            recoveryAttempt = token; committed.removeAll(); progress = [:]
+            return token
         }
     }
     @discardableResult func finishRecovery(_ expected: RecoveryToken?) async throws -> RecoveryReceipt {
         try await perform { [self] in
-            guard failure?.id == expected?.faultID,
-                  failure?.generation == expected?.generation, recoveryAttempt == expected?.attemptID else {
+            guard let expected else {
+                guard failure == nil else { throw failure! }
+                return RecoveryReceipt(clearedGeneration: generation)
+            }
+            guard authorizes(expected) else {
                 throw RequestWorkerEvidenceError(cause: "Storage recovery was superseded by a newer fault.")
             }
             if let file = faultFile {
@@ -404,36 +412,42 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                 catch { throw fail(error, operation: failure?.operation ?? "finish storage recovery", files: [file], before: [:], proposed: [:]) }
             }
             let receipt = RecoveryReceipt(clearedGeneration: generation)
-            failure = nil; undo = [:]; candidates = [:]; recoveryAllowed = false; recoveryAttempt = nil; loadedFromDisk = false
+            failure = nil; undo = [:]; candidates = [:]; recoveryAttempt = nil; loadedFromDisk = false
             return receipt
         }
+    }
+    func abortRecovery(_ token: RecoveryToken?) async {
+        try? await perform { [self] in if token != nil, recoveryAttempt == token { recoveryAttempt = nil } }
     }
     func resumeAfterExplicitRecovery() async throws {
         let id = try await restoreForRecovery(); try await finishRecovery(id)
     }
-    func write(_ bytes: Data, to file: URL, transaction: UUID? = nil) async throws {
+    func write(_ bytes: Data, to file: URL, transaction: UUID? = nil, recovery token: RecoveryToken? = nil) async throws {
         let ticket = CommitTicket<Void>()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { c in
                 ticket.attach(c)
                 queue.async { [self] in
-                    var before: [URL: Image] = [:]
+                    // Rejection is not an attempted write and contributes no ownership evidence.
+                    if let failure, !authorizes(token) { ticket.complete(.failure(failure)); return }
+                    do { try ticket.check(); try drainProgress() }
+                    catch { ticket.complete(.failure(error)); return }
+                    var before: [URL: Image] = [:], attempted: [URL: Set<String>] = [:]
                     do {
-                        try ticket.check()
-                        if let failure, !recoveryAllowed { throw failure }
-                        try drainProgress()
                         if committed[file] == bytes { try ticket.beginMutation(); ticket.complete(.success(())); return }
                         before[file] = try committed[file].map(fileImage) ?? image(file)
                         if let transaction, transactions[transaction]?.before[file] == nil { transactions[transaction]?.before[file] = before[file] }
-                        if let transaction { transactions[transaction]?.candidates[file, default: []].insert(hash(bytes)) }
                         try ticket.beginMutation()
+                        try beforeReplacement(file)
+                        let fingerprint = hash(bytes); attempted[file] = [fingerprint]
+                        if let transaction { transactions[transaction]?.candidates[file, default: []].insert(fingerprint) }
                         try replace(bytes, at: file)
-                        if recoveryAllowed, transaction == nil { let accepted = fileImage(bytes); undo[file] = accepted; candidates[file] = [accepted.hash]; summarize() }
+                        if authorizes(token), transaction == nil { let accepted = fileImage(bytes); undo[file] = accepted; candidates[file] = [accepted.hash]; summarize() }
                         ticket.complete(.success(()))
                     } catch is CancellationError where !ticket.hasStarted { ticket.complete(.failure(CancellationError())) }
                     catch {
                         let tx = transaction.flatMap { transactions[$0] }
-                        ticket.complete(.failure(fail(error, operation: tx?.operation ?? "write " + file.lastPathComponent, files: [file], before: tx?.before ?? before, proposed: tx?.candidates ?? [file: [hash(bytes)]])))
+                        ticket.complete(.failure(fail(error, operation: tx?.operation ?? "write " + file.lastPathComponent, files: [file], before: tx?.before ?? before, proposed: tx?.candidates ?? attempted)))
                     }
                 }
             }

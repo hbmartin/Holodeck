@@ -822,13 +822,13 @@ public actor ShaderRequestService {
     private func persistRecovery(retainingEvidence: Bool = false) async throws {
         try await commitFiles([.init(url: directory.appendingPathComponent("recovery.json"), recovery: recovery, generation: recoveryRevision)], retainingEvidence: retainingEvidence)
     }
-    private func commitFiles(_ files: [RequestPersistence.File], retainingEvidence: Bool = false, transaction: UUID? = nil, operation: String = "request metadata", cancellable: Bool = true) async throws {
+    private func commitFiles(_ files: [RequestPersistence.File], retainingEvidence: Bool = false, transaction: UUID? = nil, operation: String = "request metadata", cancellable: Bool = true, recoveryToken: RequestPersistence.RecoveryToken? = nil) async throws {
         persistenceRevision &+= 1
         let snapshot = RequestPersistence.Snapshot(revision: persistenceRevision, files: files, operation: operation)
         pendingCommits += 1
         defer { pendingCommits -= 1; if pendingCommits == 0, schedulingDeferred { scheduleWakeup() } }
         do {
-            let submission = persistence.submit(snapshot, retainingEvidence: retainingEvidence, transaction: transaction)
+            let submission = persistence.submit(snapshot, retainingEvidence: retainingEvidence, transaction: transaction, recovery: recoveryToken)
             let receipt = try await submission.value(cancellable: transaction != nil && cancellable)
             applyPersistenceReceipt(receipt)
         }
@@ -871,16 +871,20 @@ public actor ShaderRequestService {
         reconciled = false; refreshReconciliationFailure()
     }
     private func resetPersistenceFailure() async throws {
+        var token: RequestPersistence.RecoveryToken?
         do {
-            let token = try await persistence.restoreForRecovery()
+            token = try await persistence.restoreForRecovery()
             if token?.reloadAccepted == true { try await reloadAcceptedMetadata() }
-            try await persist()
+            try await persist(recoveryToken: token)
             let receipt = try await persistence.finishRecovery(token)
             resolvedPersistenceGeneration = max(resolvedPersistenceGeneration, receipt.clearedGeneration)
             if let fault = persistenceFault, fault.generation > receipt.clearedGeneration { throw fault }
             persistenceFault = nil
             emitUpdates(); if schedulingDeferred { scheduleWakeup() }
-        } catch { publishStorageFault(error); throw error }
+        } catch {
+            await persistence.abortRecovery(token)
+            publishStorageFault(error); throw error
+        }
     }
     func applyPersistenceReceipt(_ receipt: RequestPersistence.CommitReceipt) {
         if let value = receipt.recovery[directory.appendingPathComponent("recovery.json")], value.generation == recoveryRevision {
@@ -1621,7 +1625,7 @@ public actor ShaderRequestService {
                 return try encoder.encode(values.sorted { $0.status.id.uuidString < $1.status.id.uuidString })
             })]
     }
-    private func persist(progress: Bool = false, operation: String = "request metadata") async throws {
+    private func persist(progress: Bool = false, operation: String = "request metadata", recoveryToken: RequestPersistence.RecoveryToken? = nil) async throws {
         try await waitForStorageChange(cancellable: false)
         let files = metadataFiles(rows: records, acknowledgements: detachedOwners, store: recovery)
         if progress {
@@ -1631,7 +1635,7 @@ public actor ShaderRequestService {
             }, failed: { [weak self] error in
                 Task { await self?.progressPersistenceFailed(error) }
             })
-        } else { try await commitFiles(files, operation: operation) }
+        } else { try await commitFiles(files, operation: operation, recoveryToken: recoveryToken) }
         emitUpdates()
     }
     private func emitUpdates() {

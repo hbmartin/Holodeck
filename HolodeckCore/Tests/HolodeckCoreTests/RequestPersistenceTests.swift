@@ -32,6 +32,51 @@ import XCTest
         _ = try await first.value()
         XCTAssertEqual(try Data(contentsOf: file), Data("two".utf8))
     }
+    func testRecoveryAuthorizationNeverPermitsOrdinaryOrStaleWrites() async throws {
+        let root = try directory(), file = root.appendingPathComponent("recovery.json"), probe = PersistenceWriteProbe()
+        let writer = RequestPersistence(directory: root, recoveryWriter: { try probe.write($0, $1) })
+        try Data("accepted".utf8).write(to: file); probe.failAfterPublication()
+        do { try await writer.write(Data("rejected".utf8), to: file) } catch {}
+        let token = try await writer.restoreForRecovery()
+        do { try await writer.write(Data("ordinary".utf8), to: file); XCTFail("Ordinary write entered recovery") } catch {}
+        await writer.abortRecovery(token)
+        try Data("manual repair".utf8).write(to: file)
+        do { try await writer.write(Data("stale".utf8), to: file, recovery: token); XCTFail("Aborted recovery wrote") } catch {}
+        XCTAssertEqual(try Data(contentsOf: file), Data("manual repair".utf8))
+    }
+    func testBlockedWriteAddsNeitherCandidateNorFaultSummaryWrite() async throws {
+        let root = try directory(), file = root.appendingPathComponent("recovery.json"), probe = PersistenceWriteProbe()
+        let writer = RequestPersistence(directory: root, recoveryWriter: { try probe.write($0, $1) })
+        try Data("accepted".utf8).write(to: file); probe.failAfterPublication()
+        do { try await writer.write(Data("attempted".utf8), to: file) } catch {}
+        let summary = try Data(contentsOf: root.appendingPathComponent("storage-recovery.json"))
+        do { try await writer.write(Data("never attempted".utf8), to: file) } catch {}
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("storage-recovery.json")), summary)
+        try Data("never attempted".utf8).write(to: file)
+        do { _ = try await writer.restoreForRecovery(); XCTFail("Unattempted content accepted as writer-owned") } catch {}
+        XCTAssertEqual(try Data(contentsOf: file), Data("never attempted".utf8))
+    }
+    func testNoFaultRecoveryDoesNotRemoveAnythingAndSupportsRootAlias() async throws {
+        let root = try directory(), target = root.appendingPathComponent("real"), alias = root.appendingPathComponent("alias")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: target)
+        let writer = RequestPersistence(directory: alias, removeFile: { _ in XCTFail("No fault marker should be removed") })
+        let token = try await writer.restoreForRecovery(); XCTAssertNil(token)
+        _ = try await writer.finishRecovery(token)
+        try RequestJournalWriter.remove(alias.appendingPathComponent("absent"))
+        let fault = await writer.fault(); XCTAssertNil(fault)
+    }
+    func testProgressValidationIsNotAnUnrelatedDirectWriteFault() async throws {
+        let root = try directory(), writer = RequestPersistence(directory: root), probe = PersistenceWriteProbe()
+        probe.hold()
+        let held = Task { try await writer.perform { try probe.write(Data(), root.appendingPathComponent("gate")) } }
+        while !probe.entered { try await Task.sleep(for: .milliseconds(1)) }
+        writer.enqueueProgress(.init(revision: 1, files: [.init(url: root.appendingPathComponent("recovery.json"), encode: { throw RequestPersistence.ValidationError(message: "capacity") })])) { _ in }
+        let direct = Task { try await writer.write(Data("unrelated".utf8), to: root.appendingPathComponent("other")) }
+        probe.release(); try await held.value
+        do { try await direct.value; XCTFail("Invalid pending progress was ignored") } catch { XCTAssertTrue(error is RequestPersistence.ValidationError) }
+        let fault = await writer.fault(); XCTAssertNil(fault)
+    }
     func testCriticalCommitSkipsUnchangedFilesAndSupersedesProgress() async throws {
         let root = try directory(), probe = PersistenceWriteProbe()
         let writer = RequestPersistence(recoveryWriter: { try probe.write($0, $1) }), file = root.appendingPathComponent("recovery.json")
@@ -271,10 +316,10 @@ extension RequestPersistenceTests {
         try Data("accepted".utf8).write(to: file); probe.failAfterPublication()
         do { try await writer.write(Data("rejected".utf8), to: file) } catch {}
         let first = try await writer.restoreForRecovery(); probe.failAfterPublication()
-        do { try await writer.write(Data("converged".utf8), to: file); XCTFail("Convergence fault succeeded") } catch {}
+        do { try await writer.write(Data("converged".utf8), to: file, recovery: first); XCTFail("Convergence fault succeeded") } catch {}
         let second = try await writer.restoreForRecovery()
         XCTAssertGreaterThan(second!.generation, first!.generation)
-        try await writer.write(Data("converged".utf8), to: file)
+        try await writer.write(Data("converged".utf8), to: file, recovery: second)
         let receipt = try await writer.finishRecovery(second)
         XCTAssertEqual(receipt.clearedGeneration, second?.generation)
         XCTAssertEqual(try Data(contentsOf: file), Data("converged".utf8))
@@ -285,7 +330,7 @@ extension RequestPersistenceTests {
         try Data("accepted".utf8).write(to: file); probe.failAfterPublication()
         do { try await writer.write(Data("rejected".utf8), to: file) } catch {}
         let first = try await writer.restoreForRecovery()
-        try await writer.write(Data("converged".utf8), to: file)
+        try await writer.write(Data("converged".utf8), to: file, recovery: first)
         removal.arm()
         do { try await writer.finishRecovery(first); XCTFail("Failed removal succeeded") } catch {}
         do { try await writer.finishRecovery(first); XCTFail("Stale token cleared a new fault") } catch {}
