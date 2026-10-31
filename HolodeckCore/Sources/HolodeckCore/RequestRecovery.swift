@@ -266,6 +266,8 @@ nonisolated enum RequestJournalWriter {
     }
     /// Also fsync an already-absent file's parent to finish an interrupted removal.
     static func remove(_ file: URL) throws {
+        // Resolve the supported root alias, never the marker itself (it may be a symlink).
+        let file = URL(fileURLWithPath: RequestPaths.canonical(file.deletingLastPathComponent())).appendingPathComponent(file.lastPathComponent)
         if unlink(file.path) != 0, errno != ENOENT { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
         var directory = file.deletingLastPathComponent()
         while !RequestProcessIdentity.evidenceExists(directory), directory.deletingLastPathComponent() != directory { directory.deleteLastPathComponent() }
