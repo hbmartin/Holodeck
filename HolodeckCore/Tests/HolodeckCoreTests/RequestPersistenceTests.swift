@@ -10,6 +10,28 @@ import XCTest
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         return root
     }
+    func testRejectedTentativeRevisionDoesNotSupersedeIndependentEvidence() async throws {
+        let root = try directory(), file = root.appendingPathComponent("recovery.json"), id = UUID()
+        let baseline = Data("accepted".utf8), evidence = Data("retained ownership".utf8)
+        try baseline.write(to: file)
+        let writer = RequestPersistence(directory: root, beforeReplacement: { if $0.lastPathComponent == "fail.json" { throw POSIXError(.EIO) } })
+        try await writer.begin(id, operation: "rejected newer proposal")
+        do {
+            try await writer.commit(.init(revision: 2, files: [.init(url: file, bytes: evidence), .init(url: root.appendingPathComponent("fail.json"), bytes: Data())]), transaction: id)
+            XCTFail("Injected replacement succeeded")
+        } catch {}
+        try await writer.reject(id)
+        try await writer.commit(.init(revision: 1, files: [.init(url: file, bytes: evidence)]), retainingEvidence: true)
+        XCTAssertEqual(try Data(contentsOf: file), evidence)
+    }
+    func testSubmissionAdmissionPrecedesAwaitAndReceiptSurvivesEarlyCompletion() async throws {
+        let root = try directory(), file = root.appendingPathComponent("journal.json"), writer = RequestPersistence()
+        let first = writer.submit(.init(revision: 1, files: [.init(url: file, bytes: Data("one".utf8))]))
+        let second = writer.submit(.init(revision: 2, files: [.init(url: file, bytes: Data("two".utf8))]))
+        _ = try await second.value()
+        _ = try await first.value()
+        XCTAssertEqual(try Data(contentsOf: file), Data("two".utf8))
+    }
     func testCriticalCommitSkipsUnchangedFilesAndSupersedesProgress() async throws {
         let root = try directory(), probe = PersistenceWriteProbe()
         let writer = RequestPersistence(recoveryWriter: { try probe.write($0, $1) }), file = root.appendingPathComponent("recovery.json")

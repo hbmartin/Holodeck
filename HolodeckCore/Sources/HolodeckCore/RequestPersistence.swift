@@ -9,9 +9,14 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         private let lock = NSLock()
         private var continuation: CheckedContinuation<Value, Error>?
         private var cancelled = false, committing = false, finished = false
+        private var result: Result<Value, Error>?
         func attach(_ c: CheckedContinuation<Value, Error>) {
-            let reject = lock.withLock { if cancelled { return true }; continuation = c; return false }
-            if reject { c.resume(throwing: CancellationError()) }
+            let ready: Result<Value, Error>? = lock.withLock {
+                if cancelled { return .failure(CancellationError()) }
+                if let result { return result }
+                continuation = c; return nil
+            }
+            if let ready { c.resume(with: ready) }
         }
         func cancel() {
             let c = lock.withLock { () -> CheckedContinuation<Value, Error>? in
@@ -26,7 +31,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             try lock.withLock { if cancelled { throw CancellationError() }; committing = true }
         }
         func complete(_ result: Result<Value, Error>) {
-            let c = lock.withLock { let c = continuation; continuation = nil; finished = true; return c }
+            let c = lock.withLock { self.result = result; let c = continuation; continuation = nil; finished = true; return c }
             c?.resume(with: result)
         }
     }
@@ -104,7 +109,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     private let metrics = Metrics()
     private func fileImage(_ bytes: Data) -> Image { Image(bytes, metrics: metrics) }
     private func hash(_ bytes: Data) -> String { metrics.hashes += 1; return CatalogHash.sha256(bytes) }
-    private struct Transaction { let operation: String; var before: [URL: Image] = [:]; var candidates: [URL: Set<String>] = [:] }
+    private struct Transaction { let operation: String; var before: [URL: Image] = [:]; var candidates: [URL: Set<String>] = [:]; var revisions: [URL: UInt64] = [:] }
     private let queue = DispatchQueue(label: "Holodeck.request-persistence", qos: .utility)
     private let recoveryWriter: @Sendable (Data, URL) throws -> Void
     private let removeFile: @Sendable (URL) throws -> Void
@@ -209,7 +214,8 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             try ticket?.beginMutation()
             for file in files {
                 if let bytes = proposed[file.url] { try replace(bytes, at: file.url) }
-                applied[file.url] = snapshot.revision
+                if let transaction { transactions[transaction]?.revisions[file.url] = snapshot.revision }
+                else { applied[file.url] = snapshot.revision }
             }
             if recoveryAllowed, transaction == nil {
                 for (file, bytes) in encoded { let accepted = fileImage(bytes); undo[file] = accepted; candidates[file] = [accepted.hash] }
@@ -218,7 +224,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             if files.allSatisfy({ $0.url.lastPathComponent == "recovery.json" }) {
                 // Durable recovery/Detach intent is independent of a caller's rejected mutation.
                 for id in transactions.keys {
-                    for (url, bytes) in encoded { transactions[id]?.before[url] = fileImage(bytes); transactions[id]?.candidates[url] = [hash(bytes)] }
+                    for (url, bytes) in encoded { transactions[id]?.before[url] = fileImage(bytes); transactions[id]?.candidates[url] = [hash(bytes)]; transactions[id]?.revisions[url] = snapshot.revision }
                 }
                 if failure != nil {
                     for (url, bytes) in encoded { let accepted = fileImage(bytes); undo[url] = accepted; candidates[url] = [accepted.hash] }
@@ -245,7 +251,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             pending.values.first { $0.revision == revision }?.completed(receipt)
         }
     }
-    func begin(_ id: UUID, operation: String) async throws {
+    func begin(_ id: UUID, operation: String, cancellable: Bool = true) async throws {
         let ticket = CommitTicket<Void>()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { c in
@@ -259,13 +265,21 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                     } catch { ticket.complete(.failure(error)) }
                 }
             }
-        } onCancel: { ticket.cancel() }
+        } onCancel: { if cancellable { ticket.cancel() } }
     }
     /// Only for cancellation certified by the ticket before filesystem mutation.
     /// Queuing release keeps cancellation responsive even while encoding is paused.
     func abandon(_ id: UUID) { queue.async { [self] in transactions[id] = nil } }
     func accept(_ id: UUID) async {
-        await withCheckedContinuation { c in queue.async { [self] in transactions[id] = nil; c.resume() } }
+        await withCheckedContinuation { c in queue.async { [self] in
+            if let tx = transactions.removeValue(forKey: id) {
+                for (file, revision) in tx.revisions {
+                    applied[file] = max(applied[file, default: 0], revision)
+                    if progress[file].map({ $0.revision <= revision }) == true { progress[file] = nil }
+                }
+            }
+            c.resume()
+        } }
     }
     private func restore(_ images: [URL: Image], proposed: [URL: Set<String>]) throws {
         for (file, old) in images.sorted(by: { $0.key.path < $1.key.path }) {
@@ -291,21 +305,34 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             }
         } }
     }
-    @discardableResult func commit(_ snapshot: Snapshot, retainingEvidence: Bool = false, transaction: UUID? = nil) async throws -> CommitReceipt {
+    /// Admission is synchronous. Awaiting (or cancelling) the receipt cannot reorder disk work.
+    final class Submission: @unchecked Sendable {
+        fileprivate let ticket: CommitTicket<CommitReceipt>
+        fileprivate init(_ ticket: CommitTicket<CommitReceipt>) { self.ticket = ticket }
+        func value(cancellable: Bool = true) async throws -> CommitReceipt {
+            if !cancellable { return try await withCheckedThrowingContinuation { ticket.attach($0) } }
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { ticket.attach($0) }
+            } onCancel: { self.ticket.cancel() }
+        }
+    }
+    func submit(_ snapshot: Snapshot, retainingEvidence: Bool = false, transaction: UUID? = nil) -> Submission {
         let ticket = CommitTicket<CommitReceipt>()
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { c in
-                ticket.attach(c)
-                queue.async { [self] in
-                    do {
-                        try ticket.check()
-                        let receipt = try apply(snapshot, transaction: transaction, retainingEvidence: retainingEvidence, ticket: ticket)
-                        for file in snapshot.files where progress[file.url].map({ $0.revision <= snapshot.revision }) == true { progress[file.url] = nil }
-                        ticket.complete(.success(receipt))
-                    } catch { ticket.complete(.failure(error)) }
-                }
-            }
-        } onCancel: { ticket.cancel() }
+        queue.async { [self] in
+            do {
+                try ticket.check()
+                let receipt = try apply(snapshot, transaction: transaction, retainingEvidence: retainingEvidence, ticket: ticket)
+                if transaction == nil { supersedeProgress(snapshot) }
+                ticket.complete(.success(receipt))
+            } catch { ticket.complete(.failure(error)) }
+        }
+        return Submission(ticket)
+    }
+    private func supersedeProgress(_ snapshot: Snapshot) {
+        for file in snapshot.files where progress[file.url].map({ $0.revision <= snapshot.revision }) == true { progress[file.url] = nil }
+    }
+    @discardableResult func commit(_ snapshot: Snapshot, retainingEvidence: Bool = false, transaction: UUID? = nil) async throws -> CommitReceipt {
+        try await submit(snapshot, retainingEvidence: retainingEvidence, transaction: transaction).value()
     }
     func enqueueProgress(_ snapshot: Snapshot, failed: @escaping @Sendable (Error) -> Void) {
         enqueueProgress(snapshot, completed: { _ in }, failed: failed)
