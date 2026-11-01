@@ -206,7 +206,12 @@ public actor ShaderRequestService {
     private var workerTask: Task<Void, Never>?
     private var preparedID: UUID? { didSet { if preparedID == nil { preparedAttemptID = nil } } }
     private var preparedAttemptID: UUID?
-    private struct Execution { let id = UUID(); var interrupted = false }
+    private struct Execution {
+        let id = UUID()
+        var interrupted = false
+        // Verified history across attempts, independent of provisional dispatch launch state.
+        var checkoutLaunched = false
+    }
     private var execution: Execution?
     private var selectingRepository = false
     private var acceptingRepository = false
@@ -869,7 +874,11 @@ public actor ShaderRequestService {
             return AcceptedMetadata(records: rows, acknowledgements: acknowledgements,
                 recovery: store, configuration: configuration,
                 active: try read("active.json", as: UUID.self), operations: operations,
-                launchEvidence: Set(rows.filter { Self.hasProcessEvidence(root.appendingPathComponent($0.status.id.uuidString)) || operations[$0.status.id]?.phase == .complete }.map { $0.status.id }),
+                launchEvidence: Set(rows.filter { row in
+                    if Self.hasProcessEvidence(root.appendingPathComponent(row.status.id.uuidString)) { return true }
+                    guard let operationID = row.dispatch?.workerOperationID else { return false }
+                    return operations[row.status.id]?.id == operationID && operations[row.status.id]?.phase == .complete
+                }.map { $0.status.id }),
                 validation: try read("metadata-validation.json", as: RequestPersistence.ValidationBlocker.self, limit: 65536),
                 paths: Self.canonicalRepositories((configuration.map { [$0.repository] } ?? []) + acknowledgements.map(\.repository)))
         }
@@ -1493,10 +1502,20 @@ public actor ShaderRequestService {
     }
 
     private func settleProcess(_ process: RequestWorkerProcess) async throws {
+        let operation = execution?.id
         do {
             try await waitForWorker(process)
-            if let id = activeID { transitionRecord(id) { $0.dispatch?.launched = process.checkoutLaunched } }
-            if activeID != nil, let id = execution?.id { settledExecutions.insert(id) }
+            if let operation, execution?.id == operation {
+                let launched = execution?.checkoutLaunched == true || process.checkoutLaunched
+                execution?.checkoutLaunched = launched
+                if let id = activeID {
+                    transitionRecord(id) { record in
+                        guard record.dispatch?.executionID == operation else { return }
+                        record.dispatch?.launched = launched
+                    }
+                    settledExecutions.insert(operation)
+                }
+            }
         }
         catch {
             await holdForRecovery(journal: process.recoveryTarget?.directory ?? activeID.map(folder) ?? directory.appendingPathComponent("publication"),
@@ -1561,17 +1580,19 @@ public actor ShaderRequestService {
             throw error
         }
         while true {
-            do { try checkExecution(operation) }
-            catch {
+            do {
+                try checkExecution(operation)
+                if let id = activeID {
+                    transitionRecord(id) { $0.dispatch?.workerOperationID = attempt.id }
+                    try await persist()
+                }
+                try checkExecution(operation)
+            } catch {
                 if attempt.phase == .initial, ["preflight", "publication"].contains(mode) { try await finishWorkerOperation(attempt, journal: journal) }
                 throw error
             }
             let process = workerProcess()
-            if let id = activeID {
-                transitionRecord(id) { $0.dispatch?.workerOperationID = attempt.id }
-                try await persist()
-                transitionRecord(id) { $0.dispatch?.launched = true }
-            }
+            if let id = activeID { transitionRecord(id) { $0.dispatch?.launched = true } }
             activeProcess = process
             let attemptID = UUID()
             var completion: RequestWorkerEvent?
