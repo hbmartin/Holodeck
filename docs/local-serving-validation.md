@@ -751,3 +751,38 @@ Additional per-job metadata records the dispatch binding and verified retirement
 Final evidence is `/tmp/pr39-{python39,python-current,core-final,release-final,mac-build,tv-build,package,metal,gpu,ui,profile39,profile315,profile-slow}.log`, `/tmp/pr39-native-progress.json`, `/tmp/pr39-frozen-hashes.json` and `/tmp/pr39-ui.xcresult`. Runtime, UI, regression and profiling source hashes matched before and after all eleven native steps. Earlier development failures and interrupted acceptance attempts are excluded from these totals; `/tmp/pr39-core-observer-race.log` retains the observer-race reproduction, and `/tmp/pr39-drain-stress.log` records the isolated repetitions.
 
 Linux CI, checker artifacts, library locks, network contracts and the live installation/request settings are unchanged. No merge or deployment occurred.
+
+
+## Request transition and startup recovery follow-up — 2026-11-05
+
+Settlement proof now belongs to the current worker attempt. Starting another attempt invalidates the previous proof, and a failed settlement cannot retire its active marker. Metadata-blocked cleanup retains its pending intent without acquiring an ordinary cleanup failure. Every marker-retirement failure retains evidence and exposes the corresponding journal recovery action.
+
+Deferred record facts are typed commands applied against accepted state. Status, cleanup intent, recovery priority and retirement decisions are made together when each command is applied; callers that depend on the resulting record await its receipt. Stopping and process observation remain immediate. Writer validation errors carry the actual failed snapshot's revision, operation and paths through progress coalescing and delayed callbacks. A successful recovery floor therefore excludes old callbacks without inventing a new revision for them.
+
+Startup metadata inspection and journal retirement share one in-flight load. Cancelling a waiter does not cancel the shared inspection. First initialization reuses its parsed preferences; subsequent initialization and trusted bundled-tool relocation remain supported. The recognized legacy preferences missing shader-tool/reasoning additions receive their original defaults. Invalid required fields, root markers and recovery stores instead produce a file-specific Storage Recovery row while cached serving continues. Original files, including dangling links, are retained until explicit repair and Retry Recovery. Parked activation/clarification requests remain parked, and terminal cleanup retains recovery priority. Unmatched raw process evidence remains conservative. The legacy process-ownership behavior is unchanged.
+
+Candidate fingerprints are lazy on successful ordinary writes. Attempted bytes are retained until the outcome is known; transactions and uncertain replacements still retain the fingerprints required for rollback and recovery ownership. The four-write structural regression performs zero unused candidate hashes, while the request profile halves hashes from eight to four. Existing unchanged-write, payload-release, rollback and capacity regressions remain passing.
+
+Final validation used macOS 27.0.1, Xcode 27.2 (27B52), Swift 6.4.2, Python 3.9.6 and Python 3.15.0:
+
+- Python worker coverage: **119 tests passed on each interpreter**.
+- Full core/native coverage: **438 tests, six opt-in skips, zero failures**, including all **25 indexed local scenes** and the enabled GPU checks.
+- Release request/persistence/packaging coverage: **238 tests, one opt-in skip, zero failures**. The supervision fixture measured **33.77 polls/s and 0.57% CPU**.
+- Thirteen gated dispatch, retry, retirement, record-transition and startup regressions passed ten optimized repetitions: **130 test executions**.
+- Final-source isolated Mac UI coverage: **seven tests, zero failures**, including corrupt startup preferences with cached serving, explicit Storage Recovery, maintenance repair, queued cancellation, reconciliation and Detach.
+- Both unsigned Release app builds passed. Packaged worker/process modules and checker artifacts exactly matched source bytes, no bytecode caches were packaged, and native artifact identity matched both the bundled and selected-library locks.
+- The packaged checker compiled **68 assets plus shader/snippet templates for macOS and tvOS** using the available matching Metal component. Mac GPU verification passed **seven profile checks** on Apple M2 Pro.
+
+Release persistence profiling compares against the already committed local fixes at `e5cf5ca` (the identical tree is published here as prerequisite commit `5bb1d3c`), on the same filesystem, alternating baseline/current order for five samples per fixture. Each fixture emits 200 stage events and clarification. Wall and service-process CPU values are medians; reply latency is the maximum observed. Count ranges retain sample variation. Fsync accounting includes metadata file and parent-directory synchronization and excludes operation/process evidence equally.
+
+| Fixture | Wall ms, baseline → current | CPU ms | Metadata encodes | Replacements | Fsyncs | Byte reads | Hashes | Peak actor reply ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Python 3.9 | 105.24 → 108.02 | 29.57 → 30.43 | 24 → 24 | 6 → 6 | 12 → 12 | 0 → 0 | 8 → 4 | 0.20 → 0.19 |
+| Python 3.15 | 46.61 → 46.49 | 23.64 → 23.70 | 24 → 21–24 | 6 → 5–6 | 12 → 10–12 | 0 → 0 | 8 → 4 | 0.05 → 0.08 |
+| Python 3.9, 5 ms storage delay | 319.76 → 335.71 | 40.18 → 52.27 | 24 → 24 | 6 → 6 | 12 → 12 | 0 → 0 | 8 → 4 | 0.14 → 0.05 |
+
+These samples establish the hash-work reduction and retained responsiveness; they do not establish a wall-time improvement. Structural assertions enforce the intended work bounds without CI timing thresholds.
+
+Evidence is `/tmp/recovery-{python39,python315,core-accepted,release,writer-final,writer-release-final,stress,ui-final,mac-build,tv-build,package,metal,gpu}.log`, `/tmp/recovery-ui-final.xcresult`, `/tmp/recovery-native-progress.json`, and `/tmp/recovery-profile{39,315,-slow}.json`. Frozen runtime and regression hashes matched throughout final full-core, UI, app/package/native verification and profiling. Earlier development fixture failures are excluded from these acceptance totals.
+
+The six full-core opt-in skips cover three unrelated catalog profiles, live LAN/TLS, real Codex publication and the supervision profile run separately in Release. Physical Apple TV and tvOS simulator execution were not run. Linux CI, checker bytes/locks, network contracts, root-alias support, termination budgets and template editing scope are unchanged. No live installation replacement, enabling of requests, merge or deployment occurred.

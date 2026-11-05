@@ -10,6 +10,21 @@ import XCTest
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         return root
     }
+    func testSuccessfulOrdinaryReplacementsDoNotHashUnusedCandidates() async throws {
+        let root = try directory(), writer = RequestPersistence()
+        try await writer.write(Data("one".utf8), to: root.appendingPathComponent("one.json"))
+        try await writer.write(Data("two".utf8), to: root.appendingPathComponent("two.json"))
+        try await writer.commit(.init(revision: 1, files: [
+            .init(url: root.appendingPathComponent("three.json"), bytes: Data("three".utf8)),
+            .init(url: root.appendingPathComponent("four.json"), bytes: Data("four".utf8))]))
+        let statistics = await writer.statistics()
+        XCTAssertEqual(statistics["hashes"], 0)
+        XCTAssertEqual(statistics["encodings"], 2)
+        for name in ["one", "two", "three", "four"] {
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(name + ".json")), Data(name.utf8))
+        }
+    }
+
     func testRejectedTentativeRevisionDoesNotSupersedeIndependentEvidence() async throws {
         let root = try directory(), file = root.appendingPathComponent("recovery.json"), id = UUID()
         let baseline = Data("accepted".utf8), evidence = Data("retained ownership".utf8)
@@ -547,10 +562,10 @@ extension RequestPersistenceTests {
         let root = try directory(), writer = RequestPersistence(), failed = expectation(description: "Actual coalesced failure")
         let probe = ValidationOriginProbe(), file = root.appendingPathComponent("progress.json")
         writer.enqueueProgress(.init(revision: 1, files: [.init(url: file, bytes: Data("superseded".utf8))]), failed: { _ in XCTFail("Superseded callback received a newer snapshot failure") })
-        writer.enqueueProgress(.init(revision: 2, files: [.init(url: file, encode: { throw RequestPersistence.ValidationError(message: "Capacity") })]), failed: { error in probe.capture(error); failed.fulfill() })
+        writer.enqueueProgress(.init(revision: 2, files: [.init(url: file, encode: { throw RequestPersistence.ValidationError(message: "Capacity") })], operation: "newer coalesced owner"), failed: { error in probe.capture(error); failed.fulfill() })
         await fulfillment(of: [failed], timeout: 3)
         let error = try XCTUnwrap(probe.error)
-        XCTAssertEqual(error.revision, 2); XCTAssertEqual(error.operation, "background request progress"); XCTAssertEqual(error.paths, [file.path])
+        XCTAssertEqual(error.revision, 2); XCTAssertEqual(error.operation, "newer coalesced owner"); XCTAssertEqual(error.paths, [file.path])
         XCTAssertFalse(RequestProcessIdentity.evidenceExists(file))
     }
 }
