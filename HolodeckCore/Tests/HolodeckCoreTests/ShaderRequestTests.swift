@@ -4337,11 +4337,11 @@ extension ShaderRequestTests {
     }
     func testBackgroundValidationRequiresExplicitRecoveryAndIgnoresDelayedCallback() async throws {
         let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script)
-        await service.progressPersistenceFailed(RequestPersistence.ValidationError(message: "capacity"), revision: 900)
+        await service.progressPersistenceFailed(RequestPersistence.ValidationError(message: "capacity", revision: 900))
         var statuses = await service.recoveryStatuses(); XCTAssertTrue(statuses.contains { $0.kind == .persistence && $0.message.contains("validation") })
         do { try await service.ensurePublication(force: true); XCTFail("Rebuild waited despite validation blocker") } catch {}
         try await service.retryReconciliation()
-        await service.progressPersistenceFailed(RequestPersistence.ValidationError(message: "delayed"), revision: 901)
+        await service.progressPersistenceFailed(RequestPersistence.ValidationError(message: "delayed", revision: 901))
         statuses = await service.recoveryStatuses(); XCTAssertFalse(statuses.contains { $0.kind == .persistence })
         XCTAssertFalse(RequestProcessIdentity.evidenceExists(root.appendingPathComponent("metadata-validation.json")))
     }
@@ -4812,5 +4812,59 @@ private actor SettlementEvidenceFixture {
             try FileManager.default.createSymbolicLink(atPath: replaceMarker.path, withDestinationPath: "missing-active-target")
         }
     }
+}
+#endif
+
+#if os(macOS)
+extension ShaderRequestTests {
+    func testDelayedWriterValidationRetainsActualOriginAcrossRecovery() async throws {
+        let (root, script) = try recoveryFixture(), writer = RequestPersistence(), delivery = ValidationDeliveryGate()
+        let service = try await recoveryService(root, script: script)
+        await service.progressPersistenceFailed(RequestPersistence.ValidationError(message: "Initial capacity", revision: 900))
+        writer.enqueueProgress(.init(revision: 1, files: [.init(url: root.appendingPathComponent("old.json"), encode: { throw RequestPersistence.ValidationError(message: "Old actual snapshot") })]), failed: { error in
+            Task { await delivery.deliver(error, to: service) }
+        })
+        try await waitFor { await delivery.entered }
+        try await service.retryReconciliation()
+        await delivery.release()
+        try await waitFor { await delivery.completed }
+        let afterOld = await service.recoveryStatuses(); XCTAssertFalse(afterOld.contains { $0.kind == .persistence })
+        writer.enqueueProgress(.init(revision: 10_000, files: [.init(url: root.appendingPathComponent("old.json"), encode: { throw RequestPersistence.ValidationError(message: "New actual snapshot") })]), failed: { error in
+            Task { await service.progressPersistenceFailed(error) }
+        })
+        try await waitFor { await service.recoveryStatuses().contains { $0.kind == .persistence && $0.message.contains("New actual snapshot") } }
+    }
+
+    func testDeferredSettlementAndFinishApplyAfterCallerCommit() async throws {
+        let (root, script) = try recoveryFixture(), settlement = RequestPreparationGate(), commit = DraftReplacementGate(failAfterRelease: false)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script,
+            waitForWorker: { try await $0.waitForExit(); await settlement.hold() }, beforePersistenceReplacement: { try commit.before($0) })
+        await service.suspend(); try await service.start(configuration: .init(repository: root.path, python: root.appendingPathComponent("missing-python").path, enabled: true))
+        let first = ShaderRequest(prompt: "Never opened a gate", context: try context()), second = ShaderRequest(prompt: "Independent caller commit", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: first), deviceID: "TV1")
+        let patch = root.appendingPathComponent(first.id.uuidString).appendingPathComponent("owned-patch"), bytes = Data([0,255,13,10]); try bytes.write(to: patch)
+        await service.resume(); try await waitFor { await settlement.entered }
+        commit.arm(root.appendingPathComponent("journal.json")); defer { commit.release() }
+        let submission = Task { try await service.control(operation: "requestSubmit", payload: .init(request: second), deviceID: "TV2") }
+        try await waitFor { commit.entered }
+        let suspension = Task { await service.suspend() }
+        try await waitFor { await service.isSuspended }
+        await settlement.release()
+        try await waitFor { await service.pendingRecordTransitionCount >= 4 }
+        commit.release(); _ = try await submission.value; await suspension.value
+        try await waitFor { !RequestProcessIdentity.evidenceExists(root.appendingPathComponent("active.json")) }
+        let jobs = await service.allJobs(); XCTAssertEqual(jobs.first { $0.id == first.id }?.stage, .queued)
+        XCTAssertTrue(jobs.contains { $0.id == second.id }); XCTAssertEqual(try Data(contentsOf: patch), bytes)
+    }
+}
+private actor ValidationDeliveryGate {
+    private(set) var entered = false
+    private(set) var completed = false
+    private var continuation: CheckedContinuation<Void,Never>?
+    func deliver(_ error: Error, to service: ShaderRequestService) async {
+        entered = true; await withCheckedContinuation { continuation = $0 }
+        await service.progressPersistenceFailed(error); completed = true
+    }
+    func release() { continuation?.resume(); continuation = nil }
 }
 #endif

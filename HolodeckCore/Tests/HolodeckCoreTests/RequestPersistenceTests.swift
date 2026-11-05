@@ -540,3 +540,24 @@ private final class InterruptedRemovalProbe: @unchecked Sendable {
     }
 }
 #endif
+
+#if os(macOS)
+extension RequestPersistenceTests {
+    func testCoalescedValidationReportsTheFailedSnapshotOwner() async throws {
+        let root = try directory(), writer = RequestPersistence(), failed = expectation(description: "Actual coalesced failure")
+        let probe = ValidationOriginProbe(), file = root.appendingPathComponent("progress.json")
+        writer.enqueueProgress(.init(revision: 1, files: [.init(url: file, bytes: Data("superseded".utf8))]), failed: { _ in XCTFail("Superseded callback received a newer snapshot failure") })
+        writer.enqueueProgress(.init(revision: 2, files: [.init(url: file, encode: { throw RequestPersistence.ValidationError(message: "Capacity") })]), failed: { error in probe.capture(error); failed.fulfill() })
+        await fulfillment(of: [failed], timeout: 3)
+        let error = try XCTUnwrap(probe.error)
+        XCTAssertEqual(error.revision, 2); XCTAssertEqual(error.operation, "background request progress"); XCTAssertEqual(error.paths, [file.path])
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(file))
+    }
+}
+private final class ValidationOriginProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: RequestPersistence.ValidationError?
+    var error: RequestPersistence.ValidationError? { lock.withLock { value } }
+    func capture(_ error: Error) { lock.withLock { value = error as? RequestPersistence.ValidationError } }
+}
+#endif
