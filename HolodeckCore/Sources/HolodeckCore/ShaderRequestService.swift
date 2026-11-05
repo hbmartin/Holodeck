@@ -34,6 +34,24 @@ nonisolated public struct ShaderRequestConfiguration: Codable, Sendable, Equatab
     public var checkoutID: String?
     var detachedOwner: DetachedCheckoutAcknowledgement?
     public var enabled: Bool
+    private enum CodingKeys: String, CodingKey {
+        case repository, codex, python, git, shaderTool, model, reasoning, checkoutID, detachedOwner, enabled
+    }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        repository = try values.decode(String.self, forKey: .repository)
+        codex = try values.decode(String.self, forKey: .codex)
+        python = try values.decode(String.self, forKey: .python)
+        git = try values.decode(String.self, forKey: .git)
+        // These optional additions have safe, recognized legacy defaults. Ownership
+        // and enablement fields still require their original explicit representation.
+        shaderTool = try values.decodeIfPresent(String.self, forKey: .shaderTool) ?? ""
+        model = try values.decode(String.self, forKey: .model)
+        reasoning = try values.decodeIfPresent(String.self, forKey: .reasoning) ?? "high"
+        checkoutID = try values.decodeIfPresent(String.self, forKey: .checkoutID)
+        detachedOwner = try values.decodeIfPresent(DetachedCheckoutAcknowledgement.self, forKey: .detachedOwner)
+        enabled = try values.decode(Bool.self, forKey: .enabled)
+    }
     public init(repository: String = "", codex: String = "/opt/homebrew/bin/codex", python: String = "/usr/bin/python3",
                 git: String = "/usr/bin/git", shaderTool: String = "", model: String = "", reasoning: String = "high", enabled: Bool = false) {
         self.repository = repository; self.codex = codex; self.python = python; self.git = git
@@ -171,7 +189,22 @@ public actor ShaderRequestService {
     private var persistenceFault: RequestPersistence.Fault?
     private var validationBlocker: RequestPersistence.ValidationBlocker?
     private var resolvedValidationRevision: UInt64 = 0
-    private var persistenceFailure: String? { persistenceFault?.localizedDescription ?? validationBlocker?.message }
+    private struct MetadataIssue: LocalizedError, Sendable {
+        let id = UUID()
+        let file: String
+        let reason: String
+        var errorDescription: String? {
+            "Request metadata is unreadable or unsupported at " + file + ": " + reason +
+            " Retain this file and restore or repair it, then choose Retry Recovery. Checkout work stays disabled; the cached library remains available."
+        }
+    }
+    private var metadataIssue: MetadataIssue?
+    private var persistenceFailure: String? { persistenceFault?.localizedDescription ?? metadataIssue?.localizedDescription ?? validationBlocker?.message }
+    private func publishMetadataIssue(_ error: Error, file: String) {
+        metadataIssue = error as? MetadataIssue ?? MetadataIssue(file: file, reason: RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 4096))
+        configuration.enabled = false
+        activeProcess?.shutdown(); failPendingPublicationForRecovery(metadataIssue!.localizedDescription); emitUpdates()
+    }
     private struct MetadataUnavailable: LocalizedError { let message: String; var errorDescription: String? { message } }
     private var settledExecutions: Set<UUID> = []
     private var pendingRetirements: [UUID: UUID] = [:]
@@ -381,6 +414,10 @@ public actor ShaderRequestService {
     private var detachedOwners: [DetachedCheckoutAcknowledgement] = []
     private var suspended = false
     private var loaded = false
+    private var loadingTask: Task<Void, Never>?
+    private var loadedPreferences: ShaderRequestConfiguration?
+    private(set) var acceptedMetadataLoadCount = 0
+    private(set) var preferencesReadCount = 0
     private var activeRetryJournals: [String: UUID] = [:]
     private var recoveryID: UUID?
     private var setupMessage = "Enable shader requests in Mac Settings."
@@ -560,14 +597,20 @@ public actor ShaderRequestService {
         activateScheduling()
     }
     public func initialize(configuration: ShaderRequestConfiguration) async throws {
+        let wasInitialized = initialized
         try await load()
         guard !selectingRepository else { throw ShaderRequestError.unavailable("Wait for the selected folder to finish loading.") }
         let previous = self.configuration
-        let preferences = directory.appendingPathComponent("preferences.json")
-        self.configuration = try await persistence.perform {
-            guard RequestProcessIdentity.evidenceExists(preferences) else { return configuration }
-            return try JSONDecoder().decode(ShaderRequestConfiguration.self,
-                from: BoundedCatalogReader(root: preferences.deletingLastPathComponent()).read(preferences.lastPathComponent, limit: CatalogLimits.headBytes).bytes)
+        if metadataIssue == nil {
+            if wasInitialized {
+                let preferences = directory.appendingPathComponent("preferences.json")
+                preferencesReadCount += 1
+                do {
+                    self.configuration = try await persistence.perform {
+                        try Self.readPreferences(at: preferences) ?? configuration
+                    }
+                } catch { publishMetadataIssue(error, file: preferences.path) }
+            } else { self.configuration = loadedPreferences ?? configuration }
         }
         if !configuration.shaderTool.isEmpty { self.configuration.shaderTool = configuration.shaderTool }
         let paths = Self.canonicalRepositories([previous.repository, self.configuration.repository] + detachedOwners.map(\.repository))
@@ -580,6 +623,7 @@ public actor ShaderRequestService {
             cancelPublicationRequests()
             publicationGeneration = UUID(); unresolvedPublicationFailure = nil; emitPublication()
         }
+        if metadataIssue != nil { self.configuration.enabled = false }
         if !self.configuration.enabled { cancelPublicationRequests() }
         initialized = true
         setupMessage = self.configuration.enabled ? "Ready for shader requests" : "Enable shader requests in Mac Settings."
@@ -589,16 +633,48 @@ public actor ShaderRequestService {
     public func activateScheduling() { schedulingActive = true; kick() }
     private func load() async throws {
         guard !loaded else { return }
-        let root = directory
-        try await persistence.perform { try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true) }
-        try await reloadAcceptedMetadata()
-        persistenceFault = try await persistence.loadFault()
-        loaded = true
-        if persistenceFailure == nil {
-            try await persist()
-            try await retirePendingWorkers()
-            for id in records.keys where records[id]?.deletionPending == true { await finishDeletion(id) }
+        let shared: Task<Void, Never>
+        if let loadingTask { shared = loadingTask }
+        else {
+            let task = Task { await self.performInitialLoad() }
+            loadingTask = task; shared = task
         }
+        // Cancelling one caller releases that waiter without cancelling the shared
+        // metadata inspection or a different caller's exact-journal reconciliation.
+        let ticket = RequestPersistence.CommitTicket<Void>()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { c in
+                ticket.attach(c)
+                Task { await shared.value; ticket.complete(.success(())) }
+            }
+        } onCancel: { ticket.cancel() }
+    }
+    private func performInitialLoad() async {
+        defer { loaded = true; loadingTask = nil; emitUpdates() }
+        let root = directory
+        do {
+            try await persistence.perform { try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true) }
+            persistenceFault = try await persistence.loadFault()
+            try await reloadAcceptedMetadata()
+            if persistenceFailure == nil {
+                try await persist()
+                try await retirePendingWorkers()
+                for id in records.keys where records[id]?.deletionPending == true { await finishDeletion(id) }
+            }
+        } catch {
+            if error is RequestPersistence.Fault { publishStorageFault(error) }
+            else if error is RequestPersistence.ValidationError { publishValidation(error) }
+            else if error is MetadataIssue { publishMetadataIssue(error, file: root.path) }
+            else if !Self.requiresCheckoutRecovery(error) { publishMetadataIssue(error, file: root.path) }
+            // Journal retirement records its exact ownership error before returning.
+        }
+    }
+    nonisolated private static func readPreferences(at file: URL) throws -> ShaderRequestConfiguration? {
+        guard RequestProcessIdentity.evidenceExists(file) else { return nil }
+        do {
+            return try JSONDecoder().decode(ShaderRequestConfiguration.self,
+                from: BoundedCatalogReader(root: file.deletingLastPathComponent()).read(file.lastPathComponent, limit: CatalogLimits.headBytes).bytes)
+        } catch { throw MetadataIssue(file: file.path, reason: RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 4096)) }
     }
     private func folder(_ id: UUID) -> URL { directory.appendingPathComponent(id.uuidString) }
     public func artifacts(for id: UUID) -> URL { folder(id) }
@@ -966,14 +1042,18 @@ public actor ShaderRequestService {
     }
     private func reloadAcceptedMetadata() async throws {
         let root = directory
+        acceptedMetadataLoadCount += 1; preferencesReadCount += 1
         let accepted = try await persistence.perform {
-            let reader = try BoundedCatalogReader(root: root)
+            let reader: BoundedCatalogReader
+            do { reader = try BoundedCatalogReader(root: root) }
+            catch { throw MetadataIssue(file: root.path, reason: error.localizedDescription) }
             func read<T: Decodable>(_ name: String, as: T.Type, limit: Int = CatalogLimits.manifestBytes) throws -> T? {
                 guard RequestProcessIdentity.evidenceExists(root.appendingPathComponent(name)) else { return nil }
-                return try JSONDecoder().decode(T.self, from: reader.read(name, limit: limit).bytes)
+                do { return try JSONDecoder().decode(T.self, from: reader.read(name, limit: limit).bytes) }
+                catch { throw MetadataIssue(file: root.appendingPathComponent(name).path, reason: RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 4096)) }
             }
             let store = try read("recovery.json", as: RequestRecoveryStore.self) ?? RequestRecoveryStore()
-            guard store.formatVersion == 1, store.entries.allSatisfy({ $0.key == $0.value.journal && URL(fileURLWithPath: $0.key).deletingLastPathComponent().path == RequestPaths.canonical(root) }) else { throw RequestWorkerOwnershipError() }
+            guard store.formatVersion == 1, store.entries.allSatisfy({ $0.key == $0.value.journal && URL(fileURLWithPath: $0.key).deletingLastPathComponent().path == RequestPaths.canonical(root) }) else { throw MetadataIssue(file: root.appendingPathComponent("recovery.json").path, reason: "Expected recovery format 1 and journal paths belonging to this request directory.") }
             let rows = try read("journal.json", as: [Record].self, limit: 128 * 1024 * 1024) ?? []
             let acknowledgements = try read("detached-checkouts.json", as: [DetachedCheckoutAcknowledgement].self) ?? []
             let configuration = try read("preferences.json", as: ShaderRequestConfiguration.self, limit: CatalogLimits.headBytes)
@@ -993,10 +1073,11 @@ public actor ShaderRequestService {
                 validation: try read("metadata-validation.json", as: RequestPersistence.ValidationBlocker.self, limit: 65536),
                 paths: Self.canonicalRepositories((configuration.map { [$0.repository] } ?? []) + acknowledgements.map(\.repository)))
         }
-        guard Set(accepted.records.map { $0.status.id }).count == accepted.records.count else { throw RequestWorkerOwnershipError() }
+        guard Set(accepted.records.map { $0.status.id }).count == accepted.records.count else { throw MetadataIssue(file: root.appendingPathComponent("journal.json").path, reason: "Duplicate request identities.") }
         try await waitForStorageChange(cancellable: false)
         records = Dictionary(uniqueKeysWithValues: accepted.records.map { ($0.status.id, $0) })
         detachedOwners = accepted.acknowledgements; recovery = accepted.recovery
+        loadedPreferences = accepted.configuration
         if let id = recoveryID, records[id] == nil { recoveryID = nil }
         maintenanceProposals.removeAll()
         if var restored = accepted.configuration {
@@ -1016,14 +1097,18 @@ public actor ShaderRequestService {
             guard var record = records[id] else { continue }
             if let dispatch = record.dispatch {
                 if !dispatch.launched && !launchEvidence.contains(id) {
-                    if !record.status.stage.terminal { record.status.stage = dispatch.priorStage }
+                    if !record.status.stage.terminal && ![.awaitingActivation, .awaitingClarification].contains(record.status.stage) { record.status.stage = dispatch.priorStage }
                     pendingRetirements[id] = dispatch.executionID
                 } else if dispatch.retirementPending || (operations[id]?.id == dispatch.workerOperationID && operations[id]?.phase == .complete) {
                     pendingRetirements[id] = dispatch.executionID
                     if !record.status.stage.terminal && ![.awaitingActivation, .awaitingClarification].contains(record.status.stage) {
                         record.status.stage = .failed; record.status.message = "Worker settled before metadata recovery; inspect its retained log."
                     }
-                } else if active == id, !record.status.stage.terminal { recoveryID = id; record.status.stage = .repairing }
+                } else if active == id, ![.awaitingActivation, .awaitingClarification].contains(record.status.stage),
+                          !record.status.stage.terminal || record.cleanupPending == true {
+                    recoveryID = id
+                    if !record.status.stage.terminal { record.status.stage = .repairing }
+                }
             } else if active == id, (!record.status.stage.terminal || record.cleanupPending == true), ![.awaitingActivation, .awaitingClarification].contains(record.status.stage) {
                 recoveryID = id
                 if !record.status.stage.terminal { record.status.stage = .repairing; record.status.message = "Recovering interrupted request" }
@@ -1036,16 +1121,18 @@ public actor ShaderRequestService {
                 record.cleanupPending = true; record.cleanupMessage = "TV access was revoked; any pushed commit remains"
                 record.status.stage = .failed; record.status.message = "TV access was revoked; checkout cleanup is pending"
             }
+            if record.detached == true, recoveryID == id { recoveryID = nil }
             record.cleanupFailure = nil; records[id] = record
         }
         if detachedOwners.contains(where: { Self.matchesDetachedCheckout(configuration, acknowledgement: $0, paths: paths) }) { configuration.enabled = false }
     }
     private func resetPersistenceFailure() async throws {
         var token: RequestPersistence.RecoveryToken?
+        let issueID = metadataIssue?.id
         do {
             if let retirementTask { await retirementTask.value }
             token = try await persistence.restoreForRecovery()
-            if token?.reloadAccepted == true { try await reloadAcceptedMetadata() }
+            if token?.reloadAccepted == true || metadataIssue != nil { try await reloadAcceptedMetadata() }
             let validationRevision = try await persist(recoveryToken: token)
             try await retirePendingWorkers(recoveryToken: token)
             try await persistence.clearValidation(through: validationRevision)
@@ -1053,12 +1140,14 @@ public actor ShaderRequestService {
             resolvedPersistenceGeneration = max(resolvedPersistenceGeneration, receipt.clearedGeneration)
             if let fault = persistenceFault, fault.generation > receipt.clearedGeneration { throw fault }
             persistenceFault = nil
+            if metadataIssue?.id == issueID { metadataIssue = nil }
             resolvedValidationRevision = max(resolvedValidationRevision, validationRevision)
             if (validationBlocker?.revision ?? 0) <= validationRevision { validationBlocker = nil }
             if let validationBlocker { throw RequestPersistence.ValidationError(message: validationBlocker.message) }
             emitUpdates(); if schedulingDeferred { scheduleWakeup() }
         } catch {
             await persistence.abortRecovery(token)
+            if error is MetadataIssue { publishMetadataIssue(error, file: directory.path) }
             publishStorageFault(error); throw error
         }
     }
