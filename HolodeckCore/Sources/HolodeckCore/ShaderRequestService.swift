@@ -211,6 +211,7 @@ public actor ShaderRequestService {
         var interrupted = false
         // Verified history across attempts, independent of provisional dispatch launch state.
         var checkoutLaunched = false
+        var processID: ObjectIdentifier?
     }
     private var execution: Execution?
     private var selectingRepository = false
@@ -1502,10 +1503,10 @@ public actor ShaderRequestService {
     }
 
     private func settleProcess(_ process: RequestWorkerProcess) async throws {
-        let operation = execution?.id
+        let operation = execution?.id, processID = ObjectIdentifier(process)
         do {
             try await waitForWorker(process)
-            if let operation, execution?.id == operation {
+            if let operation, execution?.id == operation, execution?.processID == processID {
                 let launched = execution?.checkoutLaunched == true || process.checkoutLaunched
                 execution?.checkoutLaunched = launched
                 if let id = activeID {
@@ -1518,6 +1519,7 @@ public actor ShaderRequestService {
             }
         }
         catch {
+            if let operation, execution?.id == operation, execution?.processID == processID { settledExecutions.remove(operation) }
             await holdForRecovery(journal: process.recoveryTarget?.directory ?? activeID.map(folder) ?? directory.appendingPathComponent("publication"),
                 configuration: process.recoveryTarget?.configuration ?? configurationForActiveWorker, error: error)
             throw error
@@ -1594,6 +1596,8 @@ public actor ShaderRequestService {
             let process = workerProcess()
             if let id = activeID { transitionRecord(id) { $0.dispatch?.launched = true } }
             activeProcess = process
+            execution?.processID = ObjectIdentifier(process)
+            settledExecutions.remove(operation)
             let attemptID = UUID()
             var completion: RequestWorkerEvent?
             do {
@@ -2039,6 +2043,12 @@ public actor ShaderRequestService {
         }
     }
 
+    private static func isMetadataBlocker(_ error: Error) -> Bool {
+        error is MetadataUnavailable || error is RequestPersistence.Fault || error is RequestPersistence.ValidationError
+    }
+    private static func requiresCheckoutRecovery(_ error: Error) -> Bool {
+        error is RequestWorkerEvidenceError || error is RequestWorkerOwnershipError || error is RequestWorkerTeardownError || error is RequestWorkerSupervisionError
+    }
     private func cleanup(_ id: UUID, operation: UUID) async {
         guard let record = records[id] else { finishWorker(id); return }
         await prepareCleanup()
@@ -2054,10 +2064,11 @@ public actor ShaderRequestService {
                 try await update(id, stage: record.status.stage, message: record.status.message)
             } else { try await update(id, stage: .failed, message: record.cleanupMessage ?? "Owned checkout cleanup completed; see the retained request diagnostic") }
         } catch {
-            if error is RequestWorkerEvidenceError || error is RequestWorkerOwnershipError || error is RequestWorkerTeardownError || error is RequestWorkerSupervisionError || error is RequestPersistence.Fault {
+            if Self.isMetadataBlocker(error) {
+                // Storage recovery retains the cleanup intent and resumes it after convergence.
+            } else if Self.requiresCheckoutRecovery(error) {
                 await holdForRecovery(journal: folder(id), configuration: record.configuration, error: error)
-            }
-            if execution?.interrupted == false, records[id]?.detached != true {
+            } else if execution?.interrupted == false, records[id]?.detached != true {
                 transitionRecord(id) { $0.cleanupFailure = error.localizedDescription }
                 setupMessage = "Checkout recovery is required. Correct the saved folder/tool paths and retry cleanup, or detach the checkout."
                 try? await update(id, stage: .failed, message: "Cleanup failed: \(error.localizedDescription). \(setupMessage)")
@@ -2101,11 +2112,19 @@ public actor ShaderRequestService {
             // The bound complete operation (or a prepared, never-launched dispatch)
             // already supplies durable restart evidence before marker retirement.
             let marker = directory.appendingPathComponent("active.json")
-            try await persistence.journal("retire settled worker", files: [marker]) {
-                if RequestProcessIdentity.evidenceExists(marker) {
-                    let bytes = try BoundedCatalogReader(root: marker.deletingLastPathComponent()).read(marker.lastPathComponent, limit: 4096).bytes
-                    if try JSONDecoder().decode(UUID.self, from: bytes) == id { try RequestJournalWriter.remove(marker) }
+            do {
+                try await persistence.journal("retire settled worker", files: [marker]) {
+                    if RequestProcessIdentity.evidenceExists(marker) {
+                        let bytes = try BoundedCatalogReader(root: marker.deletingLastPathComponent()).read(marker.lastPathComponent, limit: 4096).bytes
+                        if try JSONDecoder().decode(UUID.self, from: bytes) == id { try RequestJournalWriter.remove(marker) }
+                    }
                 }
+            } catch {
+                if !Self.isMetadataBlocker(error) {
+                    await holdForRecovery(journal: job, configuration: records[id]?.configuration,
+                        error: RequestWorkerEvidenceError(cause: "Cannot retire active marker at " + marker.path + ": " + error.localizedDescription))
+                }
+                throw error
             }
             transitionRecord(id) { $0.dispatch = nil }
             try await persist(recoveryToken: recoveryToken)

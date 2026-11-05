@@ -4716,3 +4716,101 @@ private actor SettlementValidationFault {
     }
 }
 #endif
+
+#if os(macOS)
+extension ShaderRequestTests {
+    func testCleanupMetadataPauseResumesAfterStorageRecovery() async throws {
+        let (root, script) = try recoveryFixture(), gate = RequestPreparationGate()
+        let seed = try await recoveryService(root, script: script)
+        let request = ShaderRequest(prompt: "Resume metadata-paused cleanup", context: try context())
+        _ = try await seed.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        try await seed.cancelQueued(request.id)
+        let file = root.appendingPathComponent("journal.json")
+        var rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [[String:Any]])
+        rows[0]["cleanupPending"] = true
+        try JSONSerialization.data(withJSONObject: rows).write(to: file)
+        let patch = root.appendingPathComponent(request.id.uuidString).appendingPathComponent("owned-patch")
+        let bytes = Data([0,255,13,10]); try bytes.write(to: patch)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("cat2")), directory: root,
+            workerScript: script, prepareCleanup: { await gate.hold() })
+        await service.suspend(); try await service.start(configuration: .init(repository: root.path, enabled: true)); await service.resume()
+        try await waitFor { await gate.entered }
+        await service.progressPersistenceFailed(RequestPersistence.ValidationError(message: "Cleanup metadata pause"))
+        await gate.release()
+        try await waitFor { await service.recoveryStatuses().contains { $0.kind == .persistence && !$0.isRunning } }
+        XCTAssertEqual(try Data(contentsOf: patch), bytes)
+        await service.suspend(); try await service.retryReconciliation()
+        let recovery = await service.recoveryStatuses()
+        XCTAssertFalse(recovery.contains { $0.message.contains("Cleanup metadata pause") })
+        await service.resume()
+        try await waitFor { !(await service.hasPendingCleanup()) }
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(patch))
+        await service.suspend()
+    }
+
+    func testFailedRetrySettlementCannotRetireEarlierAttemptProof() async throws {
+        let (root, script) = try recoveryFixture(), proof = SettlementEvidenceFixture()
+        try """
+        import json,signal,sys,time
+        from pathlib import Path
+        job=Path(sys.argv[3]);counter=job/'count';n=int(counter.read_text())+1 if counter.exists() else 1;counter.write_text(str(n))
+        if n==2:
+            def stop(*args):
+                while not (job/'allow-stop').exists():time.sleep(.005)
+                sys.exit(0)
+            signal.signal(signal.SIGTERM,stop)
+        print(json.dumps(dict(event='failure',failureKind='supervision',retryable=True,recoveryRequired=False,message='Attempt supervision fault')),flush=True)
+        if n==2:
+            while True:time.sleep(.005)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root,
+            workerScript: script, waitForWorker: { try await proof.settle($0, failSecond: true) })
+        await service.suspend(); try await service.start(configuration: .init(repository: root.path, enabled: true))
+        let request = ShaderRequest(prompt: "Do not reuse old settlement proof", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        let release = root.appendingPathComponent(request.id.uuidString).appendingPathComponent("allow-stop")
+        addTeardownBlock { try? Data().write(to: release); let child = await proof.child; try? await child?.waitForExit() }
+        await service.resume()
+        try await waitFor { await service.recoveryStatuses().contains { $0.kind == .reconciliation && !$0.isRunning } }
+        let child = await proof.child; XCTAssertTrue(child?.process.isRunning == true)
+        XCTAssertTrue(RequestProcessIdentity.evidenceExists(root.appendingPathComponent("active.json")))
+        let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("journal.json"))) as? [[String:Any]])
+        XCTAssertNotNil(rows[0]["dispatch"])
+        try Data().write(to: release); try await child?.waitForExit(); await service.suspend()
+    }
+
+    func testUnverifiableRetirementMarkerHasVisibleRecoveryAndCanRetry() async throws {
+        let (root, script) = try recoveryFixture(), proof = SettlementEvidenceFixture(), active = root.appendingPathComponent("active.json")
+        try "import json;print(json.dumps(dict(event='clarification',question='Choose',options=['A','B'])),flush=True)".write(to: script, atomically: true, encoding: .utf8)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root,
+            workerScript: script, waitForWorker: { try await proof.settle($0, replaceMarker: active) })
+        let gitdir = try initializeRecoveryGit(root), checkoutID = UUID().uuidString
+        try checkoutID.write(to: gitdir.appendingPathComponent("holodeck-checkout-id"), atomically: true, encoding: .utf8)
+        var configuration = ShaderRequestConfiguration(repository: root.path, enabled: true); configuration.checkoutID = checkoutID
+        await service.suspend(); try await service.start(configuration: configuration)
+        let request = ShaderRequest(prompt: "Report retirement evidence failure", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        await service.resume()
+        try await waitFor { await service.recoveryStatuses().contains { $0.kind == .reconciliation && $0.message.contains("active marker") && !$0.isRunning } }
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: active.path), "missing-active-target")
+        await service.suspend()
+        try FileManager.default.removeItem(at: active); try JSONEncoder().encode(request.id).write(to: active)
+        try await service.retryReconciliation()
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(active))
+        let status = await service.allJobs().first; XCTAssertEqual(status?.stage, .awaitingClarification)
+    }
+}
+private actor SettlementEvidenceFixture {
+    private var count = 0
+    private(set) var child: RequestWorkerProcess?
+    func settle(_ process: RequestWorkerProcess, failSecond: Bool = false, replaceMarker: URL? = nil) async throws {
+        count += 1
+        if count == 2 && failSecond { child = process; throw RequestWorkerTeardownError(cause: "Injected unverified retry") }
+        try await process.waitForExit()
+        if let replaceMarker, count == 1 {
+            try FileManager.default.removeItem(at: replaceMarker)
+            try FileManager.default.createSymbolicLink(atPath: replaceMarker.path, withDestinationPath: "missing-active-target")
+        }
+    }
+}
+#endif
