@@ -43,14 +43,22 @@ nonisolated public struct ShaderRequestConfiguration: Codable, Sendable, Equatab
         codex = try values.decode(String.self, forKey: .codex)
         python = try values.decode(String.self, forKey: .python)
         git = try values.decode(String.self, forKey: .git)
-        // These optional additions have safe, recognized legacy defaults. Ownership
-        // and enablement fields still require their original explicit representation.
-        shaderTool = try values.decodeIfPresent(String.self, forKey: .shaderTool) ?? ""
+        shaderTool = try values.decode(String.self, forKey: .shaderTool)
         model = try values.decode(String.self, forKey: .model)
-        reasoning = try values.decodeIfPresent(String.self, forKey: .reasoning) ?? "high"
+        reasoning = try values.decode(String.self, forKey: .reasoning)
         checkoutID = try values.decodeIfPresent(String.self, forKey: .checkoutID)
         detachedOwner = try values.decodeIfPresent(DetachedCheckoutAcknowledgement.self, forKey: .detachedOwner)
         enabled = try values.decode(Bool.self, forKey: .enabled)
+    }
+    /// Only preferences and their UserDefaults copy support these two legacy omissions.
+    /// Captured requests, operation bindings and recovery evidence use strict Codable.
+    public static func decodePreferences(_ bytes: Data) throws -> Self {
+        guard var object = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else {
+            return try JSONDecoder().decode(Self.self, from: bytes)
+        }
+        if object["shaderTool"] == nil { object["shaderTool"] = "" }
+        if object["reasoning"] == nil { object["reasoning"] = "high" }
+        return try JSONDecoder().decode(Self.self, from: JSONSerialization.data(withJSONObject: object))
     }
     public init(repository: String = "", codex: String = "/opt/homebrew/bin/codex", python: String = "/usr/bin/python3",
                 git: String = "/usr/bin/git", shaderTool: String = "", model: String = "", reasoning: String = "high", enabled: Bool = false) {
@@ -143,6 +151,15 @@ public struct ShaderRepositorySelection: Sendable {
     public let publication: CatalogReloadResult
 }
 
+/// Local accepted setup; draft fields and blocked initialization are never preferences.
+public struct ShaderRequestSetupSnapshot: Sendable, Equatable {
+    public enum Phase: Sendable { case blockedInitialization, accepted, requiresVerification }
+    public let revision: UInt64
+    public let phase: Phase
+    public let configuration: ShaderRequestConfiguration?
+    public let blocked: Bool
+}
+
 public actor ShaderRequestService {
     private struct DispatchState: Codable, Sendable, Equatable {
         let executionID: UUID
@@ -193,6 +210,7 @@ public actor ShaderRequestService {
         let id = UUID()
         let file: String
         let reason: String
+        var preferencesOnly = false
         var errorDescription: String? {
             "Request metadata is unreadable or unsupported at " + file + ": " + reason +
             " Retain this file and restore or repair it, then choose Retry Recovery. Checkout work stays disabled; the cached library remains available."
@@ -221,8 +239,11 @@ public actor ShaderRequestService {
         }
     }
     private var persistenceFailure: String? { persistenceFault?.localizedDescription ?? metadataIssue?.localizedDescription ?? validationBlocker?.message }
-    private func publishMetadataIssue(_ error: Error, file: String) {
-        metadataIssue = error as? MetadataIssue ?? MetadataIssue(file: file, reason: RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 4096))
+    private func publishMetadataIssue(_ error: Error, file: String, preferencesOnly: Bool = false) {
+        var issue = error as? MetadataIssue ?? MetadataIssue(file: file, reason: RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 4096))
+        issue.preferencesOnly = preferencesOnly
+        metadataIssue = issue
+        if !acceptedMetadataAvailable { startupWasBlocked = true }
         activeProcess?.shutdown(); failPendingPublicationForRecovery(metadataIssue!.localizedDescription); emitUpdates()
     }
     private struct MetadataUnavailable: LocalizedError { let message: String; var errorDescription: String? { message } }
@@ -435,7 +456,11 @@ public actor ShaderRequestService {
     private var suspended = false
     private var loaded = false
     private var loadingTask: Task<Void, Never>?
-    private var loadedPreferences: ShaderRequestConfiguration?
+    private var initializationInput: ShaderRequestConfiguration?
+    private var configurationAccepted = false
+    private var startupWasBlocked = false
+    private var requiresVerification = false
+    private var lastSetupSnapshot: ShaderRequestSetupSnapshot?
     private(set) var acceptedMetadataLoadCount = 0
     private(set) var preferencesReadCount = 0
     private var activeRetryJournals: [String: UUID] = [:]
@@ -619,39 +644,54 @@ public actor ShaderRequestService {
         try await initialize(configuration: configuration)
         activateScheduling()
     }
-    public func initialize(configuration: ShaderRequestConfiguration) async throws {
+    public func initialize(configuration incoming: ShaderRequestConfiguration) async throws {
+        // Capture the first proposal before load suspends; concurrent callers cannot
+        // replace it with defaults while authoritative preferences are unavailable.
+        if initializationInput == nil { initializationInput = incoming }
         let wasInitialized = initialized
         try await load()
         guard !selectingRepository else { throw ShaderRequestError.unavailable("Wait for the selected folder to finish loading.") }
-        let previous = self.configuration
-        if metadataIssue == nil {
+        if acceptedMetadataAvailable, metadataIssue == nil {
             if wasInitialized {
                 let preferences = directory.appendingPathComponent("preferences.json")
                 preferencesReadCount += 1
                 do {
-                    self.configuration = try await persistence.perform {
-                        try Self.readPreferences(at: preferences) ?? configuration
+                    let saved = try await persistence.perform { try Self.readPreferences(at: preferences) }
+                    if let saved, !Self.preferencesMatch(saved, accepted: configuration, bundledTool: bundledShaderTool) {
+                        throw MetadataIssue(file: preferences.path, reason: "Preferences conflict with the accepted setup. Restore its settings before retrying recovery.")
                     }
-                } catch { publishMetadataIssue(error, file: preferences.path) }
-            } else { self.configuration = loadedPreferences ?? configuration }
+                } catch { publishMetadataIssue(error, file: preferences.path, preferencesOnly: true) }
+            } else if !configurationAccepted {
+                configuration = initializationInput ?? incoming; configurationAccepted = true
+            }
         }
-        if !configuration.shaderTool.isEmpty { self.configuration.shaderTool = configuration.shaderTool }
-        let paths = Self.canonicalRepositories([previous.repository, self.configuration.repository] + detachedOwners.map(\.repository))
-        if detachedOwners.contains(where: {
-            Self.matchesDetachedCheckout(self.configuration, acknowledgement: $0, paths: paths)
-        }) {
-            self.configuration.enabled = false
-        }
-        if initialized, !Self.samePublicationCheckout(previous, self.configuration, paths: paths) {
-            cancelPublicationRequests()
-            publicationGeneration = UUID(); unresolvedPublicationFailure = nil; emitPublication()
-        }
-        if metadataIssue != nil { self.configuration.enabled = false }
-        if !self.configuration.enabled { cancelPublicationRequests() }
+        // The application may relocate its own bundled executable, never an unrelated tool.
+        if let bundledShaderTool, incoming.shaderTool == bundledShaderTool, configurationAccepted { configuration.shaderTool = bundledShaderTool }
+        let paths = Self.canonicalRepositories([configuration.repository] + detachedOwners.map(\.repository))
+        if detachedOwners.contains(where: { Self.matchesDetachedCheckout(configuration, acknowledgement: $0, paths: paths) }) { configuration.enabled = false }
+        if !configuration.enabled { cancelPublicationRequests() }
         initialized = true
-        setupMessage = self.configuration.enabled ? "Ready for shader requests" : "Enable shader requests in Mac Settings."
+        setupMessage = persistenceFailure ?? (configuration.enabled ? "Ready for shader requests" : "Enable shader requests in Mac Settings.")
         emitUpdates()
         await proposalTask?.value
+    }
+    nonisolated private static func preferencesMatch(_ saved: ShaderRequestConfiguration, accepted: ShaderRequestConfiguration, bundledTool: String?) -> Bool {
+        var candidate = saved, current = accepted
+        candidate.repository = RequestPaths.canonical(URL(fileURLWithPath: candidate.repository))
+        current.repository = RequestPaths.canonical(URL(fileURLWithPath: current.repository))
+        if let bundledTool, current.shaderTool == bundledTool, trustedBundledTool(candidate.shaderTool) { candidate.shaderTool = bundledTool }
+        return candidate == current
+    }
+    nonisolated private static func trustedBundledTool(_ path: String) -> Bool {
+        path.hasSuffix(".app/Contents/Resources/Tools/holodeck-shader-tool")
+    }
+    public func setupSnapshot() -> ShaderRequestSetupSnapshot {
+        let phase: ShaderRequestSetupSnapshot.Phase = !acceptedMetadataAvailable || !configurationAccepted ? .blockedInitialization : requiresVerification ? .requiresVerification : .accepted
+        let accepted = configurationAccepted ? configuration : nil
+        let blocked = persistenceFailure != nil
+        if let old = lastSetupSnapshot, old.phase == phase, old.configuration == accepted, old.blocked == blocked { return old }
+        let value = ShaderRequestSetupSnapshot(revision: (lastSetupSnapshot?.revision ?? 0) &+ 1, phase: phase, configuration: accepted, blocked: blocked)
+        lastSetupSnapshot = value; return value
     }
     public func activateScheduling() { schedulingActive = true; kick() }
     private func load() async throws {
@@ -696,8 +736,8 @@ public actor ShaderRequestService {
     nonisolated private static func readPreferences(at file: URL) throws -> ShaderRequestConfiguration? {
         guard RequestProcessIdentity.evidenceExists(file) else { return nil }
         do {
-            return try JSONDecoder().decode(ShaderRequestConfiguration.self,
-                from: BoundedCatalogReader(root: file.deletingLastPathComponent()).read(file.lastPathComponent, limit: CatalogLimits.headBytes).bytes)
+            return try ShaderRequestConfiguration.decodePreferences(
+                BoundedCatalogReader(root: file.deletingLastPathComponent()).read(file.lastPathComponent, limit: CatalogLimits.headBytes).bytes)
         } catch { throw MetadataIssue(file: file.path, reason: RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 4096)) }
     }
     private func folder(_ id: UUID) -> URL { directory.appendingPathComponent(id.uuidString) }
@@ -737,6 +777,7 @@ public actor ShaderRequestService {
         }
     }
     private func acceptRepository(_ accepted: ShaderRequestConfiguration) {
+        configurationAccepted = true
         if Self.samePublicationCheckout(configuration, accepted) { configuration = accepted; return }
         cancelPublicationRequests()
         configuration = accepted
@@ -1082,7 +1123,7 @@ public actor ShaderRequestService {
             guard store.formatVersion == 1, store.entries.allSatisfy({ $0.key == $0.value.journal && URL(fileURLWithPath: $0.key).deletingLastPathComponent().path == RequestPaths.canonical(root) }) else { throw MetadataIssue(file: root.appendingPathComponent("recovery.json").path, reason: "Expected recovery format 1 and journal paths belonging to this request directory.") }
             let rows = try read("journal.json", as: [Record].self, limit: 128 * 1024 * 1024) ?? []
             let acknowledgements = try read("detached-checkouts.json", as: [DetachedCheckoutAcknowledgement].self) ?? []
-            let configuration = try read("preferences.json", as: ShaderRequestConfiguration.self, limit: CatalogLimits.headBytes)
+            let configuration = try Self.readPreferences(at: root.appendingPathComponent("preferences.json"))
             var operations: [UUID: RequestWorkerOperation] = [:]
             for row in rows where row.dispatch != nil {
                 let journal = root.appendingPathComponent(row.status.id.uuidString)
@@ -1103,14 +1144,18 @@ public actor ShaderRequestService {
         try await waitForStorageChange(cancellable: false)
         records = Dictionary(uniqueKeysWithValues: accepted.records.map { ($0.status.id, $0) })
         detachedOwners = accepted.acknowledgements; recovery = accepted.recovery
-        loadedPreferences = accepted.configuration
+        // Full reconstruction is reserved for startup and on-disk storage recovery.
+        // Independently accepted facts arriving during inspection take precedence.
         if let id = recoveryID, records[id] == nil { recoveryID = nil }
         maintenanceProposals.removeAll()
         if var restored = accepted.configuration {
             // Initialization's trusted app relocation is launch context, not a
             // rejected preference edit. Captured request configurations stay exact.
             if let bundledShaderTool, configuration.shaderTool == bundledShaderTool { restored.shaderTool = bundledShaderTool }
-            configuration = restored
+            configuration = restored; configurationAccepted = true; requiresVerification = false
+        } else if !configurationAccepted, var proposed = initializationInput {
+            if startupWasBlocked { proposed.enabled = false; requiresVerification = true }
+            configuration = proposed; configurationAccepted = true
         }
         if validationBlocker == nil { validationBlocker = accepted.validation }
         if let validationBlocker { persistenceRevision = max(persistenceRevision, validationBlocker.revision) }
@@ -1164,7 +1209,22 @@ public actor ShaderRequestService {
                 if let retirementTask { await retirementTask.value }
                 try await inspectStorage()
                 token = try await persistence.restoreForRecovery()
-                if token?.reloadAccepted == true || metadataIssue != nil || !acceptedMetadataAvailable { try await reloadAcceptedMetadata() }
+                if !acceptedMetadataAvailable || token?.reloadAccepted == true {
+                    try await reloadAcceptedMetadata()
+                } else if metadataIssue?.preferencesOnly == true {
+                    let preferences = directory.appendingPathComponent("preferences.json")
+                    let accepted = configuration, tool = bundledShaderTool
+                    preferencesReadCount += 1
+                    let saved = try await persistence.perform { try Self.readPreferences(at: preferences) }
+                    if let saved, !Self.preferencesMatch(saved, accepted: accepted, bundledTool: tool) {
+                        throw MetadataIssue(file: preferences.path, reason: "Repaired preferences must match the accepted setup.", preferencesOnly: true)
+                    }
+                }
+                if configurationAccepted, metadataIssue?.preferencesOnly == true || requiresVerification {
+                    try admitMetadataMutation()
+                    let bytes = try JSONEncoder().encode(configuration)
+                    try await persistence.write(bytes, to: directory.appendingPathComponent("preferences.json"), recovery: token)
+                }
                 let validationRevision = try await persist(recoveryToken: token)
                 try await retirePendingWorkers(recoveryToken: token)
                 try await persistence.clearValidation(through: validationRevision)
@@ -1179,7 +1239,7 @@ public actor ShaderRequestService {
                 emitUpdates(); if schedulingDeferred { scheduleWakeup() }
             } catch {
                 await persistence.abortRecovery(token)
-                if error is MetadataIssue { publishMetadataIssue(error, file: directory.path) }
+                if error is MetadataIssue { publishMetadataIssue(error, file: directory.path, preferencesOnly: metadataIssue?.preferencesOnly == true) }
                 publishStorageFault(error); throw error
             }
         }
@@ -2016,6 +2076,7 @@ public actor ShaderRequestService {
                 files: [.init(url: service.directory.appendingPathComponent("preferences.json"), value: verified)])
         }
         if !initialized { initialized = true; schedulingActive = true }
+        requiresVerification = false
         setupMessage = "Ready for shader requests"; resolvePublicationFailure(); kick()
     }
     public func canDisableRequests() -> Bool {

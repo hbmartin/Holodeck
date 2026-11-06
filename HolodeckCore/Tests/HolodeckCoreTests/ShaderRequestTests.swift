@@ -4933,7 +4933,8 @@ extension ShaderRequestTests {
         XCTAssertEqual(accepted.model, "legacy"); XCTAssertEqual(accepted.reasoning, "high")
         let reads = await service.preferencesReadCount; XCTAssertEqual(reads, 1)
         value["model"] = "updated"; try JSONSerialization.data(withJSONObject: value).write(to: file)
-        try await service.initialize(configuration: .init()); accepted = await service.configurationValue(); XCTAssertEqual(accepted.model, "updated")
+        try await service.initialize(configuration: .init()); accepted = await service.configurationValue(); XCTAssertEqual(accepted.model, "legacy")
+        let conflicts = await service.recoveryStatuses(); XCTAssertTrue(conflicts.contains { $0.message.contains("conflict") })
         value.removeValue(forKey: "enabled"); try JSONSerialization.data(withJSONObject: value).write(to: file)
         try await service.initialize(configuration: .init())
         let rows = await service.recoveryStatuses(); XCTAssertTrue(rows.contains { $0.kind == .persistence && $0.message.contains("preferences.json") })
@@ -5035,6 +5036,86 @@ extension ShaderRequestTests {
         let statuses = await service.recoveryStatuses()
         XCTAssertTrue(statuses.contains { $0.kind == .reconciliation &&  $0.journal.map { RequestPaths.canonical($0) } == RequestPaths.canonical(root.appendingPathComponent(request.id.uuidString)) && $0.message.contains("Retirement observation unavailable") })
         XCTAssertFalse(statuses.contains { $0.message.contains("metadata is unreadable") })
+    }
+}
+#endif
+
+#if os(macOS)
+extension ShaderRequestTests {
+    func testBlockedInitializationRestoresFirstInputDisabledUntilVerification() async throws {
+        let (root, script) = try recoveryFixture(), active = root.appendingPathComponent("active.json")
+        try Data("{".utf8).write(to: active)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script)
+        let input = ShaderRequestConfiguration(repository: root.path, codex: "/captured/codex", python: "/usr/bin/python3", git: "/usr/bin/git", shaderTool: "/captured/tool", model: "captured-model", reasoning: "medium", enabled: true)
+        await service.suspend(); try await service.initialize(configuration: input)
+        try await service.initialize(configuration: .init())
+        let blocked = await service.setupSnapshot(); XCTAssertEqual(blocked.phase, .blockedInitialization); XCTAssertNil(blocked.configuration)
+        try FileManager.default.removeItem(at: active)
+        try await service.retryReconciliation()
+        var expected = input; expected.enabled = false
+        let accepted = await service.configurationValue(), snapshot = await service.setupSnapshot()
+        XCTAssertEqual(accepted, expected); XCTAssertEqual(snapshot.phase, .requiresVerification)
+        XCTAssertEqual(try JSONDecoder().decode(ShaderRequestConfiguration.self, from: Data(contentsOf: root.appendingPathComponent("preferences.json"))), expected)
+        await service.resume(); try await service.verify(configuration: expected)
+        let verified = await service.setupSnapshot(); XCTAssertEqual(verified.phase, .accepted); XCTAssertTrue(verified.configuration?.enabled == true)
+    }
+
+    func testSelectionBeforeFirstInitializeUsesCurrentAcceptedConfiguration() async throws {
+        let (root, script) = try recoveryFixture()
+        let first = ShaderRequestConfiguration(repository: root.path, model: "saved-model", enabled: false)
+        try JSONEncoder().encode(first).write(to: root.appendingPathComponent("preferences.json"))
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script)
+        await service.suspend()
+        let selected = try await service.selectRepository(root.appendingPathComponent("B"))
+        try await service.initialize(configuration: first)
+        let current = await service.configurationValue(); XCTAssertEqual(current, selected)
+        let snapshot = await service.setupSnapshot(); XCTAssertEqual(snapshot.configuration, selected)
+        XCTAssertEqual(try JSONDecoder().decode(ShaderRequestConfiguration.self, from: Data(contentsOf: root.appendingPathComponent("preferences.json"))), selected)
+    }
+
+    func testLivePreferencesRepairPreservesAcceptedSetupAndCleanupFailure() async throws {
+        let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script)
+        let request = ShaderRequest(prompt: "Preserve live facts", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        let job = root.appendingPathComponent(request.id.uuidString)
+        try Data().write(to: job.appendingPathComponent("fail-cleanup"))
+        try await service.revoke("TV"); await service.resume()
+        // A queued revocation needs no discard; seed retained cleanup explicitly.
+        await service.suspend()
+        var rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("journal.json"))) as? [[String: Any]])
+        rows[0]["cleanupPending"] = true; rows[0]["cleanupFailure"] = "Independent ordinary cleanup failure"
+        try JSONSerialization.data(withJSONObject: rows).write(to: root.appendingPathComponent("journal.json"))
+        let live = try await recoveryService(root, script: script)
+        await live.resume()
+        try await waitFor { await live.recoveryStatuses().contains { $0.kind == .cleanup && $0.message.contains("Fixture cleanup unavailable") && !$0.isRunning } }
+        await live.suspend()
+        let accepted = await live.configurationValue(), preferences = root.appendingPathComponent("preferences.json")
+        try Data("{".utf8).write(to: preferences)
+        try await live.initialize(configuration: .init())
+        let stillAccepted = await live.configurationValue(); XCTAssertEqual(stillAccepted, accepted)
+        try JSONEncoder().encode(accepted).write(to: preferences)
+        let beforeLoads = await live.acceptedMetadataLoadCount
+        try await live.retryReconciliation()
+        let afterLoads = await live.acceptedMetadataLoadCount, statuses = await live.recoveryStatuses()
+        XCTAssertEqual(beforeLoads, afterLoads)
+        XCTAssertTrue(statuses.contains { $0.kind == .cleanup && $0.message.contains("Fixture cleanup unavailable") })
+        let after = await live.configurationValue(); XCTAssertEqual(after, accepted)
+    }
+
+    func testLegacyDefaultsArePreferencesOnlyAndSavedPreferencesWinRecovery() async throws {
+        let (root, script) = try recoveryFixture()
+        let saved = ShaderRequestConfiguration(repository: root.path, model: "authoritative", enabled: true)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(saved)) as? [String: Any])
+        object.removeValue(forKey: "shaderTool"); object.removeValue(forKey: "reasoning")
+        let legacy = try JSONSerialization.data(withJSONObject: object)
+        XCTAssertThrowsError(try JSONDecoder().decode(ShaderRequestConfiguration.self, from: legacy))
+        XCTAssertEqual(try ShaderRequestConfiguration.decodePreferences(legacy), saved)
+        let marker = root.appendingPathComponent("active.json"); try Data("{".utf8).write(to: marker)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script)
+        await service.suspend(); try await service.initialize(configuration: .init(repository: "/unaccepted", model: "proposal"))
+        try legacy.write(to: root.appendingPathComponent("preferences.json")); try FileManager.default.removeItem(at: marker)
+        try await service.retryReconciliation()
+        let restored = await service.configurationValue(); XCTAssertEqual(restored, saved)
     }
 }
 #endif
