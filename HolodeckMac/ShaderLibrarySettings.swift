@@ -76,7 +76,8 @@ final class MacLibraryModel {
         #endif
         let server = server
         let requestService = requests.service
-        Task { await server.setRequestService(requestService) }
+        // The trusted approvals coordinator is registered in startup before any
+        // publication or request scheduling can enter the checkout.
         requests.onPublication = { [weak self] status in
             guard let self, self.requests.configuration.enabled else { return }
             self.ready = true; self.previewWarnings = status.warnings
@@ -116,6 +117,7 @@ final class MacLibraryModel {
         localReloading = true
         Task {
             do {
+                await server.setRequestService(requestService)
                 try await requests.initialized()
                 if !requests.configuration.repository.isEmpty {
                     folder = URL(fileURLWithPath: requests.configuration.repository)

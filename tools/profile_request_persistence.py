@@ -20,9 +20,21 @@ nonisolated final class BaselineHashCounter: @unchecked Sendable {
  static func reset() { lock.withLock { value = 0 } }
  static func hash(_ bytes: Data) -> String { lock.withLock { value += 1 }; return CatalogHash.sha256(bytes) }
 }
+nonisolated final class BaselineTicketCounter: @unchecked Sendable {
+ static let lock = NSLock(); nonisolated(unsafe) private static var value = 0
+ static var count: Int { lock.withLock { value } }
+ static func increment() { lock.withLock { value += 1 } }
+}
 actor LatencyCounter {
  var maximum: Double = 0
  func record(_ seconds: Double) { maximum = max(maximum, seconds) }
+}
+func retired(_ root: URL, request: UUID) -> Bool {
+ guard !FileManager.default.fileExists(atPath:root.appendingPathComponent("active.json").path),
+       let bytes=try? Data(contentsOf:root.appendingPathComponent("journal.json")),
+       let rows=try? JSONSerialization.jsonObject(with:bytes) as? [[String:Any]],
+       let row=rows.first(where:{($0["status"] as? [String:Any])?["id"] as? String == request.uuidString}) else {return false}
+ return row["dispatch"] == nil
 }
 func responsiveness(_ read: @escaping @Sendable () async -> Void, counter: LatencyCounter) -> Task<Void, Never> {
  Task {
@@ -58,17 +70,17 @@ final class Counter: @unchecked Sendable {
     """.write(to:script,atomically:true,encoding:.utf8)
     let config=ShaderRequestConfiguration(repository:root.path,python:python,enabled:true)
     let request=ShaderRequest(prompt:"Persistence fixture",context:context),job=root.appendingPathComponent(request.id.uuidString)
-    let began:TimeInterval, cpu:clock_t, replacements:Int, encodings:Int, reads:Int, hashes:Int, response:Double
+    let began:TimeInterval, cpu:clock_t, replacements:Int, encodings:Int, reads:Int, hashes:Int, tickets:Int, response:Double
     if baseline {
      BaselineHashCounter.reset()
      let service=BaselineShaderRequestService(catalog:DirectoryCatalog(directory:root.appendingPathComponent("catalog")),directory:root,workerScript:script,recoveryWriter:{try counter.write($0,$1)})
      await service.suspend();try await service.start(configuration:config)
      let latency = LatencyCounter()
      let responsivenessTask = responsiveness({ _ = await service.configurationValue() }, counter: latency)
-     let before=await service.persistenceStatistics();began=ProcessInfo.processInfo.systemUptime;cpu=clock()
+     let before=await service.persistenceStatistics();let ticketStart=BaselineTicketCounter.count;began=ProcessInfo.processInfo.systemUptime;cpu=clock()
      _=try await service.control(operation:"requestSubmit",payload:.init(request:request),deviceID:"fixture")
      await service.resume()
-     while (try? RequestWorkerOperation.read(in:job)?.phase) != .complete || fm.fileExists(atPath:root.appendingPathComponent("active.json").path) {
+     while (try? RequestWorkerOperation.read(in:job)?.phase) != .complete || !retired(root,request:request.id) {
       guard ProcessInfo.processInfo.systemUptime-began<30 else {await service.suspend();throw CocoaError(.userCancelled)}
       try await Task.sleep(for:.milliseconds(2))
      }
@@ -76,6 +88,7 @@ final class Counter: @unchecked Sendable {
      replacements=["journal.json","recovery.json","detached-checkouts.json"].reduce(0){$0+(after[$1,default:0]-before[$1,default:0])}
      encodings=after["metadataEncodings",default:0]-before["metadataEncodings",default:0]
      reads=after["reads",default:0]-before["reads",default:0];hashes=after["hashes",default:0]-before["hashes",default:0]
+     tickets=BaselineTicketCounter.count-ticketStart
      responsivenessTask.cancel();await responsivenessTask.value;response=await latency.maximum;await service.suspend()
     } else {
      let service=ShaderRequestService(catalog:DirectoryCatalog(directory:root.appendingPathComponent("catalog")),directory:root,workerScript:script,recoveryWriter:{try counter.write($0,$1)},beforePersistenceReplacement:{_ in ProfileDelay.pause()})
@@ -85,7 +98,7 @@ final class Counter: @unchecked Sendable {
      let before=await service.persistenceStatistics();began=ProcessInfo.processInfo.systemUptime;cpu=clock()
      _=try await service.control(operation:"requestSubmit",payload:.init(request:request),deviceID:"fixture")
      await service.resume()
-     while (try? RequestWorkerOperation.read(in:job)?.phase) != .complete || fm.fileExists(atPath:root.appendingPathComponent("active.json").path) {
+     while (try? RequestWorkerOperation.read(in:job)?.phase) != .complete || !retired(root,request:request.id) {
       guard ProcessInfo.processInfo.systemUptime-began<30 else {await service.suspend();throw CocoaError(.userCancelled)}
       try await Task.sleep(for:.milliseconds(2))
      }
@@ -93,10 +106,11 @@ final class Counter: @unchecked Sendable {
      replacements=["journal.json","recovery.json","detached-checkouts.json"].reduce(0){$0+(after[$1,default:0]-before[$1,default:0])}
      encodings=after["metadataEncodings",default:0]-before["metadataEncodings",default:0]
      reads=after["reads",default:0]-before["reads",default:0];hashes=after["hashes",default:0]-before["hashes",default:0]
+     tickets=after["recordTickets",default:0]-before["recordTickets",default:0]
      responsivenessTask.cancel();await responsivenessTask.value;response=await latency.maximum;await service.suspend()
     }
     let elapsed=ProcessInfo.processInfo.systemUptime-began,used=Double(clock()-cpu)/Double(CLOCKS_PER_SEC)
-    results.append(["baseline":baseline,"iteration":iteration,"milliseconds":elapsed*1000,"cpu_seconds":used,"metadata_replacements":replacements,"metadata_fsyncs":replacements*2,"metadata_encodings":encodings,"persistence_reads":reads,"persistence_hashes":hashes,"maximum_actor_reply_ms":response*1000])
+    results.append(["baseline":baseline,"iteration":iteration,"milliseconds":elapsed*1000,"cpu_seconds":used,"metadata_replacements":replacements,"metadata_fsyncs":replacements*2,"metadata_encodings":encodings,"persistence_reads":reads,"persistence_hashes":hashes,"record_tickets":tickets,"maximum_actor_reply_ms":response*1000])
     try fm.removeItem(at:root)
    }
   }
@@ -123,6 +137,7 @@ def main():
     original = subprocess.check_output(['git', 'show', baseline_sha + ':HolodeckCore/Sources/HolodeckCore/ShaderRequestService.swift'], cwd=ROOT, text=True)
     actor = original[original.index('public actor ShaderRequestService {'):]
     actor = actor.replace('ShaderRequestService', 'BaselineShaderRequestService').replace('RequestPersistence', 'BaselineRequestPersistence')
+    actor = actor.replace('let receipt = RecordReceipt()', 'BaselineTicketCounter.increment(); let receipt = RecordReceipt()')
     persistence = subprocess.check_output(['git', 'show', baseline_sha + ':HolodeckCore/Sources/HolodeckCore/RequestPersistence.swift'], cwd=ROOT, text=True).replace('RequestPersistence', 'BaselineRequestPersistence')
     # Instrument the reviewed writer without changing its read/write decisions.
     if 'private let metrics' not in persistence:

@@ -25,6 +25,8 @@ final class MacRequestsModel {
     @ObservationIgnored private var selectionIsProposal = false
     @ObservationIgnored private var selectionID: UUID?
     @ObservationIgnored private var didInitialize = false
+    @ObservationIgnored private var setupRevision: UInt64 = 0
+    @ObservationIgnored private var acceptedSetup: ShaderRequestConfiguration?
     @ObservationIgnored private var publicationSequence: UInt64?
     @ObservationIgnored private var initialization: Task<ShaderRequestConfiguration, Error>?
 
@@ -43,7 +45,9 @@ final class MacRequestsModel {
         directory = defaultDirectory
         #endif
         service = ShaderRequestService(catalog: catalog, directory: directory)
-        configuration = ((try? Data(contentsOf: directory.appendingPathComponent("preferences.json"))) ?? defaults?.data(forKey: "holodeck.requestConfiguration")).flatMap { try? JSONDecoder().decode(ShaderRequestConfiguration.self, from: $0) } ?? .init()
+        let saved = (try? Data(contentsOf: directory.appendingPathComponent("preferences.json"))).flatMap { try? ShaderRequestConfiguration.decodePreferences($0) }
+        let fallback = defaults?.data(forKey: "holodeck.requestConfiguration").flatMap { try? ShaderRequestConfiguration.decodePreferences($0) }
+        configuration = saved ?? fallback ?? .init()
         configuration.shaderTool = Bundle.main.resourceURL?.appendingPathComponent("Tools/holodeck-shader-tool").path ?? ""
         #if DEBUG
         if namespace != nil, fixture.hasExplicitStorageSuite, let journal = ProcessInfo.processInfo.environment["HOLODECK_UI_TEST_REQUEST_JOURNAL"],
@@ -76,6 +80,7 @@ final class MacRequestsModel {
                 self.pendingCleanup = await service.hasPendingCleanup()
                 self.recoveries = await service.recoveryStatuses()
                 self.canDisableRequests = await service.canDisableRequests()
+                await self.refreshAcceptedSetup()
             }
         }
         publicationObservation = Task { [weak self] in
@@ -93,10 +98,19 @@ final class MacRequestsModel {
         }
     }
     isolated deinit { observation?.cancel(); publicationObservation?.cancel() }
+    private func refreshAcceptedSetup() async {
+        let snapshot = await service.setupSnapshot()
+        guard snapshot.revision > setupRevision else { return }
+        setupRevision = snapshot.revision
+        guard snapshot.phase != .blockedInitialization, let accepted = snapshot.configuration else { return }
+        if acceptedSetup != accepted { configuration = accepted; acceptedSetup = accepted }
+        if snapshot.phase == .requiresVerification { message = "Settings restored. Verify setup to enable requests." }
+        // A recovery-status update must never save editable inputs as accepted settings.
+        if !snapshot.blocked { defaults?.set(try? JSONEncoder().encode(accepted), forKey: "holodeck.requestConfiguration") }
+    }
     private func initializeAcceptedConfiguration() async throws {
-        let accepted = try await initialization?.value
-        // No await between the one-time decision and installing this shared result.
-        if !didInitialize, let accepted { acceptSelection(accepted); didInitialize = true }
+        _ = try await initialization?.value
+        if !didInitialize { await refreshAcceptedSetup(); didInitialize = true }
     }
     func initialized() async throws {
         try await initializeAcceptedConfiguration()
@@ -217,7 +231,7 @@ final class MacRequestsModel {
         checking = true; error = nil
         Task {
             defer { checking = false }
-            do { try await service.retryReconciliation() }
+            do { try await service.retryReconciliation(); await refreshAcceptedSetup() }
             catch { self.error = error.localizedDescription }
         }
     }

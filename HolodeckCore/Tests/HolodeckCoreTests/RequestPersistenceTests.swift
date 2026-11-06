@@ -576,3 +576,54 @@ private final class ValidationOriginProbe: @unchecked Sendable {
     func capture(_ error: Error) { lock.withLock { value = error as? RequestPersistence.ValidationError } }
 }
 #endif
+
+#if os(macOS)
+extension RequestPersistenceTests {
+    func testQueuedWriteRechecksMetadataAuthorityBeforeMutation() async throws {
+        let root = try directory(), file = root.appendingPathComponent("journal.json"), gate = RequestPersistence.MetadataAdmission()
+        let retained = Data("accepted baseline".utf8); try retained.write(to: file)
+        let writer = RequestPersistence(directory: root, metadataAdmission: gate)
+        gate.inspectedStorage(); gate.establishBaseline(blocked: false)
+        let permit = try gate.permit(recovery: nil), entered = expectation(description: "encoding began"), release = DispatchSemaphore(value: 0), transaction = UUID()
+        try await writer.begin(transaction, operation: "queued proposal")
+        let task = Task {
+            try await writer.commit(.init(revision: 1, files: [.init(url: file, encode: {
+                entered.fulfill(); guard release.wait(timeout: .now() + 8) == .success else { throw POSIXError(.ETIMEDOUT) }
+                return Data("unaccepted".utf8)
+            })], operation: "queued metadata proposal", metadataPermit: permit), transaction: transaction)
+        }
+        await fulfillment(of: [entered], timeout: 3)
+        gate.block(); release.signal()
+        do { _ = try await task.value; XCTFail("Invalidated write mutated metadata") } catch { XCTAssertTrue(error is RequestPersistence.MetadataAdmission.Unavailable) }
+        try await writer.reject(transaction)
+        XCTAssertEqual(try Data(contentsOf: file), retained)
+        let counts = await writer.statistics(); XCTAssertEqual(counts["journal.json", default: 0], 0)
+        let fault = await writer.fault(); XCTAssertNil(fault)
+        let attempt = UUID(); gate.beginRecovery(attempt)
+        let recoveryPermit = try gate.permit(recovery: attempt)
+        try await writer.commit(.init(revision: 2, files: [.init(url: file, bytes: retained)], operation: "explicit recovery", metadataPermit: recoveryPermit))
+        gate.endRecovery(attempt, accepted: true)
+        XCTAssertThrowsError(try gate.check(recoveryPermit))
+        _ = try gate.permit(recovery: nil)
+    }
+
+    func testRecoveryCandidateImageIsSharedAcrossAllBookkeeping() async throws {
+        let root = try directory(), writer = RequestPersistence(directory: root, beforeReplacement: { if $0.lastPathComponent == "fail.json" { throw POSIXError(.EIO) } })
+        do { try await writer.write(Data("attempt".utf8), to: root.appendingPathComponent("fail.json")); XCTFail("Expected injected fault") } catch {}
+        let token = try await writer.restoreForRecovery(), before = await writer.statistics()
+        try await writer.commit(.init(revision: 1, files: [.init(url: root.appendingPathComponent("recovery.json"), bytes: Data("retained recovery".utf8))]), recovery: token)
+        let after = await writer.statistics()
+        XCTAssertEqual(after["hashes", default: 0] - before["hashes", default: 0], 1)
+    }
+
+    func testFaultReinspectionPreservesNewerInMemoryRollbackImages() async throws {
+        let root = try directory(), writer = RequestPersistence(directory: root, beforeReplacement: { if $0.lastPathComponent == "fail.json" { throw POSIXError(.EIO) } })
+        do { try await writer.write(Data("attempt".utf8), to: root.appendingPathComponent("fail.json")) } catch {}
+        let current = await writer.fault(), inMemory = try XCTUnwrap(current)
+        let old = RequestPersistence.Fault(id: UUID(), generation: 0, operation: "stale", paths: [], primary: "older disk fault")
+        try JSONEncoder().encode(old).write(to: root.appendingPathComponent("storage-recovery.json"))
+        let inspected = try await writer.loadFault(); XCTAssertEqual(inspected?.id, inMemory.id); XCTAssertEqual(inspected?.generation, inMemory.generation)
+        _ = try await writer.restoreForRecovery()
+    }
+}
+#endif
