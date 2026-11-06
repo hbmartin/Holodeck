@@ -5207,7 +5207,7 @@ extension ShaderRequestTests {
         let afterFailure = await service.recoveryStatuses(); XCTAssertFalse(afterFailure.contains { $0.message.contains("revocation") })
         let request = ShaderRequest(prompt: "Still authorized", context: try context())
         _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
-        do { try await server.revoke(String(repeating: "x", count: 65536)); XCTFail("Oversized intent accepted") } catch { XCTAssertTrue(error.localizedDescription.contains("64 KiB")) }
+        try await server.revoke(String(repeating: "x", count: 65536)) // Already unapproved: no intent is created.
         XCTAssertEqual(trusted.read(), bytes)
     }
 
@@ -5282,6 +5282,99 @@ extension ShaderRequestTests {
         XCTAssertFalse(RequestWorkerOwnershipError(cause: " \n").localizedDescription.contains("Original error:"))
         XCTAssertFalse(RequestWorkerTeardownError(cause: "").localizedDescription.contains("Original error:"))
         XCTAssertTrue(RequestWorkerEvidenceError(cause: "").localizedDescription.contains("Process ownership evidence"))
+    }
+}
+#endif
+
+#if os(macOS)
+extension ShaderRequestTests {
+    func testOverlappingTrustedRevokesPreserveBothDevicesAndCoalesceDoubleClick() async throws {
+        for duplicate in [false, true] {
+            let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script), gate = RecoveryGate()
+            let trusted = TrustedApprovalFixture(try JSONEncoder().encode([ApprovedTV(id: "A", name: "A", tokenHash: "old-A"), ApprovedTV(id: "B", name: "B", tokenHash: "old-B")]))
+            let server = LocalCatalogServer(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), testingNamespace: "overlap", readApprovals: { trusted.read() }, writeApprovals: { try trusted.write($0) }, beforeTrustedCommit: { if $0.deviceID == "A" { try await gate.wait() } })
+            await server.setRequestService(service)
+            let first = Task { try await server.revoke("A") }
+            try await waitFor { await gate.hasEntered }
+            let second = Task { try await server.revoke(duplicate ? "A" : "B") }
+            try await waitFor { await server.trustedMutationWaiterCount == 1 }
+            let waiting = await server.currentState; XCTAssertEqual(waiting.approved.count, 2)
+            await gate.release(); try await first.value; try await second.value
+            let envelope = try TrustedTVApprovals.decode(XCTUnwrap(trusted.read()))
+            XCTAssertEqual(envelope.approvals.map(\.id), duplicate ? ["B"] : [])
+            XCTAssertTrue(envelope.revocations.isEmpty)
+            try await service.retryReconciliation()
+            let status = await service.recoveryStatuses(); XCTAssertTrue(status.isEmpty)
+        }
+    }
+    func testTrustedMutationCancellationBeforeCommitAndWhileQueuedPreservesExactApprovals() async throws {
+        let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script), gate = RecoveryGate()
+        let bytes = try JSONEncoder().encode([ApprovedTV(id: "A", name: "A", tokenHash: "A"), ApprovedTV(id: "B", name: "B", tokenHash: "B")])
+        let trusted = TrustedApprovalFixture(bytes)
+        let server = LocalCatalogServer(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), testingNamespace: "cancel", readApprovals: { trusted.read() }, writeApprovals: { try trusted.write($0) }, beforeTrustedCommit: { _ in try await gate.wait() })
+        await server.setRequestService(service)
+        let first = Task { try await server.revoke("A") }; try await waitFor { await gate.hasEntered }
+        let queued = Task { try await server.revoke("B") }; try await waitFor { await server.trustedMutationWaiterCount == 1 }
+        queued.cancel()
+        do { try await queued.value; XCTFail("Queued cancellation committed") } catch is CancellationError {}
+        first.cancel()
+        do { try await first.value; XCTFail("Prepared cancellation committed") } catch is CancellationError {}
+        XCTAssertEqual(trusted.read(), bytes)
+        let statuses = await service.recoveryStatuses(); XCTAssertTrue(statuses.isEmpty)
+    }
+    func testNewRevocationJoinsReplayAndCancellationCannotAbandonTrustedCommit() async throws {
+        let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script), gate = RecoveryGate()
+        let trusted = TrustedApprovalFixture(try JSONEncoder().encode([ApprovedTV(id: "A", name: "A", tokenHash: "A"), ApprovedTV(id: "B", name: "B", tokenHash: "B")]))
+        let server = LocalCatalogServer(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), testingNamespace: "join", readApprovals: { trusted.read() }, writeApprovals: { try trusted.write($0) }, beforeRevocationReplay: { if $0.deviceID == "A" { try await gate.wait() } })
+        await server.setRequestService(service)
+        let first = Task { try await server.revoke("A") }; try await waitFor { await gate.hasEntered }
+        let second = Task { try await server.revoke("B") }
+        try await waitFor { (trusted.read().flatMap { try? TrustedTVApprovals.decode($0) }?.revocations.count) == 2 }
+        first.cancel(); await gate.release()
+        try await first.value; try await second.value
+        let envelope = try TrustedTVApprovals.decode(XCTUnwrap(trusted.read())); XCTAssertTrue(envelope.approvals.isEmpty); XCTAssertTrue(envelope.revocations.isEmpty)
+        let statuses = await service.recoveryStatuses(); XCTAssertTrue(statuses.isEmpty)
+    }
+    func testReplayFailureBelongsToItsIntentAndDoesNotSkipNewDevices() async throws {
+        let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script), gate = RecoveryGate()
+        let trusted = TrustedApprovalFixture(try JSONEncoder().encode([ApprovedTV(id: "A", name: "A", tokenHash: "A"), ApprovedTV(id: "B", name: "B", tokenHash: "B")]))
+        let server = LocalCatalogServer(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), testingNamespace: "failure", readApprovals: { trusted.read() }, writeApprovals: { try trusted.write($0) }, beforeRevocationReplay: {
+            if $0.deviceID == "A" { try await gate.wait(); throw ShaderRequestError.unavailable("A replay failed") }
+        })
+        await server.setRequestService(service)
+        let a = Task { try await server.revoke("A") }; try await waitFor { await gate.hasEntered }
+        let b = Task { try await server.revoke("B") }
+        try await waitFor { (trusted.read().flatMap { try? TrustedTVApprovals.decode($0) }?.revocations.count) == 2 }
+        await gate.release()
+        do { try await a.value; XCTFail("Failed A appeared acknowledged") } catch { XCTAssertTrue(error.localizedDescription.contains("A replay failed")) }
+        try await b.value
+        let envelope = try TrustedTVApprovals.decode(XCTUnwrap(trusted.read())); XCTAssertEqual(envelope.revocations.map(\.deviceID), ["A"])
+    }
+    func testTrustedSnapshotRetiresProvisionalReservationsButRetainsDurableUncertainty() async throws {
+        let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script), owner = UUID()
+        await service.registerRevocationCoordinator(id: owner) {}
+        let first = RequestRevocationIntent(operationID: UUID(), deviceID: "A"), second = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        let revision = TrustedRevocationRevision(coordinator: owner, sequence: 1)
+        try await service.reserveRevocation(first, revision: revision); try await service.reserveRevocation(second, revision: revision)
+        try await service.commitTrustedRevocation(second, revision: revision)
+        try await service.loadTrustedRevocations([second], revision: revision)
+        try await service.acknowledgeTrustedRevocation(second, revision: revision)
+        await service.revocationReplaySucceeded(revision: revision)
+        let cleared = await service.recoveryStatuses(); XCTAssertTrue(cleared.isEmpty)
+        try await service.commitTrustedRevocation(first, revision: revision)
+        do { try await service.loadTrustedRevocations([], revision: revision); XCTFail("Durable uncertainty disappeared") } catch {}
+        do { try await service.acknowledgeTrustedRevocation(first, revision: .init(coordinator: UUID(), sequence: 99)); XCTFail("Foreign coordinator cleared evidence") } catch {}
+        let retained = await service.recoveryStatuses(); XCTAssertFalse(retained.isEmpty)
+    }
+    func testRevocationCapacityFailurePrecedesReservationAndTrustedReplacement() async throws {
+        let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script)
+        let id = String(repeating: "x", count: 65536), bytes = try JSONEncoder().encode([ApprovedTV(id: id, name: "Large ID", tokenHash: "token")])
+        let trusted = TrustedApprovalFixture(bytes)
+        let server = LocalCatalogServer(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), testingNamespace: "capacity", readApprovals: { trusted.read() }, writeApprovals: { try trusted.write($0) })
+        await server.setRequestService(service)
+        do { try await server.revoke(id); XCTFail("Capacity failure accepted") } catch { XCTAssertTrue(error.localizedDescription.contains("64 KiB")) }
+        XCTAssertEqual(trusted.read(), bytes)
+        let statuses = await service.recoveryStatuses(); XCTAssertTrue(statuses.isEmpty)
     }
 }
 #endif

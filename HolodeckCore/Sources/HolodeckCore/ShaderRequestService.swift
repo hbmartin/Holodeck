@@ -497,44 +497,76 @@ public actor ShaderRequestService {
     private var activeRetryJournals: [String: UUID] = [:]
     private var recoveryID: UUID?
     private var pendingRevocations: [UUID: RequestRevocationIntent] = [:]
+    private var durableRevocations: Set<UUID> = []
+    private var revocationCoordinatorID: UUID?
+    private var revocationRevision: UInt64 = 0
     private var revocationCoordinator: (@Sendable () async throws -> Void)?
     private var revocationInspectionPending = false
     private var revocationFailure: String?
+    private var revocationFailures: [UUID: String] = [:]
     private var revocationBlocker: String? {
         if let revocationFailure { return "TV revocation recovery required: " + revocationFailure }
+        if let failure = revocationFailures.sorted(by: { $0.key.uuidString < $1.key.uuidString }).first?.value { return "TV revocation recovery required: " + failure }
         return revocationInspectionPending || !pendingRevocations.isEmpty ? "TV access was revoked; request cancellation must be durably replayed before accepting or starting new work. Choose Retry Recovery." : nil
     }
-    func registerRevocationCoordinator(_ coordinator: @escaping @Sendable () async throws -> Void) {
+    func registerRevocationCoordinator(id: UUID, _ coordinator: @escaping @Sendable () async throws -> Void) {
+        revocationCoordinatorID = id; revocationRevision = 0
         revocationCoordinator = coordinator; revocationInspectionPending = true; emitUpdates()
     }
-    func reserveRevocation(_ intent: RequestRevocationIntent) { pendingRevocations[intent.operationID] = intent; emitUpdates() }
-    func cancelRevocationReservation(_ intent: RequestRevocationIntent) {
-        if pendingRevocations[intent.operationID] == intent { pendingRevocations[intent.operationID] = nil }; emitUpdates(); kick()
+    private func acceptRevocationRevision(_ revision: TrustedRevocationRevision) throws {
+        guard revision.coordinator == revocationCoordinatorID, revision.sequence >= revocationRevision else {
+            throw ShaderRequestError.unavailable("The trusted TV revocation coordinator changed; retry recovery.")
+        }
+        revocationRevision = revision.sequence
     }
-    func commitTrustedRevocation(_ intent: RequestRevocationIntent) {
-        pendingRevocations[intent.operationID] = intent
+    func reserveRevocation(_ intent: RequestRevocationIntent, revision: TrustedRevocationRevision) throws {
+        try acceptRevocationRevision(revision)
+        pendingRevocations[intent.operationID] = intent; emitUpdates()
+    }
+    func cancelRevocationReservation(_ intent: RequestRevocationIntent, revision: TrustedRevocationRevision) {
+        guard (try? acceptRevocationRevision(revision)) != nil else { return }
+        if !durableRevocations.contains(intent.operationID), pendingRevocations[intent.operationID] == intent { pendingRevocations[intent.operationID] = nil }
+        emitUpdates(); kick()
+    }
+    func commitTrustedRevocation(_ intent: RequestRevocationIntent, revision: TrustedRevocationRevision) throws {
+        try acceptRevocationRevision(revision)
+        pendingRevocations[intent.operationID] = intent; durableRevocations.insert(intent.operationID)
         if let activeID, records[activeID]?.status.deviceID == intent.deviceID {
             execution?.interrupted = true; activeProcess?.stop()
         }
         emitUpdates()
     }
-    func loadTrustedRevocations(_ intents: [RequestRevocationIntent]) {
-        for intent in intents { commitTrustedRevocation(intent) }
-        revocationInspectionPending = false
+    func loadTrustedRevocations(_ intents: [RequestRevocationIntent], revision: TrustedRevocationRevision) throws {
+        try acceptRevocationRevision(revision)
+        let ids = Set(intents.map(\.operationID))
+        // The coordinator holds its mutation lease: absent provisional reservations
+        // cannot still publish. Missing durable ownership requires explicit recovery.
+        pendingRevocations = pendingRevocations.filter { ids.contains($0.key) || durableRevocations.contains($0.key) }
+        for intent in intents { try commitTrustedRevocation(intent, revision: revision) }
+        if !durableRevocations.isSubset(of: ids) {
+            throw ShaderRequestError.unavailable("Trusted TV storage omitted an unacknowledged durable revocation. Retain the approval evidence and retry recovery.")
+        }
+        revocationInspectionPending = false; revocationFailure = nil; emitUpdates()
     }
-    func applyTrustedRevocation(_ intent: RequestRevocationIntent) async throws {
+    func applyTrustedRevocation(_ intent: RequestRevocationIntent, revision: TrustedRevocationRevision) async throws {
+        try acceptRevocationRevision(revision)
         guard pendingRevocations[intent.operationID] == intent else { throw ShaderRequestError.unavailable("The TV revocation intent changed; retry recovery.") }
         try await revoke(intent.deviceID)
     }
-    func acknowledgeTrustedRevocation(_ intent: RequestRevocationIntent) {
+    func acknowledgeTrustedRevocation(_ intent: RequestRevocationIntent, revision: TrustedRevocationRevision) throws {
+        try acceptRevocationRevision(revision)
         if pendingRevocations[intent.operationID] == intent { pendingRevocations[intent.operationID] = nil }
-        emitUpdates()
+        durableRevocations.remove(intent.operationID); revocationFailures[intent.operationID] = nil
+        emitUpdates(); kick()
     }
-    func revocationReplayFailed(_ error: Error) {
-        revocationFailure = RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 8192)
-        failPendingPublicationForRecovery(revocationFailure!); emitUpdates()
+    func revocationReplayFailed(_ error: Error, intent: RequestRevocationIntent? = nil, revision: TrustedRevocationRevision? = nil) {
+        if let revision, (try? acceptRevocationRevision(revision)) == nil { return }
+        let detail = RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 8192)
+        if let intent { revocationFailures[intent.operationID] = detail } else { revocationFailure = detail }
+        if let revocationBlocker { failPendingPublicationForRecovery(revocationBlocker) }; emitUpdates()
     }
-    func revocationReplaySucceeded() {
+    func revocationReplaySucceeded(revision: TrustedRevocationRevision) {
+        guard (try? acceptRevocationRevision(revision)) != nil else { return }
         revocationFailure = nil; revocationInspectionPending = false; emitUpdates(); kick()
     }
     private var setupMessage = "Enable shader requests in Mac Settings."
