@@ -251,6 +251,29 @@ final class HolodeckMacUITests: XCTestCase {
             object: app.staticTexts["Unable to Load Scenes"])], timeout: 10), .completed)
     }
 
+    func testCorruptStartupPreferencesKeepCachedServingAndOfferRecovery() throws {
+        let f = try managedRecoveryFixture(), app = f.app
+        try FileManager.default.removeItem(at: f.marker)
+        let preferences = f.marker.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("preferences.json")
+        var configuration = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: preferences)) as? [String: Any])
+        configuration["enabled"] = false
+        let accepted = try JSONSerialization.data(withJSONObject: configuration); try accepted.write(to: preferences)
+        app.launchEnvironment["HOLODECK_UI_TEST_SHADER_BOOKMARK"] = try f.authoring.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil).base64EncodedString()
+        app.launch(); app.activate(); waitForTitle(f.name, in: app); app.terminate()
+        let corrupt = Data("{".utf8); try corrupt.write(to: preferences)
+        app.launch(); app.activate(); waitForTitle(f.name, in: app)
+        element("shader-library-settings", in: app).click(); waitForLibraryIdle(in: app)
+        XCTAssertTrue(app.staticTexts["Storage Recovery"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.buttons["Open Recovery Journal"].firstMatch.exists)
+        let serving = element("shader-serving-status", in: app)
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", "Serving shaders", "Serving shaders"), object: serving)], timeout: 15), .completed)
+        XCTAssertEqual(try Data(contentsOf: preferences), corrupt)
+        try accepted.write(to: preferences)
+        let retry = element("retry-checkout-cleanup", in: app)
+        XCTAssertTrue(retry.waitForExistence(timeout: 10)); retry.click()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.staticTexts["Storage Recovery"])], timeout: 15), .completed)
+    }
+
     func testStorageRecoveryOffersRetryWithoutCheckoutRecoveryEntry() throws {
         let f = try managedRecoveryFixture(), app = f.app
         try FileManager.default.removeItem(at: f.marker)

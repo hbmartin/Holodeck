@@ -4337,11 +4337,11 @@ extension ShaderRequestTests {
     }
     func testBackgroundValidationRequiresExplicitRecoveryAndIgnoresDelayedCallback() async throws {
         let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script)
-        await service.progressPersistenceFailed(RequestPersistence.ValidationError(message: "capacity"), revision: 900)
+        await service.progressPersistenceFailed(RequestPersistence.ValidationError(message: "capacity", revision: 900))
         var statuses = await service.recoveryStatuses(); XCTAssertTrue(statuses.contains { $0.kind == .persistence && $0.message.contains("validation") })
         do { try await service.ensurePublication(force: true); XCTFail("Rebuild waited despite validation blocker") } catch {}
         try await service.retryReconciliation()
-        await service.progressPersistenceFailed(RequestPersistence.ValidationError(message: "delayed"), revision: 901)
+        await service.progressPersistenceFailed(RequestPersistence.ValidationError(message: "delayed", revision: 901))
         statuses = await service.recoveryStatuses(); XCTAssertFalse(statuses.contains { $0.kind == .persistence })
         XCTAssertFalse(RequestProcessIdentity.evidenceExists(root.appendingPathComponent("metadata-validation.json")))
     }
@@ -4565,5 +4565,409 @@ private final class BindingMetadataFault: @unchecked Sendable {
         }
         if fail { throw POSIXError(.ENOSPC) }
     }
+}
+#endif
+
+#if os(macOS)
+extension ShaderRequestTests {
+    func testBindingCommitInterruptionPreventsWorkerLaunch() async throws {
+        for detach in [false, true] {
+            let (root, script) = try recoveryFixture(), gate = WorkerBindingCommitGate()
+            try """
+            import sys,time
+            from pathlib import Path
+            (Path(sys.argv[3])/'worker-started').touch()
+            while True:time.sleep(.01)
+            """.write(to: script, atomically: true, encoding: .utf8)
+            let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root,
+                workerScript: script, beforePersistenceReplacement: { try gate.before($0) })
+            await service.suspend(); try await service.start(configuration: .init(repository: root.path, enabled: true))
+            try await service.retryReconciliation()
+            let request = ShaderRequest(prompt: "Interrupt the binding commit", context: try context())
+            _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+            let job = root.appendingPathComponent(request.id.uuidString), patch = job.appendingPathComponent("owned-patch")
+            let bytes = Data([0,255,13,10]); try bytes.write(to: patch)
+            gate.arm(); defer { gate.release(); gate.release() }
+            await service.resume(); try await waitFor { gate.phase == 2 }
+            let interruption = Task {
+                if detach { try await service.detachCheckout(.request(request.id)) }
+                else { await service.suspend() }
+            }
+            if detach { try await waitFor { !(await service.configurationValue()).enabled } }
+            else { try await waitFor { await service.allJobs().first?.stage == .repairing } }
+            gate.release(); try await waitFor { gate.phase == 3 }
+            // Keep the interruption's own persistence blocked so its later stop
+            // cannot conceal a launch after execution authorization was revoked.
+            let marker = job.appendingPathComponent("worker-started")
+            try await waitFor {
+                let stage = await service.allJobs().first?.stage
+                return RequestProcessIdentity.evidenceExists(marker) || stage == .queued
+            }
+            XCTAssertFalse(RequestProcessIdentity.evidenceExists(marker), "Worker launched after \(detach ? "Detach" : "Suspend")")
+            let stage = await service.allJobs().first?.stage; XCTAssertEqual(stage, .queued)
+            gate.release(); try await interruption.value
+            try await waitFor { !RequestProcessIdentity.evidenceExists(root.appendingPathComponent("active.json")) }
+            XCTAssertEqual(try Data(contentsOf: patch), bytes)
+            XCTAssertFalse(RequestProcessIdentity.evidenceExists(marker))
+        }
+    }
+
+    func testRestartLaunchEvidenceMatchesCurrentDispatchOperation() async throws {
+        for evidence in ["missing-id", "other-id", "matching-id", "process-marker"] {
+            let (root, script) = try recoveryFixture(), config = ShaderRequestConfiguration(repository: root.path, enabled: true)
+            let seed = try await recoveryService(root, script: script)
+            let request = ShaderRequest(prompt: "Dispatch after an earlier completed run", context: try context())
+            _ = try await seed.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+            let job = root.appendingPathComponent(request.id.uuidString)
+            var old = try RequestWorkerOperation.begin(mode: "run", configuration: config, in: job)
+            old.phase = .complete; try old.save(in: job)
+            let file = root.appendingPathComponent("journal.json")
+            var rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [[String: Any]])
+            var status = try XCTUnwrap(rows[0]["status"] as? [String: Any]); status["stage"] = "implementing"; rows[0]["status"] = status
+            let execution = UUID().uuidString
+            var dispatch: [String: Any] = ["executionID": execution, "priorStage": "queued", "launched": false, "retirementPending": false]
+            if evidence == "other-id" { dispatch["workerOperationID"] = UUID().uuidString }
+            if evidence == "matching-id" { dispatch["workerOperationID"] = old.id.uuidString }
+            rows[0]["executionID"] = execution; rows[0]["dispatch"] = dispatch
+            try JSONSerialization.data(withJSONObject: rows).write(to: file)
+            try JSONEncoder().encode(request.id).write(to: root.appendingPathComponent("active.json"))
+            if evidence == "process-marker" { try Data("[]".utf8).write(to: job.appendingPathComponent("children.json")) }
+            let restarted = try await recoveryService(root, script: script)
+            let stage = await restarted.allJobs().first?.stage
+            let expected: ShaderRequestStatus.Stage = evidence == "matching-id" ? .failed : (evidence == "process-marker" ? .repairing : .queued)
+            XCTAssertEqual(stage, expected, evidence)
+        }
+    }
+
+    func testRetryPrelaunchFailurePreservesEarlierVerifiedLaunch() async throws {
+        let (root, script) = try recoveryFixture(), interpreter = root.appendingPathComponent("python3"), fault = SettlementValidationFault(at: 2)
+        try FileManager.default.createSymbolicLink(at: interpreter, withDestinationURL: URL(fileURLWithPath: "/usr/bin/python3"))
+        try """
+        import json,sys
+        from pathlib import Path
+        (Path(sys.argv[3])/'owned-patch').write_bytes(bytes([0,255,13,10]))
+        Path(\(String(reflecting: interpreter.path))).unlink()
+        print(json.dumps(dict(event='failure',failureKind='supervision',retryable=True,recoveryRequired=False,message='First attempt supervision fault')),flush=True)
+        raise SystemExit(1)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script,
+            waitForWorker: { try await $0.waitForExit(); await fault.afterWait() })
+        await fault.install(service)
+        await service.suspend(); try await service.start(configuration: .init(repository: root.path, python: interpreter.path, enabled: true))
+        let request = ShaderRequest(prompt: "Keep verified launch history across retries", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        await service.resume()
+        try await waitFor { await service.recoveryStatuses().contains { $0.kind == .persistence && !$0.isRunning } }
+        let stage = await service.allJobs().first?.stage; XCTAssertEqual(stage, .repairing)
+        let patch = root.appendingPathComponent(request.id.uuidString).appendingPathComponent("owned-patch")
+        XCTAssertEqual(try Data(contentsOf: patch), Data([0,255,13,10]))
+        await service.suspend()
+    }
+
+    func testFirstPrelaunchFailureDoesNotBecomeVerifiedLaunch() async throws {
+        let (root, script) = try recoveryFixture(), fault = SettlementValidationFault(at: 1)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script,
+            waitForWorker: { try await $0.waitForExit(); await fault.afterWait() })
+        await fault.install(service)
+        await service.suspend(); try await service.start(configuration: .init(repository: root.path, python: root.appendingPathComponent("missing-python").path, enabled: true))
+        let request = ShaderRequest(prompt: "No launch gate was opened", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        await service.resume()
+        try await waitFor { await service.recoveryStatuses().contains { $0.kind == .persistence && !$0.isRunning } }
+        let stage = await service.allJobs().first?.stage; XCTAssertEqual(stage, .queued)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(root.appendingPathComponent(request.id.uuidString).appendingPathComponent("worker-started")))
+        await service.suspend(); try await service.retryReconciliation()
+        let recovered = await service.allJobs().first?.stage; XCTAssertEqual(recovered, .queued)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(root.appendingPathComponent("active.json")))
+    }
+}
+
+private final class WorkerBindingCommitGate: @unchecked Sendable {
+    private let lock = NSLock(), gate = DispatchSemaphore(value: 0)
+    private var armed = false, journalWrites = 0, currentPhase = 0
+    var phase: Int { lock.withLock { currentPhase } }
+    func arm() { lock.withLock { armed = true } }
+    func release() { gate.signal() }
+    func before(_ file: URL) throws {
+        let pause = lock.withLock {
+            guard armed else { return false }
+            if currentPhase == 2 { currentPhase = 3; armed = false; return true }
+            guard file.lastPathComponent == "journal.json" else { return false }
+            journalWrites += 1
+            if journalWrites == 2 { currentPhase = 2; return true }
+            return false
+        }
+        if pause, gate.wait(timeout: .now() + 8) != .success { throw POSIXError(.ETIMEDOUT) }
+    }
+}
+
+private actor SettlementValidationFault {
+    private let target: Int
+    private var count = 0
+    private var service: ShaderRequestService?
+    init(at target: Int) { self.target = target }
+    func install(_ service: ShaderRequestService) { self.service = service }
+    func afterWait() async {
+        count += 1
+        if count == target {
+            let current = service; service = nil
+            await current?.progressPersistenceFailed(RequestPersistence.ValidationError(message: "Metadata unavailable after verified settlement"))
+        }
+    }
+}
+#endif
+
+#if os(macOS)
+extension ShaderRequestTests {
+    func testCleanupMetadataPauseResumesAfterStorageRecovery() async throws {
+        let (root, script) = try recoveryFixture(), gate = RequestPreparationGate()
+        let seed = try await recoveryService(root, script: script)
+        let request = ShaderRequest(prompt: "Resume metadata-paused cleanup", context: try context())
+        _ = try await seed.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        try await seed.cancelQueued(request.id)
+        let file = root.appendingPathComponent("journal.json")
+        var rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [[String:Any]])
+        rows[0]["cleanupPending"] = true
+        try JSONSerialization.data(withJSONObject: rows).write(to: file)
+        let patch = root.appendingPathComponent(request.id.uuidString).appendingPathComponent("owned-patch")
+        let bytes = Data([0,255,13,10]); try bytes.write(to: patch)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("cat2")), directory: root,
+            workerScript: script, prepareCleanup: { await gate.hold() })
+        await service.suspend(); try await service.start(configuration: .init(repository: root.path, enabled: true)); await service.resume()
+        try await waitFor { await gate.entered }
+        await service.progressPersistenceFailed(RequestPersistence.ValidationError(message: "Cleanup metadata pause"))
+        await gate.release()
+        try await waitFor { await service.recoveryStatuses().contains { $0.kind == .persistence && !$0.isRunning } }
+        XCTAssertEqual(try Data(contentsOf: patch), bytes)
+        await service.suspend(); try await service.retryReconciliation()
+        let recovery = await service.recoveryStatuses()
+        XCTAssertFalse(recovery.contains { $0.message.contains("Cleanup metadata pause") })
+        await service.resume()
+        try await waitFor { !(await service.hasPendingCleanup()) }
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(patch))
+        await service.suspend()
+    }
+
+    func testFailedRetrySettlementCannotRetireEarlierAttemptProof() async throws {
+        let (root, script) = try recoveryFixture(), proof = SettlementEvidenceFixture()
+        try """
+        import json,signal,sys,time
+        from pathlib import Path
+        job=Path(sys.argv[3]);counter=job/'count';n=int(counter.read_text())+1 if counter.exists() else 1;counter.write_text(str(n))
+        if n==2:
+            def stop(*args):
+                while not (job/'allow-stop').exists():time.sleep(.005)
+                sys.exit(0)
+            signal.signal(signal.SIGTERM,stop)
+        print(json.dumps(dict(event='failure',failureKind='supervision',retryable=True,recoveryRequired=False,message='Attempt supervision fault')),flush=True)
+        if n==2:
+            while True:time.sleep(.005)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root,
+            workerScript: script, waitForWorker: { try await proof.settle($0, failSecond: true) })
+        await service.suspend(); try await service.start(configuration: .init(repository: root.path, enabled: true))
+        let request = ShaderRequest(prompt: "Do not reuse old settlement proof", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        let release = root.appendingPathComponent(request.id.uuidString).appendingPathComponent("allow-stop")
+        addTeardownBlock { try? Data().write(to: release); let child = await proof.child; try? await child?.waitForExit() }
+        await service.resume()
+        try await waitFor { await service.recoveryStatuses().contains { $0.kind == .reconciliation && !$0.isRunning } }
+        let child = await proof.child; XCTAssertTrue(child?.process.isRunning == true)
+        XCTAssertTrue(RequestProcessIdentity.evidenceExists(root.appendingPathComponent("active.json")))
+        let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("journal.json"))) as? [[String:Any]])
+        XCTAssertNotNil(rows[0]["dispatch"])
+        try Data().write(to: release); try await child?.waitForExit(); await service.suspend()
+    }
+
+    func testUnverifiableRetirementMarkerHasVisibleRecoveryAndCanRetry() async throws {
+        let (root, script) = try recoveryFixture(), proof = SettlementEvidenceFixture(), active = root.appendingPathComponent("active.json")
+        try "import json;print(json.dumps(dict(event='clarification',question='Choose',options=['A','B'])),flush=True)".write(to: script, atomically: true, encoding: .utf8)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root,
+            workerScript: script, waitForWorker: { try await proof.settle($0, replaceMarker: active) })
+        let gitdir = try initializeRecoveryGit(root), checkoutID = UUID().uuidString
+        try checkoutID.write(to: gitdir.appendingPathComponent("holodeck-checkout-id"), atomically: true, encoding: .utf8)
+        var configuration = ShaderRequestConfiguration(repository: root.path, enabled: true); configuration.checkoutID = checkoutID
+        await service.suspend(); try await service.start(configuration: configuration)
+        let request = ShaderRequest(prompt: "Report retirement evidence failure", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        await service.resume()
+        try await waitFor { await service.recoveryStatuses().contains { $0.kind == .reconciliation && $0.message.contains("active marker") && !$0.isRunning } }
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: active.path), "missing-active-target")
+        await service.suspend()
+        try FileManager.default.removeItem(at: active); try JSONEncoder().encode(request.id).write(to: active)
+        try await service.retryReconciliation()
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(active))
+        let status = await service.allJobs().first; XCTAssertEqual(status?.stage, .awaitingClarification)
+    }
+}
+private actor SettlementEvidenceFixture {
+    private var count = 0
+    private(set) var child: RequestWorkerProcess?
+    func settle(_ process: RequestWorkerProcess, failSecond: Bool = false, replaceMarker: URL? = nil) async throws {
+        count += 1
+        if count == 2 && failSecond { child = process; throw RequestWorkerTeardownError(cause: "Injected unverified retry") }
+        try await process.waitForExit()
+        if let replaceMarker, count == 1 {
+            try FileManager.default.removeItem(at: replaceMarker)
+            try FileManager.default.createSymbolicLink(atPath: replaceMarker.path, withDestinationPath: "missing-active-target")
+        }
+    }
+}
+#endif
+
+#if os(macOS)
+extension ShaderRequestTests {
+    func testDelayedWriterValidationRetainsActualOriginAcrossRecovery() async throws {
+        let (root, script) = try recoveryFixture(), writer = RequestPersistence(), delivery = ValidationDeliveryGate()
+        let service = try await recoveryService(root, script: script)
+        await service.progressPersistenceFailed(RequestPersistence.ValidationError(message: "Initial capacity", revision: 900))
+        writer.enqueueProgress(.init(revision: 1, files: [.init(url: root.appendingPathComponent("old.json"), encode: { throw RequestPersistence.ValidationError(message: "Old actual snapshot") })]), failed: { error in
+            Task { await delivery.deliver(error, to: service) }
+        })
+        try await waitFor { await delivery.entered }
+        try await service.retryReconciliation()
+        await delivery.release()
+        try await waitFor { await delivery.completed }
+        let afterOld = await service.recoveryStatuses(); XCTAssertFalse(afterOld.contains { $0.kind == .persistence })
+        writer.enqueueProgress(.init(revision: 10_000, files: [.init(url: root.appendingPathComponent("old.json"), encode: { throw RequestPersistence.ValidationError(message: "New actual snapshot") })]), failed: { error in
+            Task { await service.progressPersistenceFailed(error) }
+        })
+        try await waitFor { await service.recoveryStatuses().contains { $0.kind == .persistence && $0.message.contains("New actual snapshot") } }
+    }
+
+    func testDeferredSettlementAndFinishApplyAfterCallerCommit() async throws {
+        let (root, script) = try recoveryFixture(), settlement = RequestPreparationGate(), commit = DraftReplacementGate(failAfterRelease: false)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script,
+            waitForWorker: { try await $0.waitForExit(); await settlement.hold() }, beforePersistenceReplacement: { try commit.before($0) })
+        await service.suspend(); try await service.start(configuration: .init(repository: root.path, python: root.appendingPathComponent("missing-python").path, enabled: true))
+        let first = ShaderRequest(prompt: "Never opened a gate", context: try context()), second = ShaderRequest(prompt: "Independent caller commit", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: first), deviceID: "TV1")
+        let patch = root.appendingPathComponent(first.id.uuidString).appendingPathComponent("owned-patch"), bytes = Data([0,255,13,10]); try bytes.write(to: patch)
+        await service.resume(); try await waitFor { await settlement.entered }
+        commit.arm(root.appendingPathComponent("journal.json")); defer { commit.release() }
+        let submission = Task { try await service.control(operation: "requestSubmit", payload: .init(request: second), deviceID: "TV2") }
+        try await waitFor { commit.entered }
+        let suspension = Task { await service.suspend() }
+        try await waitFor { await service.isSuspended }
+        await settlement.release()
+        try await waitFor { await service.pendingRecordTransitionCount >= 4 }
+        commit.release(); _ = try await submission.value; await suspension.value
+        try await waitFor { !RequestProcessIdentity.evidenceExists(root.appendingPathComponent("active.json")) }
+        let jobs = await service.allJobs(); XCTAssertEqual(jobs.first { $0.id == first.id }?.stage, .queued)
+        XCTAssertTrue(jobs.contains { $0.id == second.id }); XCTAssertEqual(try Data(contentsOf: patch), bytes)
+    }
+}
+private actor ValidationDeliveryGate {
+    private(set) var entered = false
+    private(set) var completed = false
+    private var continuation: CheckedContinuation<Void,Never>?
+    func deliver(_ error: Error, to service: ShaderRequestService) async {
+        entered = true; await withCheckedContinuation { continuation = $0 }
+        await service.progressPersistenceFailed(error); completed = true
+    }
+    func release() { continuation?.resume(); continuation = nil }
+}
+#endif
+
+#if os(macOS)
+extension ShaderRequestTests {
+    func testConcurrentStartupSharesRetirementAndCancelledWaiter() async throws {
+        let (root, script) = try recoveryFixture(), gate = StartupInspectionGate()
+        let request = ShaderRequest(prompt: "One startup inspection", context: try context()), operation = UUID()
+        let config = ShaderRequestConfiguration(repository: root.path, enabled: true)
+        let status = ShaderRequestStatus(request: request, deviceID: "TV")
+        func object<T: Encodable>(_ value: T) throws -> Any { try JSONSerialization.jsonObject(with: JSONEncoder().encode(value)) }
+        let row: [String: Any] = ["status": try object(status), "configuration": try object(config), "revoked": false, "executionID": operation.uuidString,
+            "dispatch": ["executionID": operation.uuidString, "priorStage": "queued", "launched": false, "retirementPending": false]]
+        try JSONSerialization.data(withJSONObject: [row]).write(to: root.appendingPathComponent("journal.json"))
+        try JSONEncoder().encode(config).write(to: root.appendingPathComponent("preferences.json"))
+        try JSONEncoder().encode(request.id).write(to: root.appendingPathComponent("active.json"))
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root,
+            workerScript: script, reconcileWorker: { _ in await gate.inspect() })
+        await service.suspend()
+        let cancelled = Task { try await service.initialize(configuration: config) }
+        try await waitFor { await gate.count == 1 }
+        let survivor = Task { try await service.initialize(configuration: config) }
+        cancelled.cancel()
+        do { try await cancelled.value; XCTFail("Cancelled startup waiter remained blocked") } catch is CancellationError {} catch { XCTFail("Unexpected cancellation: \(error)") }
+        var waiters: [Task<Void, Error>] = []
+        for _ in 0..<14 { waiters.append(Task { try await service.initialize(configuration: config) }) }
+        await gate.release(); try await survivor.value
+        for waiter in waiters { try await waiter.value }
+        let inspections = await gate.count, loads = await service.acceptedMetadataLoadCount
+        XCTAssertEqual(inspections, 1); XCTAssertEqual(loads, 1)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(root.appendingPathComponent("active.json")))
+    }
+
+    func testUnreadableStartupMetadataIsAnActionableBlockerUntilExplicitRepair() async throws {
+        for name in ["preferences.json", "active.json", "recovery.json", "dangling-preferences"] {
+            let (root, script) = try recoveryFixture()
+            let file = root.appendingPathComponent(name == "dangling-preferences" ? "preferences.json" : name)
+            let bytes = name == "recovery.json" ? Data("{\"formatVersion\":2,\"entries\":{}}".utf8) : Data("{".utf8)
+            if name == "dangling-preferences" { try FileManager.default.createSymbolicLink(atPath: file.path, withDestinationPath: "missing-preferences") }
+            else { try bytes.write(to: file) }
+            let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script)
+            await service.suspend(); try await service.initialize(configuration: .init(repository: root.path, enabled: true))
+            let issues = await service.recoveryStatuses(), configuration = await service.configurationValue()
+            XCTAssertFalse(configuration.enabled)
+            XCTAssertTrue(issues.contains { $0.kind == .persistence && $0.message.contains(file.lastPathComponent) && $0.message.contains("Retry Recovery") }, name)
+            XCTAssertFalse(RequestProcessIdentity.evidenceExists(root.appendingPathComponent("journal.json")), "Invalid startup must not publish partial metadata")
+            if name == "dangling-preferences" { XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: file.path), "missing-preferences") }
+            else { XCTAssertEqual(try Data(contentsOf: file), bytes) }
+            do { try await service.retryReconciliation(); XCTFail("Unrepaired metadata was accepted") } catch { XCTAssertTrue(error.localizedDescription.contains(file.lastPathComponent)) }
+            try FileManager.default.removeItem(at: file)
+            if file.lastPathComponent == "preferences.json" { try JSONEncoder().encode(ShaderRequestConfiguration(repository: root.path, enabled: true)).write(to: file) }
+            try await service.retryReconciliation()
+            let after = await service.recoveryStatuses(); XCTAssertFalse(after.contains { $0.kind == .persistence })
+        }
+    }
+
+    func testLegacyPreferencesDecodeOnceAndUnsupportedShapesStayBlocked() async throws {
+        let (root, script) = try recoveryFixture(), file = root.appendingPathComponent("preferences.json")
+        var value = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(ShaderRequestConfiguration(repository: root.path, model: "legacy", enabled: false))) as? [String: Any])
+        value.removeValue(forKey: "shaderTool"); value.removeValue(forKey: "reasoning")
+        try JSONSerialization.data(withJSONObject: value).write(to: file)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script)
+        await service.suspend(); try await service.initialize(configuration: .init())
+        var accepted = await service.configurationValue()
+        XCTAssertEqual(accepted.model, "legacy"); XCTAssertEqual(accepted.reasoning, "high")
+        let reads = await service.preferencesReadCount; XCTAssertEqual(reads, 1)
+        value["model"] = "updated"; try JSONSerialization.data(withJSONObject: value).write(to: file)
+        try await service.initialize(configuration: .init()); accepted = await service.configurationValue(); XCTAssertEqual(accepted.model, "updated")
+        value.removeValue(forKey: "enabled"); try JSONSerialization.data(withJSONObject: value).write(to: file)
+        try await service.initialize(configuration: .init())
+        let rows = await service.recoveryStatuses(); XCTAssertTrue(rows.contains { $0.kind == .persistence && $0.message.contains("preferences.json") })
+    }
+
+    func testRestartPreservesParkedDispatchStatesAndTerminalCleanupPriority() async throws {
+        for stage in [ShaderRequestStatus.Stage.awaitingActivation, .awaitingClarification, .failed] {
+            let (root, script) = try recoveryFixture(), seed = try await recoveryService(root, script: script)
+            let request = ShaderRequest(prompt: "Parked or terminal cleanup", context: try context()), next = ShaderRequest(prompt: "Queued follower", context: try context())
+            _ = try await seed.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV1")
+            _ = try await seed.control(operation: "requestSubmit", payload: .init(request: next), deviceID: "TV2")
+            let journal = root.appendingPathComponent("journal.json"), operation = UUID()
+            var rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: journal)) as? [[String: Any]])
+            let index = try XCTUnwrap(rows.firstIndex { ($0["status"] as? [String: Any])?["id"] as? String == request.id.uuidString })
+            var status = try XCTUnwrap(rows[index]["status"] as? [String: Any]); status["stage"] = stage.rawValue; rows[index]["status"] = status
+            rows[index]["executionID"] = operation.uuidString
+            rows[index]["dispatch"] = ["executionID": operation.uuidString, "priorStage": "implementing", "launched": true, "retirementPending": false]
+            if stage == .failed { rows[index]["cleanupPending"] = true }
+            try JSONSerialization.data(withJSONObject: rows).write(to: journal)
+            try JSONEncoder().encode(request.id).write(to: root.appendingPathComponent("active.json"))
+            let service = try await recoveryService(root, script: script)
+            let jobs = await service.allJobs(); XCTAssertEqual(jobs.first { $0.id == request.id }?.stage, stage)
+            if stage == .failed {
+                await service.resume()
+                try await waitFor { RequestProcessIdentity.evidenceExists(root.appendingPathComponent(request.id.uuidString).appendingPathComponent("cleanup-started")) }
+                await service.suspend()
+            }
+        }
+    }
+}
+private actor StartupInspectionGate {
+    private(set) var count = 0
+    private var continuation: CheckedContinuation<Void, Never>?
+    func inspect() async { count += 1; await withCheckedContinuation { continuation = $0 } }
+    func release() { continuation?.resume(); continuation = nil }
 }
 #endif

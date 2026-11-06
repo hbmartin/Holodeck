@@ -39,16 +39,20 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         let message: String
         var operation: String? = nil
         var paths: [String] = []
-        var errorDescription: String? { message }
+        var revision: UInt64? = nil
+        var errorDescription: String? {
+            message + (paths.isEmpty ? "" : " Affected files: " + paths.map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: ", "))
+        }
     }
     struct ValidationBlocker: Codable, Sendable {
         let revision: UInt64
         let message: String
+        var unversioned: Bool? = nil
     }
     private var validationBlocker: ValidationBlocker?
     func recordValidation(_ value: ValidationBlocker, failed: @escaping @Sendable (Error) -> Void) {
         queue.async { [self] in
-            guard validationBlocker == nil || value.revision > validationBlocker!.revision else { return }
+            guard validationBlocker == nil || value.unversioned == true || value.revision > validationBlocker!.revision else { return }
             validationBlocker = value
             guard let directory else { return }
             do { try RequestJournalWriter.write(JSONEncoder().encode(value), to: directory.appendingPathComponent("metadata-validation.json")) }
@@ -135,7 +139,6 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     }
     private let metrics = Metrics()
     private func fileImage(_ bytes: Data) -> Image { Image(bytes, metrics: metrics) }
-    private func hash(_ bytes: Data) -> String { metrics.hashes += 1; return CatalogHash.sha256(bytes) }
     private struct Transaction { let operation: String; var before: [URL: Image] = [:]; var candidates: [URL: Set<String>] = [:]; var revisions: [URL: UInt64] = [:] }
     private let queue = DispatchQueue(label: "Holodeck.request-persistence", qos: .utility)
     private let recoveryWriter: @Sendable (Data, URL) throws -> Void
@@ -156,7 +159,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     private var applied: [URL: UInt64] = [:]
     private var encodings = 0
     private var metadataEncodings = 0
-    private struct Pending { let revision: UInt64; let file: File; let completed: @Sendable (CommitReceipt) -> Void }
+    private struct Pending { let revision: UInt64; let operation: String; let file: File; let completed: @Sendable (CommitReceipt) -> Void; let failed: @Sendable (Error) -> Void }
     private var progress: [URL: Pending] = [:]
     private var progressScheduled = false
     init(directory: URL? = nil, recoveryWriter: @escaping @Sendable (Data, URL) throws -> Void = { try RequestJournalWriter.write($0, to: $1) }, beforeReplacement: @escaping @Sendable (URL) throws -> Void = { _ in }, removeFile: @escaping @Sendable (URL) throws -> Void = RequestJournalWriter.remove) {
@@ -217,7 +220,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         if retainingEvidence, !snapshot.files.allSatisfy({ $0.url.lastPathComponent == "recovery.json" }) { throw RequestWorkerOwnershipError() }
         if let failure, !authorizes(token) && !retainingEvidence { throw failure }
         let files = snapshot.files.filter { snapshot.revision > applied[$0.url, default: 0] }
-        var before: [URL: Image] = [:], proposed: [URL: Data] = [:], encoded: [URL: Data] = [:], attempted: [URL: Set<String>] = [:]
+        var before: [URL: Image] = [:], proposed: [URL: Data] = [:], encoded: [URL: Data] = [:], attempted: [URL: Image] = [:]
         try ticket?.check()
         // Validation is completed before any filesystem mutation and is not an I/O fault.
         var receipt = CommitReceipt(revision: snapshot.revision)
@@ -230,7 +233,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                     receipt.recovery[file.url] = NormalizedRecovery(store: normalized, generation: value.generation)
                 } else { encoded[file.url] = try file.encode() }
             }
-        } catch { throw ValidationError(message: error.localizedDescription, operation: snapshot.operation, paths: files.map { $0.url.path }) }
+        } catch { throw ValidationError(message: error.localizedDescription, operation: snapshot.operation, paths: files.map { $0.url.path }, revision: snapshot.revision) }
         do {
             for file in files {
                 guard committed[file.url] != encoded[file.url] else { continue }
@@ -242,21 +245,24 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             for file in files {
                 if let bytes = proposed[file.url] {
                     try beforeReplacement(file.url)
-                    let fingerprint = hash(bytes); attempted[file.url, default: []].insert(fingerprint)
-                    if let transaction { transactions[transaction]?.candidates[file.url, default: []].insert(fingerprint) }
+                    let candidate = fileImage(bytes); attempted[file.url] = candidate
+                    if let transaction { transactions[transaction]?.candidates[file.url, default: []].insert(candidate.hash) }
                     try replace(bytes, at: file.url)
                 }
                 if let transaction { transactions[transaction]?.revisions[file.url] = snapshot.revision }
                 else { applied[file.url] = snapshot.revision }
             }
             if authorizes(token), transaction == nil {
-                for (file, bytes) in encoded { let accepted = fileImage(bytes); undo[file] = accepted; candidates[file] = [accepted.hash] }
+                for (file, bytes) in encoded { let accepted = attempted[file] ?? fileImage(bytes); undo[file] = accepted; candidates[file] = [accepted.hash] }
                 summarize()
             }
             if files.allSatisfy({ $0.url.lastPathComponent == "recovery.json" }) {
                 // Durable recovery/Detach intent is independent of a caller's rejected mutation.
-                for id in transactions.keys {
-                    for (url, bytes) in encoded { transactions[id]?.before[url] = fileImage(bytes); transactions[id]?.candidates[url] = [hash(bytes)]; transactions[id]?.revisions[url] = snapshot.revision }
+                for (url, bytes) in encoded {
+                    let accepted = attempted[url] ?? fileImage(bytes)
+                    for id in transactions.keys {
+                        transactions[id]?.before[url] = accepted; transactions[id]?.candidates[url] = [accepted.hash]; transactions[id]?.revisions[url] = snapshot.revision
+                    }
                 }
                 if failure != nil {
                     for (url, bytes) in encoded { let accepted = fileImage(bytes); undo[url] = accepted; candidates[url] = [accepted.hash] }
@@ -268,7 +274,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         catch {
             committed.removeAll()
             let tx = transaction.flatMap { transactions[$0] }
-            throw fail(error, operation: tx?.operation ?? snapshot.operation, files: files.map(\.url), before: tx?.before ?? before, proposed: tx?.candidates ?? attempted)
+            throw fail(error, operation: tx?.operation ?? snapshot.operation, files: files.map(\.url), before: tx?.before ?? before, proposed: tx?.candidates ?? attempted.mapValues { [$0.hash] })
         }
     }
     private func drainProgress() throws {
@@ -287,10 +293,11 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                 return $0.url.path < $1.url.path
             }
             do {
-                let receipt = try apply(.init(revision: revision, files: files, operation: "background request progress"))
+                let receipt = try apply(.init(revision: revision, files: files, operation: pending.values.first { $0.revision == revision }!.operation))
                 pending.values.first { $0.revision == revision }?.completed(receipt)
             } catch {
                 for (url, value) in pending where value.revision >= revision && (progress[url]?.revision ?? 0) < value.revision { progress[url] = value }
+                pending.values.first { $0.revision == revision }?.failed(error)
                 throw error
             }
         }
@@ -386,12 +393,12 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         queue.async { [self] in
             if let failure { failed(failure); return }
             for file in snapshot.files where snapshot.revision > applied[file.url, default: 0] && snapshot.revision > (progress[file.url]?.revision ?? 0) {
-                progress[file.url] = Pending(revision: snapshot.revision, file: file, completed: completed)
+                progress[file.url] = Pending(revision: snapshot.revision, operation: snapshot.operation, file: file, completed: completed, failed: failed)
             }
             guard !progressScheduled else { return }; progressScheduled = true
             queue.asyncAfter(deadline: .now() + .milliseconds(25)) { [self] in
                 progressScheduled = false
-                do { try drainProgress() } catch { failed(error) }
+                do { try drainProgress() } catch { /* The failed snapshot reports its own origin. */ }
             }
         }
     }
@@ -472,22 +479,22 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                     if let failure, !authorizes(token) { ticket.complete(.failure(failure)); return }
                     do { try ticket.check(); try drainProgress() }
                     catch { ticket.complete(.failure(error)); return }
-                    var before: [URL: Image] = [:], attempted: [URL: Set<String>] = [:]
+                    var before: [URL: Image] = [:], attempted: [URL: Image] = [:]
                     do {
                         if committed[file] == bytes { try ticket.beginMutation(); ticket.complete(.success(())); return }
                         before[file] = try committed[file].map(fileImage) ?? image(file)
                         if let transaction, transactions[transaction]?.before[file] == nil { transactions[transaction]?.before[file] = before[file] }
                         try ticket.beginMutation()
                         try beforeReplacement(file)
-                        let fingerprint = hash(bytes); attempted[file] = [fingerprint]
-                        if let transaction { transactions[transaction]?.candidates[file, default: []].insert(fingerprint) }
+                        let candidate = fileImage(bytes); attempted[file] = candidate
+                        if let transaction { transactions[transaction]?.candidates[file, default: []].insert(candidate.hash) }
                         try replace(bytes, at: file)
-                        if authorizes(token), transaction == nil { let accepted = fileImage(bytes); undo[file] = accepted; candidates[file] = [accepted.hash]; summarize() }
+                        if authorizes(token), transaction == nil { let accepted = attempted[file] ?? fileImage(bytes); undo[file] = accepted; candidates[file] = [accepted.hash]; summarize() }
                         ticket.complete(.success(()))
                     } catch is CancellationError where !ticket.hasStarted { ticket.complete(.failure(CancellationError())) }
                     catch {
                         let tx = transaction.flatMap { transactions[$0] }
-                        ticket.complete(.failure(fail(error, operation: tx?.operation ?? "write " + file.lastPathComponent, files: [file], before: tx?.before ?? before, proposed: tx?.candidates ?? attempted)))
+                        ticket.complete(.failure(fail(error, operation: tx?.operation ?? "write " + file.lastPathComponent, files: [file], before: tx?.before ?? before, proposed: tx?.candidates ?? attempted.mapValues { [$0.hash] })))
                     }
                 }
             }
