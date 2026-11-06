@@ -11,17 +11,17 @@ nonisolated enum RequestWorkerDiagnostic {
 
 nonisolated struct RequestWorkerTeardownError: LocalizedError, Sendable {
     var cause: String? = nil
-    var errorDescription: String? { "Worker processes did not exit within ten seconds. Checkout recovery is required; process evidence was retained." + (cause.map { " Original error: " + $0 } ?? "") }
+    var errorDescription: String? { "Worker processes did not exit within ten seconds. Checkout recovery is required; process evidence was retained." + (RequestWorkerDiagnostic.combined(cause).map { " Original error: " + $0 } ?? "") }
 }
 
 nonisolated struct RequestWorkerOwnershipError: LocalizedError, Sendable {
     var cause: String? = nil
-    var errorDescription: String? { "Worker ownership cannot be verified. Registered commands were left untouched; repair the worker marker and retry recovery before reusing or detaching the checkout." + (cause.map { " Original error: " + $0 } ?? "") }
+    var errorDescription: String? { "Worker ownership cannot be verified. Registered commands were left untouched; repair the worker marker and retry recovery before reusing or detaching the checkout." + (RequestWorkerDiagnostic.combined(cause).map { " Original error: " + $0 } ?? "") }
 }
 
 nonisolated struct RequestWorkerEvidenceError: LocalizedError, Sendable {
     let cause: String
-    var errorDescription: String? { cause + " Repair the journal or detach while retaining its files and evidence." }
+    var errorDescription: String? { (RequestWorkerDiagnostic.combined(cause) ?? "Process ownership evidence could not be verified.") + " Repair the journal or detach while retaining its files and evidence." }
 }
 
 nonisolated final class RequestBootIdentityCache: @unchecked Sendable {

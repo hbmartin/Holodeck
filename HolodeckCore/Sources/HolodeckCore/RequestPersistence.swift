@@ -4,6 +4,47 @@ import Darwin
 
 /// One ordered disk owner. Before-images are deliberately retained only in this process.
 nonisolated final class RequestPersistence: @unchecked Sendable {
+    /// Shared with the service so readiness changes invalidate queued writes before
+    /// their first mutation, without hopping through the writer's busy queue.
+    final class MetadataAdmission: @unchecked Sendable {
+        struct Permit: Sendable { fileprivate let revision: UInt64; fileprivate let recovery: UUID? }
+        struct Unavailable: LocalizedError, Sendable {
+            var errorDescription: String? { "Request metadata is unavailable or its write authority changed. Choose Retry Recovery." }
+        }
+        private let lock = NSLock()
+        private var revision: UInt64 = 0
+        private var baseline = false, inspected = false, blocked = true
+        private var recovery: UUID?
+        func inspectedStorage() { lock.withLock { inspected = true } }
+        func establishBaseline(blocked: Bool) { lock.withLock { baseline = true; self.blocked = blocked; revision &+= 1 } }
+        func block() { lock.withLock { blocked = true; revision &+= 1 } }
+        func beginRecovery(_ id: UUID) { lock.withLock { recovery = id } }
+        func endRecovery(_ id: UUID, accepted: Bool) {
+            lock.withLock { if recovery == id { recovery = nil; if accepted { blocked = false }; revision &+= 1 } }
+        }
+        func permit(recovery candidate: UUID?) throws -> Permit {
+            try lock.withLock {
+                guard baseline, inspected, !blocked || (candidate != nil && candidate == recovery) else { throw Unavailable() }
+                return Permit(revision: revision, recovery: candidate)
+            }
+        }
+        func check(_ permit: Permit?) throws { try claim(permit) {} }
+        func claim(_ permit: Permit?, start: () throws -> Void) throws {
+            try lock.withLock {
+                guard let permit, baseline, inspected, permit.revision == revision,
+                      !blocked || (permit.recovery != nil && permit.recovery == recovery) else { throw Unavailable() }
+                // Readiness invalidation and entry into the noncancellable commit
+                // have one ordering point; no filesystem I/O runs under this lock.
+                try start()
+            }
+        }
+    }
+    private let metadataAdmission: MetadataAdmission?
+    private func admit(_ permit: MetadataAdmission.Permit?) throws { try metadataAdmission?.check(permit) }
+    private func enterMutation<T: Sendable>(_ permit: MetadataAdmission.Permit?, ticket: CommitTicket<T>?) throws {
+        if let metadataAdmission { try metadataAdmission.claim(permit) { try ticket?.beginMutation() } }
+        else { try ticket?.beginMutation() }
+    }
     /// Cancellation wins until the first replacement, then the writer owns completion.
     final class CommitTicket<Value: Sendable>: @unchecked Sendable {
         private let lock = NSLock()
@@ -47,12 +88,11 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     struct ValidationBlocker: Codable, Sendable {
         let revision: UInt64
         let message: String
-        var unversioned: Bool? = nil
     }
     private var validationBlocker: ValidationBlocker?
     func recordValidation(_ value: ValidationBlocker, failed: @escaping @Sendable (Error) -> Void) {
         queue.async { [self] in
-            guard validationBlocker == nil || value.unversioned == true || value.revision > validationBlocker!.revision else { return }
+            guard validationBlocker == nil || value.revision > validationBlocker!.revision else { return }
             validationBlocker = value
             guard let directory else { return }
             do { try RequestJournalWriter.write(JSONEncoder().encode(value), to: directory.appendingPathComponent("metadata-validation.json")) }
@@ -93,7 +133,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         }
     }
     // A recovery value is normalized once on the writer, and returned with its captured generation.
-    struct Snapshot: Sendable { let revision: UInt64; let files: [File]; var operation = "request metadata" }
+    struct Snapshot: Sendable { let revision: UInt64; let files: [File]; var operation = "request metadata"; var metadataPermit: MetadataAdmission.Permit? = nil }
     struct RecoveryToken: Sendable, Equatable {
         let faultID: UUID
         let generation: UInt64
@@ -159,11 +199,11 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     private var applied: [URL: UInt64] = [:]
     private var encodings = 0
     private var metadataEncodings = 0
-    private struct Pending { let revision: UInt64; let operation: String; let file: File; let completed: @Sendable (CommitReceipt) -> Void; let failed: @Sendable (Error) -> Void }
+    private struct Pending { let revision: UInt64; let operation: String; let file: File; let metadataPermit: MetadataAdmission.Permit?; let completed: @Sendable (CommitReceipt) -> Void; let failed: @Sendable (Error) -> Void }
     private var progress: [URL: Pending] = [:]
     private var progressScheduled = false
-    init(directory: URL? = nil, recoveryWriter: @escaping @Sendable (Data, URL) throws -> Void = { try RequestJournalWriter.write($0, to: $1) }, beforeReplacement: @escaping @Sendable (URL) throws -> Void = { _ in }, removeFile: @escaping @Sendable (URL) throws -> Void = RequestJournalWriter.remove) {
-        self.directory = directory; self.recoveryWriter = recoveryWriter; self.beforeReplacement = beforeReplacement; self.removeFile = removeFile
+    init(directory: URL? = nil, metadataAdmission: MetadataAdmission? = nil, recoveryWriter: @escaping @Sendable (Data, URL) throws -> Void = { try RequestJournalWriter.write($0, to: $1) }, beforeReplacement: @escaping @Sendable (URL) throws -> Void = { _ in }, removeFile: @escaping @Sendable (URL) throws -> Void = RequestJournalWriter.remove) {
+        self.directory = directory; self.metadataAdmission = metadataAdmission; self.recoveryWriter = recoveryWriter; self.beforeReplacement = beforeReplacement; self.removeFile = removeFile
     }
     private var faultFile: URL? { directory?.appendingPathComponent("storage-recovery.json") }
     private func image(_ file: URL) throws -> Image {
@@ -217,6 +257,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         if ["journal.json", "recovery.json", "detached-checkouts.json", "preferences.json"].contains(file.lastPathComponent) { committed[file] = bytes }
     }
     private func apply(_ snapshot: Snapshot, transaction: UUID? = nil, retainingEvidence: Bool = false, ticket: CommitTicket<CommitReceipt>? = nil, recovery token: RecoveryToken? = nil) throws -> CommitReceipt {
+        try admit(snapshot.metadataPermit)
         if retainingEvidence, !snapshot.files.allSatisfy({ $0.url.lastPathComponent == "recovery.json" }) { throw RequestWorkerOwnershipError() }
         if let failure, !authorizes(token) && !retainingEvidence { throw failure }
         let files = snapshot.files.filter { snapshot.revision > applied[$0.url, default: 0] }
@@ -241,7 +282,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                 proposed[file.url] = encoded[file.url]
                 if let transaction, transactions[transaction]?.before[file.url] == nil { transactions[transaction]?.before[file.url] = before[file.url] }
             }
-            try ticket?.beginMutation()
+            try enterMutation(snapshot.metadataPermit, ticket: ticket)
             for file in files {
                 if let bytes = proposed[file.url] {
                     try beforeReplacement(file.url)
@@ -252,25 +293,31 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                 if let transaction { transactions[transaction]?.revisions[file.url] = snapshot.revision }
                 else { applied[file.url] = snapshot.revision }
             }
+            var acceptedImages = attempted
+            func acceptedImage(_ file: URL, _ bytes: Data) -> Image {
+                if let value = acceptedImages[file] { return value }
+                let value = fileImage(bytes); acceptedImages[file] = value; return value
+            }
             if authorizes(token), transaction == nil {
-                for (file, bytes) in encoded { let accepted = attempted[file] ?? fileImage(bytes); undo[file] = accepted; candidates[file] = [accepted.hash] }
+                for (file, bytes) in encoded { let accepted = acceptedImage(file, bytes); undo[file] = accepted; candidates[file] = [accepted.hash] }
                 summarize()
             }
             if files.allSatisfy({ $0.url.lastPathComponent == "recovery.json" }) {
                 // Durable recovery/Detach intent is independent of a caller's rejected mutation.
                 for (url, bytes) in encoded {
-                    let accepted = attempted[url] ?? fileImage(bytes)
+                    let accepted = acceptedImage(url, bytes)
                     for id in transactions.keys {
                         transactions[id]?.before[url] = accepted; transactions[id]?.candidates[url] = [accepted.hash]; transactions[id]?.revisions[url] = snapshot.revision
                     }
                 }
                 if failure != nil {
-                    for (url, bytes) in encoded { let accepted = fileImage(bytes); undo[url] = accepted; candidates[url] = [accepted.hash] }
+                    for (url, bytes) in encoded { let accepted = acceptedImage(url, bytes); undo[url] = accepted; candidates[url] = [accepted.hash] }
                     summarize()
                 }
             }
             return receipt
         } catch is CancellationError where ticket != nil && ticket?.hasStarted == false { throw CancellationError() }
+        catch let error as MetadataAdmission.Unavailable { throw error }
         catch {
             committed.removeAll()
             let tx = transaction.flatMap { transactions[$0] }
@@ -287,17 +334,19 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             if tentative { progress[url] = value } else { pending[url] = value }
         }
         for revision in Set(pending.values.map(\.revision)).sorted() {
-            let files = pending.values.filter { $0.revision == revision }.map(\.file).sorted {
+            let batch = pending.values.filter { $0.revision == revision }
+            guard let owner = batch.first else { continue }
+            let files = batch.map(\.file).sorted {
                 if $0.url.lastPathComponent == "recovery.json" { return true }
                 if $1.url.lastPathComponent == "recovery.json" { return false }
                 return $0.url.path < $1.url.path
             }
             do {
-                let receipt = try apply(.init(revision: revision, files: files, operation: pending.values.first { $0.revision == revision }!.operation))
-                pending.values.first { $0.revision == revision }?.completed(receipt)
+                let receipt = try apply(.init(revision: revision, files: files, operation: owner.operation, metadataPermit: owner.metadataPermit))
+                owner.completed(receipt)
             } catch {
                 for (url, value) in pending where value.revision >= revision && (progress[url]?.revision ?? 0) < value.revision { progress[url] = value }
-                pending.values.first { $0.revision == revision }?.failed(error)
+                owner.failed(error)
                 throw error
             }
         }
@@ -349,7 +398,10 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     func reject(_ id: UUID) async throws {
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in queue.async { [self] in
             guard let tx = transactions.removeValue(forKey: id) else { c.resume(); return }
-            do { try restore(tx.before, proposed: tx.candidates); c.resume() }
+            // Before-images collected during preparation do not authorize a
+            // replacement when readiness was lost before the first attempt.
+            let affected = tx.before.filter { tx.candidates[$0.key] != nil }
+            do { try restore(affected, proposed: tx.candidates); c.resume() }
             catch {
                 _ = fail(error, operation: tx.operation, files: Array(tx.before.keys), before: tx.before, proposed: tx.candidates)
                 c.resume(throwing: failure!)
@@ -393,7 +445,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         queue.async { [self] in
             if let failure { failed(failure); return }
             for file in snapshot.files where snapshot.revision > applied[file.url, default: 0] && snapshot.revision > (progress[file.url]?.revision ?? 0) {
-                progress[file.url] = Pending(revision: snapshot.revision, operation: snapshot.operation, file: file, completed: completed, failed: failed)
+                progress[file.url] = Pending(revision: snapshot.revision, operation: snapshot.operation, file: file, metadataPermit: snapshot.metadataPermit, completed: completed, failed: failed)
             }
             guard !progressScheduled else { return }; progressScheduled = true
             queue.asyncAfter(deadline: .now() + .milliseconds(25)) { [self] in
@@ -471,7 +523,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     func resumeAfterExplicitRecovery() async throws {
         let id = try await restoreForRecovery(); try await finishRecovery(id)
     }
-    func write(_ bytes: Data, to file: URL, transaction: UUID? = nil, recovery token: RecoveryToken? = nil) async throws {
+    func write(_ bytes: Data, to file: URL, transaction: UUID? = nil, recovery token: RecoveryToken? = nil, metadataPermit: MetadataAdmission.Permit? = nil) async throws {
         let ticket = CommitTicket<Void>()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { c in
@@ -479,21 +531,27 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
                 queue.async { [self] in
                     // Rejection is not an attempted write and contributes no ownership evidence.
                     if let failure, !authorizes(token) { ticket.complete(.failure(failure)); return }
-                    do { try ticket.check(); try drainProgress() }
+                    do {
+                        try admit(metadataPermit); try ticket.check()
+                        // Explicit recovery replaces pending snapshots from current
+                        // accepted facts; old, invalidated permits cannot block it.
+                        if metadataPermit?.recovery == nil && !authorizes(token) { try drainProgress() }
+                    }
                     catch { ticket.complete(.failure(error)); return }
                     var before: [URL: Image] = [:], attempted: [URL: Image] = [:]
                     do {
                         if committed[file] == bytes { try ticket.beginMutation(); ticket.complete(.success(())); return }
                         before[file] = try committed[file].map(fileImage) ?? image(file)
                         if let transaction, transactions[transaction]?.before[file] == nil { transactions[transaction]?.before[file] = before[file] }
-                        try ticket.beginMutation()
+                        try enterMutation(metadataPermit, ticket: ticket)
                         try beforeReplacement(file)
                         let candidate = fileImage(bytes); attempted[file] = candidate
                         if let transaction { transactions[transaction]?.candidates[file, default: []].insert(candidate.hash) }
                         try replace(bytes, at: file)
-                        if authorizes(token), transaction == nil { let accepted = attempted[file] ?? fileImage(bytes); undo[file] = accepted; candidates[file] = [accepted.hash]; summarize() }
+                        if authorizes(token), transaction == nil { undo[file] = candidate; candidates[file] = [candidate.hash]; summarize() }
                         ticket.complete(.success(()))
                     } catch is CancellationError where !ticket.hasStarted { ticket.complete(.failure(CancellationError())) }
+                    catch let error as MetadataAdmission.Unavailable { ticket.complete(.failure(error)) }
                     catch {
                         let tx = transaction.flatMap { transactions[$0] }
                         ticket.complete(.failure(fail(error, operation: tx?.operation ?? "write " + file.lastPathComponent, files: [file], before: tx?.before ?? before, proposed: tx?.candidates ?? attempted.mapValues { [$0.hash] })))
@@ -504,15 +562,18 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     }
     /// Binding/archival coordinators retain their own durable intent; never roll those
     /// ownership transitions back as a side effect of rejecting caller preferences.
-    func journal<T: Sendable>(_ operation: String, files: [URL], _ body: @escaping @Sendable () throws -> T) async throws -> T {
+    func journal<T: Sendable>(_ operation: String, files: [URL], metadataPermit: MetadataAdmission.Permit? = nil, _ body: @escaping @Sendable () throws -> T) async throws -> T {
         try await perform { [self] in
-            do { return try body() }
+            do { try admit(metadataPermit); return try body() }
             catch {
                 let value = error as NSError
                 guard error is POSIXError || value.domain == NSCocoaErrorDomain else { throw error }
                 throw fail(error, operation: operation, files: files, before: [:], proposed: [:])
             }
         }
+    }
+    func mutate<T: Sendable>(metadataPermit: MetadataAdmission.Permit, _ body: @escaping @Sendable () throws -> T) async throws -> T {
+        try await perform { [self] in try admit(metadataPermit); return try body() }
     }
     func perform<T: Sendable>(_ operation: @escaping @Sendable () throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { c in queue.async {

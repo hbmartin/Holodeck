@@ -272,6 +272,24 @@ final class HolodeckMacUITests: XCTestCase {
         let retry = element("retry-checkout-cleanup", in: app)
         XCTAssertTrue(retry.waitForExistence(timeout: 10)); retry.click()
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.staticTexts["Storage Recovery"])], timeout: 15), .completed)
+        let restoredModel = element("request-model", in: app), restoredCodex = element("request-codex-path", in: app)
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", configuration["model"] as? String ?? ""), object: restoredModel)], timeout: 10), .completed)
+        XCTAssertEqual(restoredCodex.value as? String, configuration["codex"] as? String)
+        XCTAssertEqual(try Data(contentsOf: preferences), accepted)
+        // A later missing preferences file restores the trusted UserDefaults input,
+        // retaining its model/tools but requiring a new Verify before requests run.
+        app.terminate(); try corrupt.write(to: preferences)
+        app.launch(); app.activate(); waitForTitle(f.name, in: app)
+        element("shader-library-settings", in: app).click(); waitForLibraryIdle(in: app)
+        XCTAssertTrue(app.staticTexts["Storage Recovery"].waitForExistence(timeout: 15))
+        try FileManager.default.removeItem(at: preferences)
+        element("retry-checkout-cleanup", in: app).click()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.staticTexts["Storage Recovery"])], timeout: 15), .completed)
+        XCTAssertEqual(element("request-model", in: app).value as? String, configuration["model"] as? String)
+        XCTAssertEqual(element("request-codex-path", in: app).value as? String, configuration["codex"] as? String)
+        let restored = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: preferences)) as? [String: Any])
+        XCTAssertEqual(restored["enabled"] as? Bool, false)
+        XCTAssertEqual(restored["model"] as? String, configuration["model"] as? String)
     }
 
     func testStorageRecoveryOffersRetryWithoutCheckoutRecoveryEntry() throws {
