@@ -88,7 +88,7 @@ final class Counter: @unchecked Sendable {
      replacements=["journal.json","recovery.json","detached-checkouts.json"].reduce(0){$0+(after[$1,default:0]-before[$1,default:0])}
      encodings=after["metadataEncodings",default:0]-before["metadataEncodings",default:0]
      reads=after["reads",default:0]-before["reads",default:0];hashes=after["hashes",default:0]-before["hashes",default:0]
-     tickets=BaselineTicketCounter.count-ticketStart
+     tickets=after["recordTickets",default:BaselineTicketCounter.count]-before["recordTickets",default:ticketStart]
      responsivenessTask.cancel();await responsivenessTask.value;response=await latency.maximum;await service.suspend()
     } else {
      let service=ShaderRequestService(catalog:DirectoryCatalog(directory:root.appendingPathComponent("catalog")),directory:root,workerScript:script,recoveryWriter:{try counter.write($0,$1)},beforePersistenceReplacement:{_ in ProfileDelay.pause()})
@@ -122,7 +122,7 @@ final class Counter: @unchecked Sendable {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--baseline', default='104ad2e')
+    parser.add_argument('--baseline', default='5f44344791ae6044d94538bf8f631d6a2d30051d')
     parser.add_argument('--samples', type=int, default=5)
     parser.add_argument('--stages', type=int, default=200)
     parser.add_argument('--python', default='/usr/bin/python3')

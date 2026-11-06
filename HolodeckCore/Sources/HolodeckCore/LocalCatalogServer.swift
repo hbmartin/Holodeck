@@ -29,6 +29,17 @@ nonisolated struct RequestRevocationIntent: Codable, Sendable, Equatable {
     let operationID: UUID
     let deviceID: String
 }
+/// Held by authenticated calls across actor hops. Revocation invalidates the old
+/// approval even if its queued call reaches the request actor after replay finishes.
+nonisolated final class TrustedRequestAuthorization: @unchecked Sendable {
+    let coordinator: UUID
+    let deviceID: String
+    private let lock = NSLock()
+    private var current = true
+    init(coordinator: UUID, deviceID: String) { self.coordinator = coordinator; self.deviceID = deviceID }
+    var isCurrent: Bool { lock.withLock { current } }
+    func invalidate() { lock.withLock { current = false } }
+}
 nonisolated struct TrustedRevocationRevision: Sendable {
     let coordinator: UUID
     let sequence: UInt64
@@ -62,7 +73,8 @@ public actor LocalCatalogServer {
         do {
             let lease = try await acquireTrustedMutation(cancellable: false)
             if requests !== service {
-                requests = service
+                requestAuthorizations.values.forEach { $0.invalidate() }; requestAuthorizations.removeAll()
+                coordinatorID = UUID(); requests = service
                 await service.registerRevocationCoordinator(id: coordinatorID) { [weak self] in
                     guard let self else { throw ShaderRequestError.unavailable("The trusted TV revocation coordinator is unavailable.") }
                     try await self.replayRevocations()
@@ -95,7 +107,9 @@ public actor LocalCatalogServer {
     private var approved: [String: ApprovedTV] = [:]
     private var revocations: [RequestRevocationIntent] = []
     private var approvalsLoaded = false
-    private let coordinatorID = UUID()
+    private var coordinatorID = UUID()
+    private var requestAuthorizations: [String: TrustedRequestAuthorization] = [:]
+    private(set) var trustedEncodingCount = 0
     private var trustedSequence: UInt64 = 0
     private var trustedRevision: TrustedRevocationRevision { .init(coordinator: coordinatorID, sequence: trustedSequence) }
     private var trustedMutation: UUID?
@@ -196,6 +210,7 @@ public actor LocalCatalogServer {
     }
 
     public func stop() {
+        requestAuthorizations.values.forEach { $0.invalidate() }; requestAuthorizations.removeAll()
         listenerID = nil; listener?.cancel(); listener = nil
         for id in sessions.keys { cancelSession(id) }
         publish("Local sharing is stopped.")
@@ -233,6 +248,7 @@ public actor LocalCatalogServer {
         let record = ApprovedTV(id: request.deviceID, name: request.approval.name, tokenHash: CatalogHash.sha256(Data(token.utf8)))
         var candidate = approved; candidate[record.id] = record
         try persist(candidate)
+        requestAuthorizations.removeValue(forKey: record.id)?.invalidate()
         approved = candidate; issued[id] = token; pending[id] = nil; authenticated[id] = record
         deadlineTasks.removeValue(forKey: id)?.cancel(); deadlines[id] = nil
         publish()
@@ -274,7 +290,7 @@ public actor LocalCatalogServer {
                 var candidate = approved; candidate[id] = nil
                 let intents = existing == nil ? revocations + [intent] : revocations
                 // All trusted mutations hold the lease, so these validated bytes remain current across reservation.
-                let bytes = try TrustedTVApprovals(approvals: Array(candidate.values), revocations: intents).encoded()
+                let bytes = try approvalBytes(candidate, revocations: intents)
                 try await requests?.reserveRevocation(intent, revision: trustedRevision)
                 do {
                     try await beforeTrustedCommit(intent)
@@ -285,6 +301,7 @@ public actor LocalCatalogServer {
                     throw error
                 }
                 // No cancellation after publication: the trusted intent must reach the service before handoff.
+                requestAuthorizations.removeValue(forKey: id)?.invalidate()
                 approved = candidate; revocations = intents; trustedSequence &+= 1
                 for (session, record) in authenticated where record.id == id { cancelSession(session) }
                 publish()
@@ -312,9 +329,12 @@ public actor LocalCatalogServer {
     }
     private func drainRevocations() async {
         var attempted: Set<UUID> = [], failures: [UUID: ReplayFailure] = [:]
+        var owner = coordinatorID
         while true {
             let lease = try! await acquireTrustedMutation(cancellable: false)
             let intent: RequestRevocationIntent
+            let service = requests, revision = trustedRevision
+            if owner != coordinatorID { owner = coordinatorID; attempted.removeAll(); failures.removeAll() }
             do {
                 try loadApprovals()
                 try await requests?.loadTrustedRevocations(revocations, revision: trustedRevision)
@@ -332,8 +352,10 @@ public actor LocalCatalogServer {
             releaseTrustedMutation(lease)
             do {
                 try await beforeRevocationReplay(intent)
-                try await requests?.applyTrustedRevocation(intent, revision: trustedRevision)
+                guard owner == coordinatorID else { continue }
+                try await service?.applyTrustedRevocation(intent, revision: revision)
                 let acknowledgement = try! await acquireTrustedMutation(cancellable: false)
+                guard owner == coordinatorID, requests === service else { releaseTrustedMutation(acknowledgement); continue }
                 do {
                     // Approvals can change during replay. Preserve the current tokens and remove only this intent.
                     let remaining = revocations.filter { $0.operationID != intent.operationID }
@@ -345,8 +367,9 @@ public actor LocalCatalogServer {
                 } catch { releaseTrustedMutation(acknowledgement); throw error }
                 releaseTrustedMutation(acknowledgement)
             } catch {
+                guard owner == coordinatorID else { continue }
                 failures[intent.operationID] = ReplayFailure(error)
-                await requests?.revocationReplayFailed(error, intent: intent, revision: trustedRevision)
+                await service?.revocationReplayFailed(error, intent: intent, revision: revision)
             }
         }
     }
@@ -365,9 +388,19 @@ public actor LocalCatalogServer {
             if let failure { value.resume(throwing: failure) } else { value.resume() }
         }
     }
+    private func approvalBytes(_ records: [String: ApprovedTV], revocations pending: [RequestRevocationIntent]) throws -> Data {
+        trustedEncodingCount += 1
+        return try TrustedTVApprovals(approvals: Array(records.values), revocations: pending).encoded()
+    }
     private func persist(_ records: [String: ApprovedTV], revocations pending: [RequestRevocationIntent]? = nil) throws {
-        try writeApprovals(TrustedTVApprovals(approvals: Array(records.values), revocations: pending ?? revocations).encoded())
+        try writeApprovals(approvalBytes(records, revocations: pending ?? revocations))
         trustedSequence &+= 1
+    }
+    func requestAuthorization(for deviceID: String) throws -> TrustedRequestAuthorization {
+        guard approved[deviceID] != nil else { throw ShaderRequestError.unavailable("TV access was revoked") }
+        if let value = requestAuthorizations[deviceID] { return value }
+        let value = TrustedRequestAuthorization(coordinator: coordinatorID, deviceID: deviceID)
+        requestAuthorizations[deviceID] = value; return value
     }
     private func authorized(_ id: UUID) -> Bool {
         guard !closing.contains(id), let record = authenticated[id] else { return false }
@@ -407,7 +440,11 @@ public actor LocalCatalogServer {
         guard let channel = sessions[id] else { return }
         closing.insert(id)
         deadlineTasks.removeValue(forKey: id)?.cancel()
-        pending[id] = nil; issued[id] = nil; authenticated[id] = nil
+        let deviceID = authenticated.removeValue(forKey: id)?.id
+        pending[id] = nil; issued[id] = nil
+        if let deviceID, !authenticated.values.contains(where: { $0.id == deviceID }) {
+            requestAuthorizations.removeValue(forKey: deviceID)?.invalidate()
+        }
         channel.cancel()
     }
 
@@ -433,7 +470,8 @@ public actor LocalCatalogServer {
             do {
                 guard let requests else { throw ShaderRequestError.unavailable("Update the Mac app to enable requests.") }
                 let control = try JSONDecoder().decode(ShaderRequestControl.self, from: packet.payload)
-                let value = try await requests.control(operation: packet.message.operation, payload: control, deviceID: deviceID, authorization: trustedRevision)
+                let authorization = try requestAuthorization(for: deviceID)
+                let value = try await requests.control(operation: packet.message.operation, payload: control, deviceID: deviceID, authorization: authorization)
                 guard authorized(id) else { return LocalPacket(message: LocalMessage(operation: "ok", error: "revoked")) }
                 return LocalPacket(message: reply, payload: try JSONEncoder().encode(value))
             } catch {
