@@ -199,10 +199,30 @@ public actor ShaderRequestService {
         }
     }
     private var metadataIssue: MetadataIssue?
+    // Inspection completion releases shared load waiters; only a fully decoded
+    // baseline and an inspected fault marker authorize metadata mutation.
+    private var acceptedMetadataAvailable = false
+    private var storageFaultInspected = false
+    private var metadataRecoveryAttempt: UUID?
+    private enum MetadataAuthority { @TaskLocal static var recovery: UUID? }
+    private func admitMetadataMutation() throws {
+        guard acceptedMetadataAvailable, storageFaultInspected,
+              metadataIssue == nil || (metadataRecoveryAttempt != nil && MetadataAuthority.recovery == metadataRecoveryAttempt) else {
+            throw MetadataUnavailable(message: metadataIssue?.localizedDescription ?? "Request metadata inspection has not established an accepted baseline. Choose Retry Recovery.")
+        }
+    }
+    private func inspectStorage() async throws {
+        let root = directory
+        do { try await persistence.perform { try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true) } }
+        catch { throw MetadataIssue(file: root.path, reason: error.localizedDescription) }
+        if !storageFaultInspected {
+            if let fault = try await persistence.loadFault() { publishStorageFault(fault) }
+            storageFaultInspected = true
+        }
+    }
     private var persistenceFailure: String? { persistenceFault?.localizedDescription ?? metadataIssue?.localizedDescription ?? validationBlocker?.message }
     private func publishMetadataIssue(_ error: Error, file: String) {
         metadataIssue = error as? MetadataIssue ?? MetadataIssue(file: file, reason: RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 4096))
-        configuration.enabled = false
         activeProcess?.shutdown(); failPendingPublicationForRecovery(metadataIssue!.localizedDescription); emitUpdates()
     }
     private struct MetadataUnavailable: LocalizedError { let message: String; var errorDescription: String? { message } }
@@ -515,6 +535,7 @@ public actor ShaderRequestService {
     }
     private func writeFile(to file: URL, bytes: (isolated ShaderRequestService) throws -> Data) async throws {
         try await waitForStorageChange(cancellable: false)
+        try admitMetadataMutation()
         let id = UUID(); storageCommit = id
         defer { releaseStorageCommit() }
         let data = try bytes(self)
@@ -525,12 +546,14 @@ public actor ShaderRequestService {
         catch { publishStorageFault(error); throw error }
     }
     private func journalChange<T: Sendable>(_ operation: String, in journal: URL, _ body: @escaping @Sendable () throws -> T) async throws -> T {
+        try admitMetadataMutation()
         defer { invalidateMaintenanceProposal(RequestPaths.canonical(journal)) }
         do { return try await persistence.journal(operation, files: [journal.appendingPathComponent(RequestWorkerOperation.filename), journal.appendingPathComponent("configuration.json")], body) }
         catch { publishStorageFault(error); throw error }
     }
     private func commitProposal(_ operation: String, cancellable: Bool = true, build: (isolated ShaderRequestService) throws -> StorageProposal) async throws {
         try await waitForStorageChange(cancellable: cancellable)
+        try admitMetadataMutation()
         if let persistenceFailure { throw persistenceFault as Error? ?? MetadataUnavailable(message: persistenceFailure) }
         let id = UUID(); storageCommit = id
         defer { releaseStorageCommit() }
@@ -651,22 +674,23 @@ public actor ShaderRequestService {
     }
     private func performInitialLoad() async {
         defer { loaded = true; loadingTask = nil; emitUpdates() }
-        let root = directory
         do {
-            try await persistence.perform { try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true) }
-            persistenceFault = try await persistence.loadFault()
+            try await inspectStorage()
             try await reloadAcceptedMetadata()
-            if persistenceFailure == nil {
-                try await persist()
-                try await retirePendingWorkers()
-                for id in records.keys where records[id]?.deletionPending == true { await finishDeletion(id) }
-            }
         } catch {
-            if error is RequestPersistence.Fault { publishStorageFault(error) }
-            else if error is RequestPersistence.ValidationError { publishValidation(error) }
-            else if error is MetadataIssue { publishMetadataIssue(error, file: root.path) }
-            else if !Self.requiresCheckoutRecovery(error) { publishMetadataIssue(error, file: root.path) }
-            // Journal retirement records its exact ownership error before returning.
+            if error is MetadataIssue { publishMetadataIssue(error, file: directory.path) }
+            else { publishStorageFault(error) }
+            return
+        }
+        guard persistenceFailure == nil else { return }
+        do {
+            try await persist()
+            try await retirePendingWorkers()
+            for id in records.keys where records[id]?.deletionPending == true { await finishDeletion(id) }
+        } catch {
+            // Retirement owns its journal-specific recovery. An operational failure
+            // after decoding must never be reported as unreadable shared metadata.
+            progressPersistenceFailed(error)
         }
     }
     nonisolated private static func readPreferences(at file: URL) throws -> ShaderRequestConfiguration? {
@@ -874,6 +898,7 @@ public actor ShaderRequestService {
     }
 
     private func reconcileWorkers() async throws {
+        try admitMetadataMutation()
         guard !reconciled else { return }
         let legacyDetachKeys = recovery.entries.filter { $0.value.disposition == .detach && $0.value.archiveID == nil }.map(\.key)
         for key in legacyDetachKeys { recovery.entries[key]?.archiveID = UUID() }
@@ -1013,6 +1038,7 @@ public actor ShaderRequestService {
         try await commitFiles([.init(url: directory.appendingPathComponent("recovery.json"), recovery: recovery, generation: recoveryRevision)], retainingEvidence: retainingEvidence)
     }
     @discardableResult private func commitFiles(_ files: [RequestPersistence.File], retainingEvidence: Bool = false, transaction: UUID? = nil, operation: String = "request metadata", cancellable: Bool = true, recoveryToken: RequestPersistence.RecoveryToken? = nil) async throws -> UInt64 {
+        try admitMetadataMutation()
         persistenceRevision &+= 1
         let snapshot = RequestPersistence.Snapshot(revision: persistenceRevision, files: files, operation: operation)
         pendingCommits += 1
@@ -1089,6 +1115,7 @@ public actor ShaderRequestService {
         if validationBlocker == nil { validationBlocker = accepted.validation }
         if let validationBlocker { persistenceRevision = max(persistenceRevision, validationBlocker.revision) }
         normalizeAcceptedMetadata(active: accepted.active, operations: accepted.operations, launchEvidence: accepted.launchEvidence, paths: accepted.paths)
+        acceptedMetadataAvailable = true
         reconciled = false; refreshReconciliationFailure()
     }
     private func normalizeAcceptedMetadata(active: UUID?, operations: [UUID: RequestWorkerOperation], launchEvidence: Set<UUID>, paths: [String: String]) {
@@ -1127,28 +1154,34 @@ public actor ShaderRequestService {
         if detachedOwners.contains(where: { Self.matchesDetachedCheckout(configuration, acknowledgement: $0, paths: paths) }) { configuration.enabled = false }
     }
     private func resetPersistenceFailure() async throws {
-        var token: RequestPersistence.RecoveryToken?
-        let issueID = metadataIssue?.id
-        do {
-            if let retirementTask { await retirementTask.value }
-            token = try await persistence.restoreForRecovery()
-            if token?.reloadAccepted == true || metadataIssue != nil { try await reloadAcceptedMetadata() }
-            let validationRevision = try await persist(recoveryToken: token)
-            try await retirePendingWorkers(recoveryToken: token)
-            try await persistence.clearValidation(through: validationRevision)
-            let receipt = try await persistence.finishRecovery(token)
-            resolvedPersistenceGeneration = max(resolvedPersistenceGeneration, receipt.clearedGeneration)
-            if let fault = persistenceFault, fault.generation > receipt.clearedGeneration { throw fault }
-            persistenceFault = nil
-            if metadataIssue?.id == issueID { metadataIssue = nil }
-            resolvedValidationRevision = max(resolvedValidationRevision, validationRevision)
-            if (validationBlocker?.revision ?? 0) <= validationRevision { validationBlocker = nil }
-            if let validationBlocker { throw RequestPersistence.ValidationError(message: validationBlocker.message) }
-            emitUpdates(); if schedulingDeferred { scheduleWakeup() }
-        } catch {
-            await persistence.abortRecovery(token)
-            if error is MetadataIssue { publishMetadataIssue(error, file: directory.path) }
-            publishStorageFault(error); throw error
+        let attempt = UUID()
+        metadataRecoveryAttempt = attempt
+        defer { if metadataRecoveryAttempt == attempt { metadataRecoveryAttempt = nil } }
+        try await MetadataAuthority.$recovery.withValue(attempt) {
+            var token: RequestPersistence.RecoveryToken?
+            let issueID = metadataIssue?.id
+            do {
+                if let retirementTask { await retirementTask.value }
+                try await inspectStorage()
+                token = try await persistence.restoreForRecovery()
+                if token?.reloadAccepted == true || metadataIssue != nil || !acceptedMetadataAvailable { try await reloadAcceptedMetadata() }
+                let validationRevision = try await persist(recoveryToken: token)
+                try await retirePendingWorkers(recoveryToken: token)
+                try await persistence.clearValidation(through: validationRevision)
+                let receipt = try await persistence.finishRecovery(token)
+                resolvedPersistenceGeneration = max(resolvedPersistenceGeneration, receipt.clearedGeneration)
+                if let fault = persistenceFault, fault.generation > receipt.clearedGeneration { throw fault }
+                persistenceFault = nil
+                if metadataIssue?.id == issueID { metadataIssue = nil }
+                resolvedValidationRevision = max(resolvedValidationRevision, validationRevision)
+                if (validationBlocker?.revision ?? 0) <= validationRevision { validationBlocker = nil }
+                if let validationBlocker { throw RequestPersistence.ValidationError(message: validationBlocker.message) }
+                emitUpdates(); if schedulingDeferred { scheduleWakeup() }
+            } catch {
+                await persistence.abortRecovery(token)
+                if error is MetadataIssue { publishMetadataIssue(error, file: directory.path) }
+                publishStorageFault(error); throw error
+            }
         }
     }
     func applyPersistenceReceipt(_ receipt: RequestPersistence.CommitReceipt) {
@@ -1194,6 +1227,7 @@ public actor ShaderRequestService {
         _ = try? await persistence.perform { try RequestJournalWriter.appendDiagnostic(detail, to: log) }
     }
     private func finalizeDetachment(_ entry: RequestRecoveryStore.Entry) async throws {
+        try admitMetadataMutation()
         guard let archiveID = entry.archiveID else {
             throw RequestWorkerEvidenceError(cause: "Detachment archive intent is missing; retry explicit Detach.")
         }
@@ -1447,6 +1481,7 @@ public actor ShaderRequestService {
         if current?.id != repair.replacementID {
             if let current { guard current.id == repair.operation.id, current.target == repair.operation.target else { throw RequestWorkerOwnershipError() } }
             else { guard try RequestWorkerOperation.read(in: archive)?.id == repair.operation.id else { throw RequestWorkerOwnershipError() } }
+            try admitMetadataMutation()
             try await persistence.perform { try RequestJournalWriter.archive(in: journal, id: repair.archiveID) }
             try checkMaintenance(lease)
         }
@@ -1918,6 +1953,7 @@ public actor ShaderRequestService {
     }
     @discardableResult private func persist(progress: Bool = false, operation: String = "request metadata", recoveryToken: RequestPersistence.RecoveryToken? = nil) async throws -> UInt64 {
         try await waitForStorageChange(cancellable: false)
+        try admitMetadataMutation()
         let files = metadataFiles(rows: records, acknowledgements: detachedOwners, store: recovery)
         let committedRevision: UInt64
         if progress {
@@ -2017,6 +2053,7 @@ public actor ShaderRequestService {
         await finishDeletion(id)
     }
     private func finishDeletion(_ id: UUID) async {
+        guard (try? admitMetadataMutation()) != nil else { return }
         guard records[id]?.deletionPending == true else { return }
         let tombstone = records[id]
         do {
@@ -2037,6 +2074,8 @@ public actor ShaderRequestService {
         }
     }
     public func revoke(_ deviceID: String) async throws {
+        try await load()
+        try admitMetadataMutation()
         for id in records.keys where records[id]?.status.deviceID == deviceID { transitionRecord(id, .revoked) }
         try await persist(); kick()
     }
@@ -2257,6 +2296,7 @@ public actor ShaderRequestService {
     }
     private func finishRetirementTask() { retirementTask = nil; emitUpdates(); kick() }
     private func retirePendingWorkers(recoveryToken: RequestPersistence.RecoveryToken? = nil) async throws {
+        try admitMetadataMutation()
         for (id, operation) in pendingRetirements.sorted(by: { $0.key.uuidString < $1.key.uuidString }) {
             guard records[id]?.dispatch?.executionID == operation || records[id]?.dispatch == nil else { continue }
             let job = folder(id)

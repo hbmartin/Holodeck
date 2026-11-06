@@ -4971,3 +4971,70 @@ private actor StartupInspectionGate {
     func release() { continuation?.resume(); continuation = nil }
 }
 #endif
+
+#if os(macOS)
+extension ShaderRequestTests {
+    func testBlockedStartupCannotReplaceRetainedSharedMetadata() async throws {
+        for action in ["verify", "select", "revoke", "detach", "submit"] {
+            let (root, script) = try recoveryFixture(), seed = try await recoveryService(root, script: script)
+            let request = ShaderRequest(prompt: "Retained exact metadata", context: try context())
+            _ = try await seed.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+            var store = RequestRecoveryStore()
+            let journal = RequestPaths.canonical(root.appendingPathComponent("setup"))
+            store.entries[journal] = .init(journal: journal, requestID: nil, configuration: nil, disposition: .resume, message: "Retain this evidence")
+            try store.encoded().write(to: root.appendingPathComponent("recovery.json"))
+            let ack = DetachedCheckoutAcknowledgement(requestID: UUID(), directory: root.appendingPathComponent("old").path, repository: root.path + "-detached", checkoutID: nil)
+            try JSONEncoder().encode([ack]).write(to: root.appendingPathComponent("detached-checkouts.json"))
+            let names = ["journal.json", "recovery.json", "detached-checkouts.json"]
+            let retained = try names.map { try Data(contentsOf: root.appendingPathComponent($0)) }
+            try Data("{".utf8).write(to: root.appendingPathComponent("preferences.json"))
+            let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script)
+            await service.suspend(); try await service.initialize(configuration: .init(repository: root.path, enabled: true))
+            do {
+                switch action {
+                case "verify": try await service.verify(configuration: .init(repository: root.path))
+                case "select": _ = try await service.selectRepository(root.appendingPathComponent("other"))
+                case "revoke": try await service.revoke("TV")
+                case "detach": try await service.detachCheckout(.selectedCheckout)
+                default: _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+                }
+                XCTFail("Blocked startup accepted \(action)")
+            } catch {}
+            for (name, bytes) in zip(names, retained) { XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(name)), bytes, action + ": " + name) }
+        }
+    }
+
+    func testRepairedDirectoryInspectsRetainedFaultBeforeRecoveryWrites() async throws {
+        let (parent, script) = try recoveryFixture(), root = parent.appendingPathComponent("requests")
+        try Data("obstruction".utf8).write(to: root)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: parent.appendingPathComponent("catalog")), directory: root, workerScript: script)
+        await service.suspend(); try await service.initialize(configuration: .init(repository: parent.path, enabled: true))
+        try FileManager.default.moveItem(at: root, to: parent.appendingPathComponent("retained-obstruction"))
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let fault = RequestPersistence.Fault(id: UUID(), generation: 91, operation: "retained ownership", paths: [], primary: "Manual proof required", manualRepairRequired: true)
+        let bytes = try JSONEncoder().encode(fault), marker = root.appendingPathComponent("storage-recovery.json")
+        try bytes.write(to: marker)
+        do { try await service.retryReconciliation(); XCTFail("Fault inspection was bypassed") } catch { XCTAssertTrue(error.localizedDescription.contains("Manual proof")) }
+        XCTAssertEqual(try Data(contentsOf: marker), bytes)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(root.appendingPathComponent("journal.json")))
+        let statuses = await service.recoveryStatuses(); XCTAssertTrue(statuses.contains { $0.message.contains("Manual proof") })
+    }
+
+    func testStartupRetirementFailureRetainsItsJournalCategory() async throws {
+        let (root, script) = try recoveryFixture(), seed = try await recoveryService(root, script: script)
+        let request = ShaderRequest(prompt: "Retirement fault", context: try context())
+        _ = try await seed.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+        let journal = root.appendingPathComponent("journal.json"), execution = UUID()
+        var rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: journal)) as? [[String: Any]])
+        rows[0]["executionID"] = execution.uuidString
+        rows[0]["dispatch"] = ["executionID": execution.uuidString, "priorStage": "queued", "launched": false, "retirementPending": false]
+        try JSONSerialization.data(withJSONObject: rows).write(to: journal)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script,
+            reconcileWorker: { _ in throw ShaderRequestError.unavailable("Retirement observation unavailable") })
+        await service.suspend(); try await service.initialize(configuration: .init(repository: root.path, enabled: true))
+        let statuses = await service.recoveryStatuses()
+        XCTAssertTrue(statuses.contains { $0.kind == .reconciliation &&  $0.journal.map { RequestPaths.canonical($0) } == RequestPaths.canonical(root.appendingPathComponent(request.id.uuidString)) && $0.message.contains("Retirement observation unavailable") })
+        XCTAssertFalse(statuses.contains { $0.message.contains("metadata is unreadable") })
+    }
+}
+#endif

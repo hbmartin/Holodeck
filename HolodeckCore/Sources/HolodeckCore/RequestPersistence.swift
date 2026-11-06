@@ -410,6 +410,8 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
     }
     func loadFault() async throws -> Fault? {
         try await perform { [self] in
+            // Reinspection must never replace a newer in-session fault or its undo images.
+            if let failure { return failure }
             if let file = faultFile, RequestProcessIdentity.evidenceExists(file) {
                 do {
                     failure = try JSONDecoder().decode(Fault.self, from: BoundedCatalogReader(root: file.deletingLastPathComponent()).read(file.lastPathComponent, limit: 65536).bytes)
