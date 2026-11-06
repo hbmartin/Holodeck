@@ -162,7 +162,7 @@ final class MacRequestsModel {
     }
     func finishStartupSelection() { startupSelectionContinuation?.resume(); startupSelectionContinuation = nil }
     #endif
-    var hasUnfinishedJobs: Bool { pendingCleanup || !recoveries.isEmpty || jobs.contains { !$0.stage.terminal } }
+    var hasUnfinishedJobs: Bool { pendingCleanup || recoveries.contains { $0.blocksCheckoutWork } || jobs.contains { !$0.stage.terminal } }
     /// A startup bookmark is a proposal until the service accepts it.
     func proposeRepository(_ url: URL) {
         guard !configuration.enabled, !hasUnfinishedJobs else { return }

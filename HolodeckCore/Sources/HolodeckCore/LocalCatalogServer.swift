@@ -70,7 +70,10 @@ public actor LocalCatalogServer {
             }
             releaseTrustedMutation(lease)
             try await replayRevocations()
-        } catch { await service.revocationReplayFailed(error, revision: trustedRevision) }
+        } catch {
+            // The drain already published the exact inspection/intent failure.
+            // Do not turn a failed device replay into an unknown global approval state.
+        }
     }
     private let catalog: DirectoryCatalog
     private let allowLoopback: Bool
@@ -430,7 +433,7 @@ public actor LocalCatalogServer {
             do {
                 guard let requests else { throw ShaderRequestError.unavailable("Update the Mac app to enable requests.") }
                 let control = try JSONDecoder().decode(ShaderRequestControl.self, from: packet.payload)
-                let value = try await requests.control(operation: packet.message.operation, payload: control, deviceID: deviceID)
+                let value = try await requests.control(operation: packet.message.operation, payload: control, deviceID: deviceID, authorization: trustedRevision)
                 guard authorized(id) else { return LocalPacket(message: LocalMessage(operation: "ok", error: "revoked")) }
                 return LocalPacket(message: reply, payload: try JSONEncoder().encode(value))
             } catch {

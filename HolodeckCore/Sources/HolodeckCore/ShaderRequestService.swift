@@ -111,6 +111,7 @@ public struct ShaderRequestRecoveryStatus: Sendable, Identifiable {
     public var disposition: ShaderRequestRecoveryDisposition? = nil
     public var isRetrying = false
     public var repairConfiguration: ShaderRequestConfiguration? = nil
+    public var blocksCheckoutWork = true
 }
 
 public struct ShaderRequestPublicationStatus: Sendable {
@@ -341,17 +342,7 @@ public actor ShaderRequestService {
             record.detached = true; record.interrupted = true; record.cleanupPending = false; record.cleanupFailure = nil
             if !wasDetached, !record.status.stage.terminal { Self.setStatus(&record, stage: .failed, message: "Checkout detached; unpublished files and evidence were retained") }
         case .interrupted: record.interrupted = true
-        case .revoked:
-            if !record.status.stage.terminal {
-                record.revoked = true
-                if activeID != id {
-                    if record.status.stage == .queued { Self.setStatus(&record, stage: .cancelled, message: "TV access was revoked") }
-                    else {
-                        record.cleanupPending = true; record.cleanupMessage = "TV access was revoked; any pushed commit remains"
-                        Self.setStatus(&record, stage: .failed, message: "TV access was revoked; checkout cleanup is pending")
-                    }
-                }
-            }
+        case .revoked: Self.markRevoked(&record, active: activeID == id)
         case .ownedRecovery:
             if record.detached != true {
                 recoveryID = id
@@ -500,16 +491,35 @@ public actor ShaderRequestService {
     private var durableRevocations: Set<UUID> = []
     private var revocationCoordinatorID: UUID?
     private var revocationRevision: UInt64 = 0
+    private var deviceRevocationRevisions: [String: UInt64] = [:]
     private var revocationCoordinator: (@Sendable () async throws -> Void)?
     private var revocationInspectionPending = false
     private var revocationFailure: String?
     private var revocationFailures: [UUID: String] = [:]
+    private var unknownRevocationBlocker: String? {
+        if let revocationFailure { return "TV approval inspection requires recovery: " + revocationFailure }
+        return revocationInspectionPending ? "TV approvals have not been inspected. TV requests are paused; choose Retry Recovery." : nil
+    }
+    private func revocationBlocker(for deviceID: String) -> String? {
+        if let unknownRevocationBlocker { return unknownRevocationBlocker }
+        guard let intent = pendingRevocations.values.first(where: { $0.deviceID == deviceID }) else { return nil }
+        if let failure = revocationFailures[intent.operationID] { return "TV revocation recovery required for " + deviceID + ": " + failure }
+        return "TV access revocation is pending for " + deviceID + "; request cancellation must be durably replayed. Choose Retry Recovery if it does not finish."
+    }
     private var revocationBlocker: String? {
-        if let revocationFailure { return "TV revocation recovery required: " + revocationFailure }
-        if let failure = revocationFailures.sorted(by: { $0.key.uuidString < $1.key.uuidString }).first?.value { return "TV revocation recovery required: " + failure }
-        return revocationInspectionPending || !pendingRevocations.isEmpty ? "TV access was revoked; request cancellation must be durably replayed before accepting or starting new work. Choose Retry Recovery." : nil
+        if let unknownRevocationBlocker { return unknownRevocationBlocker }
+        guard let device = pendingRevocations.values.map(\.deviceID).sorted().first else { return nil }
+        return revocationBlocker(for: device)
+    }
+    private var revocationCheckoutBlocker: String? {
+        records.values.first { record in
+            guard record.detached != true, revocationBlocker(for: record.status.deviceID) != nil else { return false }
+            return record.cleanupPending == true || record.dispatch?.launched == true ||
+                (!record.status.stage.terminal && ![.queued, .awaitingActivation].contains(record.status.stage))
+        }.map { "TV revocation must settle its owned checkout before starting other checkout work: " + $0.status.deviceID }
     }
     func registerRevocationCoordinator(id: UUID, _ coordinator: @escaping @Sendable () async throws -> Void) {
+        if revocationCoordinatorID != id { deviceRevocationRevisions.removeAll() }
         revocationCoordinatorID = id; revocationRevision = 0
         revocationCoordinator = coordinator; revocationInspectionPending = true; emitUpdates()
     }
@@ -531,6 +541,7 @@ public actor ShaderRequestService {
     func commitTrustedRevocation(_ intent: RequestRevocationIntent, revision: TrustedRevocationRevision) throws {
         try acceptRevocationRevision(revision)
         pendingRevocations[intent.operationID] = intent; durableRevocations.insert(intent.operationID)
+        deviceRevocationRevisions[intent.deviceID] = max(deviceRevocationRevisions[intent.deviceID, default: 0], revision.sequence)
         if let activeID, records[activeID]?.status.deviceID == intent.deviceID {
             execution?.interrupted = true; activeProcess?.stop()
         }
@@ -563,7 +574,7 @@ public actor ShaderRequestService {
         if let revision, (try? acceptRevocationRevision(revision)) == nil { return }
         let detail = RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 8192)
         if let intent { revocationFailures[intent.operationID] = detail } else { revocationFailure = detail }
-        if let revocationBlocker { failPendingPublicationForRecovery(revocationBlocker) }; emitUpdates()
+        emitUpdates(); kick()
     }
     func revocationReplaySucceeded(revision: TrustedRevocationRevision) {
         guard (try? acceptRevocationRevision(revision)) != nil else { return }
@@ -848,13 +859,14 @@ public actor ShaderRequestService {
         return configuration
     }
     var hasPendingStorageChange: Bool { storageCommit != nil }
+    var hasActiveCheckoutWork: Bool { activeID != nil || workerTask != nil || maintenanceBusy }
     var isSuspended: Bool { suspended }
     var pendingRecordTransitionCount: Int { recordTransitions.count }
     func persistenceStatistics() async -> [String: Int] {
         var statistics = await persistence.statistics(); statistics["recordTickets"] = recordTicketAllocations; return statistics
     }
     private func requireRepositorySelection() throws {
-        if let revocationBlocker { throw ShaderRequestError.unavailable(revocationBlocker) }
+        if let revocationCheckoutBlocker { throw ShaderRequestError.unavailable(revocationCheckoutBlocker) }
         guard !configuration.enabled else { throw ShaderRequestError.unavailable("Disable shader requests before selecting another checkout.") }
         guard activeID == nil, !maintenanceBusy, workerTask == nil else { throw ShaderRequestError.unavailable("Wait for active library preparation or checkout work before selecting another folder.") }
         guard recovery.entries.isEmpty, reconciliationFailure == nil else { throw ShaderRequestError.unavailable(recoveryBlocker ?? "Retry checkout recovery before selecting another folder.") }
@@ -940,7 +952,6 @@ public actor ShaderRequestService {
     }
     private var recoveryBlocker: String? {
         if let persistenceFailure { return "Mac persistence recovery required: " + persistenceFailure }
-        if let revocationBlocker { return revocationBlocker }
         if let entry = recovery.entries.values.sorted(by: { $0.journal < $1.journal }).first(where: { !isActiveRetry($0.journal) }) { return "Mac checkout recovery required: " + entry.message }
         if let reconciliationFailure { return "Mac checkout recovery required: " + reconciliationFailure }
         if let record = records.values.first(where: { $0.cleanupPending == true }) {
@@ -1042,7 +1053,7 @@ public actor ShaderRequestService {
                 isRunning: maintenanceBusy, journal: folder(record.status.id)))
         }
         if let revocationBlocker {
-            statuses.append(ShaderRequestRecoveryStatus(id: Self.revocationStatusID, kind: .persistence, repository: "", python: "", git: "", message: revocationBlocker, isRunning: maintenanceBusy, journal: directory))
+            statuses.append(ShaderRequestRecoveryStatus(id: Self.revocationStatusID, kind: .persistence, repository: "", python: "", git: "", message: revocationBlocker, isRunning: maintenanceBusy, journal: directory, blocksCheckoutWork: revocationCheckoutBlocker != nil))
         }
         return statuses
     }
@@ -1188,10 +1199,10 @@ public actor ShaderRequestService {
     private func persistRecovery(retainingEvidence: Bool = false) async throws {
         try await commitFiles([.init(url: directory.appendingPathComponent("recovery.json"), recovery: recovery, generation: recoveryRevision)], retainingEvidence: retainingEvidence)
     }
-    @discardableResult private func commitFiles(_ files: [RequestPersistence.File], retainingEvidence: Bool = false, transaction: UUID? = nil, operation: String = "request metadata", cancellable: Bool = true, recoveryToken: RequestPersistence.RecoveryToken? = nil) async throws -> UInt64 {
-        try admitMetadataMutation()
+    @discardableResult private func commitFiles(_ files: [RequestPersistence.File], retainingEvidence: Bool = false, transaction: UUID? = nil, operation: String = "request metadata", cancellable: Bool = true, recoveryToken: RequestPersistence.RecoveryToken? = nil, metadataPermit: RequestPersistence.MetadataAdmission.Permit? = nil) async throws -> UInt64 {
+        let permit = try metadataPermit ?? admitMetadataMutation()
         persistenceRevision &+= 1
-        let snapshot = RequestPersistence.Snapshot(revision: persistenceRevision, files: files, operation: operation, metadataPermit: try admitMetadataMutation())
+        let snapshot = RequestPersistence.Snapshot(revision: persistenceRevision, files: files, operation: operation, metadataPermit: permit)
         pendingCommits += 1
         defer { pendingCommits -= 1; if pendingCommits == 0, schedulingDeferred { scheduleWakeup() } }
         do {
@@ -1432,10 +1443,7 @@ public actor ShaderRequestService {
         // Invalidate the previous observer before storage recovery's first await;
         // its late result must not publish a new failure into the restored state.
         try await drainReconciliation(lease: lease); try await resetPersistenceFailure()
-        if let coordinator = revocationCoordinator {
-            do { try await coordinator() }
-            catch { revocationReplayFailed(error); throw error }
-        }
+        if let coordinator = revocationCoordinator { try await coordinator() }
         for id in records.keys.sorted(by: { $0.uuidString < $1.uuidString }) where records[id]?.deletionPending == true { await finishDeletion(id) }
         var failures: [String] = []
         for key in recovery.entries.keys.sorted() {
@@ -2081,7 +2089,10 @@ public actor ShaderRequestService {
     private func checkExecution(_ id: UUID) throws {
         try Task.checkCancellation()
         if let persistenceFailure { throw MetadataUnavailable(message: persistenceFailure) }
-        if let revocationBlocker { throw MetadataUnavailable(message: revocationBlocker) }
+        // A reservation fences unlaunched work, not another TV's running command.
+        // Trusted commit interrupts its matching execution explicitly.
+        if let activeID, !(activeProcess?.checkoutLaunched ?? (records[activeID]?.dispatch?.launched == true)), let deviceID = records[activeID]?.status.deviceID,
+           let blocker = revocationBlocker(for: deviceID) { throw MetadataUnavailable(message: blocker) }
         guard execution?.id == id, execution?.interrupted == false, !suspended else { throw CancellationError() }
     }
 
@@ -2262,8 +2273,33 @@ public actor ShaderRequestService {
         try await load()
         try admitMetadataMutation()
         if let activeID, records[activeID]?.status.deviceID == deviceID { execution?.interrupted = true; activeProcess?.stop() }
-        for id in records.keys where records[id]?.status.deviceID == deviceID { _ = try await appliedRecord(id, .revoked) }
-        try await persist(operation: "revoke requests from TV " + deviceID); kick()
+        // Revocation is an independently accepted trusted fact. Wait for prior
+        // submissions, then keep its cancellation state even if the writer is faulted.
+        try await waitForStorageChange(cancellable: false)
+        let permit = try admitMetadataMutation()
+        storageCommit = UUID(); defer { releaseStorageCommit() }
+        var changed = false
+        for (id, var record) in records where record.status.deviceID == deviceID && record.deletionPending != true {
+            let previous = record
+            Self.markRevoked(&record, active: activeID == id)
+            if record != previous { records[id] = record; changed = true }
+        }
+        if changed {
+            let files = metadataFiles(rows: records, acknowledgements: detachedOwners, store: recovery)
+            try await commitFiles(files, operation: "revoke requests from TV " + deviceID, metadataPermit: permit)
+        }
+        kick()
+    }
+    private static func markRevoked(_ record: inout Record, active: Bool) {
+        guard !record.status.stage.terminal else { return }
+        record.revoked = true
+        if !active {
+            if record.status.stage == .queued { Self.setStatus(&record, stage: .cancelled, message: "TV access was revoked") }
+            else {
+                record.cleanupPending = true; record.cleanupMessage = "TV access was revoked; any pushed commit remains"
+                Self.setStatus(&record, stage: .failed, message: "TV access was revoked; checkout cleanup is pending")
+            }
+        }
     }
 
     private func acceptedPerformanceID(_ request: ShaderRequest, deviceID: String) -> UUID? {
@@ -2275,10 +2311,24 @@ public actor ShaderRequestService {
     }
 
     public func control(operation: String, payload: ShaderRequestControl, deviceID: String) async throws -> ShaderRequestControlReply {
+        try await performControl(operation: operation, payload: payload, deviceID: deviceID, authorization: nil)
+    }
+    func control(operation: String, payload: ShaderRequestControl, deviceID: String, authorization: TrustedRevocationRevision) async throws -> ShaderRequestControlReply {
+        try await performControl(operation: operation, payload: payload, deviceID: deviceID, authorization: authorization)
+    }
+    private func checkControlAdmission(deviceID: String, cutover: UInt64, coordinator: UUID?, authorization: TrustedRevocationRevision?) throws {
+        guard coordinator == revocationCoordinatorID, cutover == deviceRevocationRevisions[deviceID, default: 0],
+              authorization.map({ $0.coordinator == revocationCoordinatorID && $0.sequence >= cutover }) ?? true else {
+            throw ShaderRequestError.unavailable("TV access changed before this request was accepted. Reconnect before submitting again.")
+        }
+    }
+    private func performControl(operation: String, payload: ShaderRequestControl, deviceID: String, authorization: TrustedRevocationRevision?) async throws -> ShaderRequestControlReply {
+        let cutover = deviceRevocationRevisions[deviceID, default: 0], coordinator = revocationCoordinatorID
         try await load()
         if ["requestSubmit", "requestAnswer", "requestActivated", "requestDelivery"].contains(operation) {
             // Only already accepted records can take this path. A duplicate of an
             // in-flight submission still waits for its original commit's outcome.
+            try checkControlAdmission(deviceID: deviceID, cutover: cutover, coordinator: coordinator, authorization: authorization)
             let candidateID = payload.request?.id ?? payload.requestID
             let canInspect = candidateID.flatMap { records[$0] } != nil ||
                 (operation == "requestSubmit" && payload.request.flatMap { acceptedPerformanceID($0, deviceID: deviceID) } != nil)
@@ -2287,7 +2337,12 @@ public actor ShaderRequestService {
                 let proposal = try controlProposal(operation: operation, payload: payload, deviceID: deviceID)
                 unchanged = proposal.files.isEmpty && proposal.configuration == nil && proposal.acknowledgements == nil && proposal.records.allSatisfy { records[$0.key] == $0.value }
             } else { unchanged = false }
-            if !unchanged { try await commitProposal(operation) { try $0.controlProposal(operation: operation, payload: payload, deviceID: deviceID) } }
+            if !unchanged {
+                try await commitProposal(operation) { service in
+                    try service.checkControlAdmission(deviceID: deviceID, cutover: cutover, coordinator: coordinator, authorization: authorization)
+                    return try service.controlProposal(operation: operation, payload: payload, deviceID: deviceID)
+                }
+            }
             kick()
         }
         var responseID = payload.request?.id ?? payload.requestID
@@ -2301,6 +2356,7 @@ public actor ShaderRequestService {
         record.status.updatedAt = Date(); record.status.sequence &+= 1
     }
     private func controlProposal(operation: String, payload: ShaderRequestControl, deviceID: String) throws -> StorageProposal {
+        if let blocker = revocationBlocker(for: deviceID) { throw ShaderRequestError.unavailable(blocker) }
         if operation == "requestSubmit" {
             guard configuration.enabled else { throw ShaderRequestError.unavailable(setupMessage) }
             if let blocker = recoveryBlocker { throw ShaderRequestError.unavailable(blocker) }
@@ -2351,12 +2407,12 @@ public actor ShaderRequestService {
     private func reply(deviceID: String, requestID: UUID?) async throws -> ShaderRequestControlReply {
         let owned = allJobs().filter { $0.deviceID == deviceID }
         let jobs = requestID.map { id in owned.filter { $0.id == id } } ?? owned.filter { !$0.stage.terminal }
-        return ShaderRequestControlReply(enabled: configurationValue().enabled && recoveryBlocker == nil,
-                                        message: recoveryBlocker ?? (configuration.enabled ? "Ready for shader requests" : setupMessage), jobs: jobs,
+        let blocker = recoveryBlocker ?? revocationBlocker(for: deviceID)
+        return ShaderRequestControlReply(enabled: configurationValue().enabled && blocker == nil,
+                                        message: blocker ?? (configuration.enabled ? "Ready for shader requests" : setupMessage), jobs: jobs,
                                         publicationRevision: await catalog.publicationRevisionValue())
     }
     private func kick() {
-        if let revocationBlocker { failPendingPublicationForRecovery(revocationBlocker); return }
         if let persistenceFailure { failPendingPublicationForRecovery(persistenceFailure); return }
         guard loaded, initialized, !suspended, !maintenanceBusy, activeID == nil, workerTask == nil else { return }
         if storageCommit != nil || pendingCommits != 0 || !pendingRetirements.isEmpty || retirementTask != nil { schedulingDeferred = true; return }
@@ -2378,7 +2434,7 @@ public actor ShaderRequestService {
             return
         }
         if let entry = recovery.entries.values.first { failPendingPublicationForRecovery(entry.message); return }
-        let eligible = records.values.filter { !$0.revoked && $0.detached != true }.map(\.status)
+        let eligible = records.values.filter { !$0.revoked && $0.detached != true && revocationBlocker(for: $0.status.deviceID) == nil }.map(\.status)
         if let recoveryID, let failure = records[recoveryID]?.cleanupFailure {
             failPendingPublicationForRecovery(failure); return
         }
@@ -2386,7 +2442,7 @@ public actor ShaderRequestService {
         let cleanupID = ownerCleanup ?? records.values.filter { $0.cleanupPending == true && $0.cleanupFailure == nil }.sorted { $0.status.createdAt < $1.status.createdAt }.first?.status.id
         let interrupted = recoveryID.flatMap { id -> UUID? in
             guard configuration.enabled, schedulingActive || pendingPublication != nil || retryPublicationForce != nil,
-                  let value = records[id], !value.revoked, value.detached != true,
+                  let value = records[id], !value.revoked, value.detached != true, revocationBlocker(for: value.status.deviceID) == nil,
                   value.cleanupPending != true, value.status.stage == .repairing || value.status.stage == .queued else { return nil }
             return id
         }
@@ -2397,6 +2453,7 @@ public actor ShaderRequestService {
             let failure = records.values.first { $0.cleanupPending == true && $0.cleanupFailure != nil }?.cleanupFailure
             failPendingPublicationForRecovery(failure ?? "Checkout cleanup is required."); return
         }
+        else if let revocationCheckoutBlocker { failPendingPublicationForRecovery(revocationCheckoutBlocker); return }
         else if pendingPublication != nil || (retryPublicationForce != nil && configuration.enabled) { work = .publication }
         else if schedulingActive, configuration.enabled, let id = ShaderRequestScheduling.next(in: eligible, recoveringID: recoveryID) { work = .execute(id) }
         else { return }

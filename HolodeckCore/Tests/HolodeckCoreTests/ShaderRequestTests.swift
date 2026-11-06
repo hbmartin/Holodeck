@@ -5378,3 +5378,118 @@ extension ShaderRequestTests {
     }
 }
 #endif
+
+#if os(macOS)
+extension ShaderRequestTests {
+    func testTrustedRevocationIncludesSubmissionAlreadyReplacingItsFiles() async throws {
+        let (root, script) = try recoveryFixture(), gate = DraftReplacementGate(failAfterRelease: false)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script, beforePersistenceReplacement: { try gate.before($0) })
+        await service.suspend(); try await service.start(configuration: .init(repository: root.path, enabled: true))
+        let trusted = TrustedApprovalFixture(try JSONEncoder().encode([ApprovedTV(id: "A", name: "A", tokenHash: "A")]))
+        let server = LocalCatalogServer(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), testingNamespace: "in-flight", readApprovals: { trusted.read() }, writeApprovals: { try trusted.write($0) })
+        await server.setRequestService(service)
+        let request = ShaderRequest(prompt: "Already committing", context: try context())
+        gate.arm(root.appendingPathComponent(request.id.uuidString).appendingPathComponent("request.json"))
+        let submitting = Task { try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "A") }
+        defer { gate.release() }
+        try await waitFor { gate.entered }
+        let revoking = Task { try await server.revoke("A") }
+        try await waitFor { await server.currentState.approved.isEmpty }
+        gate.release(); _ = try await submitting.value; try await revoking.value
+        let job = await service.allJobs().first; XCTAssertEqual(job?.stage, .cancelled)
+        let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("journal.json"))) as? [[String: Any]])
+        XCTAssertEqual(rows.first?["revoked"] as? Bool, true)
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(trusted.read())).revocations.isEmpty)
+        await service.resume(); let running = await service.hasActiveCheckoutWork; XCTAssertFalse(running)
+    }
+    func testAcknowledgedRevocationRejectsOldAuthorizationButAllowsOtherTVsAndReapproval() async throws {
+        let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script), owner = UUID()
+        await service.registerRevocationCoordinator(id: owner) {}
+        let old = TrustedRevocationRevision(coordinator: owner, sequence: 0), fresh = TrustedRevocationRevision(coordinator: owner, sequence: 1)
+        try await service.loadTrustedRevocations([], revision: old)
+        let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        try await service.reserveRevocation(intent, revision: old); try await service.commitTrustedRevocation(intent, revision: fresh)
+        try await service.applyTrustedRevocation(intent, revision: fresh); try await service.acknowledgeTrustedRevocation(intent, revision: fresh)
+        await service.revocationReplaySucceeded(revision: fresh)
+        let stale = ShaderRequest(prompt: "Old authenticated request", context: try context())
+        do { _ = try await service.control(operation: "requestSubmit", payload: .init(request: stale), deviceID: "A", authorization: old); XCTFail("Old authorization survived acknowledgment") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("access changed")) }
+        let unrelated = ShaderRequest(prompt: "Other TV old authorization remains valid", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: unrelated), deviceID: "B", authorization: old)
+        let reapproved = ShaderRequest(prompt: "New approval", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: reapproved), deviceID: "A", authorization: fresh)
+        let jobs = await service.allJobs(); XCTAssertEqual(Set(jobs.map(\.id)), [unrelated.id, reapproved.id])
+    }
+    func testPendingDeviceReplayDoesNotBlockOrRestartUnrelatedJob() async throws {
+        let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script), gate = RecoveryGate()
+        var code = try String(contentsOf: script, encoding: .utf8)
+        code = code.replacingOccurrences(of: "while True: time.sleep(.005)", with: "while True:\n    if (job/'emit-progress').exists():\n        (job/'emit-progress').unlink(); emit('stage',stage='validating',message='Unrelated progress accepted')\n    time.sleep(.005)")
+        try code.write(to: script, atomically: true, encoding: .utf8)
+        let trusted = TrustedApprovalFixture(try JSONEncoder().encode([ApprovedTV(id: "A", name: "A", tokenHash: "A")]))
+        let server = LocalCatalogServer(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), testingNamespace: "unrelated", readApprovals: { trusted.read() }, writeApprovals: { try trusted.write($0) }, beforeRevocationReplay: { _ in try await gate.wait() })
+        await server.setRequestService(service)
+        let revoking = Task { try await server.revoke("A") }; try await waitFor { await gate.hasEntered }
+        let request = ShaderRequest(prompt: "Unrelated B may queue and run", context: try context())
+        let accepted = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "B"); XCTAssertTrue(accepted.enabled)
+        let affected = try await service.control(operation: "requestStatus", payload: .init(), deviceID: "A"); XCTAssertFalse(affected.enabled)
+        await service.resume()
+        let job = root.appendingPathComponent(request.id.uuidString)
+        try await waitFor { RequestProcessIdentity.evidenceExists(job.appendingPathComponent("worker-started")) }
+        try Data().write(to: job.appendingPathComponent("emit-progress"))
+        try await waitFor { await service.allJobs().first?.message == "Unrelated progress accepted" }
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(job.appendingPathComponent("stopping")))
+        await gate.release(); try await revoking.value
+        XCTAssertEqual(try String(contentsOf: job.appendingPathComponent("worker-count"), encoding: .utf8), "1")
+        await service.suspend(); try await waitFor { !(await service.hasActiveCheckoutWork) }
+    }
+    func testRejectedTrustedWriteDoesNotInterruptAnyRunningJob() async throws {
+        for device in ["A", "B"] {
+            let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script), gate = RecoveryGate()
+            var code = try String(contentsOf: script, encoding: .utf8)
+            code = code.replacingOccurrences(of: "while True: time.sleep(.005)", with: "while True:\n    if (job/'emit-progress').exists():\n        (job/'emit-progress').unlink(); emit('stage',stage='validating',message='Prepared revoke did not interrupt')\n    time.sleep(.005)")
+            try code.write(to: script, atomically: true, encoding: .utf8)
+            let trusted = TrustedApprovalFixture(try JSONEncoder().encode([ApprovedTV(id: "A", name: "A", tokenHash: "A")]))
+            let server = LocalCatalogServer(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), testingNamespace: "prepare", readApprovals: { trusted.read() }, writeApprovals: { try trusted.write($0) }, beforeTrustedCommit: { _ in try await gate.wait() })
+            await server.setRequestService(service)
+            let request = ShaderRequest(prompt: "Running during rejected revoke", context: try context())
+            _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: device)
+            await service.resume()
+            let job = root.appendingPathComponent(request.id.uuidString)
+            try await waitFor { RequestProcessIdentity.evidenceExists(job.appendingPathComponent("worker-started")) }
+            trusted.fail(at: 1)
+            let revoking = Task { try await server.revoke("A") }; try await waitFor { await gate.hasEntered }
+            try Data().write(to: job.appendingPathComponent("emit-progress"))
+            try await waitFor { await service.allJobs().first?.message == "Prepared revoke did not interrupt" }
+            await gate.release()
+            do { try await revoking.value; XCTFail("Failed write accepted") } catch {}
+            XCTAssertFalse(RequestProcessIdentity.evidenceExists(job.appendingPathComponent("stopping")))
+            XCTAssertEqual(try String(contentsOf: job.appendingPathComponent("worker-count"), encoding: .utf8), "1")
+            await service.suspend(); try await waitFor { !(await service.hasActiveCheckoutWork) }
+        }
+    }
+    func testUnreadableApprovalsBlockTVsButAllowSafeMacPreparation() async throws {
+        for enabled in [false, true] {
+            let (root, script) = try recoveryFixture(), authoring = try requestAuthoringFixture(root.appendingPathComponent("authoring"))
+            try """
+            import json,sys
+            print(json.dumps({'event':'preparePublication'}),flush=True)
+            assert json.loads(sys.stdin.readline())['ok']
+            print(json.dumps({'event':'publicationReady'}),flush=True)
+            """.write(to: script, atomically: true, encoding: .utf8)
+            let previews = ShaderPreviewGenerator(directory: root.appendingPathComponent("previews")) { _ in try ShaderPNG.gradient(colors: [[0,0,0],[1,1,1]]) }
+            let catalog = DirectoryCatalog(directory: root.appendingPathComponent("catalog"), previewGenerator: previews)
+            let service = ShaderRequestService(catalog: catalog, directory: root.appendingPathComponent("service"), workerScript: script)
+            try await service.initialize(configuration: .init(repository: authoring.path, shaderTool: NativeShaderToolFixture.executable.path, enabled: enabled))
+            let server = LocalCatalogServer(catalog: catalog, testingNamespace: "unreadable", readApprovals: { throw POSIXError(.EACCES) })
+            await server.setRequestService(service)
+            if enabled {
+                let request = ShaderRequest(prompt: "Unknown approval state", context: try context())
+                do { _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV"); XCTFail("Uninspected TV admitted") } catch {}
+                try await service.ensurePublication(force: true)
+            } else { _ = try await service.reloadRepository(authoring) }
+            let publication = try await catalog.cached(); XCTAssertNotNil(publication)
+            let statuses = await service.recoveryStatuses(); XCTAssertTrue(statuses.contains { $0.message.contains("approval") && !$0.blocksCheckoutWork })
+        }
+    }
+}
+#endif
