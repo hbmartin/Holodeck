@@ -142,9 +142,11 @@ final class MacRequestsModel {
             if selectionID == id { acceptSelection(result.configuration) }
             return result
         } catch {
-            let accepted = await service.configurationValue()
+            let snapshot = await service.setupSnapshot()
             if selectionID == id {
-                acceptSelection(accepted)
+                if snapshot.phase != .blockedInitialization, !snapshot.blocked, let accepted = snapshot.configuration {
+                    acceptSelection(accepted)
+                }
                 if proposal { self.error = "The proposed shader folder was not accepted: " + error.localizedDescription }
             }
             throw error
@@ -170,7 +172,8 @@ final class MacRequestsModel {
     }
     private func acceptSelection(_ accepted: ShaderRequestConfiguration) {
         configuration.repository = accepted.repository; configuration.checkoutID = accepted.checkoutID; configuration.enabled = accepted.enabled
-        save()
+        // Backup only the authoritative configuration, never unrelated editable draft fields.
+        defaults?.set(try? JSONEncoder().encode(accepted), forKey: "holodeck.requestConfiguration")
     }
     func reloadRepository(_ url: URL) async throws -> CatalogReloadResult {
         try await initializeAcceptedConfiguration()

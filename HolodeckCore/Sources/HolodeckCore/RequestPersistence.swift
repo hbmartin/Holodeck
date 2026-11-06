@@ -20,11 +20,18 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         func block() { lock.withLock { blocked = true; revision &+= 1 } }
         func beginRecovery(_ id: UUID) { lock.withLock { recovery = id } }
         func endRecovery(_ id: UUID, accepted: Bool) {
-            lock.withLock { if recovery == id { recovery = nil; if accepted { blocked = false }; revision &+= 1 } }
+            lock.withLock {
+                guard recovery == id else { return }
+                recovery = nil
+                // Recovery authority expires independently of ordinary permits.
+                // Only an effective readiness change invalidates those permits.
+                if accepted && blocked { blocked = false; revision &+= 1 }
+            }
         }
         func permit(recovery candidate: UUID?) throws -> Permit {
             try lock.withLock {
-                guard baseline, inspected, !blocked || (candidate != nil && candidate == recovery) else { throw Unavailable() }
+                guard baseline, inspected, candidate == nil || candidate == recovery,
+                      !blocked || (candidate != nil && candidate == recovery) else { throw Unavailable() }
                 return Permit(revision: revision, recovery: candidate)
             }
         }
@@ -32,6 +39,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         func claim(_ permit: Permit?, start: () throws -> Void) throws {
             try lock.withLock {
                 guard let permit, baseline, inspected, permit.revision == revision,
+                      permit.recovery == nil || permit.recovery == recovery,
                       !blocked || (permit.recovery != nil && permit.recovery == recovery) else { throw Unavailable() }
                 // Readiness invalidation and entry into the noncancellable commit
                 // have one ordering point; no filesystem I/O runs under this lock.

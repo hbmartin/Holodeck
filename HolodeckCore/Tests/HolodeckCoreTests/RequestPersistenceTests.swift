@@ -627,3 +627,49 @@ extension RequestPersistenceTests {
     }
 }
 #endif
+
+#if os(macOS)
+extension RequestPersistenceTests {
+    func testHealthyRecoveryKeepsOrdinaryPermitsButExpiresRecoveryAuthority() throws {
+        let gate = RequestPersistence.MetadataAdmission(); gate.inspectedStorage(); gate.establishBaseline(blocked: false)
+        let ordinary = try gate.permit(recovery: nil), first = UUID(), next = UUID()
+        gate.beginRecovery(first); let expired = try gate.permit(recovery: first)
+        gate.beginRecovery(next); gate.endRecovery(first, accepted: true)
+        XCTAssertThrowsError(try gate.check(expired))
+        XCTAssertThrowsError(try gate.permit(recovery: first))
+        let recovery = try gate.permit(recovery: next)
+        try gate.check(ordinary); gate.endRecovery(next, accepted: true); try gate.check(ordinary)
+        XCTAssertThrowsError(try gate.check(recovery))
+        gate.block(); XCTAssertThrowsError(try gate.check(ordinary))
+    }
+    func testQueuedOrdinaryWriteSurvivesNoOpRecoveryWithExactAcceptedBytes() async throws {
+        let root = try directory(), file = root.appendingPathComponent("journal.json"), gate = RequestPersistence.MetadataAdmission()
+        gate.inspectedStorage(); gate.establishBaseline(blocked: false)
+        let permit = try gate.permit(recovery: nil), writer = RequestPersistence(directory: root, metadataAdmission: gate)
+        let entered = expectation(description: "encoding before replacement"), release = DispatchSemaphore(value: 0)
+        let writing = Task {
+            try await writer.commit(.init(revision: 1, files: [.init(url: file, encode: {
+                entered.fulfill(); guard release.wait(timeout: .now() + 8) == .success else { throw POSIXError(.ETIMEDOUT) }
+                return Data("accepted during healthy recovery".utf8)
+            })], operation: "ordinary submit", metadataPermit: permit))
+        }
+        await fulfillment(of: [entered], timeout: 3)
+        let recovery = UUID(); gate.beginRecovery(recovery); gate.endRecovery(recovery, accepted: true); release.signal()
+        _ = try await writing.value
+        XCTAssertEqual(try Data(contentsOf: file), Data("accepted during healthy recovery".utf8))
+        let fault = await writer.fault(); XCTAssertNil(fault)
+    }
+    func testExpiredRecoveryPermitCannotWriteEvenWhenOrdinaryReadinessIsHealthy() async throws {
+        let root = try directory(), file = root.appendingPathComponent("preferences.json"), gate = RequestPersistence.MetadataAdmission()
+        let retained = Data("accepted".utf8); try retained.write(to: file)
+        gate.inspectedStorage(); gate.establishBaseline(blocked: false)
+        let attempt = UUID(); gate.beginRecovery(attempt); let permit = try gate.permit(recovery: attempt)
+        gate.endRecovery(attempt, accepted: true)
+        let writer = RequestPersistence(directory: root, metadataAdmission: gate)
+        do { try await writer.write(Data("stale recovery".utf8), to: file, metadataPermit: permit); XCTFail("Expired recovery wrote") }
+        catch { XCTAssertTrue(error is RequestPersistence.MetadataAdmission.Unavailable) }
+        XCTAssertEqual(try Data(contentsOf: file), retained)
+        let fault = await writer.fault(); XCTAssertNil(fault)
+    }
+}
+#endif

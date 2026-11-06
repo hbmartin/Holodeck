@@ -5493,3 +5493,57 @@ extension ShaderRequestTests {
     }
 }
 #endif
+
+#if os(macOS)
+private final class StartupFinalizationFailureProbe: @unchecked Sendable {
+    private let lock = NSLock(); private var failures = 1
+    func finalize() throws {
+        try lock.withLock { if failures > 0 { failures -= 1; throw ShaderRequestError.unavailable("Unexpected finalization diagnostic") } }
+    }
+}
+extension ShaderRequestTests {
+    func testStartupUnexpectedFinalizationHasOperationalRecoveryAndRetainsAcceptedJournal() async throws {
+        let (root, script) = try recoveryFixture(), seed = try await recoveryService(root, script: script)
+        let request = ShaderRequest(prompt: "Preserve startup facts", context: try context())
+        _ = try await seed.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "A")
+        let retained = try Data(contentsOf: root.appendingPathComponent("journal.json")), probe = StartupFinalizationFailureProbe()
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script, beforeStartupFinalization: { try probe.finalize() })
+        await service.suspend(); try await service.initialize(configuration: .init(repository: root.path, enabled: true))
+        let statuses = await service.recoveryStatuses()
+        XCTAssertTrue(statuses.contains { $0.message.contains("Unexpected finalization diagnostic") && $0.message.contains("Retry Recovery") })
+        XCTAssertFalse(statuses.contains { $0.message.contains("metadata is unreadable") })
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("journal.json")), retained)
+        let next = ShaderRequest(prompt: "Blocked until finalized", context: try context())
+        do { _ = try await service.control(operation: "requestSubmit", payload: .init(request: next), deviceID: "B"); XCTFail("Unfinished startup admitted work") } catch {}
+        try await service.retryReconciliation()
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: next), deviceID: "B")
+        let jobs = await service.allJobs(); XCTAssertEqual(Set(jobs.map(\.id)), [request.id, next.id])
+    }
+    func testStartupRetirementOperationalErrorKeepsExactJournalRecovery() async throws {
+        let (root, script) = try recoveryFixture(), seed = try await recoveryService(root, script: script)
+        let request = ShaderRequest(prompt: "Retirement counterexample", context: try context())
+        _ = try await seed.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "A")
+        let file = root.appendingPathComponent("journal.json"), operation = UUID()
+        var rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [[String: Any]])
+        rows[0]["executionID"] = operation.uuidString
+        rows[0]["dispatch"] = ["executionID": operation.uuidString, "priorStage": "queued", "launched": false, "retirementPending": true]
+        try JSONSerialization.data(withJSONObject: rows).write(to: file)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script, reconcileWorker: { _ in throw ShaderRequestError.unavailable("Known retirement diagnostic") })
+        await service.suspend(); try await service.initialize(configuration: .init(repository: root.path, enabled: true))
+        let statuses = await service.recoveryStatuses()
+        XCTAssertTrue(statuses.contains { $0.journal.map { RequestPaths.canonical($0) } == RequestPaths.canonical(root.appendingPathComponent(request.id.uuidString)) && $0.message.contains("Known retirement diagnostic") })
+        XCTAssertFalse(statuses.contains { $0.message.contains("startup finalization failed") || $0.message.contains("metadata is unreadable") })
+    }
+    func testRecoveredStartupTVGuidanceRequestsVerificationInsteadOfOldMetadataError() async throws {
+        let (root, script) = try recoveryFixture(), file = root.appendingPathComponent("active.json")
+        try Data("{".utf8).write(to: file)
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script)
+        await service.suspend(); try await service.initialize(configuration: .init(repository: root.path, model: "restored", enabled: true))
+        try FileManager.default.removeItem(at: file); try await service.retryReconciliation()
+        let reply = try await service.control(operation: "requestStatus", payload: .init(), deviceID: "TV"), setup = await service.setupSnapshot()
+        XCTAssertEqual(setup.phase, .requiresVerification); XCTAssertFalse(reply.enabled)
+        XCTAssertTrue(reply.message.contains("Verify setup")); XCTAssertFalse(reply.message.contains("metadata is unreadable"))
+        XCTAssertEqual(setup.configuration?.repository, root.path)
+    }
+}
+#endif

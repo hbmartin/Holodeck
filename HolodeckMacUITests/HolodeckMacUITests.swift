@@ -282,6 +282,11 @@ final class HolodeckMacUITests: XCTestCase {
         app.launch(); app.activate(); waitForTitle(f.name, in: app)
         element("shader-library-settings", in: app).click(); waitForLibraryIdle(in: app)
         XCTAssertTrue(app.staticTexts["Storage Recovery"].waitForExistence(timeout: 15))
+        // Reopen while still blocked: a rejected startup selection must not have
+        // overwritten the authoritative UserDefaults backup with empty settings.
+        app.terminate(); app.launch(); app.activate(); waitForTitle(f.name, in: app)
+        element("shader-library-settings", in: app).click(); waitForLibraryIdle(in: app)
+        XCTAssertTrue(app.staticTexts["Storage Recovery"].waitForExistence(timeout: 15))
         try FileManager.default.removeItem(at: preferences)
         element("retry-checkout-cleanup", in: app).click()
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.staticTexts["Storage Recovery"])], timeout: 15), .completed)
@@ -290,6 +295,9 @@ final class HolodeckMacUITests: XCTestCase {
         let restored = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: preferences)) as? [String: Any])
         XCTAssertEqual(restored["enabled"] as? Bool, false)
         XCTAssertEqual(restored["model"] as? String, configuration["model"] as? String)
+        XCTAssertEqual(restored["repository"] as? String, configuration["repository"] as? String)
+        XCTAssertEqual(restored["python"] as? String, configuration["python"] as? String)
+        XCTAssertEqual(restored["git"] as? String, configuration["git"] as? String)
     }
 
     func testStorageRecoveryOffersRetryWithoutCheckoutRecoveryEntry() throws {
