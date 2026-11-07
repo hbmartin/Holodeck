@@ -76,6 +76,42 @@ final class DirectoryCatalogTests: XCTestCase {
         catch {}
     }
 
+    func testReapprovalDuringRevocationReplayPreservesNewTokenAndRejectsOldAuthorization() async throws {
+        let (root, catalog) = try fixture(); _ = try await catalog.reload(from: root)
+        let requests = ShaderRequestService(catalog: catalog, directory: root.deletingLastPathComponent().appendingPathComponent("request-reapproval"))
+        await requests.suspend(); try await requests.initialize(configuration: .init(repository: root.path))
+        let gate = RecoveryGate(), server = LocalCatalogServer(catalog: catalog, testingNamespace: "reapproval-" + UUID().uuidString,
+            beforeRevocationReplay: { _ in try await gate.wait() })
+        await server.setRequestService(requests)
+        addTeardownBlock { await gate.release(); try await server.clearTestSecrets() }
+        try await server.start()
+        let device = UUID().uuidString
+        func pair() async throws -> (LocalConnection, String) {
+            let client = try await tlsClient(server).0
+            var message = LocalMessage(operation: "pair"); message.deviceID = device; message.name = "Reapproved TV"
+            _ = try await client.exchange(LocalPacket(message: message))
+            let pending = await server.currentState.pending.first
+            try await server.approve(XCTUnwrap(pending).id)
+            let response = try await client.exchange(LocalPacket(message: .init(operation: "pairStatus")))
+            return (client, try XCTUnwrap(response.message.token))
+        }
+        let (_, oldToken) = try await pair(), oldAuthorization = try await server.requestAuthorization(for: device)
+        let revoked = Task { try await server.revoke(device) }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+        while !(await gate.hasEntered), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        let entered = await gate.hasEntered; XCTAssertTrue(entered)
+        let (_, newToken) = try await pair(); XCTAssertNotEqual(oldToken, newToken)
+        let currentAuthorization = try await server.requestAuthorization(for: device)
+        XCTAssertFalse(oldAuthorization.isCurrent); XCTAssertTrue(currentAuthorization.isCurrent)
+        await gate.release(); try await revoked.value
+        var message = LocalMessage(operation: "authenticate"); message.deviceID = device
+        let oldClient = try await tlsClient(server).0; message.token = oldToken
+        let old = try await oldClient.exchange(LocalPacket(message: message)); XCTAssertEqual(old.message.error, "revoked")
+        let newClient = try await tlsClient(server).0; message.token = newToken
+        let fresh = try await newClient.exchange(LocalPacket(message: message)); XCTAssertNil(fresh.message.error)
+        XCTAssertTrue(currentAuthorization.isCurrent)
+    }
+
     func testShaderRequestControlRequiresAuthenticatedTVAndKeepsAssetFraming() async throws {
         let (root, store) = try fixture()
         let catalog = try await store.reload(from: root).catalog

@@ -27,6 +27,7 @@ final class MacRequestsModel {
     @ObservationIgnored private var didInitialize = false
     @ObservationIgnored private var setupRevision: UInt64 = 0
     @ObservationIgnored private var acceptedSetup: ShaderRequestConfiguration?
+    @ObservationIgnored private var backedUpSetup: ShaderRequestConfiguration?
     @ObservationIgnored private var publicationSequence: UInt64?
     @ObservationIgnored private var initialization: Task<ShaderRequestConfiguration, Error>?
 
@@ -74,13 +75,11 @@ final class MacRequestsModel {
         observation = Task { [weak self] in
             do { _ = try await initialization.value }
             catch { self?.error = error.localizedDescription }
-            for await jobs in await service.updates() {
+            for await state in await service.localUpdates() {
                 guard let self else { break }
-                self.jobs = jobs
-                self.pendingCleanup = await service.hasPendingCleanup()
-                self.recoveries = await service.recoveryStatuses()
-                self.canDisableRequests = await service.canDisableRequests()
-                await self.refreshAcceptedSetup()
+                self.jobs = state.jobs; self.pendingCleanup = state.pendingCleanup
+                self.recoveries = state.recoveries; self.canDisableRequests = state.canDisableRequests
+                self.applyAcceptedSetup(state.setup)
             }
         }
         publicationObservation = Task { [weak self] in
@@ -98,15 +97,29 @@ final class MacRequestsModel {
         }
     }
     isolated deinit { observation?.cancel(); publicationObservation?.cancel() }
-    private func refreshAcceptedSetup() async {
-        let snapshot = await service.setupSnapshot()
+    private func refreshAcceptedSetup() async { applyAcceptedSetup(await service.setupSnapshot()) }
+    private func applyAcceptedSetup(_ snapshot: ShaderRequestSetupSnapshot) {
         guard snapshot.revision > setupRevision else { return }
         setupRevision = snapshot.revision
         guard snapshot.phase != .blockedInitialization, let accepted = snapshot.configuration else { return }
-        if acceptedSetup != accepted { configuration = accepted; acceptedSetup = accepted }
+        if acceptedSetup != accepted {
+            if let previous = acceptedSetup {
+                // Preserve fields edited while an accepted repository transition was in flight.
+                var merged = accepted
+                for field: WritableKeyPath<ShaderRequestConfiguration, String> in [\.codex, \.python, \.git, \.shaderTool, \.model, \.reasoning] {
+                    if configuration[keyPath: field] != previous[keyPath: field] { merged[keyPath: field] = configuration[keyPath: field] }
+                }
+                configuration = merged
+            } else { configuration = accepted }
+            acceptedSetup = accepted
+        }
         if snapshot.phase == .requiresVerification { message = "Settings restored. Verify setup to enable requests." }
-        // A recovery-status update must never save editable inputs as accepted settings.
-        if !snapshot.blocked { defaults?.set(try? JSONEncoder().encode(accepted), forKey: "holodeck.requestConfiguration") }
+        if !snapshot.blocked { saveAccepted(accepted) }
+    }
+    private func saveAccepted(_ accepted: ShaderRequestConfiguration) {
+        guard backedUpSetup != accepted else { return }
+        defaults?.set(try? JSONEncoder().encode(accepted), forKey: "holodeck.requestConfiguration")
+        backedUpSetup = accepted
     }
     private func initializeAcceptedConfiguration() async throws {
         _ = try await initialization?.value
@@ -142,9 +155,11 @@ final class MacRequestsModel {
             if selectionID == id { acceptSelection(result.configuration) }
             return result
         } catch {
-            let accepted = await service.configurationValue()
+            let snapshot = await service.setupSnapshot()
             if selectionID == id {
-                acceptSelection(accepted)
+                if snapshot.phase != .blockedInitialization, !snapshot.blocked, let accepted = snapshot.configuration {
+                    acceptSelection(accepted)
+                }
                 if proposal { self.error = "The proposed shader folder was not accepted: " + error.localizedDescription }
             }
             throw error
@@ -162,7 +177,7 @@ final class MacRequestsModel {
     }
     func finishStartupSelection() { startupSelectionContinuation?.resume(); startupSelectionContinuation = nil }
     #endif
-    var hasUnfinishedJobs: Bool { pendingCleanup || !recoveries.isEmpty || jobs.contains { !$0.stage.terminal } }
+    var hasUnfinishedJobs: Bool { pendingCleanup || recoveries.contains { $0.blocksCheckoutWork } || jobs.contains { !$0.stage.terminal } }
     /// A startup bookmark is a proposal until the service accepts it.
     func proposeRepository(_ url: URL) {
         guard !configuration.enabled, !hasUnfinishedJobs else { return }
@@ -170,7 +185,8 @@ final class MacRequestsModel {
     }
     private func acceptSelection(_ accepted: ShaderRequestConfiguration) {
         configuration.repository = accepted.repository; configuration.checkoutID = accepted.checkoutID; configuration.enabled = accepted.enabled
-        save()
+        // Backup only the authoritative configuration, never unrelated editable draft fields.
+        saveAccepted(accepted)
     }
     func reloadRepository(_ url: URL) async throws -> CatalogReloadResult {
         try await initializeAcceptedConfiguration()
@@ -187,7 +203,6 @@ final class MacRequestsModel {
         guard let publication = result.publication else { throw ShaderRequestError.invalidRequest }
         return publication
     }
-    private func save() { defaults?.set(try? JSONEncoder().encode(configuration), forKey: "holodeck.requestConfiguration") }
     func verify() {
         guard !checking else { return }
         checking = true; error = nil; message = "Checking tools, Git access, model and image review…"
@@ -198,13 +213,16 @@ final class MacRequestsModel {
                 let candidate = configuration
                 try await service.verify(configuration: candidate)
                 configuration = await service.configurationValue()
-                save(); message = "Ready for shader requests"
+                saveAccepted(configuration); message = "Ready for shader requests"
             } catch { self.error = error.localizedDescription; message = "Setup needs attention" }
         }
     }
     func disable() {
         Task {
-            do { try await service.disable(); configuration.enabled = false; save(); message = "Requests disabled" }
+            do {
+                try await service.disable(); configuration.enabled = false
+                saveAccepted(await service.configurationValue()); message = "Requests disabled"
+            }
             catch { self.error = error.localizedDescription }
         }
     }
@@ -214,7 +232,7 @@ final class MacRequestsModel {
             defer { checking = false }
             do {
                 try await service.retryCleanup(id, repository: repository, python: python, git: git)
-                configuration = await service.configurationValue(); save()
+                configuration = await service.configurationValue(); saveAccepted(configuration)
             }
             catch { self.error = error.localizedDescription }
         }
@@ -241,7 +259,7 @@ final class MacRequestsModel {
             defer { checking = false }
             do {
                 try await service.detachCheckout(target)
-                configuration = await service.configurationValue(); save()
+                configuration = await service.configurationValue(); saveAccepted(configuration)
                 message = "Checkout detached; files and evidence retained. Verify setup to enable requests."
             } catch { self.error = error.localizedDescription }
         }
