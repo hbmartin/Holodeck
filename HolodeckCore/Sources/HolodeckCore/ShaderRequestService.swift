@@ -170,6 +170,25 @@ public struct ShaderRequestLocalState: Sendable {
 }
 
 public actor ShaderRequestService {
+    nonisolated private let hostOwners = RequestServiceOwners()
+    nonisolated public func retainOwner() -> RequestServiceOwnerLease {
+        let id = hostOwners.acquire()
+        Task { [weak self] in await self?.hostOwnershipChanged() }
+        return RequestServiceOwnerLease { [self] in
+            hostOwners.release(id)
+            Task { await self.hostOwnershipChanged() }
+        }
+    }
+    private func hostOwnershipChanged() {
+        if !hostOwners.mayDispatch, let request = pendingPublication {
+            pendingPublication = nil
+            retryPublicationForce = (retryPublicationForce ?? false) || request.force
+            let error = ShaderRequestError.unavailable("Library preparation is paused until a local host reconnects.")
+            for waiter in request.waiters { waiter.continuation.resume(throwing: error) }
+        }
+        emitUpdates(); kick()
+    }
+
     private struct DispatchState: Codable, Sendable, Equatable {
         let executionID: UUID
         var workerOperationID: UUID?
@@ -2541,6 +2560,7 @@ public actor ShaderRequestService {
                                         publicationRevision: await catalog.publicationRevisionValue())
     }
     private func kick() {
+        guard hostOwners.mayDispatch else { return }
         if let startupFinalizationFailure { failPendingPublicationForRecovery(startupFinalizationFailure); return }
         if let persistenceFailure { failPendingPublicationForRecovery(persistenceFailure); return }
         guard loaded, initialized, !suspended, !maintenanceBusy, activeID == nil, workerTask == nil else { return }

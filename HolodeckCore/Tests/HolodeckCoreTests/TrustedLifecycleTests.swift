@@ -202,5 +202,126 @@ private final class TrustedWriteGate: @unchecked Sendable {
         let next = try await tls(server); try await authenticate(next, device: device, token: token)
     }
 
+    private func pair(_ server: LocalCatalogServer, client: LocalConnection, device: String = UUID().uuidString) async throws -> TVApproval {
+        var message = LocalMessage(operation: "pair"); message.deviceID = device; message.name = "Lifecycle TV"
+        let reply = try await client.exchange(LocalPacket(message: message)); XCTAssertEqual(reply.message.operation, "pending")
+        try await wait { await !server.currentState.pending.isEmpty }
+        let state = await server.currentState
+        return try XCTUnwrap(state.pending.first)
+    }
+    func testAdmittedApprovalRetainsBytesWhenDeliveryBecomesImpossible() async throws {
+        for ending in ["close", "expire", "decline", "retire"] {
+            let fixture = try await fixture(), backend = TrustedBackendFixture(nil), gate = TrustedWriteGate(), clock = TestClock()
+            let authority = TrustedApprovalsCoordinator(read: { backend.read() }, write: { _ = gate.wait(); try backend.write($0) })
+            let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "pair-outcome-" + UUID().uuidString, clock: clock, trustedApprovals: authority)
+            addTeardownBlock { gate.release(); try await server.clearTestSecrets() }
+            try await server.start(); let client = try await tls(server), device = UUID().uuidString
+            let proposal = try await pair(server, client: client, device: device)
+            gate.arm(); let approval = Task { try await server.approve(proposal.id) }
+            try await wait { gate.entered }
+            switch ending {
+            case "close": client.cancel(); try await wait { await server.sessionCount == 0 }
+            case "expire": await clock.advance(by: .seconds(301)); try await wait { await server.sessionCount == 0 }
+            case "decline": await server.decline(proposal.id)
+            default:
+                let replacement = try await authority.register(TrustedOwnerRecorder().owner())
+                // Registration waits for the admitted write. Final teardown invalidates delivery immediately.
+                let shutdown = Task { await server.shutdown() }
+                try await wait { await server.sessionCount == 0 }
+                gate.release(); await shutdown.value; try await accept(replacement)
+            }
+            gate.release()
+            do { try await approval.value; XCTFail("Committed undeliverable approval reported success: \(ending)") }
+            catch is CommittedApprovalDeliveryError {} catch { XCTFail("Incorrect approval outcome: \(error)") }
+            let stored = try TrustedTVApprovals.decode(XCTUnwrap(backend.read()))
+            XCTAssertEqual(stored.approvals.map(\.id), [device]); XCTAssertEqual(backend.writes, 1)
+            if ending != "retire" {
+                let next = try await tls(server), repeated = try await pair(server, client: next, device: device)
+                try await server.approve(repeated.id)
+                let issued = try await next.exchange(LocalPacket(message: .init(operation: "pairStatus")))
+                XCTAssertNotNil(issued.message.token); XCTAssertEqual(backend.writes, 2)
+            }
+        }
+    }
+    func testIneligiblePairingDoesNotEncodeOrWrite() async throws {
+        for ending in ["close", "expire", "decline", "retire"] {
+            let fixture = try await fixture(), backend = TrustedBackendFixture(nil), authority = backend.coordinator(), clock = TestClock()
+            let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "pair-ineligible-" + UUID().uuidString, clock: clock, trustedApprovals: authority)
+            addTeardownBlock { try await server.clearTestSecrets() }
+            try await server.start(); let client = try await tls(server), proposal = try await pair(server, client: client)
+            switch ending {
+            case "close": client.cancel(); try await wait { await server.sessionCount == 0 }
+            case "expire": await clock.advance(by: .seconds(301)); try await wait { await server.sessionCount == 0 }
+            case "decline": await server.decline(proposal.id)
+            default: await server.shutdown()
+            }
+            let before = await authority.observation
+            do { try await server.approve(proposal.id) }
+            catch { XCTAssertEqual(ending, "retire"); XCTAssertTrue(error.localizedDescription.contains("replaced")) }
+            let after = await authority.observation
+            XCTAssertEqual(before.encodings, after.encodings); XCTAssertEqual(backend.writes, 0)
+        }
+    }
+    func testShutdownCannotReviveRegistrationWaitingForInspection() async throws {
+        let fixture = try await fixture(), backend = TrustedBackendFixture(nil), gate = TrustedWriteGate()
+        let authority = TrustedApprovalsCoordinator(read: { _ = gate.wait(); return backend.read() }, write: { try backend.write($0) })
+        let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "shutdown-register-" + UUID().uuidString, trustedApprovals: authority)
+        addTeardownBlock { gate.release(); try await server.clearTestSecrets() }
+        gate.arm(); let setup = Task { await server.setRequestService(fixture.service) }
+        try await wait { gate.entered }; await server.shutdown(); gate.release(); await setup.value
+        do { try await server.start(); XCTFail("Final teardown allowed implicit registration") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("replaced")) }
+        await server.setRequestService(fixture.service); try await server.start()
+        try await wait { await (server.listeningPort ?? 0) > 0 }
+    }
+    func testLastOwnerPausesDispatchWhileActiveWorkFinishesAndWaitingJobsRemain() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let script = root.appendingPathComponent("owner-worker.py"), gate = root.appendingPathComponent("hold")
+        try Data().write(to: gate)
+        try """
+        import json, sys, time
+        from pathlib import Path
+        job=Path(sys.argv[3]); root=job.parent
+        if sys.argv[1]=='preflight': print(json.dumps(dict(event='preflight')),flush=True); sys.exit(0)
+        (job/'started').touch()
+        while (root/'hold').exists(): time.sleep(.005)
+        print(json.dumps(dict(event='clarification',question='Choose',options=['A','B'])),flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        var service: ShaderRequestService? = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: script)
+        weak let released = service
+        defer { try? FileManager.default.removeItem(at: root) }
+        let owner = try XCTUnwrap(service).retainOwner()
+        try await service!.start(configuration: .init(repository: root.path, enabled: true))
+        let one = ShaderRequest(prompt: "First", context: try context()), two = ShaderRequest(prompt: "Second", context: try context())
+        _ = try await service!.control(operation: "requestSubmit", payload: .init(request: one), deviceID: "A")
+        _ = try await service!.control(operation: "requestSubmit", payload: .init(request: two), deviceID: "B")
+        let first = root.appendingPathComponent(one.id.uuidString), second = root.appendingPathComponent(two.id.uuidString)
+        try await wait { FileManager.default.fileExists(atPath: first.appendingPathComponent("started").path) }
+        owner.release(); try FileManager.default.removeItem(at: gate)
+        try await wait { await service!.allJobs().first(where: { $0.id == one.id })?.stage == .awaitingClarification }
+        try await wait { await !service!.hasActiveCheckoutWork }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: second.appendingPathComponent("started").path))
+        let rows = await service!.allJobs(); XCTAssertEqual(rows.first(where: { $0.id == two.id })?.stage, .queued)
+        // A newer lease makes an old repeated release harmless and resumes only queued work.
+        let next = service!.retainOwner(); owner.release()
+        try await wait { await service!.allJobs().first(where: { $0.id == two.id })?.stage == .awaitingClarification }
+        try await wait { await !service!.hasActiveCheckoutWork }; next.release()
+        service = nil
+        try await wait { released == nil }
+    }
+    func testIdleAuthorityDoesNotRetainReleasedServiceAndAccountsShare() async throws {
+        let namespace = "weak-host-" + UUID().uuidString
+        let one = TrustedApprovalsCoordinator.keychain(namespace: namespace), two = TrustedApprovalsCoordinator.keychain(namespace: namespace)
+        XCTAssertTrue(one === two)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        var service: ShaderRequestService? = ShaderRequestService(catalog: DirectoryCatalog(directory: root), directory: root)
+        weak let standalone = service
+        let target = try await one.register(TrustedOwnerRecorder().owner(service: service))
+        try await accept(target); service = nil
+        try await wait { standalone == nil }
+        await one.discardTestingCacheIfIdle()
+    }
+
 }
 #endif

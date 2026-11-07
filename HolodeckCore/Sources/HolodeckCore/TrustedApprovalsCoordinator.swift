@@ -38,9 +38,10 @@ struct TrustedRevocationRemoval: Sendable {
 
 /// One authority per trusted backend. Replay belongs to the store, not its current transport.
 actor TrustedApprovalsCoordinator {
-    static let production = TrustedApprovalsCoordinator(
-        read: { try LocalSecrets.read("mac-library-approved-tvs") },
-        write: { try LocalSecrets.write($0, account: "mac-library-approved-tvs") })
+    nonisolated static func keychain(namespace: String) -> TrustedApprovalsCoordinator {
+        TrustedAuthorityRegistry.shared.authority(account: approvalsAccount(namespace))
+    }
+    nonisolated static func approvalsAccount(_ namespace: String) -> String { namespace + "-approved-tvs" }
 
     struct Snapshot: Sendable {
         let approvals: [String: ApprovedTV]
@@ -49,7 +50,9 @@ actor TrustedApprovalsCoordinator {
     }
     struct Binding: Sendable {
         let permit: TrustedOwnerPermit
-        let service: ShaderRequestService?
+        private let target: WeakRequestService
+        var service: ShaderRequestService? { target.value }
+        init(permit: TrustedOwnerPermit, service: ShaderRequestService?) { self.permit = permit; target = .init(service) }
     }
     enum BindingOutcome: Sendable { case accepted(Binding), superseded }
     struct Registration: Sendable {
@@ -74,13 +77,23 @@ actor TrustedApprovalsCoordinator {
     struct Approval: Sendable {
         let record: ApprovedTV
         let token: String
+        let eligibility: TrustedApprovalEligibility
+        init(record: ApprovedTV, token: String, eligibility: TrustedApprovalEligibility) {
+            self.record = record; self.token = token; self.eligibility = eligibility
+        }
     }
     struct Owner: Sendable {
         let serverID: UUID
-        let service: ShaderRequestService?
+        private let target: WeakRequestService
+        let requiresService: Bool
+        var service: ShaderRequestService? { target.value }
         let changed: @Sendable (Snapshot, Binding) async -> Void
         let retired: @Sendable () async -> Void
         let beforeReplay: @Sendable (RequestRevocationIntent) async throws -> Void
+        init(serverID: UUID, service: ShaderRequestService?, changed: @escaping @Sendable (Snapshot, Binding) async -> Void,
+             retired: @escaping @Sendable () async -> Void, beforeReplay: @escaping @Sendable (RequestRevocationIntent) async throws -> Void) {
+            self.serverID = serverID; target = .init(service); requiresService = service != nil; self.changed = changed; self.retired = retired; self.beforeReplay = beforeReplay
+        }
     }
     private struct Request {
         let owner: Owner
@@ -108,14 +121,22 @@ actor TrustedApprovalsCoordinator {
     nonisolated let id = UUID()
     private let read: @Sendable () throws -> Data?
     private let write: @Sendable (Data) throws -> Void
+    private let retainEvidence: @Sendable (TrustedApprovalsCoordinator, Bool) -> Void
     private var envelope = TrustedTVApprovals()
     private var bytes: Data?
     private var loaded = false
     private var sequence: UInt64 = 0
     private var accepted: Accepted?
-    private var service: ShaderRequestService?
+    private weak var service: ShaderRequestService?
     private struct TargetKey: Hashable { let service: UUID; let registration: UUID }
-    private struct Target { let service: ShaderRequestService; let key: TargetKey }
+    private struct Target {
+        private let reference: WeakRequestService
+        var service: ShaderRequestService? { reference.value }
+        let key: TargetKey
+        init(service: ShaderRequestService, key: TargetKey) { reference = .init(service); self.key = key }
+    }
+    // Pins exist only while durable intent or unresolved recovery needs this target.
+    private var targetPins: [TargetKey: ShaderRequestService] = [:]
     private var targets: [TargetKey: Target] = [:]
     private var required: [UUID: Set<TargetKey>] = [:]
     private var applications: [UUID: [TargetKey: TrustedRevocationApplication]] = [:]
@@ -134,8 +155,13 @@ actor TrustedApprovalsCoordinator {
     private var replayWaiters: [UUID: [CheckedContinuation<Void, Error>]] = [:]
     private var replayAll: [CheckedContinuation<Void, Error>] = []
 
-    init(read: @escaping @Sendable () throws -> Data?, write: @escaping @Sendable (Data) throws -> Void) {
-        self.read = read; self.write = write
+    init(read: @escaping @Sendable () throws -> Data?, write: @escaping @Sendable (Data) throws -> Void,
+         retainEvidence: @escaping @Sendable (TrustedApprovalsCoordinator, Bool) -> Void = { _, _ in }) {
+        self.read = read; self.write = write; self.retainEvidence = retainEvidence
+    }
+    private func updateRetention() {
+        targets = targets.filter { $0.value.service != nil }
+        retainEvidence(self, !envelope.revocations.isEmpty || !failures.isEmpty || mutationFailure != nil || !targetPins.isEmpty)
     }
     var observation: Observation {
         .init(requestedGeneration: generation, acceptedGeneration: accepted?.binding.permit.generation,
@@ -176,6 +202,7 @@ actor TrustedApprovalsCoordinator {
     private func release(_ token: UUID) {
         precondition(lane == token)
         lane = nil
+        updateRetention()
         let waiting = waiters; waiters.removeAll()
         waiting.forEach { $0.continuation.resume() }
     }
@@ -201,7 +228,7 @@ actor TrustedApprovalsCoordinator {
         let key = TargetKey(service: serviceID, registration: registration)
         let previous = targets.keys.filter { $0.service == serviceID && $0 != key }
         for old in previous {
-            targets[old] = nil; recoveryTargets.remove(old)
+            targets[old] = nil; targetPins[old] = nil; recoveryTargets.remove(old)
             for intent in required.keys where required[intent]?.contains(old) == true {
                 required[intent]?.remove(old); required[intent]?.insert(key)
                 applications[intent]?[old] = nil
@@ -215,7 +242,7 @@ actor TrustedApprovalsCoordinator {
             _ = try await ticket.value()
         }
         for key in recoveryTargets where key.service != requester {
-            if let target = targets[key] { try await target.service.retryReconciliation(replayTrusted: false) }
+            if let target = targets[key]?.service { try await target.retryReconciliation(replayTrusted: false) }
         }
         let token = try await acquire()
         do { try await readFresh(target: service); release(token) }
@@ -230,8 +257,9 @@ actor TrustedApprovalsCoordinator {
             let next = sequence &+ (current == bytes ? 0 : 1)
             let revision = TrustedRevocationRevision(coordinator: id, sequence: next)
             for known in targets.values {
-                try await known.service.loadTrustedRevocations(candidate.revocations, revision: revision)
-                for intent in candidate.revocations { required[intent.operationID, default: []].insert(known.key) }
+                guard let target = known.service else { continue }
+                try await target.loadTrustedRevocations(candidate.revocations, revision: revision)
+                for intent in candidate.revocations { required[intent.operationID, default: []].insert(known.key); targetPins[known.key] = target }
             }
             let changed = current != bytes
             envelope = candidate; bytes = current; sequence = next; loaded = true
@@ -256,6 +284,9 @@ actor TrustedApprovalsCoordinator {
             pending = nil; preparing = request.registration.generation
             do {
                 try request.registration.completion.check()
+                guard !request.owner.requiresService || request.owner.service != nil else {
+                    throw Self.unavailable("The proposed request service was released before registration.")
+                }
                 if let target = request.owner.service { await configure(target) }
                 try await readFresh(target: request.owner.service ?? service)
                 try request.registration.completion.check()
@@ -271,7 +302,7 @@ actor TrustedApprovalsCoordinator {
                 let binding = Binding(permit: permit, service: request.owner.service)
                 prior?.binding.permit.invalidate()
                 accepted = Accepted(owner: request.owner, binding: binding)
-                if let target = request.owner.service { service = target }
+                service = request.owner.service
                 await request.owner.changed(snapshot, binding)
                 if let prior, prior.owner.serverID != request.owner.serverID { await prior.owner.retired() }
                 request.registration.completion.complete(.success(.accepted(binding)))
@@ -282,6 +313,22 @@ actor TrustedApprovalsCoordinator {
             preparing = nil; release(token)
         }
         registrationTask = nil
+    }
+    func releaseBinding(_ permit: TrustedOwnerPermit) async {
+        let token = try! await acquire(cancellable: false)
+        defer { release(token) }
+        guard accepted?.binding.permit === permit else { return }
+        permit.invalidate(); permit.lifetime.invalidate()
+        accepted = nil; service = nil
+        if failedRegistration?.serverID == permit.serverID { failedRegistration = nil }
+        targets = targets.filter { $0.value.service != nil }
+    }
+    func discardTestingCacheIfIdle() {
+        guard accepted == nil, pending == nil, preparing == nil, lane == nil, replayTask == nil else { return }
+        envelope = .init(); bytes = nil; loaded = false
+        required.removeAll(); applications.removeAll(); failures.removeAll(); recoveryTargets.removeAll(); targetPins.removeAll()
+        mutationFailure = nil; failedRegistration = nil
+        updateRetention()
     }
     private func ensureLoaded() async throws {
         if !loaded { try await readFresh(target: service) }
@@ -311,11 +358,11 @@ actor TrustedApprovalsCoordinator {
         defer { release(token) }
         try await ensureLoaded(); try Task.checkCancellation()
         guard let proposal = try await proposal() else { return nil }
-        try Task.checkCancellation(); try validate(permit)
+        try Task.checkCancellation(); try validate(permit); try proposal.eligibility.check()
         var value = envelope
         value.approvals.removeAll { $0.id == proposal.record.id }; value.approvals.append(proposal.record)
         let candidate = try prepare(value)
-        try Task.checkCancellation()
+        try Task.checkCancellation(); try proposal.eligibility.beginWrite()
         do { try await persist(value, bytes: candidate) }
         catch {
             await recordMutationFailure(error, operation: UUID(), context: "TV approval for " + proposal.record.id)
@@ -338,7 +385,7 @@ actor TrustedApprovalsCoordinator {
                 value.approvals.removeAll { $0.id == device }
                 if existing == nil { value.revocations.append(intent) }
                 let candidate = try prepare(value)
-                for target in targets.values { try await target.service.reserveRevocation(intent, revision: revision) }
+                for target in targets.values { try await target.service?.reserveRevocation(intent, revision: revision) }
                 do {
                     try await beforeCommit(intent); try Task.checkCancellation()
                     try await persist(value, bytes: candidate)
@@ -346,13 +393,14 @@ actor TrustedApprovalsCoordinator {
                     if !(error is CancellationError) {
                         await recordMutationFailure(error, operation: intent.operationID, context: "TV revocation for " + intent.deviceID)
                     }
-                    for target in targets.values { await target.service.cancelRevocationReservation(intent, revision: revision) }
+                    for target in targets.values { await target.service?.cancelRevocationReservation(intent, revision: revision) }
                     throw error
                 }
                 await notify()
                 for target in targets.values {
-                    try await target.service.commitTrustedRevocation(intent, revision: revision)
-                    required[intent.operationID, default: []].insert(target.key)
+                    guard let service = target.service else { continue }
+                    try await service.commitTrustedRevocation(intent, revision: revision)
+                    required[intent.operationID, default: []].insert(target.key); targetPins[target.key] = service
                 }
             }
         } catch { release(token); throw error }
@@ -360,7 +408,7 @@ actor TrustedApprovalsCoordinator {
         try await replay(target: intent.operationID)
     }
     func replay(target: UUID? = nil) async throws {
-        guard service != nil else { return }
+        guard targets.values.contains(where: { $0.service != nil }) else { return }
         try await withCheckedThrowingContinuation { c in
             if let target {
                 guard envelope.revocations.contains(where: { $0.operationID == target }) else { c.resume(); return }
@@ -372,7 +420,9 @@ actor TrustedApprovalsCoordinator {
     private func record(_ error: Error, intent: RequestRevocationIntent) async -> Failure {
         let failure = failures[intent.operationID]?.appending(error) ?? Failure(error)
         failures[intent.operationID] = failure
-        await service?.revocationReplayFailed(failure, intent: intent, revision: revision)
+        for key in required[intent.operationID] ?? [] {
+            await targets[key]?.service?.revocationReplayFailed(failure, intent: intent, revision: revision)
+        }
         return failure
     }
     private struct Attempt: Hashable { let intent: UUID; let target: TargetKey }
@@ -381,8 +431,8 @@ actor TrustedApprovalsCoordinator {
         let proofs = applications[intent.operationID] ?? [:]
         guard needed.allSatisfy({ proofs[$0] != nil }) else { return false }
         for key in needed {
-            guard let target = targets[key], let proof = proofs[key] else { return false }
-            try await target.service.validateTrustedRevocation(proof)
+            guard let target = targets[key]?.service, let proof = proofs[key] else { return false }
+            try await target.validateTrustedRevocation(proof)
         }
         var value = envelope; value.revocations.removeAll { $0.operationID == intent.operationID }
         let candidate = try prepare(value)
@@ -390,9 +440,12 @@ actor TrustedApprovalsCoordinator {
         let removal = TrustedRevocationRemoval(authority: id, intent: intent,
             applications: Dictionary(uniqueKeysWithValues: needed.compactMap { key in proofs[key].map { (key.service, $0) } }))
         for key in needed {
-            if let target = targets[key], let proof = proofs[key] { try await target.service.finalizeTrustedRevocation(proof, removal: removal) }
+            if let target = targets[key]?.service, let proof = proofs[key] { try await target.finalizeTrustedRevocation(proof, removal: removal) }
         }
         required[intent.operationID] = nil; applications[intent.operationID] = nil; failures[intent.operationID] = nil
+        let retained = Set(required.values.flatMap { $0 })
+        targetPins = targetPins.filter { retained.contains($0.key) }
+        targets = targets.filter { $0.value.service != nil }
         await notify()
         let waiting = replayWaiters.removeValue(forKey: intent.operationID) ?? []
         waiting.forEach { $0.resume() }
@@ -402,12 +455,12 @@ actor TrustedApprovalsCoordinator {
         var attempted: Set<Attempt> = [], failed: [UUID: Failure] = [:], removalAttempted: Set<UUID> = []
         drain: while true {
             let token = try! await acquire(cancellable: false)
-            var work: (RequestRevocationIntent, Target)?
+            var work: (RequestRevocationIntent, TargetKey, ShaderRequestService)?
             for intent in envelope.revocations {
                 for key in required[intent.operationID] ?? [] {
                     let attempt = Attempt(intent: intent.operationID, target: key)
-                    if applications[intent.operationID]?[key] == nil, !attempted.contains(attempt), let target = targets[key] {
-                        work = (intent, target); attempted.insert(attempt); break
+                    if applications[intent.operationID]?[key] == nil, !attempted.contains(attempt), let target = targets[key]?.service {
+                        work = (intent, key, target); attempted.insert(attempt); break
                     }
                 }
                 if work != nil { break }
@@ -418,22 +471,22 @@ actor TrustedApprovalsCoordinator {
                     removalAttempted.insert(intent.operationID)
                 }
             }
-            guard let (intent, target) = work else {
+            guard let (intent, key, target) = work else {
                 let remaining = Set(envelope.revocations.map(\.operationID))
                 failed = failed.filter { remaining.contains($0.key) }
                 // A successful target cannot erase another target's unresolved application.
                 for id in remaining where failed[id] == nil { failed[id] = failures[id] }
-                for known in targets.values { await known.service.revocationReplaySucceeded(revision: revision) }
+                for known in targets.values { await known.service?.revocationReplaySucceeded(revision: revision) }
                 finishReplay(failed); release(token); return
             }
             let hook = accepted?.owner.beforeReplay, appliedRevision = revision
             release(token)
             do {
                 try await hook?(intent)
-                let proof = try await target.service.applyTrustedRevocation(intent, revision: appliedRevision)
+                let proof = try await target.applyTrustedRevocation(intent, revision: appliedRevision)
                 let commit = try! await acquire(cancellable: false)
-                applications[intent.operationID, default: [:]][target.key] = proof
-                recoveryTargets.remove(target.key)
+                applications[intent.operationID, default: [:]][key] = proof
+                recoveryTargets.remove(key)
                 removalAttempted.remove(intent.operationID)
                 do {
                     if try await acknowledgeIfReady(intent) { failed[intent.operationID] = nil }
@@ -444,7 +497,7 @@ actor TrustedApprovalsCoordinator {
                 release(commit)
             } catch {
                 let commit = try! await acquire(cancellable: false)
-                recoveryTargets.insert(target.key)
+                recoveryTargets.insert(key)
                 failed[intent.operationID] = await record(error, intent: intent)
                 release(commit)
             }

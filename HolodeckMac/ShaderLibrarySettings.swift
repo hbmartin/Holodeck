@@ -144,6 +144,8 @@ final class MacLibraryModel {
 
     isolated deinit {
         updates?.cancel(); scopedURL?.stopAccessingSecurityScopedResource()
+        let server = server
+        Task { await server.shutdown() }
         for observer in sleepObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
     }
 
