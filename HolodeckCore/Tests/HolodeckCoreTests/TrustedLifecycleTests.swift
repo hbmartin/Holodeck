@@ -1,6 +1,8 @@
 #if os(macOS)
 import Foundation
 import XCTest
+import Network
+import Clocks
 @testable import HolodeckCore
 
 private final class TrustedWriteGate: @unchecked Sendable {
@@ -109,5 +111,96 @@ private final class TrustedWriteGate: @unchecked Sendable {
         do { try await submit(fixture); XCTFail("New authority's fence disappeared") }
         catch { XCTAssertTrue(error.localizedDescription.contains("revocation")) }
     }
+    private func tls(_ server: LocalCatalogServer) async throws -> LocalConnection {
+        try await wait { await (server.listeningPort ?? 0) > 0 }
+        let port = await server.listeningPort
+        let trust = LocalTrust()
+        let connection = LocalConnection(NWConnection(host: "127.0.0.1", port: .init(rawValue: try XCTUnwrap(port))!, using: NWParameters(tls: trust.options(expected: nil), tcp: .init())))
+        try await connection.start(); addTeardownBlock { connection.cancel() }; return connection
+    }
+    private func authenticate(_ client: LocalConnection, device: String, token: String) async throws {
+        var message = LocalMessage(operation: "authenticate"); message.deviceID = device; message.token = token
+        let reply = try await client.exchange(LocalPacket(message: message)); XCTAssertNil(reply.message.error)
+    }
+    func testFailedInitialStartAndRejectedVacancyRegistrationRemainRetryable() async throws {
+        let fixture = try await fixture(), backend = TrustedBackendFixture(try TrustedTVApprovals().encoded()), authority = backend.coordinator()
+        let first = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "registration-retry-" + UUID().uuidString, trustedApprovals: authority)
+        let second = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "vacancy-retry-" + UUID().uuidString, trustedApprovals: authority)
+        addTeardownBlock { try await first.clearTestSecrets(); try await second.clearTestSecrets() }
+        backend.failReads(true)
+        do { try await first.start(); XCTFail("Failed inspection accepted") }
+        catch let error as POSIXError { XCTAssertEqual(error.code, .EACCES) }
+        backend.failReads(false); try await first.start()
+        try await wait { await (first.listeningPort ?? 0) > 0 }
+        do { try await second.revoke("unapproved"); XCTFail("Vacancy-only registration displaced its owner") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("handoff is pending")) }
+        try await second.start()
+        let old = await first.listeningPort; XCTAssertNil(old)
+        try await wait { await (second.listeningPort ?? 0) > 0 }
+    }
+    func testStopInvalidatesInitialStartAcrossInspectionAwait() async throws {
+        let fixture = try await fixture(), backend = TrustedBackendFixture(nil), gate = TrustedWriteGate()
+        let authority = TrustedApprovalsCoordinator(read: { _ = gate.wait(); return backend.read() }, write: { try backend.write($0) })
+        let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "stop-start-" + UUID().uuidString, trustedApprovals: authority)
+        addTeardownBlock { gate.release(); try await server.clearTestSecrets() }
+        gate.arm(); let start = Task { try await server.start() }
+        try await wait { gate.entered }; await server.stop(); gate.release()
+        do { try await start.value; XCTFail("Stopped start created a listener") } catch is CancellationError {}
+        let stopped = await server.listeningPort; XCTAssertNil(stopped)
+        try await server.start(); try await wait { await (server.listeningPort ?? 0) > 0 }
+    }
+    func testQueuedRevocationSurvivesSameServerRegistration() async throws {
+        let fixture = try await fixture(), backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [ApprovedTV(id: "A", name: "A", tokenHash: "A"), ApprovedTV(id: "B", name: "B", tokenHash: "B")]).encoded())
+        let authority = backend.coordinator(), gate = RecoveryGate()
+        let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "same-server", beforeTrustedCommit: { if $0.deviceID == "A" { try await gate.wait() } }, trustedApprovals: authority)
+        await server.setRequestService(fixture.service)
+        let first = Task { try await server.revoke("A") }; try await wait { await gate.hasEntered }
+        let rebind = Task { await server.setRequestService(fixture.service) }; try await wait { await authority.observation.queuedGeneration != nil }
+        let queued = Task { try await server.revoke("B") }; try await wait { await authority.observation.mutationWaiters > 0 }
+        await gate.release(); try await first.value; await rebind.value; try await queued.value
+        let value = try TrustedTVApprovals.decode(XCTUnwrap(backend.read()))
+        XCTAssertTrue(value.approvals.isEmpty); XCTAssertTrue(value.revocations.isEmpty); XCTAssertEqual(backend.writes, 4)
+    }
+    func testRetiredLifetimeCannotUpgradeAfterExplicitReactivation() async throws {
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [ApprovedTV(id: "A", name: "A", tokenHash: "A")]).encoded()), authority = backend.coordinator(), owner = TrustedOwnerRecorder()
+        let registration = try await authority.register(owner.owner())
+        guard case .accepted(let first) = try await registration.value() else { return XCTFail("Initial registration superseded") }
+        try await accept(authority.register(TrustedOwnerRecorder().owner()))
+        try await accept(authority.register(owner.owner()))
+        let before = await authority.observation
+        do { try await authority.revoke("A", permit: first.permit) { _ in }; XCTFail("Retired operation upgraded to a new lifetime") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("replaced")) }
+        let after = await authority.observation; XCTAssertEqual(before.encodings, after.encodings); XCTAssertEqual(after.writes, 0)
+    }
+    func testTLSHandoffClosesApprovedSessionWithoutPermanentRevocation() async throws {
+        let fixture = try await fixture(), token = "retained-token", device = UUID().uuidString
+        let original = try TrustedTVApprovals(approvals: [ApprovedTV(id: device, name: "TV", tokenHash: CatalogHash.sha256(Data(token.utf8)))]).encoded()
+        let backend = TrustedBackendFixture(original), authority = backend.coordinator(), gate = RecoveryGate()
+        let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "handoff-auth-" + UUID().uuidString, trustedApprovals: authority)
+        addTeardownBlock { await gate.release(); try await server.clearTestSecrets() }
+        await server.setRequestService(fixture.service); try await server.start()
+        let client = try await tls(server); try await authenticate(client, device: device, token: token)
+        let replacement = try await authority.register(.init(serverID: UUID(), service: fixture.service, changed: { _, _ in try? await gate.wait() }, retired: {}, beforeReplay: { _ in }))
+        try await wait { await gate.hasEntered }
+        var asset = LocalMessage(operation: "asset"); asset.request = .head; asset.limit = 65536
+        do { let reply = try await client.exchange(LocalPacket(message: asset)); XCTFail("Interrupted transport returned \(reply.message.error ?? "success")") }
+        catch LocalCatalogError.disconnected {} catch is NWError {} catch { XCTFail("Unexpected interruption category: \(error)") }
+        XCTAssertEqual(backend.read(), original)
+        await gate.release(); try await accept(replacement)
+    }
+    func testLateAssetReplyUsesTransientInterruptionAcrossRebinding() async throws {
+        let fixture = try await fixture(), token = "retained-token", device = UUID().uuidString, gate = RecoveryGate()
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [ApprovedTV(id: device, name: "TV", tokenHash: CatalogHash.sha256(Data(token.utf8)))]).encoded()), authority = backend.coordinator()
+        let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "late-asset-" + UUID().uuidString, readAsset: { _, _, _ in try await gate.wait(); return Data("old reply".utf8) }, trustedApprovals: authority)
+        addTeardownBlock { await gate.release(); try await server.clearTestSecrets() }
+        await server.setRequestService(fixture.service); try await server.start()
+        let client = try await tls(server); try await authenticate(client, device: device, token: token)
+        let reply = Task { var message = LocalMessage(operation: "asset"); message.request = .head; message.limit = 65536; return try await client.exchange(LocalPacket(message: message)) }
+        try await wait { await gate.hasEntered }; await server.setRequestService(fixture.service); await gate.release()
+        do { _ = try await reply.value; XCTFail("An obsolete binding returned an asset") }
+        catch LocalCatalogError.disconnected {} catch is NWError {} catch { XCTFail("Unexpected interruption category: \(error)") }
+        let next = try await tls(server); try await authenticate(next, device: device, token: token)
+    }
+
 }
 #endif

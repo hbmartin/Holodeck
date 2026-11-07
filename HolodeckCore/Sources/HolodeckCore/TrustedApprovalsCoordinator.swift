@@ -1,15 +1,23 @@
 #if os(macOS)
 import Foundation
 
+nonisolated final class TrustedOwnerLifetime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = true
+    var isCurrent: Bool { lock.withLock { current } }
+    func invalidate() { lock.withLock { current = false } }
+}
+
 /// A binding is revocable without an actor hop, including during transport teardown.
 nonisolated final class TrustedOwnerPermit: @unchecked Sendable {
     let serverID: UUID
     let generation: UInt64
     let authority: UUID
+    let lifetime: TrustedOwnerLifetime
     private let lock = NSLock()
     private var valid = true
-    init(serverID: UUID, generation: UInt64, authority: UUID) {
-        self.serverID = serverID; self.generation = generation; self.authority = authority
+    init(serverID: UUID, generation: UInt64, authority: UUID, lifetime: TrustedOwnerLifetime) {
+        self.serverID = serverID; self.generation = generation; self.authority = authority; self.lifetime = lifetime
     }
     var isCurrent: Bool { lock.withLock { valid } }
     func invalidate() { lock.withLock { valid = false } }
@@ -141,7 +149,8 @@ actor TrustedApprovalsCoordinator {
     }
     static func unavailable(_ message: String) -> ShaderRequestError { .unavailable(message) }
     private func validate(_ permit: TrustedOwnerPermit) throws {
-        guard permit.isCurrent, accepted?.binding.permit === permit else {
+        guard permit.lifetime.isCurrent, let current = accepted?.binding.permit, current.isCurrent,
+              current.lifetime === permit.lifetime else {
             throw Self.unavailable("This catalog server was replaced. Use its accepted replacement before changing TV access.")
         }
     }
@@ -255,7 +264,10 @@ actor TrustedApprovalsCoordinator {
                 }
                 try request.registration.completion.beginMutation()
                 let prior = accepted
-                let permit = TrustedOwnerPermit(serverID: request.owner.serverID, generation: request.registration.generation, authority: id)
+                let continuing = prior?.owner.serverID == request.owner.serverID && prior?.binding.permit.lifetime.isCurrent == true
+                let lifetime = continuing ? prior!.binding.permit.lifetime : TrustedOwnerLifetime()
+                let permit = TrustedOwnerPermit(serverID: request.owner.serverID, generation: request.registration.generation, authority: id, lifetime: lifetime)
+                if !continuing { prior?.binding.permit.lifetime.invalidate() }
                 let binding = Binding(permit: permit, service: request.owner.service)
                 prior?.binding.permit.invalidate()
                 accepted = Accepted(owner: request.owner, binding: binding)

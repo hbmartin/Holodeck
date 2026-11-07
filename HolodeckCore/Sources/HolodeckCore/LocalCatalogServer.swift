@@ -71,10 +71,9 @@ nonisolated struct TrustedTVApprovals: Codable, Sendable {
 
 public actor LocalCatalogServer {
     private static let productionNamespace = "mac-library"
-    private var requests: ShaderRequestService?
     public func setRequestService(_ service: ShaderRequestService) async {
         do {
-            _ = try await registerTrustedBinding(service: service)
+            guard try await registerTrustedBinding(service: service) else { return }
             try await trusted.replay()
         } catch is CancellationError { }
         catch { publish(error.localizedDescription) }
@@ -82,27 +81,45 @@ public actor LocalCatalogServer {
     private let instanceID = UUID()
     private let trusted: TrustedApprovalsCoordinator
     private var binding: TrustedApprovalsCoordinator.Binding?
-    private var registrationAttempted = false
+    private enum RegistrationState: Equatable { case idle, pending(UUID), superseded }
+    private var registrationState: RegistrationState = .idle
+    private var proposedService: ShaderRequestService?
     private var retired = false
+    private var startGeneration: UInt64 = 0
     private func trustedOwner(service: ShaderRequestService?) -> TrustedApprovalsCoordinator.Owner {
         .init(serverID: instanceID, service: service,
               changed: { [weak self] in await self?.acceptTrustedSnapshot($0, binding: $1) },
               retired: { [weak self] in await self?.retireTrustedBinding() }, beforeReplay: beforeRevocationReplay)
     }
     private func registerTrustedBinding(service: ShaderRequestService?, onlyIfVacant: Bool = false) async throws -> Bool {
-        registrationAttempted = true
-        let registration = try await trusted.register(trustedOwner(service: service), onlyIfVacant: onlyIfVacant)
-        switch try await registration.value() {
-        case .accepted: return true
-        case .superseded: return false
+        let attempt = UUID(), previous = registrationState
+        registrationState = .pending(attempt); proposedService = service
+        let registration: TrustedApprovalsCoordinator.Registration
+        do { registration = try await trusted.register(trustedOwner(service: service), onlyIfVacant: onlyIfVacant) }
+        catch {
+            if registrationState == .pending(attempt) { registrationState = previous }
+            throw error
+        }
+        do {
+            switch try await registration.value() {
+            case .accepted:
+                if registrationState == .pending(attempt) { registrationState = .idle }
+                return true
+            case .superseded:
+                if registrationState == .pending(attempt) { registrationState = .superseded }
+                return false
+            }
+        } catch {
+            if registrationState == .pending(attempt) { registrationState = .idle }
+            throw error
         }
     }
     private func ensureBinding(explicitStart: Bool = false) async throws -> TrustedOwnerPermit {
         if let binding, binding.permit.isCurrent { return binding.permit }
-        guard !retired, !registrationAttempted else {
+        guard !retired, registrationState == .idle else {
             throw ShaderRequestError.unavailable("Catalog server handoff is pending or this server was replaced. Use its accepted replacement.")
         }
-        guard try await registerTrustedBinding(service: nil, onlyIfVacant: !explicitStart), let binding, binding.permit.isCurrent else {
+        guard try await registerTrustedBinding(service: proposedService, onlyIfVacant: !explicitStart), let binding, binding.permit.isCurrent else {
             throw ShaderRequestError.unavailable("Catalog server handoff was superseded.")
         }
         return binding.permit
@@ -113,7 +130,7 @@ public actor LocalCatalogServer {
         for (device, authorization) in requestAuthorizations where changedOwner || approved[device]?.tokenHash != snapshot.approvals[device]?.tokenHash {
             authorization.invalidate(); requestAuthorizations[device] = nil
         }
-        approved = snapshot.approvals; self.binding = binding; requests = binding.service; retired = false
+        approved = snapshot.approvals; self.binding = binding; retired = false
         for (session, record) in authenticated where approved[record.id]?.tokenHash != record.tokenHash { cancelSession(session) }
         publish(snapshot.diagnostic)
     }
@@ -201,7 +218,11 @@ public actor LocalCatalogServer {
     }
 
     public func start() async throws {
+        if listener != nil, binding?.permit.isCurrent == true { return }
+        startGeneration &+= 1; let generation = startGeneration
         _ = try await ensureBinding(explicitStart: true)
+        try Task.checkCancellation()
+        guard generation == startGeneration else { throw CancellationError() }
         guard listener == nil else { return }
         if identity == nil {
             identity = try LocalServerIdentity.load(account: secretNamespace + "-tls-identity")
@@ -227,6 +248,7 @@ public actor LocalCatalogServer {
     }
 
     public func stop() {
+        startGeneration &+= 1
         requestAuthorizations.values.forEach { $0.invalidate() }; requestAuthorizations.removeAll()
         listenerID = nil; listener?.cancel(); listener = nil
         for id in sessions.keys { cancelSession(id) }
@@ -281,9 +303,18 @@ public actor LocalCatalogServer {
         let value = TrustedRequestAuthorization(coordinator: binding.permit.authority, deviceID: deviceID, owner: binding.permit)
         requestAuthorizations[deviceID] = value; return value
     }
-    private func authorized(_ id: UUID) -> Bool {
-        guard binding?.permit.isCurrent == true, !closing.contains(id), let record = authenticated[id] else { return false }
-        return approved[record.id]?.tokenHash == record.tokenHash
+    private enum SessionAuthorization { case permitted, credentialRejected, interrupted }
+    private func sessionAuthorization(_ id: UUID) -> SessionAuthorization {
+        guard !closing.contains(id), sessions[id] != nil, binding?.permit.isCurrent == true else { return .interrupted }
+        guard let record = authenticated[id], approved[record.id]?.tokenHash == record.tokenHash else { return .credentialRejected }
+        return .permitted
+    }
+    private func credentialAuthorized(_ id: UUID) throws -> Bool {
+        switch sessionAuthorization(id) {
+        case .permitted: return true
+        case .credentialRejected: return false
+        case .interrupted: throw LocalCatalogError.disconnected
+        }
     }
 
     private func accept(_ connection: NWConnection, listenerID: UUID) {
@@ -301,7 +332,7 @@ public actor LocalCatalogServer {
             do {
                 try await channel.start()
                 while !Task.isCancelled, !closing.contains(id) {
-                    let request = try await channel.receive(idleAllowed: authorized(id))
+                    let request = try await channel.receive(idleAllowed: sessionAuthorization(id) == .permitted)
                     let response = try await respond(request, id: id, channel: channel)
                     try await withLocalTimeout { try await channel.send(response) }
                 }
@@ -311,7 +342,7 @@ public actor LocalCatalogServer {
     }
 
     private func expire(_ id: UUID) {
-        guard !authorized(id), let deadline = deadlines[id], clock.now >= deadline else { return }
+        guard sessionAuthorization(id) != .permitted, let deadline = deadlines[id], clock.now >= deadline else { return }
         cancelSession(id); publish()
     }
 
@@ -336,13 +367,13 @@ public actor LocalCatalogServer {
     }
 
     private func respond(_ packet: LocalPacket, id: UUID, channel: LocalConnection) async throws -> LocalPacket {
-        guard !closing.contains(id) else { throw LocalCatalogError.disconnected }
+        guard !closing.contains(id), let servingPermit = binding?.permit, servingPermit.isCurrent else { throw LocalCatalogError.disconnected }
         if let deadline = deadlines[id], clock.now >= deadline {
             cancelSession(id); throw LocalCatalogError.timeout
         }
         let requestOperations = ["requestSubmit", "requestStatus", "requestAnswer", "requestActivated", "requestDelivery"]
         if requestOperations.contains(packet.message.operation) {
-            guard authorized(id), let deviceID = authenticated[id]?.id else {
+            guard try credentialAuthorized(id), let deviceID = authenticated[id]?.id else {
                 return LocalPacket(message: LocalMessage(operation: "ok", error: "revoked"))
             }
             var reply = LocalMessage(operation: "ok")
@@ -353,9 +384,12 @@ public actor LocalCatalogServer {
                 let control = try JSONDecoder().decode(ShaderRequestControl.self, from: packet.payload)
                 let authorization = try requestAuthorization(for: deviceID)
                 let value = try await requests.control(operation: packet.message.operation, payload: control, deviceID: deviceID, authorization: authorization)
-                guard authorized(id) else { return LocalPacket(message: LocalMessage(operation: "ok", error: "revoked")) }
+                guard servingPermit.isCurrent else { throw LocalCatalogError.disconnected }
+                guard try credentialAuthorized(id) else { return LocalPacket(message: LocalMessage(operation: "ok", error: "revoked")) }
                 return LocalPacket(message: reply, payload: try JSONEncoder().encode(value))
-            } catch {
+            } catch LocalCatalogError.disconnected { throw LocalCatalogError.disconnected }
+            catch {
+                guard servingPermit.isCurrent, !closing.contains(id) else { throw LocalCatalogError.disconnected }
                 reply.error = "requestError"; reply.requestMessage = error.localizedDescription
                 return LocalPacket(message: reply)
             }
@@ -366,7 +400,7 @@ public actor LocalCatalogServer {
         switch message.operation {
         case "hello":
             response.serverID = identity?.id
-            if requests != nil { response.capabilities = ["shaderRequests1"] }
+            if binding?.service != nil { response.capabilities = ["shaderRequests1"] }
         case "authenticate":
             guard let deviceID = message.deviceID, let token = message.token, token.count <= 100,
                   let record = approved[deviceID], record.tokenHash == CatalogHash.sha256(Data(token.utf8)) else {
@@ -383,18 +417,23 @@ public actor LocalCatalogServer {
             response.operation = "pending"; publish()
         case "pairStatus":
             if declined.contains(id) { response.error = "rejected" }
-            else if let token = issued.removeValue(forKey: id), authorized(id) { response.token = token }
+            else if try credentialAuthorized(id), let token = issued.removeValue(forKey: id) { response.token = token }
             else if pending[id] != nil { response.operation = "pending" }
             else { response.error = "rejected"; self.pending[id] = nil; publish() }
         case "asset":
-            guard authorized(id) else { response.error = "revoked"; break }
+            guard try credentialAuthorized(id) else { response.error = "revoked"; break }
             guard let request = message.request, let limit = message.limit,
                   (0...LocalProtocol.maximumPayload).contains(limit) else { throw LocalCatalogError.protocolViolation }
             do {
                 let data = try await readAsset(request, limit, id)
-                guard authorized(id) else { response.error = "revoked"; break }
+                guard servingPermit.isCurrent else { throw LocalCatalogError.disconnected }
+                guard try credentialAuthorized(id) else { response.error = "revoked"; break }
                 return LocalPacket(message: response, payload: data)
-            } catch { response.error = "invalidAsset" }
+            } catch LocalCatalogError.disconnected { throw LocalCatalogError.disconnected }
+            catch {
+                guard servingPermit.isCurrent, !closing.contains(id) else { throw LocalCatalogError.disconnected }
+                response.error = "invalidAsset"
+            }
         default: throw LocalCatalogError.protocolViolation
         }
         return LocalPacket(message: response)
