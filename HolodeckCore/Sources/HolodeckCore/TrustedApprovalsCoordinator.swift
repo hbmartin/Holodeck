@@ -88,6 +88,7 @@ actor TrustedApprovalsCoordinator {
     private var pending: Request?
     private var preparing: UInt64?
     private var registrationTask: Task<Void, Never>?
+    private var failedRegistration: Owner?
     private var lane: UUID?
     private var waiters: [Waiter] = []
     private var encodings = 0, writes = 0
@@ -145,6 +146,7 @@ actor TrustedApprovalsCoordinator {
         if onlyIfVacant, accepted != nil || pending != nil || preparing != nil {
             throw Self.unavailable("Catalog server handoff is pending. Wait for its accepted binding.")
         }
+        failedRegistration = nil
         generation &+= 1
         let receipt = Registration(generation: generation, completion: .init())
         pending?.registration.completion.complete(.success(.superseded))
@@ -155,8 +157,15 @@ actor TrustedApprovalsCoordinator {
     private func configure(_ target: ShaderRequestService) async {
         await target.registerRevocationCoordinator(id: id) { [weak self] in
             guard let self else { throw Self.unavailable("The trusted approval authority is unavailable.") }
-            try await self.replay()
+            try await self.retry()
         }
+    }
+    private func retry() async throws {
+        if let failedRegistration {
+            let ticket = try register(failedRegistration)
+            _ = try await ticket.value()
+        }
+        try await replay()
     }
     private func readFresh(target: ShaderRequestService?) async throws {
         do {
@@ -167,7 +176,9 @@ actor TrustedApprovalsCoordinator {
             let revision = TrustedRevocationRevision(coordinator: id, sequence: next)
             if let target { try await target.loadTrustedRevocations(candidate.revocations, revision: revision) }
             if let service, service !== target { try await service.loadTrustedRevocations(candidate.revocations, revision: revision) }
+            let changed = current != bytes
             envelope = candidate; bytes = current; sequence = next; loaded = true
+            if changed { await notify() }
             let ids = Set(candidate.revocations.map(\.operationID)); failures = failures.filter { ids.contains($0.key) }
             if let target {
                 for intent in candidate.revocations {
@@ -204,7 +215,10 @@ actor TrustedApprovalsCoordinator {
                 await request.owner.changed(snapshot, binding)
                 if let prior, prior.owner.serverID != request.owner.serverID { await prior.owner.retired() }
                 request.registration.completion.complete(.success(.accepted(binding)))
-            } catch { request.registration.completion.complete(.failure(error)) }
+            } catch {
+                if request.registration.generation == generation, !(error is CancellationError) { failedRegistration = request.owner }
+                request.registration.completion.complete(.failure(error))
+            }
             preparing = nil; release(token)
         }
         registrationTask = nil
@@ -313,8 +327,9 @@ actor TrustedApprovalsCoordinator {
                     let waiting = replayWaiters.removeValue(forKey: intent.operationID) ?? []
                     waiting.forEach { $0.resume() }
                 } catch {
+                    failed[intent.operationID] = Failure(error)
                     await record(error, intent: intent)
-                    release(commit); throw error
+                    release(commit); continue
                 }
                 release(commit)
             } catch {

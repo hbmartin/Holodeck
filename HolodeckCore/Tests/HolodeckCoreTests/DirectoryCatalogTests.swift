@@ -24,6 +24,59 @@ final class DirectoryCatalogTests: XCTestCase {
         return (channel, trust)
     }
 
+    func testTrustedReplacementRetiresOldTransportAndPreservesActualReapprovalAndQueuedWork() async throws {
+        let (root, catalog) = try fixture(); let snapshot = try await catalog.reload(from: root).catalog
+        let service = ShaderRequestService(catalog: catalog, directory: root.appendingPathComponent("requests"), workerScript: root.appendingPathComponent("unused.py"))
+        await service.suspend(); try await service.initialize(configuration: .init(repository: root.path, enabled: true))
+        let gate = RecoveryGate(), device = UUID().uuidString
+        let seed = RequestRevocationIntent(operationID: UUID(), deviceID: device)
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [ApprovedTV(id: device, name: "Preloaded", tokenHash: CatalogHash.sha256(Data("seed-token".utf8)))], revocations: [seed]).encoded())
+        let authority = backend.coordinator(), namespace = "handoff-tls-" + UUID().uuidString
+        let first = LocalCatalogServer(catalog: catalog, testingNamespace: namespace, beforeRevocationReplay: { if $0.operationID != seed.operationID { try await gate.wait() } }, trustedApprovals: authority)
+        let replacement = LocalCatalogServer(catalog: catalog, testingNamespace: namespace, trustedApprovals: authority)
+        addTeardownBlock { await first.stop(); try await replacement.clearTestSecrets() }
+        // Preload the future replacement with an intent and token that will both become obsolete.
+        try await replacement.revoke("never-approved")
+        await first.setRequestService(service); try await first.start()
+        func pair() async throws -> (LocalConnection, String, String) {
+            let (client, trust) = try await tlsClient(first)
+            var message = LocalMessage(operation: "pair"); message.deviceID = device; message.name = "Replacement TV"
+            let pending = try await client.exchange(LocalPacket(message: message)); XCTAssertEqual(pending.message.operation, "pending")
+            let state = await first.currentState
+            try await first.approve(XCTUnwrap(state.pending.first).id)
+            let response = try await client.exchange(LocalPacket(message: .init(operation: "pairStatus")))
+            return (client, try XCTUnwrap(response.message.token), try XCTUnwrap(trust.fingerprint))
+        }
+        let (_, oldToken, pin) = try await pair()
+        let oldAuthorization = try await first.requestAuthorization(for: device)
+        let revoke = Task { try await first.revoke(device) }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+        while !(await gate.hasEntered) { guard ContinuousClock.now < deadline else { throw LocalCatalogError.timeout }; try await Task.sleep(for: .milliseconds(5)) }
+        let (newSession, newToken, _) = try await pair(); XCTAssertNotEqual(newToken, oldToken)
+        let reapprovedAuthorization = try await first.requestAuthorization(for: device)
+        await gate.release(); try await revoke.value
+        let png = try RequestScreenshot.encode(pixels: Data([128, 64, 32, 255]), width: 1, height: 1, bytesPerRow: 4)
+        let request = ShaderRequest(prompt: "Preserve accepted work during replacement", context: .init(shader: snapshot.initialShader, screenshot: png, animationTime: 1, width: 1920, height: 1080))
+        let response = try await newSession.exchange(LocalPacket(message: .init(operation: "requestSubmit"), payload: JSONEncoder().encode(ShaderRequestControl(request: request))))
+        XCTAssertNil(response.message.error)
+        let before = await service.allJobs(); XCTAssertEqual(before.first?.stage, .queued)
+        await replacement.setRequestService(service); try await replacement.start()
+        XCTAssertFalse(oldAuthorization.isCurrent); XCTAssertFalse(reapprovedAuthorization.isCurrent)
+        let oldPort = await first.listeningPort; XCTAssertNil(oldPort)
+        let retired = await first.currentState; XCTAssertTrue(retired.message.contains("replaced"))
+        let (oldClient, _) = try await tlsClient(replacement, pin: pin)
+        var authentication = LocalMessage(operation: "authenticate"); authentication.deviceID = device; authentication.token = oldToken
+        let rejected = try await oldClient.exchange(LocalPacket(message: authentication)); XCTAssertEqual(rejected.message.error, "revoked")
+        let (currentClient, _) = try await tlsClient(replacement, pin: pin)
+        authentication.token = newToken
+        let accepted = try await currentClient.exchange(LocalPacket(message: authentication)); XCTAssertNil(accepted.message.error)
+        let status = try await currentClient.exchange(LocalPacket(message: .init(operation: "requestStatus"), payload: JSONEncoder().encode(ShaderRequestControl(requestID: request.id))))
+        XCTAssertNil(status.message.error)
+        let after = await service.allJobs(); XCTAssertEqual(after.first?.id, request.id); XCTAssertEqual(after.first?.stage, .queued)
+        let stored = try TrustedTVApprovals.decode(XCTUnwrap(backend.read()))
+        XCTAssertTrue(stored.revocations.isEmpty); XCTAssertEqual(stored.approvals.first?.tokenHash, CatalogHash.sha256(Data(newToken.utf8)))
+    }
+
     func testTLSApprovalCredentialReconnectRevocationAndHostPin() async throws {
         let (root, store) = try fixture()
         let catalog = try await store.reload(from: root).catalog

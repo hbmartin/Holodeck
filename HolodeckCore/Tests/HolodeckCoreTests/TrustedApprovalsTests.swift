@@ -8,14 +8,17 @@ final class TrustedBackendFixture: @unchecked Sendable {
     private var data: Data?
     private var writeCount = 0
     private var fail = false
+    private var readFailure = false
     init(_ data: Data?) { self.data = data }
     func read() -> Data? { lock.withLock { data } }
     func write(_ value: Data) throws {
         try lock.withLock { if fail { throw POSIXError(.EIO) }; data = value; writeCount += 1 }
     }
+    func failReads(_ value: Bool) { lock.withLock { readFailure = value } }
+    func checkedRead() throws -> Data? { try lock.withLock { if readFailure { throw POSIXError(.EACCES) }; return data } }
     func failWrites(_ value: Bool) { lock.withLock { fail = value } }
     var writes: Int { lock.withLock { writeCount } }
-    func coordinator() -> TrustedApprovalsCoordinator { .init(read: { self.read() }, write: { try self.write($0) }) }
+    func coordinator() -> TrustedApprovalsCoordinator { .init(read: { try self.checkedRead() }, write: { try self.write($0) }) }
 }
 actor TrustedOwnerRecorder {
     var binding: TrustedApprovalsCoordinator.Binding?
@@ -90,6 +93,27 @@ actor TrustedOwnerRecorder {
             }
         }
     }
+    func testFailedInitialInspectionCanBeRetriedWithoutPublishingAnUnacceptedBinding() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let catalog = DirectoryCatalog(directory: root.appendingPathComponent("catalog"))
+        let service = ShaderRequestService(catalog: catalog, directory: root, workerScript: root.appendingPathComponent("unused.py"))
+        await service.suspend(); try await service.initialize(configuration: .init(repository: root.path, enabled: true))
+        let original = try TrustedTVApprovals(approvals: [ApprovedTV(id: "A", name: "A", tokenHash: "A")]).encoded()
+        let backend = TrustedBackendFixture(original), authority = backend.coordinator()
+        let server = LocalCatalogServer(catalog: catalog, testingNamespace: "inspection-retry", trustedApprovals: authority)
+        backend.failReads(true); await server.setRequestService(service)
+        do { _ = try await server.requestAuthorization(for: "A"); XCTFail("Unaccepted initial binding published") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("handoff is pending")) }
+        let statuses = await service.recoveryStatuses(); XCTAssertTrue(statuses.contains { $0.message.contains(POSIXError(.EACCES).localizedDescription) })
+        XCTAssertEqual(backend.read(), original); XCTAssertEqual(backend.writes, 0)
+        backend.failReads(false); try await service.retryReconciliation()
+        let authorization = try await server.requestAuthorization(for: "A"); XCTAssertTrue(authorization.isCurrent)
+        let recovered = await service.recoveryStatuses(); XCTAssertTrue(recovered.isEmpty)
+        XCTAssertEqual(backend.read(), original); XCTAssertEqual(backend.writes, 0)
+    }
+
     func testReplacementReadsFreshBackendAndPreservesNewTokens() async throws {
         let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [ApprovedTV(id: "A", name: "A", tokenHash: "old")]).encoded())
         let coordinator = backend.coordinator(), first = TrustedOwnerRecorder(), next = TrustedOwnerRecorder()
