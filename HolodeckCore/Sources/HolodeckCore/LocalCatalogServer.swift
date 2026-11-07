@@ -355,13 +355,13 @@ public actor LocalCatalogServer {
                 guard owner == coordinatorID else { continue }
                 try await service?.applyTrustedRevocation(intent, revision: revision)
                 let acknowledgement = try! await acquireTrustedMutation(cancellable: false)
-                guard owner == coordinatorID, requests === service else { releaseTrustedMutation(acknowledgement); continue }
+                guard owner == coordinatorID, let service, requests === service else { releaseTrustedMutation(acknowledgement); continue }
                 do {
                     // Approvals can change during replay. Preserve the current tokens and remove only this intent.
                     let remaining = revocations.filter { $0.operationID != intent.operationID }
-                    try persist(approved, revocations: remaining)
-                    revocations = remaining
-                    try await requests?.acknowledgeTrustedRevocation(intent, revision: trustedRevision)
+                    let bytes = try approvalBytes(approved, revocations: remaining), write = writeApprovals
+                    try await service.acknowledgeTrustedRevocation(intent, revision: trustedRevision) { try write(bytes) }
+                    revocations = remaining; trustedSequence &+= 1
                     let completed = replayWaiters.removeValue(forKey: intent.operationID) ?? []
                     completed.forEach { $0.resume() }
                 } catch { releaseTrustedMutation(acknowledgement); throw error }
