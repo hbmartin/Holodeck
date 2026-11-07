@@ -934,3 +934,40 @@ Normal replay reuses a freshly inspected or successfully written authority revis
 Evidence: `/tmp/lifecycle-final-core.log`, `/tmp/lifecycle-final-release.log`, `/tmp/lifecycle-final-boundaries.log`, `/tmp/lifecycle-races-summary.json`, `/tmp/lifecycle-races-*.log`, `/tmp/lifecycle-profile-{baseline,current}.json`, `/tmp/lifecycle-final-{mac,tv}-build.log`, `/tmp/lifecycle-final-artifact.json`, and `/tmp/lifecycle-final-source.json`. Frozen Swift hashes matched verification, repetitions and builds. Earlier development failures are excluded from these acceptance totals.
 
 Desktop UI runtime checks remain **blocked at the user's instruction**. Live Bonjour/LAN discovery, physical Apple TV and tvOS simulator execution were not run. The six full-suite skips cover three unrelated catalog profiles, live discovery, real Codex publication and worker-supervision profiling. Isolated loopback TLS tests did run. Worker/checker/shader sources, artifacts and locks are unchanged; their separate Python, checker release, compile-all-Metal and GPU-profile suites were not rerun. Linux CI, network messages and journal/envelope formats are unchanged. No live installation, request enabling, merge or deployment occurred.
+
+
+## PR #45 follow-up — target recovery and listener admission (2026-11-07)
+
+Trusted cancellation obligations are recorded for every admitted target before fallible notification. Exact reservation receipts unwind partial pre-commit failures without clearing durable or newer fences. Inspection receipts are separate from cancellation receipts: an unrelated drain cannot clear a failed or missing inspection. Newly introduced targets join known pending obligations before fresh inspection awaits, so a failed replacement cannot disappear from the removal quorum. Successful removals require checked, unique service receipts; the duplicate-key protection is defensive rather than evidence of a reproduced public crash.
+
+Cross-authority replacement fences the target, drains its old cancellation/removal obligations and checks process settlement before changing registration. Authority lanes are released across predecessor waits. Departure admission excludes new obligations and conflicting same-service registration; cancellation catches up the retained old registration. Same-authority transport replacement continues reusing successful applications. Unresolved metadata, ownership and settlement evidence prevents handoff and retains its recovery pins.
+
+Retry Recovery completes the requester's eligible local journal/deletion work before visiting other targets. Nonrecursive target recovery and explicit partial-recovery results preserve progress while naming unresolved services. Ended registration lifetimes are withdrawn even when no binding was accepted; Retry cannot activate a shut-down failed candidate. Listener starts share one generation-scoped operation with independent cancellable waiters; stop invalidates it without reporting an ordinary sleep transition as a startup failure.
+
+Approval-write failures inspect actual trusted bytes under mutation ownership. A confirmed predecessor permits the same live pairing to retry; an exact committed candidate is retained and delivered if still eligible. Conflicting or unreadable readback retains storage, the initiating error and inspection recovery. Transport failures remain visible alongside trusted diagnostics, and error publication uses explicit identity instead of message substrings. Recovery blockers take precedence over ownerless reconnect guidance; new ownerless dispatch remains paused. Retired reservation and inspection receipts are pruned.
+
+Final-source validation on the same macOS/Xcode host:
+
+- Full Swift core/native and packaged-resource suite: **531 tests, 6 opt-in skips, zero failures**, including the local authoring and Metal fixtures; **25 local scenes** verified.
+- Final Debug/full and focused Release selections cover **62 trusted-state tests, zero failures**, covering isolated TLS approval, reapproval, uncertain write outcomes, target failure, handoff and lifecycle boundaries.
+- **20 optimized repetitions, 980 executions, zero failures**, including the suspended-teardown and ownerless-publication regressions. Subprocesses have bounded deadlines.
+- Both unsigned Release app builds succeeded. Native `library artifact-info --json` verified the packaged checker identity without Python. Runtime/test source hashes remained fixed during final verification.
+- Structural assertions retain zero encoding for ineligible operations, exact trusted bytes, one initial backend read, two encodings/writes per normal revoke/removal, and zero retired reservations, obligations or departures. Healthy replay retains one live target/inspection entry.
+
+An earlier full run failed the existing suspended-teardown assertion that revocation had not stopped its worker. Baseline source already stops matching work; five isolated baseline and five current runs passed that timing-sensitive assertion. The fixture now witnesses the stop handler before suspension and retains its gated no-premature-cleanup check. Production termination behavior was not changed. Earlier development failures are excluded from the acceptance totals above.
+
+The identical 200-revocation fixture ran in fresh Release builds of merged PR #45 (`31b14c5`, runtime source `b6857f0`) and this change. Seven alternating samples per version used the same compiler, injected backend and `/private/tmp` filesystem; medians:
+
+| Work | PR #45 | Current |
+| --- | ---: | ---: |
+| Trusted backend reads | 1 | 1 |
+| Successful trusted writes | 400 | 400 |
+| Envelope candidate encodings | 400 | 400 |
+| Timed authority work, ms | 66.50 | 68.45 |
+| Whole-process user / system CPU, seconds | 0.122 / 0.025 | 0.124 / 0.024 |
+
+These timings describe the synthetic fixture, not real Keychain latency. Gated responsiveness and work counts enforce the contracts; CI has no timing threshold.
+
+Evidence: `/tmp/pr46-final-{core,release}.log`, `/tmp/pr46-race-status.json`, `/tmp/pr46-races-*.log`, `/tmp/pr46-profile-{baseline,current}.json`, `/tmp/pr46-final-{mac,tv}-build.log`, `/tmp/pr46-final-artifact.json`, `/tmp/pr46-final-source.json`, and `/tmp/pr46-teardown-counterexample.json`.
+
+Desktop UI runtime checks remain **blocked under the user's instruction**. Live Bonjour/LAN discovery, physical Apple TV and tvOS simulator execution were not run. Worker/checker/shader sources and artifact locks are unchanged; their separate Python, checker-release, compile-all-Metal and external GPU-profile suites were not rerun. The core Metal fixtures did run. Linux CI, network messages and persisted formats are unchanged. No live installation replacement, request enabling, merge or deployment occurred.

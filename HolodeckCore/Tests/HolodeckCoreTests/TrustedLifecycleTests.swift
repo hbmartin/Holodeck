@@ -480,6 +480,7 @@ private final class LifecycleClientSecrets: @unchecked Sendable {
         let backend = TrustedBackendFixture(original), authority = backend.coordinator()
         let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "retire-write-" + UUID().uuidString,
             beforeTrustedCommit: { _ in try await gate.wait() }, trustedApprovals: authority)
+        addTeardownBlock { await gate.release(); try await server.clearTestSecrets() }
         await server.setRequestService(fixture.service); try await server.start()
         let revoke = Task { try await server.revoke("A") }
         try await wait { await gate.hasEntered }
@@ -552,6 +553,45 @@ private final class LifecycleClientSecrets: @unchecked Sendable {
         gate.release(); try await second.value
         try await wait { await (server.listeningPort ?? 0) > 0 }
         let work = await authority.observation; XCTAssertEqual(work.requestedGeneration, 1)
+    }
+
+    func testTransportFailureRemainsVisibleAlongsideTrustedDiagnostic() async throws {
+        let fixture = try await fixture(), backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [ApprovedTV(id: "A", name: "A", tokenHash: "A")]).encoded())
+        let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "diagnostic-origins-" + UUID().uuidString, trustedApprovals: backend.coordinator())
+        addTeardownBlock { try await server.clearTestSecrets() }
+        await server.setRequestService(fixture.service); try await server.start()
+        try await wait { await server.currentState.message == "Serving shaders on the local network." }
+        backend.failWrites(true)
+        do { try await server.revoke("A"); XCTFail("Failed write accepted") }
+        catch let error as POSIXError { XCTAssertEqual(error.code, .EIO) }
+        await server.publishFailure(.posix(.EACCES))
+        let failed = await server.currentState
+        XCTAssertNotNil(failed.transportFailure); XCTAssertNotNil(failed.trustedMessage)
+        XCTAssertTrue(failed.message.contains(POSIXError(.EIO).localizedDescription))
+        XCTAssertTrue(failed.message.hasPrefix(failed.transportFailure!))
+        backend.failWrites(false); try await server.revoke("A")
+        let recovered = await server.currentState
+        XCTAssertNil(recovered.trustedMessage); XCTAssertEqual(recovered.transportFailure, failed.transportFailure)
+        await server.stop(); let stopped = await server.currentState
+        XCTAssertNil(stopped.transportFailure); XCTAssertEqual(stopped.message, "Local sharing is stopped.")
+    }
+
+    func testUncertainApprovalReadbackPreservesStorageAndRequiresRecovery() async throws {
+        let fixture = try await fixture(), original = try TrustedTVApprovals().encoded()
+        let backend = TrustedBackendFixture(original)
+        let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { _ in backend.failReads(true); throw POSIXError(.EIO) })
+        let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "approval-uncertain-" + UUID().uuidString, trustedApprovals: authority)
+        addTeardownBlock { backend.failReads(false); try await server.clearTestSecrets() }
+        await server.setRequestService(fixture.service); try await server.start()
+        let client = try await tls(server), pending = try await pair(server, client: client)
+        do { try await server.approve(pending.id); XCTFail("Uncertain write accepted") }
+        catch let error as POSIXError { XCTAssertEqual(error.code, .EIO) }
+        XCTAssertEqual(backend.read(), original); XCTAssertEqual(backend.writes, 0)
+        let reply = try await fixture.service.control(operation: "requestStatus", payload: .init(), deviceID: "other")
+        XCTAssertFalse(reply.enabled); XCTAssertTrue(reply.message.contains("inspection requires recovery"))
+        backend.failReads(false); try await fixture.service.retryReconciliation()
+        let recovered = try await fixture.service.control(operation: "requestStatus", payload: .init(), deviceID: "other")
+        XCTAssertTrue(recovered.enabled); XCTAssertEqual(backend.read(), original)
     }
 
 }

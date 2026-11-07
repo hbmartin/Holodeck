@@ -556,7 +556,10 @@ public actor ShaderRequestService {
     }
     func settleTrustedAuthorityDeparture() async throws {
         if let activeID, records[activeID]?.revoked == true, let workerTask { await workerTask.value }
-        guard durableRevocations.isEmpty, activeProcess == nil || activeID.map({ records[$0]?.revoked != true }) == true else {
+        if let retirementTask { await retirementTask.value }
+        guard persistenceFailure == nil, startupFinalizationFailure == nil, recovery.entries.isEmpty,
+              pendingRetirements.isEmpty, durableRevocations.isEmpty,
+              activeProcess == nil || activeID.map({ records[$0]?.revoked != true }) == true else {
             throw ShaderRequestError.unavailable("Previous TV cancellation or process settlement requires recovery before changing authority.")
         }
     }
@@ -571,6 +574,7 @@ public actor ShaderRequestService {
         authorityTransfer = nil; emitUpdates()
     }
     private var revocationReservations: [UUID: TrustedRevocationReservation] = [:]
+    var trustedReservationCount: Int { revocationReservations.count }
     private var revocationInspection: TrustedRevocationInspection?
     private var revocationRegistration = UUID()
     private var revocationApplications: [UUID: TrustedRevocationApplication] = [:]
@@ -658,6 +662,7 @@ public actor ShaderRequestService {
     func commitTrustedRevocation(_ intent: RequestRevocationIntent, revision: TrustedRevocationRevision) throws {
         try acceptRevocationRevision(revision)
         pendingRevocations[intent.operationID] = intent; durableRevocations.insert(intent.operationID)
+        revocationReservations[intent.operationID] = nil
         controlScopes[intent.deviceID] = nil
         if let activeID, records[activeID]?.status.deviceID == intent.deviceID {
             execution?.interrupted = true; activeProcess?.stop()
@@ -670,6 +675,7 @@ public actor ShaderRequestService {
         // The coordinator holds its mutation lease: absent provisional reservations
         // cannot still publish. Missing durable ownership requires explicit recovery.
         pendingRevocations = pendingRevocations.filter { ids.contains($0.key) || durableRevocations.contains($0.key) }
+        revocationReservations = revocationReservations.filter { ids.contains($0.key) }
         for intent in intents { try commitTrustedRevocation(intent, revision: revision) }
         if !durableRevocations.isSubset(of: ids) {
             throw ShaderRequestError.unavailable("Trusted TV storage omitted an unacknowledged durable revocation. Retain the approval evidence and retry recovery.")
@@ -707,7 +713,7 @@ public actor ShaderRequestService {
         guard removal.authority == application.authority, removal.intent == application.intent,
               removal.applications[runtimeID] == application else { throw ShaderRequestError.invalidRequest }
         let id = application.intent.operationID
-        pendingRevocations[id] = nil; durableRevocations.remove(id)
+        pendingRevocations[id] = nil; durableRevocations.remove(id); revocationReservations[id] = nil
         revocationApplications[id] = nil; revocationFailures[id] = nil
         emitUpdates(); kick()
     }
@@ -2653,9 +2659,11 @@ public actor ShaderRequestService {
                                         publicationRevision: await catalog.publicationRevisionValue())
     }
     private func kick() {
-        guard hostOwners.mayDispatch else { pauseOwnerlessPublication(); return }
         if let startupFinalizationFailure { failPendingPublicationForRecovery(startupFinalizationFailure); return }
         if let persistenceFailure { failPendingPublicationForRecovery(persistenceFailure); return }
+        if let reconciliationFailure { failPendingPublicationForRecovery(reconciliationFailure); return }
+        if let entry = recovery.entries.values.sorted(by: { $0.journal < $1.journal }).first { failPendingPublicationForRecovery(entry.message); return }
+        guard hostOwners.mayDispatch else { pauseOwnerlessPublication(); return }
         guard loaded, initialized, !suspended, !maintenanceBusy, activeID == nil, workerTask == nil else { return }
         if storageCommit != nil || pendingCommits != 0 || !pendingRetirements.isEmpty || retirementTask != nil { schedulingDeferred = true; return }
         if !reconciled {

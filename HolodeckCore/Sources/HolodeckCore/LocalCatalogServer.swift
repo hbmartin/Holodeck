@@ -19,6 +19,8 @@ nonisolated public struct ApprovedTV: Identifiable, Codable, Sendable {
 }
 nonisolated public struct LocalServerState: Sendable {
     public var message = "Choose a shader folder to start sharing."
+    public var trustedMessage: String?
+    public var transportFailure: String?
     public var pending: [TVApproval] = []
     public var approved: [ApprovedTV] = []
     public init() {}
@@ -32,17 +34,15 @@ nonisolated struct RequestRevocationIntent: Codable, Sendable, Equatable {
 /// Held by authenticated calls across actor hops. Revocation invalidates the old
 /// approval even if its queued call reaches the request actor after replay finishes.
 nonisolated final class TrustedRequestAuthorization: @unchecked Sendable {
-    private let standaloneCoordinator: UUID
-    var coordinator: UUID { owner?.authority ?? standaloneCoordinator }
+    let coordinator: UUID
     let deviceID: String
-    private let lock = NSLock()
-    private var current = true
+    private let token = TrustedInvalidationToken()
     private let owner: TrustedOwnerPermit?
     init(coordinator: UUID, deviceID: String, owner: TrustedOwnerPermit? = nil) {
-        self.standaloneCoordinator = coordinator; self.deviceID = deviceID; self.owner = owner
+        self.coordinator = owner?.authority ?? coordinator; self.deviceID = deviceID; self.owner = owner
     }
-    var isCurrent: Bool { lock.withLock { current } && (owner?.isCurrent ?? true) }
-    func invalidate() { lock.withLock { current = false } }
+    var isCurrent: Bool { token.isCurrent && (owner?.isCurrent ?? true) }
+    func invalidate() { token.invalidate() }
 }
 nonisolated struct TrustedRevocationRevision: Sendable, Equatable {
     let coordinator: UUID
@@ -81,7 +81,10 @@ public actor LocalCatalogServer {
             let detail = BoundedDiagnostics.bounded(error.localizedDescription, bytes: 8192)
             // The authority publishes an intent/write failure while it still owns
             // the transition. Only preparation errors need a local publication.
-            if trustedDiagnostic?.contains(detail) != true { trustedDiagnostic = detail; publish() }
+            let identity = (error as? any TrustedReportedDiagnostic)?.diagnosticID
+            if identity == nil || identity != trustedDiagnosticID {
+                trustedDiagnostic = detail; trustedDiagnosticID = identity ?? UUID(); publish()
+            }
         }
     }
     private let instanceID = UUID()
@@ -160,7 +163,7 @@ public actor LocalCatalogServer {
         }
         approved = snapshot.approvals; self.binding = binding; retired = false
         for (session, record) in authenticated where approved[record.id]?.tokenHash != record.tokenHash { cancelSession(session) }
-        trustedDiagnostic = snapshot.diagnostic
+        trustedDiagnostic = snapshot.diagnostic; trustedDiagnosticID = snapshot.diagnosticID
         publish()
     }
     private func retireTrustedBinding() {
@@ -193,6 +196,8 @@ public actor LocalCatalogServer {
     private var state = LocalServerState()
     private var transportMessage = LocalServerState().message
     private var trustedDiagnostic: String?
+    private var trustedDiagnosticID: UUID?
+    private var transportFailure: String?
     private var observers: [UUID: AsyncStream<LocalServerState>.Continuation] = [:]
     private var identity: LocalServerIdentity?
 
@@ -247,8 +252,10 @@ public actor LocalCatalogServer {
     }
     private func removeObserver(_ id: UUID) { observers[id] = nil }
     private func publish(_ message: String? = nil) {
-        if let message { transportMessage = message }
-        state.message = trustedDiagnostic ?? transportMessage
+        if let message { transportMessage = message; transportFailure = nil }
+        state.trustedMessage = trustedDiagnostic; state.transportFailure = transportFailure
+        state.message = [transportFailure, trustedDiagnostic].compactMap { $0 }.joined(separator: "\n")
+        if state.message.isEmpty { state.message = transportMessage }
         state.pending = pending.values.map(\.approval).sorted { $0.name < $1.name }
         state.approved = approved.values.sorted { $0.name < $1.name }
         for observer in observers.values { observer.yield(state) }
@@ -345,9 +352,11 @@ public actor LocalCatalogServer {
         default: break
         }
     }
-    private func publishFailure(_ error: NWError) {
-            if LocalProtocol.isPermissionDenied(error) { publish(LocalCatalogError.permissionDenied.localizedDescription) }
-            else { publish("Local sharing failed: \(error.localizedDescription)") }
+    func publishFailure(_ error: NWError) {
+        transportFailure = LocalProtocol.isPermissionDenied(error)
+            ? LocalCatalogError.permissionDenied.localizedDescription
+            : "Local sharing failed: \(error.localizedDescription)"
+        publish()
     }
 
     public func approve(_ id: UUID) async throws {

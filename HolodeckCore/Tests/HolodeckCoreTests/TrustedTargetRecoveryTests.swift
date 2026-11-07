@@ -138,6 +138,67 @@ import XCTest
         XCTAssertEqual(after, owner); XCTAssertNotNil(port)
     }
 
+    func testOwnerlessPublicationReportsStorageRecoveryBeforeReconnectGuidance() async throws {
+        let fault = TargetStorageFault(), fixture = try await fixture(fault: fault), owner = fixture.service.retainOwner()
+        fault.enabled = true
+        do { try await submit(fixture.service); XCTFail("Storage failure accepted") } catch is RequestPersistence.Fault {}
+        owner.release()
+        do { try await fixture.service.ensurePublication(); XCTFail("Recovery blocker ignored") }
+        catch {
+            XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription))
+            XCTAssertFalse(error.localizedDescription.contains("host reconnects"))
+        }
+    }
+    func testFailedAuthorityDrainRetainsOldBindingAndCanBeRetried() async throws {
+        let fault = TargetStorageFault(), fixture = try await fixture(fault: fault); try await submit(fixture.service)
+        let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(revocations: [intent]).encoded()), old = backend.coordinator()
+        let prior = try await accept(old.register(TrustedOwnerRecorder().owner(service: fixture.service)))
+        let next = TrustedBackendFixture(try TrustedTVApprovals().encoded()).coordinator()
+        fault.enabled = true
+        do { _ = try await accept(next.register(TrustedOwnerRecorder().owner(service: fixture.service))); XCTFail("Failed drain replaced authority") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        XCTAssertTrue(prior.permit.isCurrent)
+        XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations, [intent])
+        fault.enabled = false; try await fixture.service.retryReconciliation()
+        _ = try await accept(next.register(TrustedOwnerRecorder().owner(service: fixture.service)))
+        let jobs = await fixture.service.allJobs(); XCTAssertEqual(jobs.first?.stage, .cancelled)
+        try await submit(fixture.service)
+    }
+    func testCancelledAuthorityPreparationCannotReplaceOldRegistration() async throws {
+        let fixture = try await fixture(), gate = RecoveryGate(), intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        addTeardownBlock { await gate.release() }
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(revocations: [intent]).encoded()), old = backend.coordinator()
+        let prior = try await accept(old.register(TrustedOwnerRecorder().owner(service: fixture.service, beforeReplay: { _ in try await gate.wait() })))
+        let next = TrustedBackendFixture(try TrustedTVApprovals().encoded()).coordinator()
+        let ticket = try await next.register(TrustedOwnerRecorder().owner(service: fixture.service))
+        try await wait { await gate.hasEntered }
+        let conflicting = try await old.register(TrustedOwnerRecorder().owner(service: fixture.service))
+        do { _ = try await conflicting.value(); XCTFail("Registration added obligations behind a frozen departure") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("handoff pending")) }
+        ticket.completion.cancel()
+        do { _ = try await ticket.value(); XCTFail("Cancelled handoff accepted") } catch is CancellationError {}
+        await gate.release()
+        try await wait { await next.observation.preparingGeneration == nil }
+        XCTAssertTrue(prior.permit.isCurrent)
+        try await submit(fixture.service)
+        let nextState = await next.observation; XCTAssertNil(nextState.acceptedGeneration)
+    }
+    func testRemovalReceiptRejectsDuplicateServiceKeysWithoutTrapping() throws {
+        let service = UUID(), authority = UUID(), intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        let one = TrustedRevocationApplication(serviceID: service, registrationID: UUID(), authority: authority, intent: intent)
+        let two = TrustedRevocationApplication(serviceID: service, registrationID: UUID(), authority: authority, intent: intent)
+        XCTAssertThrowsError(try TrustedRevocationRemoval.checked(authority: authority, intent: intent, proofs: [one, two]))
+    }
+    func testReplayFailureAndSnapshotCarryTheSameExplicitIdentity() async throws {
+        let fixture = try await fixture(), intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(revocations: [intent]).encoded()), authority = backend.coordinator(), owner = TrustedOwnerRecorder()
+        _ = try await accept(authority.register(owner.owner(service: fixture.service, beforeReplay: { _ in throw POSIXError(.EIO) })))
+        do { try await authority.replay(); XCTFail("Failed replay accepted") }
+        catch { XCTAssertEqual((error as? any TrustedReportedDiagnostic)?.diagnosticID, intent.operationID) }
+        let snapshot = await owner.snapshot; XCTAssertEqual(snapshot?.diagnosticID, intent.operationID)
+    }
+
 }
 private final class TargetStorageFault: @unchecked Sendable {
     private let lock = NSLock(); private var value = false

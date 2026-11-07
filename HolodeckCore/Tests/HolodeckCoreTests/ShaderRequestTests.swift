@@ -334,9 +334,10 @@ final class ShaderRequestTests: XCTestCase {
         await service.resume()
         try await waitFor { FileManager.default.fileExists(atPath: job.appendingPathComponent("worker-started").path) }
         try await service.revoke("TV-A")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: job.appendingPathComponent("stopping").path)) // Revocation does not preempt a running job.
-        await service.suspend()
+        // Revocation stops matching work. Witness its signal handler before
+        // suspending so this test covers suspension during owned teardown.
         try await waitFor { FileManager.default.fileExists(atPath: job.appendingPathComponent("stopping").path) }
+        await service.suspend()
         let second = ShaderRequest(prompt: "Queued", context: try context())
         _ = try await service.control(operation: "requestSubmit", payload: .init(request: second), deviceID: "TV-B")
         await service.resume()
