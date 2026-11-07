@@ -95,6 +95,7 @@ public actor LocalCatalogServer {
     private var ownerServiceID: UUID?
     private var retired = false
     private var startGeneration: UInt64 = 0
+    private var startup: (generation: UInt64, task: Task<Void, Error>)?
     private var lifetimeRevision: UInt64 = 0
     private var registrationTicket: (id: UUID, ticket: TrustedApprovalsCoordinator.Registration)?
     private func trustedOwner(service: ShaderRequestService?) -> TrustedApprovalsCoordinator.Owner {
@@ -255,11 +256,28 @@ public actor LocalCatalogServer {
 
     public func start() async throws {
         if listener != nil, binding?.permit.isCurrent == true { return }
-        startGeneration &+= 1; let generation = startGeneration
-        _ = try await ensureBinding(explicitStart: true)
-        try Task.checkCancellation()
-        guard generation == startGeneration else { throw CancellationError() }
-        guard listener == nil else { return }
+        let task: Task<Void, Error>
+        if let startup { task = startup.task }
+        else {
+            startGeneration &+= 1; let generation = startGeneration
+            task = Task { try await self.performStart(generation) }
+            startup = (generation, task)
+        }
+        // Each caller owns its waiter; cancelling it cannot cancel other starts.
+        let waiter = RequestPersistence.CommitTicket<Void>()
+        Task {
+            do { try await task.value; waiter.complete(.success(())) }
+            catch { waiter.complete(.failure(error)) }
+        }
+        try await waiter.value()
+    }
+    private func performStart(_ generation: UInt64) async throws {
+        defer { if startup?.generation == generation { startup = nil } }
+        do {
+            _ = try await ensureBinding(explicitStart: true)
+            try Task.checkCancellation()
+        } catch is CancellationError where generation != startGeneration { return }
+        guard generation == startGeneration, listener == nil else { return }
         if identity == nil {
             identity = try LocalServerIdentity.load(account: secretNamespace + "-tls-identity")
         }
@@ -284,7 +302,7 @@ public actor LocalCatalogServer {
     }
 
     public func stop() {
-        startGeneration &+= 1
+        startGeneration &+= 1; startup?.task.cancel(); startup = nil
         requestAuthorizations.values.forEach { $0.invalidate() }; requestAuthorizations.removeAll()
         listenerID = nil; listener?.cancel(); listener = nil
         for id in sessions.keys { cancelSession(id) }

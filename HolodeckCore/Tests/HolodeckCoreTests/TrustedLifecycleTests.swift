@@ -163,7 +163,7 @@ private final class LifecycleClientSecrets: @unchecked Sendable {
         addTeardownBlock { gate.release(); try await server.clearTestSecrets() }
         gate.arm(); let start = Task { try await server.start() }
         try await wait { gate.entered }; await server.stop(); gate.release()
-        do { try await start.value; XCTFail("Stopped start created a listener") } catch is CancellationError {}
+        try await start.value
         let stopped = await server.listeningPort; XCTAssertNil(stopped)
         try await server.start(); try await wait { await (server.listeningPort ?? 0) > 0 }
     }
@@ -512,6 +512,46 @@ private final class LifecycleClientSecrets: @unchecked Sendable {
         try await retained!.retryReconciliation()
         XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
         try await wait { retained == nil }
+    }
+
+    func testFailedApprovalWriteCanRetryTheSameLivePairing() async throws {
+        let fixture = try await fixture(), backend = TrustedBackendFixture(try TrustedTVApprovals().encoded()), authority = backend.coordinator()
+        let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "approval-write-retry-" + UUID().uuidString, trustedApprovals: authority)
+        addTeardownBlock { try await server.clearTestSecrets() }
+        try await server.start(); let client = try await tls(server), device = UUID().uuidString
+        let pending = try await pair(server, client: client, device: device)
+        backend.failWrites(true)
+        do { try await server.approve(pending.id); XCTFail("Write failure accepted") }
+        catch let error as POSIXError { XCTAssertEqual(error.code, .EIO) }
+        backend.failWrites(false); try await server.approve(pending.id)
+        let state = await server.currentState
+        XCTAssertTrue(state.pending.isEmpty); XCTAssertEqual(state.approved.map(\.id), [device])
+        XCTAssertEqual(backend.writes, 1)
+    }
+    func testApprovalReadbackRecognizesCommittedWriteWithoutCompensation() async throws {
+        let fixture = try await fixture(), backend = TrustedBackendFixture(try TrustedTVApprovals().encoded())
+        let authority = TrustedApprovalsCoordinator(read: { backend.read() }, write: { try backend.write($0); throw POSIXError(.EIO) })
+        let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "approval-write-outcome-" + UUID().uuidString, trustedApprovals: authority)
+        addTeardownBlock { try await server.clearTestSecrets() }
+        try await server.start(); let client = try await tls(server)
+        let pending = try await pair(server, client: client)
+        try await server.approve(pending.id)
+        let state = await server.currentState
+        XCTAssertTrue(state.pending.isEmpty); XCTAssertEqual(state.approved.count, 1); XCTAssertEqual(backend.writes, 1)
+    }
+    func testConcurrentStartsShareRegistrationAndOneWaiterCanCancel() async throws {
+        let fixture = try await fixture(), backend = TrustedBackendFixture(nil), gate = TrustedWriteGate()
+        let authority = TrustedApprovalsCoordinator(read: { _ = gate.wait(); return backend.read() }, write: { try backend.write($0) })
+        let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "shared-start-" + UUID().uuidString, trustedApprovals: authority)
+        addTeardownBlock { gate.release(); try await server.clearTestSecrets() }
+        gate.arm(); let first = Task { try await server.start() }
+        try await wait { gate.entered }
+        let second = Task { try await server.start() }
+        first.cancel()
+        do { try await first.value; XCTFail("Cancelled waiter did not return") } catch is CancellationError {}
+        gate.release(); try await second.value
+        try await wait { await (server.listeningPort ?? 0) > 0 }
+        let work = await authority.observation; XCTAssertEqual(work.requestedGeneration, 1)
     }
 
 }

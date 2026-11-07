@@ -279,6 +279,7 @@ final class MacLibraryModel {
         MacInspectionLifecycle.snapshot.serverStartAttempts += 1
         #endif
         do { try await server.start(); clearError(from: .server) }
+        catch is CancellationError { throw CancellationError() }
         catch { setError(error.localizedDescription, from: .server); throw error }
     }
     func setSleeping(_ value: Bool) {

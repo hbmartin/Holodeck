@@ -42,6 +42,9 @@ nonisolated final class TrustedApprovalEligibility: @unchecked Sendable {
             state = .admitted
         }
     }
+    func restoreAfterFailedWrite() {
+        lock.withLock { if state == .admitted, withinDeadline() { state = .eligible } }
+    }
     var canIssue: Bool { lock.withLock { state == .admitted && withinDeadline() } }
     func close() { lock.withLock { state = .closed } }
 }

@@ -521,12 +521,27 @@ actor TrustedApprovalsCoordinator {
         try Task.checkCancellation(); try validate(permit); try proposal.eligibility.check()
         var value = envelope
         value.approvals.removeAll { $0.id == proposal.record.id }; value.approvals.append(proposal.record)
-        let candidate = try prepare(value)
+        let candidate = try prepare(value), predecessor = bytes
         try Task.checkCancellation(); try permit.lifetime.admitWrite { try proposal.eligibility.beginWrite() }
         do { try await persist(value, bytes: candidate) }
         catch {
-            await recordMutationFailure(error, operation: UUID(), context: "TV approval for " + proposal.record.id)
-            throw error
+            let initiating = error
+            do {
+                let read = read
+                let actual = try await Task.detached { try read() }.value
+                if actual == candidate {
+                    acceptPersisted(value, bytes: candidate)
+                    await notify(); return proposal
+                }
+                if actual == predecessor {
+                    if permit.lifetime.isCurrent { proposal.eligibility.restoreAfterFailedWrite() }
+                } else { throw Self.unavailable("Approval persistence has an uncertain outcome; retain trusted storage and choose Retry Recovery.") }
+            } catch {
+                loaded = false
+                await service?.revocationReplayFailed(error, revision: revision)
+            }
+            await recordMutationFailure(initiating, operation: UUID(), context: "TV approval for " + proposal.record.id)
+            throw initiating
         }
         await notify()
         return proposal
