@@ -874,3 +874,28 @@ Validation:
 - Structural checks retain two trusted candidate encodings per completed revoke/removal and no extra trusted write for completion or handoff.
 
 Evidence: `/tmp/pr42-handoff-core.log`, `/tmp/pr42-handoff-final-{debug,release,races}.log`, and `/tmp/pr42-handoff-mac-build.log`. The Python worker, checker and shaders were unchanged and their separate suites were not rerun for this Mac coordination fix. Desktop UI runtime checks remain blocked under the existing user instruction; no UI runtime result is claimed.
+
+
+## PR #43 follow-up — shared trusted authority and server replacement (2026-11-07)
+
+Production catalog servers now share one in-process authority for the TV-approval Keychain account. It owns the accepted envelope, trusted revisions, mutation admission, registration generations, replay and bounded diagnostics. Test servers that share a backend explicitly share the same authority. Server-local approval snapshots serve authentication and display; they cannot independently authorize a trusted write or replay.
+
+Approval, revocation and exact-intent removal retain the authority's mutation lane through reservation, trusted persistence and service notification. Provisional cancellation leaves accepted approvals unchanged; a started write finishes its actual outcome. The request service retains the authority's stable identity across transport replacements, so a late server callback cannot erase a durable intent or hide its original EIO. Initiating and secondary intent diagnostics remain separate and bounded. Candidate preparation and accepted-write publication are shared; rejected stale owners encode nothing, handoffs write nothing, and a completed revoke/removal still uses two envelope candidates and two successful trusted writes.
+
+Registrations receive generations when admitted. A queued replacement waits while the accepted binding remains usable. Preparation reloads trusted storage under authority ownership, then rechecks cancellation and generation. Only the newest eligible admission activates; cancelling it does not revive an older superseded registration. Once acceptance begins it completes before another replacement. Prior permits are invalidated and the old listener/sessions retire through normal teardown without revoking approvals or cancelling accepted jobs. A retired server cannot reclaim ownership through `start()`; explicit registration is required. Failed preparation leaves the prior binding intact.
+
+Deterministic regressions witness queued and preparing registration generations before releasing storage gates. They cover reserved revocation, failed removal, stale preloaded snapshots, opposing task priorities, multiple replacements, cancellation, repeated registration, old-owner write rejection and initial inspection recovery. Real isolated TLS pairing/reapproval proves that replacement preserves the newer token and accepted queued work, rejects the old token, retires old transport/authorization permits, and successfully reauthenticates through the replacement.
+
+Final-source validation on macOS 27.0.1, Xcode 27.2 / Swift 6.4.2:
+
+- Full Swift core/native and packaged-resource suite: **489 tests, six opt-in skips, zero failures**, with the local authoring/GPU fixture enabled; **25 local scenes** verified.
+- Focused Debug and Release selections: **61 tests, two opt-in skips, zero failures in each configuration**.
+- Twenty optimized repetitions of 20 gated mutation, handoff, replay and isolated TLS cases: **400 test executions, zero failures**.
+- Both unsigned Release app builds succeeded. No installation, live request enabling, merge or deployment occurred.
+- Structural assertions cover zero stale-owner candidate encodings, no handoff writes, preserved normal successful-write counts and no encoding/writes for no-op revokes. Registration state is bounded to the active preparation, newest pending ticket and one failed preparation; intent diagnostics are bounded and retired with their exact intent.
+
+An earlier full run timed out in the existing manual-supervision-retry fixture and hit an assertion in the existing suspended-teardown fixture. Both passed the final full run and focused selections, then **ten isolated Debug repetitions (20 executions)** without a worker-runtime change. Those earlier failures are excluded from the acceptance totals above.
+
+Evidence: `/tmp/trusted-core-verified.log`, `/tmp/trusted-debug-verified.log`, `/tmp/trusted-final-release.log`, `/tmp/trusted-final-races.log`, `/tmp/trusted-worker-isolation.log`, `/tmp/trusted-final-counts-{debug,release}.log`, `/tmp/trusted-mac-verified.log`, `/tmp/trusted-final-tv-build.log`, and `/tmp/trusted-final-source.json`. Frozen runtime and regression hashes matched the final verification. The six full-suite skips cover three unrelated catalog profiles, live Bonjour/LAN discovery, real Codex publication and supervision profiling. Isolated loopback TLS tests did run.
+
+Desktop UI runtime checks remain **blocked at the user's instruction**. Physical Apple TV and tvOS simulator execution were not run. Worker/checker/shader sources, checker artifacts and locks are unchanged; their separate Python, compile-all-Metal and GPU-profile suites were not rerun for this trusted-state coordination change. Linux CI, network messages and journal/envelope formats are unchanged. Coordination is within one app process; it adds neither interprocess locking nor a persisted handoff log.

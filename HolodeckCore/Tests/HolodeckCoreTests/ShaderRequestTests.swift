@@ -5217,10 +5217,12 @@ extension ShaderRequestTests {
         var persisted = try TrustedTVApprovals.decode(XCTUnwrap(backend.read()))
         XCTAssertEqual(persisted.approvals.map(\.id), ["C"]); XCTAssertEqual(persisted.approvals.first?.tokenHash, "new-C"); XCTAssertTrue(persisted.revocations.isEmpty)
         let before = await authority.observation
+        XCTAssertEqual(before.encodings, 2); XCTAssertEqual(backend.writes, 2) // One revoke and one exact removal; handoff writes nothing.
         do { try await first.revoke("C"); XCTFail("Retired server wrote trusted approvals") } catch { XCTAssertTrue(error.localizedDescription.contains("replaced")) }
         let after = await authority.observation; XCTAssertEqual(after.encodings, before.encodings); XCTAssertEqual(after.writes, before.writes)
         try await second.revoke("C")
         persisted = try TrustedTVApprovals.decode(XCTUnwrap(backend.read()))
+        XCTAssertEqual(backend.writes, 4)
         XCTAssertTrue(persisted.approvals.isEmpty); XCTAssertTrue(persisted.revocations.isEmpty)
         let jobs = await service.allJobs(); XCTAssertEqual(jobs.first?.stage, .cancelled)
         try await service.retryReconciliation()

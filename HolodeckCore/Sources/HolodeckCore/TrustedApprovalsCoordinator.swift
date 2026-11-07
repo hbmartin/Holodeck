@@ -24,6 +24,7 @@ actor TrustedApprovalsCoordinator {
     struct Snapshot: Sendable {
         let approvals: [String: ApprovedTV]
         let revocations: [RequestRevocationIntent]
+        let diagnostic: String?
     }
     struct Binding: Sendable {
         let permit: TrustedOwnerPermit
@@ -71,9 +72,17 @@ actor TrustedApprovalsCoordinator {
         let continuation: CheckedContinuation<Void, Error>
     }
     private struct Failure: LocalizedError, Sendable {
-        let message: String
+        let primary: String
+        private var secondary: [String] = []
+        var message: String { ([primary] + secondary.map { "Additional trusted failure: " + $0 }).joined(separator: "\n") }
         var errorDescription: String? { message }
-        init(_ error: Error) { message = RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 8192) }
+        init(_ error: Error) { primary = RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 8192) }
+        func appending(_ error: Error) -> Self {
+            let detail = RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 2048)
+            guard detail != RequestRecoveryStore.Entry.bounded(primary, bytes: 2048), !secondary.contains(detail) else { return self }
+            var result = self
+            result.secondary = Array((secondary + [detail]).suffix(8)); return result
+        }
     }
     nonisolated let id = UUID()
     private let read: @Sendable () throws -> Data?
@@ -93,6 +102,7 @@ actor TrustedApprovalsCoordinator {
     private var waiters: [Waiter] = []
     private var encodings = 0, writes = 0
     private var failures: [UUID: Failure] = [:]
+    private var mutationFailure: (operation: UUID, message: String)?
     private var replayTask: Task<Void, Never>?
     private var replayWaiters: [UUID: [CheckedContinuation<Void, Error>]] = [:]
     private var replayAll: [CheckedContinuation<Void, Error>] = []
@@ -108,7 +118,7 @@ actor TrustedApprovalsCoordinator {
     }
     private var revision: TrustedRevocationRevision { .init(coordinator: id, sequence: sequence) }
     private var snapshot: Snapshot {
-        .init(approvals: Dictionary(envelope.approvals.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last }), revocations: envelope.revocations)
+        .init(approvals: Dictionary(envelope.approvals.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last }), revocations: envelope.revocations, diagnostic: mutationFailure.map { "Trusted TV operation \($0.operation): " + $0.message })
     }
     static func unavailable(_ message: String) -> ShaderRequestError { .unavailable(message) }
     private func validate(_ permit: TrustedOwnerPermit) throws {
@@ -232,7 +242,15 @@ actor TrustedApprovalsCoordinator {
     private func persist(_ value: TrustedTVApprovals, bytes candidate: Data) async throws {
         let write = write
         try await Task.detached { try write(candidate) }.value
+        acceptPersisted(value, bytes: candidate)
+    }
+    private func acceptPersisted(_ value: TrustedTVApprovals, bytes candidate: Data) {
         envelope = value; bytes = candidate; sequence &+= 1; writes += 1
+        mutationFailure = nil
+    }
+    private func recordMutationFailure(_ error: Error, operation: UUID, context: String) async {
+        mutationFailure = (operation, RequestRecoveryStore.Entry.bounded(context + ": " + error.localizedDescription, bytes: 8192))
+        await notify()
     }
     private func notify() async {
         if let accepted { await accepted.owner.changed(snapshot, accepted.binding) }
@@ -241,14 +259,18 @@ actor TrustedApprovalsCoordinator {
                  proposal: @Sendable () async throws -> Approval?) async throws -> Approval? {
         let token = try await acquire(permit: permit, mutation: true)
         defer { release(token) }
-        try await ensureLoaded()
+        try await ensureLoaded(); try Task.checkCancellation()
         guard let proposal = try await proposal() else { return nil }
         try Task.checkCancellation(); try validate(permit)
         var value = envelope
         value.approvals.removeAll { $0.id == proposal.record.id }; value.approvals.append(proposal.record)
         let candidate = try prepare(value)
         try Task.checkCancellation()
-        try await persist(value, bytes: candidate)
+        do { try await persist(value, bytes: candidate) }
+        catch {
+            await recordMutationFailure(error, operation: UUID(), context: "TV approval for " + proposal.record.id)
+            throw error
+        }
         await notify()
         return proposal
     }
@@ -257,7 +279,7 @@ actor TrustedApprovalsCoordinator {
         let token = try await acquire(permit: permit, mutation: true)
         let intent: RequestRevocationIntent
         do {
-            try await ensureLoaded()
+            try await ensureLoaded(); try Task.checkCancellation()
             let existing = envelope.revocations.first { $0.deviceID == device }
             guard envelope.approvals.contains(where: { $0.id == device }) || existing != nil else { release(token); return }
             intent = existing ?? .init(operationID: UUID(), deviceID: device)
@@ -271,6 +293,9 @@ actor TrustedApprovalsCoordinator {
                     try await beforeCommit(intent); try Task.checkCancellation()
                     try await persist(value, bytes: candidate)
                 } catch {
+                    if !(error is CancellationError) {
+                        await recordMutationFailure(error, operation: intent.operationID, context: "TV revocation for " + intent.deviceID)
+                    }
                     await service?.cancelRevocationReservation(intent, revision: revision); throw error
                 }
                 await notify()
@@ -290,9 +315,11 @@ actor TrustedApprovalsCoordinator {
             if replayTask == nil { replayTask = Task { await self.drainReplay() } }
         }
     }
-    private func record(_ error: Error, intent: RequestRevocationIntent) async {
-        let failure = Failure(error); failures[intent.operationID] = failure
+    private func record(_ error: Error, intent: RequestRevocationIntent) async -> Failure {
+        let failure = failures[intent.operationID]?.appending(error) ?? Failure(error)
+        failures[intent.operationID] = failure
         await service?.revocationReplayFailed(failure, intent: intent, revision: revision)
+        return failure
     }
     private func drainReplay() async {
         var attempted: Set<UUID> = [], failed: [UUID: Failure] = [:], inspect = true
@@ -321,20 +348,18 @@ actor TrustedApprovalsCoordinator {
                     let candidate = try prepare(value), write = write
                     guard let service else { release(commit); continue }
                     try await service.acknowledgeTrustedRevocation(intent, revision: revision) { try write(candidate) }
-                    envelope = value; bytes = candidate; sequence &+= 1; writes += 1
+                    acceptPersisted(value, bytes: candidate)
                     failures[intent.operationID] = nil
                     await notify()
                     let waiting = replayWaiters.removeValue(forKey: intent.operationID) ?? []
                     waiting.forEach { $0.resume() }
                 } catch {
-                    failed[intent.operationID] = Failure(error)
-                    await record(error, intent: intent)
+                    failed[intent.operationID] = await record(error, intent: intent)
                     release(commit); continue
                 }
                 release(commit)
             } catch {
-                failed[intent.operationID] = Failure(error)
-                await record(error, intent: intent)
+                failed[intent.operationID] = await record(error, intent: intent)
             }
         }
     }

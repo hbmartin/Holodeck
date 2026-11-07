@@ -115,7 +115,7 @@ public actor LocalCatalogServer {
         }
         approved = snapshot.approvals; self.binding = binding; requests = binding.service; retired = false
         for (session, record) in authenticated where approved[record.id]?.tokenHash != record.tokenHash { cancelSession(session) }
-        publish()
+        publish(snapshot.diagnostic)
     }
     private func retireTrustedBinding() {
         retired = true; stop(); publish("This catalog server was replaced.")
