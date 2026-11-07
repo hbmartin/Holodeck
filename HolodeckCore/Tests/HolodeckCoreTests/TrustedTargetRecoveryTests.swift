@@ -5,10 +5,18 @@ import XCTest
 
 @MainActor final class TrustedTargetRecoveryTests: XCTestCase {
     private struct Fixture { let root: URL; let service: ShaderRequestService }
-    private func fixture() async throws -> Fixture {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    private func fixture(fault: TargetStorageFault? = nil, repair: TargetRepairCounter? = nil) async throws -> Fixture {
+        let root = URL(fileURLWithPath: "/private/tmp").appendingPathComponent("pr46-" + UUID().uuidString)
+        if repair != nil {
+            let journal = root.appendingPathComponent("own-entry")
+            try FileManager.default.createDirectory(at: journal, withIntermediateDirectories: true)
+            var recovery = RequestRecoveryStore(); recovery.legacyMigrationComplete = true
+            recovery.entries[journal.path] = .init(journal: journal.path, disposition: .resume, message: "Own journal requires recovery")
+            try recovery.encoded().write(to: root.appendingPathComponent("recovery.json"))
+        }
         let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root,
-            workerScript: root.appendingPathComponent("unused.py"))
+            workerScript: root.appendingPathComponent("unused.py"), reconcileWorker: { if $0.lastPathComponent == "own-entry" { repair?.add() } },
+            beforePersistenceReplacement: { if $0.lastPathComponent == "journal.json", fault?.enabled == true { throw POSIXError(.EIO) } })
         await service.suspend(); try await service.initialize(configuration: .init(repository: root.path, enabled: true))
         addTeardownBlock { await service.suspend(); try? FileManager.default.removeItem(at: root) }
         return Fixture(root: root, service: service)
@@ -93,5 +101,51 @@ import XCTest
         try await old.revoke("B", permit: prior.permit) { _ in }
         try await submit(fixture.service)
     }
+    func testLocalJournalsRecoverBeforeAnUnrelatedTargetsFailureIsReported() async throws {
+        let counter = TargetRepairCounter(), fault = TargetStorageFault()
+        let own = try await fixture(repair: counter), other = try await fixture(fault: fault)
+        fault.enabled = true
+        do { try await submit(other.service); XCTFail("Storage failure accepted") } catch is RequestPersistence.Fault {}
+        let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(revocations: [intent]).encoded()), authority = backend.coordinator()
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: own.service)))
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: other.service)))
+        do { try await authority.replay(); XCTFail("Unresolved storage accepted") } catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        let before = counter.value
+        do { try await own.service.retryReconciliation(); XCTFail("Partial recovery reported full success") }
+        catch let error as TrustedPartialRecovery {
+            XCTAssertTrue(error.completedServices.contains(own.service.runtimeID))
+            XCTAssertTrue(error.remaining.joined().contains(POSIXError(.EIO).localizedDescription))
+        }
+        XCTAssertGreaterThan(counter.value, before)
+        XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations, [intent])
+        fault.enabled = false; try await own.service.retryReconciliation()
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
+    }
+    func testFailedCandidateShutdownCannotReplaceTheLiveOwnerOnRetry() async throws {
+        let fixture = try await fixture(), backend = TrustedBackendFixture(try TrustedTVApprovals().encoded()), authority = backend.coordinator()
+        let catalog = DirectoryCatalog(directory: fixture.root.appendingPathComponent("catalog"))
+        let live = LocalCatalogServer(catalog: catalog, testingNamespace: "live-owner-" + UUID().uuidString, trustedApprovals: authority)
+        let candidate = LocalCatalogServer(catalog: catalog, testingNamespace: "dead-candidate-" + UUID().uuidString, trustedApprovals: authority)
+        addTeardownBlock { try await candidate.clearTestSecrets(); try await live.clearTestSecrets() }
+        await live.setRequestService(fixture.service); try await live.start()
+        try await wait { await (live.listeningPort ?? 0) > 0 }
+        let owner = await authority.observation.acceptedGeneration
+        backend.failReads(true); await candidate.setRequestService(fixture.service)
+        await candidate.shutdown(); backend.failReads(false)
+        try await fixture.service.retryReconciliation()
+        let after = await authority.observation.acceptedGeneration, port = await live.listeningPort
+        XCTAssertEqual(after, owner); XCTAssertNotNil(port)
+    }
+
+}
+private final class TargetStorageFault: @unchecked Sendable {
+    private let lock = NSLock(); private var value = false
+    var enabled: Bool { get { lock.withLock { value } } set { lock.withLock { value = newValue } } }
+}
+private final class TargetRepairCounter: @unchecked Sendable {
+    private let lock = NSLock(); private var count = 0
+    func add() { lock.withLock { count += 1 } }
+    var value: Int { lock.withLock { count } }
 }
 #endif

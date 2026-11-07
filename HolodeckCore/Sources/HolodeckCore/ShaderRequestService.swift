@@ -1637,12 +1637,16 @@ public actor ShaderRequestService {
 
     public func retryReconciliation() async throws { try await retryReconciliation(replayTrusted: true) }
     func retryReconciliation(replayTrusted: Bool) async throws {
+        try await recoverLocalMetadata()
+        // Release the local maintenance lease before visiting other service targets.
+        if replayTrusted, let coordinator = revocationCoordinator { try await coordinator() }
+    }
+    private func recoverLocalMetadata() async throws {
         guard activeID == nil, !maintenanceBusy else { throw ShaderRequestError.unavailable("Wait for active checkout work to finish.") }
         let lease = try beginMaintenance(); defer { endMaintenance(lease) }
         // Invalidate the previous observer before storage recovery's first await;
         // its late result must not publish a new failure into the restored state.
         try await drainReconciliation(lease: lease); try await resetPersistenceFailure()
-        if replayTrusted, let coordinator = revocationCoordinator { try await coordinator() }
         for id in records.keys.sorted(by: { $0.uuidString < $1.uuidString }) where records[id]?.deletionPending == true { await finishDeletion(id) }
         var failures: [String] = []
         for key in recovery.entries.keys.sorted() {

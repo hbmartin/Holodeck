@@ -29,6 +29,13 @@ nonisolated final class TrustedOwnerPermit: @unchecked Sendable {
     func invalidate() { lock.withLock { valid = false } }
 }
 
+struct TrustedPartialRecovery: LocalizedError, Sendable {
+    let completedServices: [UUID]
+    let remaining: [String]
+    var errorDescription: String? {
+        remaining.joined(separator: "\n") + "\nPartial recovery: local progress was committed; unresolved trusted targets remain."
+    }
+}
 struct TrustedRevocationApplication: Sendable, Equatable {
     let serviceID: UUID
     let registrationID: UUID
@@ -99,6 +106,7 @@ actor TrustedApprovalsCoordinator {
     }
     struct Owner: Sendable {
         let serverID: UUID
+        let eligibility: TrustedOwnerLifetime
         private let target: WeakRequestService
         let requiresService: Bool
         var service: ShaderRequestService? { target.value }
@@ -106,7 +114,9 @@ actor TrustedApprovalsCoordinator {
         let retired: @Sendable () async -> Void
         let beforeReplay: @Sendable (RequestRevocationIntent) async throws -> Void
         init(serverID: UUID, service: ShaderRequestService?, changed: @escaping @Sendable (Snapshot, Binding) async -> Void,
-             retired: @escaping @Sendable () async -> Void, beforeReplay: @escaping @Sendable (RequestRevocationIntent) async throws -> Void) {
+             retired: @escaping @Sendable () async -> Void, beforeReplay: @escaping @Sendable (RequestRevocationIntent) async throws -> Void,
+             eligibility: TrustedOwnerLifetime = .init()) {
+            self.eligibility = eligibility
             self.serverID = serverID; target = .init(service); requiresService = service != nil; self.changed = changed; self.retired = retired; self.beforeReplay = beforeReplay
         }
     }
@@ -245,6 +255,7 @@ actor TrustedApprovalsCoordinator {
     }
     /// Admission is synchronous on the authority actor; scheduling cannot reorder these generations.
     func register(_ owner: Owner, onlyIfVacant: Bool = false) throws -> Registration {
+        guard owner.eligibility.isCurrent else { throw Self.unavailable("The proposed catalog server lifetime ended before registration.") }
         if onlyIfVacant, accepted != nil || pending != nil || preparing != nil {
             throw Self.unavailable("Catalog server handoff is pending. Wait for its accepted binding.")
         }
@@ -290,26 +301,38 @@ actor TrustedApprovalsCoordinator {
         }
     }
     private func retry(requester: UUID) async throws {
-        let inspectedDuringRegistration = failedRegistration != nil
-        if let failedRegistration {
-            let ticket = try register(failedRegistration)
-            _ = try await ticket.value()
+        var completed: [UUID] = [requester], errors: [String] = []
+        var inspectedDuringRegistration = false
+        if let candidate = failedRegistration {
+            if candidate.eligibility.isCurrent {
+                do { _ = try await register(candidate).value(); inspectedDuringRegistration = true }
+                catch { errors.append("Registration: " + error.localizedDescription) }
+            } else { failedRegistration = nil }
         }
-        var recoveryErrors: [Error] = []
-        for key in recoveryTargets {
+        for key in recoveryTargets.sorted(by: { $0.service.uuidString < $1.service.uuidString }) {
             do {
-                if key.service != requester, let target = targets[key]?.service { try await target.retryReconciliation(replayTrusted: false) }
+                if key.service != requester {
+                    guard let target = targets[key]?.service else { continue }
+                    try await target.retryReconciliation(replayTrusted: false)
+                    completed.append(key.service)
+                }
                 failedApplications = failedApplications.filter { $0.target != key }
-            } catch { recoveryErrors.append(error) }
+            } catch { errors.append("Service \(key.service): " + error.localizedDescription) }
         }
         if !inspectedDuringRegistration {
             let token = try await acquire()
-            do { try await readFresh(target: service); release(token) }
-            catch { release(token); throw error }
+            do { try await readFresh(target: service) }
+            catch { errors.append("Inspection: " + error.localizedDescription) }
+            release(token)
         }
         failedRemovalWrites.removeAll()
-        try await replay()
-        if let error = recoveryErrors.first { throw error }
+        if loaded {
+            do { try await replay() } catch { errors.append(error.localizedDescription) }
+        }
+        if !errors.isEmpty {
+            throw TrustedPartialRecovery(completedServices: completed,
+                remaining: errors.map { BoundedDiagnostics.bounded($0, bytes: 8192) })
+        }
     }
     private func inspect(_ known: Target, intents: [RequestRevocationIntent]) async throws {
         guard let target = known.service else { return }
@@ -397,6 +420,7 @@ actor TrustedApprovalsCoordinator {
                     token = try! await acquire(cancellable: false, registration: true)
                 }
                 try request.registration.completion.check()
+                guard request.owner.eligibility.isCurrent else { throw CancellationError() }
                 guard !request.owner.requiresService || request.owner.service != nil else {
                     throw Self.unavailable("The proposed request service was released before registration.")
                 }
@@ -404,7 +428,7 @@ actor TrustedApprovalsCoordinator {
                 if transfer != nil { try await readFresh(target: request.owner.service) }
                 try request.registration.completion.check()
                 guard request.registration.generation == generation else { throw CancellationError() }
-                if transfer != nil { try request.registration.completion.beginMutation() }
+                if transfer != nil { try request.owner.eligibility.admitWrite { try request.registration.completion.beginMutation() } }
                 if let target = request.owner.service { try await configure(target, transfer: transfer) }
                 if let transfer, let target = request.owner.service {
                     await target.finishTrustedAuthority(transfer, authority: self)
@@ -413,7 +437,7 @@ actor TrustedApprovalsCoordinator {
                 guard request.registration.completion.hasStarted || request.registration.generation == generation else {
                     request.registration.completion.complete(.success(.superseded)); preparing = nil; release(token); continue
                 }
-                try request.registration.completion.beginMutation()
+                try request.owner.eligibility.admitWrite { try request.registration.completion.beginMutation() }
                 let prior = accepted
                 let continuing = prior?.owner.serverID == request.owner.serverID && prior?.binding.permit.lifetime.isCurrent == true
                 let lifetime = continuing ? prior!.binding.permit.lifetime : TrustedOwnerLifetime()
@@ -431,12 +455,24 @@ actor TrustedApprovalsCoordinator {
                     release(token); await target.cancelTrustedAuthority(transfer)
                     token = try! await acquire(cancellable: false, registration: true)
                 }
-                if request.registration.generation == generation, !(error is CancellationError) { failedRegistration = request.owner }
+                if request.registration.generation == generation, request.owner.eligibility.isCurrent, !(error is CancellationError) { failedRegistration = request.owner }
                 request.registration.completion.complete(.failure(error))
             }
             preparing = nil; release(token)
         }
         registrationTask = nil
+    }
+    func withdraw(serverID: UUID, eligibility: TrustedOwnerLifetime) async {
+        let token = try! await acquire(cancellable: false)
+        defer { release(token) }
+        if failedRegistration?.serverID == serverID, failedRegistration?.eligibility === eligibility { failedRegistration = nil }
+        if pending?.owner.serverID == serverID, pending?.owner.eligibility === eligibility {
+            pending?.registration.completion.cancel(); pending = nil
+        }
+        if accepted?.owner.serverID == serverID, accepted?.owner.eligibility === eligibility {
+            accepted?.binding.permit.invalidate(); accepted?.binding.permit.lifetime.invalidate()
+            accepted = nil; service = nil
+        }
     }
     func releaseBinding(_ permit: TrustedOwnerPermit) async {
         let token = try! await acquire(cancellable: false)
