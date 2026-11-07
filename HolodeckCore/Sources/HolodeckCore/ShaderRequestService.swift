@@ -503,8 +503,6 @@ public actor ShaderRequestService {
     private var durableRevocations: Set<UUID> = []
     private var revocationCoordinatorID: UUID?
     private var revocationRevision: UInt64 = 0
-    private var revocationCompletionInProgress = false
-    private var revocationCompletionWaiters: [CheckedContinuation<Void, Never>] = []
     private struct ControlScope: Sendable {
         let id = UUID()
         var users = 0
@@ -536,18 +534,9 @@ public actor ShaderRequestService {
                 (!record.status.stage.terminal && ![.queued, .awaitingActivation].contains(record.status.stage))
         }.map { "TV revocation must settle its owned checkout before starting other checkout work: " + $0.status.deviceID }
     }
-    private func waitForRevocationCompletion() async {
-        while revocationCompletionInProgress {
-            await withCheckedContinuation { revocationCompletionWaiters.append($0) }
-        }
-    }
     func registerRevocationCoordinator(id: UUID, _ coordinator: @escaping @Sendable () async throws -> Void) async {
-        // A trusted removal must finish under the owner that authorized it. Waiting
-        // suspends only the handoff; observation, request fencing and stopping remain live.
-        await waitForRevocationCompletion()
-        if revocationCoordinatorID != id {
-            controlScopes.removeAll()
-        }
+        if revocationCoordinatorID == id { revocationCoordinator = coordinator; return }
+        controlScopes.removeAll()
         revocationCoordinatorID = id; revocationRevision = 0
         revocationCoordinator = coordinator; revocationInspectionPending = true; emitUpdates()
     }
@@ -596,21 +585,17 @@ public actor ShaderRequestService {
     }
     func acknowledgeTrustedRevocation(_ intent: RequestRevocationIntent, revision: TrustedRevocationRevision,
                                       persistRemoval: @escaping @Sendable () throws -> Void) async throws {
-        await waitForRevocationCompletion()
         try acceptRevocationRevision(revision)
         guard pendingRevocations[intent.operationID] == intent, durableRevocations.contains(intent.operationID) else {
             throw ShaderRequestError.unavailable("The TV revocation intent changed; retry recovery.")
         }
-        revocationCompletionInProgress = true
-        defer {
-            revocationCompletionInProgress = false
-            let waiting = revocationCompletionWaiters; revocationCompletionWaiters.removeAll()
-            waiting.forEach { $0.resume() }
+        // The shared authority owns the complete transition, including failure
+        // publication. Its stable identity survives server replacement.
+        do { try await Task.detached { try persistRemoval() }.value }
+        catch {
+            revocationReplayFailed(error, intent: intent, revision: revision)
+            throw error
         }
-        // The device stays fenced until persistence succeeds. Registration cannot
-        // change ownership between this write and fence retirement. The write runs
-        // outside the actor so slow trusted storage cannot stall observation/stop.
-        try await Task.detached { try persistRemoval() }.value
         pendingRevocations[intent.operationID] = nil
         durableRevocations.remove(intent.operationID); revocationFailures[intent.operationID] = nil
         emitUpdates(); kick()
