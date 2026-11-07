@@ -44,7 +44,7 @@ nonisolated final class TrustedRequestAuthorization: @unchecked Sendable {
     var isCurrent: Bool { lock.withLock { current } && (owner?.isCurrent ?? true) }
     func invalidate() { lock.withLock { current = false } }
 }
-nonisolated struct TrustedRevocationRevision: Sendable {
+nonisolated struct TrustedRevocationRevision: Sendable, Equatable {
     let coordinator: UUID
     let sequence: UInt64
 }
