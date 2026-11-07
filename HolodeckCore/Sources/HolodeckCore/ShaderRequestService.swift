@@ -170,6 +170,25 @@ public struct ShaderRequestLocalState: Sendable {
 }
 
 public actor ShaderRequestService {
+    nonisolated private let hostOwners = RequestServiceOwners()
+    nonisolated public func retainOwner() -> RequestServiceOwnerLease {
+        let id = hostOwners.acquire()
+        Task { [weak self] in await self?.hostOwnershipChanged() }
+        return RequestServiceOwnerLease { [self] in
+            hostOwners.release(id)
+            Task { await self.hostOwnershipChanged() }
+        }
+    }
+    private func hostOwnershipChanged() { emitUpdates(); kick() }
+    private func pauseOwnerlessPublication() {
+        if let request = pendingPublication {
+            pendingPublication = nil
+            retryPublicationForce = (retryPublicationForce ?? false) || request.force
+            let error = ShaderRequestError.unavailable("Library preparation is paused until a local host reconnects.")
+            for waiter in request.waiters { waiter.continuation.resume(throwing: error) }
+        }
+    }
+
     private struct DispatchState: Codable, Sendable, Equatable {
         let executionID: UUID
         var workerOperationID: UUID?
@@ -404,10 +423,9 @@ public actor ShaderRequestService {
     }
     private func scheduleRetirement() {
         guard !pendingRetirements.isEmpty, persistenceFailure == nil, retirementTask == nil else { return }
-        retirementTask = Task { [weak self] in
-            guard let self else { return }
-            do { try await self.retirePendingWorkers() } catch { await self.progressPersistenceFailed(error) }
-            await self.finishRetirementTask()
+        retirementTask = Task { [self] in
+            do { try await self.retirePendingWorkers() } catch { self.progressPersistenceFailed(error) }
+            self.finishRetirementTask()
         }
     }
     private var storageCommit: UUID?
@@ -499,6 +517,27 @@ public actor ShaderRequestService {
     private(set) var preferencesReadCount = 0
     private var activeRetryJournals: [String: UUID] = [:]
     private var recoveryID: UUID?
+    nonisolated let runtimeID = UUID()
+    private var hostRecoveryObservers: [UUID: @Sendable (ShaderRequestService, UInt64, Bool) async -> Void] = [:]
+    private var hostRecoveryRevision: UInt64 = 0
+    private var lastHostRecoveryRequirement: Bool?
+    private var requiresHostRecoveryPin: Bool {
+        persistenceFailure != nil || startupFinalizationFailure != nil || !recovery.entries.isEmpty || !pendingRetirements.isEmpty || retirementTask != nil
+    }
+    func observeHostRecovery(id: UUID, changed: @escaping @Sendable (ShaderRequestService, UInt64, Bool) async -> Void) {
+        hostRecoveryObservers[id] = changed
+        let required = requiresHostRecoveryPin, revision = hostRecoveryRevision
+        Task { await changed(self, revision, required) }
+    }
+    private func publishHostRecoveryRequirement() {
+        let required = requiresHostRecoveryPin
+        guard required != lastHostRecoveryRequirement else { return }
+        lastHostRecoveryRequirement = required; hostRecoveryRevision &+= 1
+        let revision = hostRecoveryRevision
+        for observer in hostRecoveryObservers.values { Task { await observer(self, revision, required) } }
+    }
+    private var revocationRegistration = UUID()
+    private var revocationApplications: [UUID: TrustedRevocationApplication] = [:]
     private var pendingRevocations: [UUID: RequestRevocationIntent] = [:]
     private var durableRevocations: Set<UUID> = []
     private var revocationCoordinatorID: UUID?
@@ -534,11 +573,13 @@ public actor ShaderRequestService {
                 (!record.status.stage.terminal && ![.queued, .awaitingActivation].contains(record.status.stage))
         }.map { "TV revocation must settle its owned checkout before starting other checkout work: " + $0.status.deviceID }
     }
-    func registerRevocationCoordinator(id: UUID, _ coordinator: @escaping @Sendable () async throws -> Void) async {
-        if revocationCoordinatorID == id { revocationCoordinator = coordinator; return }
+    @discardableResult func registerRevocationCoordinator(id: UUID, _ coordinator: @escaping @Sendable () async throws -> Void) async -> UUID {
+        if revocationCoordinatorID == id { revocationCoordinator = coordinator; return revocationRegistration }
+        revocationRegistration = UUID(); revocationApplications.removeAll()
         controlScopes.removeAll()
         revocationCoordinatorID = id; revocationRevision = 0
         revocationCoordinator = coordinator; revocationInspectionPending = true; emitUpdates()
+        return revocationRegistration
     }
     private func acceptRevocationRevision(_ revision: TrustedRevocationRevision) throws {
         guard revision.coordinator == revocationCoordinatorID, revision.sequence >= revocationRevision else {
@@ -576,29 +617,50 @@ public actor ShaderRequestService {
         }
         revocationInspectionPending = false; revocationFailure = nil; emitUpdates()
     }
-    func applyTrustedRevocation(_ intent: RequestRevocationIntent, revision: TrustedRevocationRevision) async throws {
+    @discardableResult func applyTrustedRevocation(_ intent: RequestRevocationIntent, revision: TrustedRevocationRevision) async throws -> TrustedRevocationApplication {
         guard revision.coordinator == revocationCoordinatorID,
               pendingRevocations[intent.operationID] == intent, durableRevocations.contains(intent.operationID) else {
             throw ShaderRequestError.unavailable("The TV revocation intent changed; retry recovery.")
         }
+        let registration = revocationRegistration
         try await revoke(intent.deviceID)
+        guard registration == revocationRegistration, revision.coordinator == revocationCoordinatorID else {
+            throw ShaderRequestError.unavailable("The trusted TV authority changed during request cancellation. Retain the intent and retry recovery.")
+        }
+        let proof = TrustedRevocationApplication(serviceID: runtimeID, registrationID: registration, authority: revision.coordinator, intent: intent)
+        revocationApplications[intent.operationID] = proof
+        return proof
     }
+    func validateTrustedRevocation(_ application: TrustedRevocationApplication) throws {
+        guard application.serviceID == runtimeID, application.registrationID == revocationRegistration,
+              application.authority == revocationCoordinatorID,
+              revocationApplications[application.intent.operationID] == application,
+              pendingRevocations[application.intent.operationID] == application.intent,
+              durableRevocations.contains(application.intent.operationID) else {
+            throw ShaderRequestError.unavailable("The TV revocation application no longer belongs to this service registration. Retain the intent and retry recovery.")
+        }
+    }
+    func finalizeTrustedRevocation(_ application: TrustedRevocationApplication, removal: TrustedRevocationRemoval) throws {
+        try validateTrustedRevocation(application)
+        guard removal.authority == application.authority, removal.intent == application.intent,
+              removal.applications[runtimeID] == application else { throw ShaderRequestError.invalidRequest }
+        let id = application.intent.operationID
+        pendingRevocations[id] = nil; durableRevocations.remove(id)
+        revocationApplications[id] = nil; revocationFailures[id] = nil
+        emitUpdates(); kick()
+    }
+    // Compatibility for internal direct callers; production removal is coordinated
+    // once across every service application by the trusted authority.
     func acknowledgeTrustedRevocation(_ intent: RequestRevocationIntent, revision: TrustedRevocationRevision,
                                       persistRemoval: @escaping @Sendable () throws -> Void) async throws {
         try acceptRevocationRevision(revision)
-        guard pendingRevocations[intent.operationID] == intent, durableRevocations.contains(intent.operationID) else {
-            throw ShaderRequestError.unavailable("The TV revocation intent changed; retry recovery.")
-        }
-        // The shared authority owns the complete transition, including failure
-        // publication. Its stable identity survives server replacement.
+        let application: TrustedRevocationApplication
+        if let existing = revocationApplications[intent.operationID] { application = existing }
+        else { application = try await applyTrustedRevocation(intent, revision: revision) }
+        try validateTrustedRevocation(application)
         do { try await Task.detached { try persistRemoval() }.value }
-        catch {
-            revocationReplayFailed(error, intent: intent, revision: revision)
-            throw error
-        }
-        pendingRevocations[intent.operationID] = nil
-        durableRevocations.remove(intent.operationID); revocationFailures[intent.operationID] = nil
-        emitUpdates(); kick()
+        catch { revocationReplayFailed(error, intent: intent, revision: revision); throw error }
+        try finalizeTrustedRevocation(application, removal: .init(authority: revision.coordinator, intent: intent, applications: [runtimeID: application]))
     }
     func revocationReplayFailed(_ error: Error, intent: RequestRevocationIntent? = nil, revision: TrustedRevocationRevision? = nil) {
         if let revision {
@@ -1502,13 +1564,14 @@ public actor ShaderRequestService {
         try checkMaintenance(lease)
     }
 
-    public func retryReconciliation() async throws {
+    public func retryReconciliation() async throws { try await retryReconciliation(replayTrusted: true) }
+    func retryReconciliation(replayTrusted: Bool) async throws {
         guard activeID == nil, !maintenanceBusy else { throw ShaderRequestError.unavailable("Wait for active checkout work to finish.") }
         let lease = try beginMaintenance(); defer { endMaintenance(lease) }
         // Invalidate the previous observer before storage recovery's first await;
         // its late result must not publish a new failure into the restored state.
         try await drainReconciliation(lease: lease); try await resetPersistenceFailure()
-        if let coordinator = revocationCoordinator { try await coordinator() }
+        if replayTrusted, let coordinator = revocationCoordinator { try await coordinator() }
         for id in records.keys.sorted(by: { $0.uuidString < $1.uuidString }) where records[id]?.deletionPending == true { await finishDeletion(id) }
         var failures: [String] = []
         for key in recovery.entries.keys.sorted() {
@@ -2242,6 +2305,7 @@ public actor ShaderRequestService {
                      canDisableRequests: canDisableRequests(), setup: acceptedSetupSnapshot())
     }
     private func emitUpdates() {
+        publishHostRecoveryRequirement()
         scheduleMaintenanceProposals()
         guard !observers.isEmpty || !localObservers.isEmpty else { return }
         let jobs = allJobs()
@@ -2514,6 +2578,7 @@ public actor ShaderRequestService {
                                         publicationRevision: await catalog.publicationRevisionValue())
     }
     private func kick() {
+        guard hostOwners.mayDispatch else { pauseOwnerlessPublication(); return }
         if let startupFinalizationFailure { failPendingPublicationForRecovery(startupFinalizationFailure); return }
         if let persistenceFailure { failPendingPublicationForRecovery(persistenceFailure); return }
         guard loaded, initialized, !suspended, !maintenanceBusy, activeID == nil, workerTask == nil else { return }

@@ -15,6 +15,7 @@ final class MacRequestsModel {
     var onPublication: (@MainActor (ShaderRequestPublicationStatus) -> Void)?
     var onPublicationEvent: (@MainActor (ShaderRequestPublicationEvent) -> Void)?
     let service: ShaderRequestService
+    @ObservationIgnored private let serviceOwner: RequestServiceOwnerLease
     let directory: URL
     @ObservationIgnored private let defaults: UserDefaults?
     @ObservationIgnored private var observation: Task<Void, Never>?
@@ -46,6 +47,7 @@ final class MacRequestsModel {
         directory = defaultDirectory
         #endif
         service = ShaderRequestService(catalog: catalog, directory: directory)
+        serviceOwner = service.retainOwner()
         let saved = (try? Data(contentsOf: directory.appendingPathComponent("preferences.json"))).flatMap { try? ShaderRequestConfiguration.decodePreferences($0) }
         let fallback = defaults?.data(forKey: "holodeck.requestConfiguration").flatMap { try? ShaderRequestConfiguration.decodePreferences($0) }
         configuration = saved ?? fallback ?? .init()

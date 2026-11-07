@@ -32,13 +32,14 @@ nonisolated struct RequestRevocationIntent: Codable, Sendable, Equatable {
 /// Held by authenticated calls across actor hops. Revocation invalidates the old
 /// approval even if its queued call reaches the request actor after replay finishes.
 nonisolated final class TrustedRequestAuthorization: @unchecked Sendable {
-    let coordinator: UUID
+    private let standaloneCoordinator: UUID
+    var coordinator: UUID { owner?.authority ?? standaloneCoordinator }
     let deviceID: String
     private let lock = NSLock()
     private var current = true
     private let owner: TrustedOwnerPermit?
     init(coordinator: UUID, deviceID: String, owner: TrustedOwnerPermit? = nil) {
-        self.coordinator = coordinator; self.deviceID = deviceID; self.owner = owner
+        self.standaloneCoordinator = coordinator; self.deviceID = deviceID; self.owner = owner
     }
     var isCurrent: Bool { lock.withLock { current } && (owner?.isCurrent ?? true) }
     func invalidate() { lock.withLock { current = false } }
@@ -70,55 +71,98 @@ nonisolated struct TrustedTVApprovals: Codable, Sendable {
 }
 
 public actor LocalCatalogServer {
-    private static let productionNamespace = "mac-library"
-    private var requests: ShaderRequestService?
+    nonisolated static let productionNamespace = "mac-library"
     public func setRequestService(_ service: ShaderRequestService) async {
         do {
-            _ = try await registerTrustedBinding(service: service)
+            guard try await registerTrustedBinding(service: service) else { return }
             try await trusted.replay()
         } catch is CancellationError { }
-        catch { publish(error.localizedDescription) }
+        catch {
+            let detail = BoundedDiagnostics.bounded(error.localizedDescription, bytes: 8192)
+            // The authority publishes an intent/write failure while it still owns
+            // the transition. Only preparation errors need a local publication.
+            if trustedDiagnostic?.contains(detail) != true { trustedDiagnostic = detail; publish() }
+        }
     }
     private let instanceID = UUID()
     private let trusted: TrustedApprovalsCoordinator
     private var binding: TrustedApprovalsCoordinator.Binding?
-    private var registrationAttempted = false
+    private enum RegistrationState: Equatable { case idle, pending(UUID), superseded }
+    private var registrationState: RegistrationState = .idle
+    private weak var proposedService: ShaderRequestService?
+    private var serviceOwner: RequestServiceOwnerLease?
+    private var ownerServiceID: UUID?
     private var retired = false
+    private var startGeneration: UInt64 = 0
+    private var lifetimeRevision: UInt64 = 0
+    private var registrationTicket: (id: UUID, ticket: TrustedApprovalsCoordinator.Registration)?
     private func trustedOwner(service: ShaderRequestService?) -> TrustedApprovalsCoordinator.Owner {
-        .init(serverID: instanceID, service: service,
-              changed: { [weak self] in await self?.acceptTrustedSnapshot($0, binding: $1) },
+        let revision = lifetimeRevision
+        return .init(serverID: instanceID, service: service,
+              changed: { [weak self] in await self?.acceptTrustedSnapshot($0, binding: $1, lifetime: revision) },
               retired: { [weak self] in await self?.retireTrustedBinding() }, beforeReplay: beforeRevocationReplay)
     }
     private func registerTrustedBinding(service: ShaderRequestService?, onlyIfVacant: Bool = false) async throws -> Bool {
-        registrationAttempted = true
-        let registration = try await trusted.register(trustedOwner(service: service), onlyIfVacant: onlyIfVacant)
-        switch try await registration.value() {
-        case .accepted: return true
-        case .superseded: return false
+        let attempt = UUID(), previous = registrationState, revision = lifetimeRevision
+        registrationState = .pending(attempt); proposedService = service
+        let registration: TrustedApprovalsCoordinator.Registration
+        do { registration = try await trusted.register(trustedOwner(service: service), onlyIfVacant: onlyIfVacant) }
+        catch {
+            if registrationState == .pending(attempt) { registrationState = previous }
+            throw error
+        }
+        guard revision == lifetimeRevision else { registration.completion.cancel(); throw CancellationError() }
+        registrationTicket = (attempt, registration)
+        defer { if registrationTicket?.id == attempt { registrationTicket = nil } }
+        do {
+            let result = try await registration.value()
+            guard revision == lifetimeRevision else { throw CancellationError() }
+            switch result {
+            case .accepted:
+                if registrationState == .pending(attempt) { registrationState = .idle }
+                return true
+            case .superseded:
+                if registrationState == .pending(attempt) { registrationState = .superseded }
+                return false
+            }
+        } catch {
+            if registrationState == .pending(attempt) { registrationState = .idle }
+            throw error
         }
     }
     private func ensureBinding(explicitStart: Bool = false) async throws -> TrustedOwnerPermit {
         if let binding, binding.permit.isCurrent { return binding.permit }
-        guard !retired, !registrationAttempted else {
+        guard !retired, registrationState == .idle else {
             throw ShaderRequestError.unavailable("Catalog server handoff is pending or this server was replaced. Use its accepted replacement.")
         }
-        guard try await registerTrustedBinding(service: nil, onlyIfVacant: !explicitStart), let binding, binding.permit.isCurrent else {
+        guard try await registerTrustedBinding(service: proposedService, onlyIfVacant: !explicitStart), let binding, binding.permit.isCurrent else {
             throw ShaderRequestError.unavailable("Catalog server handoff was superseded.")
         }
         return binding.permit
     }
-    private func acceptTrustedSnapshot(_ snapshot: TrustedApprovalsCoordinator.Snapshot, binding: TrustedApprovalsCoordinator.Binding) {
+    private func acceptTrustedSnapshot(_ snapshot: TrustedApprovalsCoordinator.Snapshot, binding: TrustedApprovalsCoordinator.Binding, lifetime revision: UInt64) {
+        guard revision == lifetimeRevision else {
+            binding.permit.invalidate(); binding.permit.lifetime.invalidate()
+            let trusted = trusted
+            Task { await trusted.releaseBinding(binding.permit) }
+            return
+        }
         guard binding.permit.serverID == instanceID, binding.permit.isCurrent else { return }
         let changedOwner = self.binding?.permit !== binding.permit
         for (device, authorization) in requestAuthorizations where changedOwner || approved[device]?.tokenHash != snapshot.approvals[device]?.tokenHash {
             authorization.invalidate(); requestAuthorizations[device] = nil
         }
-        approved = snapshot.approvals; self.binding = binding; requests = binding.service; retired = false
+        if ownerServiceID != binding.service?.runtimeID {
+            serviceOwner?.release(); serviceOwner = binding.service?.retainOwner(); ownerServiceID = binding.service?.runtimeID
+        }
+        approved = snapshot.approvals; self.binding = binding; retired = false
         for (session, record) in authenticated where approved[record.id]?.tokenHash != record.tokenHash { cancelSession(session) }
-        publish(snapshot.diagnostic)
+        trustedDiagnostic = snapshot.diagnostic
+        publish()
     }
     private func retireTrustedBinding() {
-        retired = true; stop(); publish("This catalog server was replaced.")
+        retired = true; serviceOwner?.release(); serviceOwner = nil; ownerServiceID = nil
+        stop(); publish("This catalog server was replaced.")
     }
     private let catalog: DirectoryCatalog
     private let allowLoopback: Bool
@@ -135,6 +179,7 @@ public actor LocalCatalogServer {
     private struct Pending { let deviceID: String; let approval: TVApproval }
     private var pending: [UUID: Pending] = [:]
     private var issued: [UUID: String] = [:]
+    private var approvalEligibility: [UUID: TrustedApprovalEligibility] = [:]
     private var declined: Set<UUID> = []
     private var authenticated: [UUID: ApprovedTV] = [:]
     private var approved: [String: ApprovedTV] = [:]
@@ -143,12 +188,14 @@ public actor LocalCatalogServer {
     private let beforeTrustedCommit: @Sendable (RequestRevocationIntent) async throws -> Void
     private let beforeRevocationReplay: @Sendable (RequestRevocationIntent) async throws -> Void
     private var state = LocalServerState()
+    private var transportMessage = LocalServerState().message
+    private var trustedDiagnostic: String?
     private var observers: [UUID: AsyncStream<LocalServerState>.Continuation] = [:]
     private var identity: LocalServerIdentity?
 
     public init(catalog: DirectoryCatalog) {
         self.catalog = catalog; self.allowLoopback = false; self.secretNamespace = Self.productionNamespace; self.advertise = true
-        trusted = .production
+        trusted = .keychain(namespace: Self.productionNamespace)
         clock = AnyClock(ContinuousClock())
         beforeTrustedCommit = { _ in }; beforeRevocationReplay = { _ in }
         readAsset = { try await catalog.get($0, limit: $1, pinFor: $2) }
@@ -165,9 +212,12 @@ public actor LocalCatalogServer {
         self.catalog = catalog; self.allowLoopback = !advertise; self.secretNamespace = testingNamespace; self.advertise = advertise
         self.clock = AnyClock(clock)
         self.beforeTrustedCommit = beforeTrustedCommit; self.beforeRevocationReplay = beforeRevocationReplay
-        self.trusted = trustedApprovals ?? TrustedApprovalsCoordinator(
-            read: readApprovals ?? { try LocalSecrets.read(testingNamespace + "-approved-tvs") },
-            write: writeApprovals ?? { try LocalSecrets.write($0, account: testingNamespace + "-approved-tvs") })
+        if let trustedApprovals { self.trusted = trustedApprovals }
+        else if readApprovals != nil || writeApprovals != nil {
+            let account = TrustedApprovalsCoordinator.approvalsAccount(testingNamespace)
+            self.trusted = TrustedApprovalsCoordinator(read: readApprovals ?? { try LocalSecrets.read(account) },
+                write: writeApprovals ?? { try LocalSecrets.write($0, account: account) })
+        } else { self.trusted = .keychain(namespace: testingNamespace) }
         self.readAsset = readAsset ?? { try await catalog.get($0, limit: $1, pinFor: $2) }
     }
     #if DEBUG
@@ -176,7 +226,7 @@ public actor LocalCatalogServer {
     }
     public static func removeTestingSecrets(namespace: String) throws {
         try LocalSecrets.remove("ui-" + namespace + "-tls-identity")
-        try LocalSecrets.remove("ui-" + namespace + "-approved-tvs")
+        try LocalSecrets.remove(TrustedApprovalsCoordinator.approvalsAccount("ui-" + namespace))
     }
     #endif
     var listeningPort: UInt16? { listener?.port?.rawValue }
@@ -194,14 +244,19 @@ public actor LocalCatalogServer {
     }
     private func removeObserver(_ id: UUID) { observers[id] = nil }
     private func publish(_ message: String? = nil) {
-        if let message { state.message = message }
+        if let message { transportMessage = message }
+        state.message = trustedDiagnostic ?? transportMessage
         state.pending = pending.values.map(\.approval).sorted { $0.name < $1.name }
         state.approved = approved.values.sorted { $0.name < $1.name }
         for observer in observers.values { observer.yield(state) }
     }
 
     public func start() async throws {
+        if listener != nil, binding?.permit.isCurrent == true { return }
+        startGeneration &+= 1; let generation = startGeneration
         _ = try await ensureBinding(explicitStart: true)
+        try Task.checkCancellation()
+        guard generation == startGeneration else { throw CancellationError() }
         guard listener == nil else { return }
         if identity == nil {
             identity = try LocalServerIdentity.load(account: secretNamespace + "-tls-identity")
@@ -227,16 +282,33 @@ public actor LocalCatalogServer {
     }
 
     public func stop() {
+        startGeneration &+= 1
         requestAuthorizations.values.forEach { $0.invalidate() }; requestAuthorizations.removeAll()
         listenerID = nil; listener?.cancel(); listener = nil
         for id in sessions.keys { cancelSession(id) }
         publish("Local sharing is stopped.")
     }
-    func clearTestSecrets() throws {
-        precondition(secretNamespace != Self.productionNamespace)
+    public func shutdown() async {
+        lifetimeRevision &+= 1
+        registrationTicket?.ticket.completion.cancel(); registrationTicket = nil
+        let prior = binding
+        prior?.permit.invalidate(); prior?.permit.lifetime.invalidate()
+        binding = nil; retired = true; proposedService = nil
+        serviceOwner?.release(); serviceOwner = nil; ownerServiceID = nil
         stop()
+        if let prior { await trusted.releaseBinding(prior.permit) }
+    }
+    deinit {
+        let trusted = trusted, permit = binding?.permit
+        permit?.invalidate(); permit?.lifetime.invalidate()
+        Task { if let permit { await trusted.releaseBinding(permit) } }
+    }
+    func clearTestSecrets() async throws {
+        precondition(secretNamespace != Self.productionNamespace)
+        await shutdown()
         try LocalServerIdentity.remove(account: secretNamespace + "-tls-identity")
-        try LocalSecrets.remove(secretNamespace + "-approved-tvs")
+        try LocalSecrets.remove(TrustedApprovalsCoordinator.approvalsAccount(secretNamespace))
+        await trusted.discardTestingCacheIfIdle()
     }
 
     private func listenerState(_ value: NWListener.State, id: UUID) {
@@ -258,7 +330,10 @@ public actor LocalCatalogServer {
     public func approve(_ id: UUID) async throws {
         let permit = try await ensureBinding()
         let proposal = try await trusted.approve(permit) { [weak self] in try await self?.approvalProposal(id) }
-        guard let proposal, pending[id] != nil, sessions[id] != nil, !closing.contains(id) else { return }
+        guard let proposal else { return }
+        guard proposal.eligibility.canIssue, pending[id] != nil, sessions[id] != nil, !closing.contains(id), permit.lifetime.isCurrent else {
+            cancelSession(id); throw CommittedApprovalDeliveryError()
+        }
         issued[id] = proposal.token; pending[id] = nil; authenticated[id] = proposal.record
         deadlineTasks.removeValue(forKey: id)?.cancel(); deadlines[id] = nil
         publish()
@@ -267,9 +342,11 @@ public actor LocalCatalogServer {
         guard let request = pending[id], sessions[id] != nil, !closing.contains(id) else { return nil }
         guard let deadline = deadlines[id], clock.now < deadline else { cancelSession(id); publish(); return nil }
         let token = try LocalSecrets.token()
-        return .init(record: ApprovedTV(id: request.deviceID, name: request.approval.name, tokenHash: CatalogHash.sha256(Data(token.utf8))), token: token)
+        guard let eligibility = approvalEligibility[id] else { return nil }
+        try eligibility.check()
+        return .init(record: ApprovedTV(id: request.deviceID, name: request.approval.name, tokenHash: CatalogHash.sha256(Data(token.utf8))), token: token, eligibility: eligibility)
     }
-    public func decline(_ id: UUID) { pending[id] = nil; declined.insert(id); publish() }
+    public func decline(_ id: UUID) { approvalEligibility.removeValue(forKey: id)?.close(); pending[id] = nil; declined.insert(id); publish() }
     public func revoke(_ id: String) async throws {
         let permit = try await ensureBinding(), hook = beforeTrustedCommit
         try await trusted.revoke(id, permit: permit, beforeCommit: hook)
@@ -281,9 +358,18 @@ public actor LocalCatalogServer {
         let value = TrustedRequestAuthorization(coordinator: binding.permit.authority, deviceID: deviceID, owner: binding.permit)
         requestAuthorizations[deviceID] = value; return value
     }
-    private func authorized(_ id: UUID) -> Bool {
-        guard binding?.permit.isCurrent == true, !closing.contains(id), let record = authenticated[id] else { return false }
-        return approved[record.id]?.tokenHash == record.tokenHash
+    private enum SessionAuthorization { case permitted, credentialRejected, interrupted }
+    private func sessionAuthorization(_ id: UUID) -> SessionAuthorization {
+        guard !closing.contains(id), sessions[id] != nil, binding?.permit.isCurrent == true else { return .interrupted }
+        guard let record = authenticated[id], approved[record.id]?.tokenHash == record.tokenHash else { return .credentialRejected }
+        return .permitted
+    }
+    private func credentialAuthorized(_ id: UUID) throws -> Bool {
+        switch sessionAuthorization(id) {
+        case .permitted: return true
+        case .credentialRejected: return false
+        case .interrupted: throw LocalCatalogError.disconnected
+        }
     }
 
     private func accept(_ connection: NWConnection, listenerID: UUID) {
@@ -301,7 +387,7 @@ public actor LocalCatalogServer {
             do {
                 try await channel.start()
                 while !Task.isCancelled, !closing.contains(id) {
-                    let request = try await channel.receive(idleAllowed: authorized(id))
+                    let request = try await channel.receive(idleAllowed: sessionAuthorization(id) == .permitted)
                     let response = try await respond(request, id: id, channel: channel)
                     try await withLocalTimeout { try await channel.send(response) }
                 }
@@ -311,7 +397,7 @@ public actor LocalCatalogServer {
     }
 
     private func expire(_ id: UUID) {
-        guard !authorized(id), let deadline = deadlines[id], clock.now >= deadline else { return }
+        guard sessionAuthorization(id) != .permitted, let deadline = deadlines[id], clock.now >= deadline else { return }
         cancelSession(id); publish()
     }
 
@@ -320,6 +406,7 @@ public actor LocalCatalogServer {
         closing.insert(id)
         deadlineTasks.removeValue(forKey: id)?.cancel()
         let deviceID = authenticated.removeValue(forKey: id)?.id
+        approvalEligibility.removeValue(forKey: id)?.close()
         pending[id] = nil; issued[id] = nil
         if let deviceID, !authenticated.values.contains(where: { $0.id == deviceID }) {
             requestAuthorizations.removeValue(forKey: deviceID)?.invalidate()
@@ -336,13 +423,13 @@ public actor LocalCatalogServer {
     }
 
     private func respond(_ packet: LocalPacket, id: UUID, channel: LocalConnection) async throws -> LocalPacket {
-        guard !closing.contains(id) else { throw LocalCatalogError.disconnected }
+        guard !closing.contains(id), let servingPermit = binding?.permit, servingPermit.isCurrent else { throw LocalCatalogError.disconnected }
         if let deadline = deadlines[id], clock.now >= deadline {
             cancelSession(id); throw LocalCatalogError.timeout
         }
         let requestOperations = ["requestSubmit", "requestStatus", "requestAnswer", "requestActivated", "requestDelivery"]
         if requestOperations.contains(packet.message.operation) {
-            guard authorized(id), let deviceID = authenticated[id]?.id else {
+            guard try credentialAuthorized(id), let deviceID = authenticated[id]?.id else {
                 return LocalPacket(message: LocalMessage(operation: "ok", error: "revoked"))
             }
             var reply = LocalMessage(operation: "ok")
@@ -353,9 +440,12 @@ public actor LocalCatalogServer {
                 let control = try JSONDecoder().decode(ShaderRequestControl.self, from: packet.payload)
                 let authorization = try requestAuthorization(for: deviceID)
                 let value = try await requests.control(operation: packet.message.operation, payload: control, deviceID: deviceID, authorization: authorization)
-                guard authorized(id) else { return LocalPacket(message: LocalMessage(operation: "ok", error: "revoked")) }
+                guard servingPermit.isCurrent else { throw LocalCatalogError.disconnected }
+                guard try credentialAuthorized(id) else { return LocalPacket(message: LocalMessage(operation: "ok", error: "revoked")) }
                 return LocalPacket(message: reply, payload: try JSONEncoder().encode(value))
-            } catch {
+            } catch LocalCatalogError.disconnected { throw LocalCatalogError.disconnected }
+            catch {
+                guard servingPermit.isCurrent, !closing.contains(id) else { throw LocalCatalogError.disconnected }
                 reply.error = "requestError"; reply.requestMessage = error.localizedDescription
                 return LocalPacket(message: reply)
             }
@@ -366,7 +456,7 @@ public actor LocalCatalogServer {
         switch message.operation {
         case "hello":
             response.serverID = identity?.id
-            if requests != nil { response.capabilities = ["shaderRequests1"] }
+            if binding?.service != nil { response.capabilities = ["shaderRequests1"] }
         case "authenticate":
             guard let deviceID = message.deviceID, let token = message.token, token.count <= 100,
                   let record = approved[deviceID], record.tokenHash == CatalogHash.sha256(Data(token.utf8)) else {
@@ -379,22 +469,30 @@ public actor LocalCatalogServer {
                   let name = message.name, !name.isEmpty, name.count <= 200 else { throw LocalCatalogError.protocolViolation }
             let code = try await channel.pairingCode()
             guard !closing.contains(id) else { throw LocalCatalogError.disconnected }
+            guard let deadline = deadlines[id] else { throw LocalCatalogError.disconnected }
+            let clock = clock
+            approvalEligibility[id] = .init(withinDeadline: { clock.now < deadline })
             pending[id] = Pending(deviceID: deviceID, approval: TVApproval(id: id, name: name, code: code))
             response.operation = "pending"; publish()
         case "pairStatus":
             if declined.contains(id) { response.error = "rejected" }
-            else if let token = issued.removeValue(forKey: id), authorized(id) { response.token = token }
+            else if try credentialAuthorized(id), let token = issued.removeValue(forKey: id) { approvalEligibility[id] = nil; response.token = token }
             else if pending[id] != nil { response.operation = "pending" }
             else { response.error = "rejected"; self.pending[id] = nil; publish() }
         case "asset":
-            guard authorized(id) else { response.error = "revoked"; break }
+            guard try credentialAuthorized(id) else { response.error = "revoked"; break }
             guard let request = message.request, let limit = message.limit,
                   (0...LocalProtocol.maximumPayload).contains(limit) else { throw LocalCatalogError.protocolViolation }
             do {
                 let data = try await readAsset(request, limit, id)
-                guard authorized(id) else { response.error = "revoked"; break }
+                guard servingPermit.isCurrent else { throw LocalCatalogError.disconnected }
+                guard try credentialAuthorized(id) else { response.error = "revoked"; break }
                 return LocalPacket(message: response, payload: data)
-            } catch { response.error = "invalidAsset" }
+            } catch LocalCatalogError.disconnected { throw LocalCatalogError.disconnected }
+            catch {
+                guard servingPermit.isCurrent, !closing.contains(id) else { throw LocalCatalogError.disconnected }
+                response.error = "invalidAsset"
+            }
         default: throw LocalCatalogError.protocolViolation
         }
         return LocalPacket(message: response)

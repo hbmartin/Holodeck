@@ -59,6 +59,12 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         private var continuation: CheckedContinuation<Value, Error>?
         private var cancelled = false, committing = false, finished = false
         private var result: Result<Value, Error>?
+        func value(cancellable: Bool = true) async throws -> Value {
+            if !cancellable { return try await withCheckedThrowingContinuation { attach($0) } }
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { attach($0) }
+            } onCancel: { self.cancel() }
+        }
         func attach(_ c: CheckedContinuation<Value, Error>) {
             let ready: Result<Value, Error>? = lock.withLock {
                 if cancelled { return .failure(CancellationError()) }
@@ -247,7 +253,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             generation &+= 1
             var next = Fault(id: UUID(), generation: generation, operation: previous.operation,
                 paths: Array(Set(previous.paths + files.map(\.path))).sorted(), primary: previous.primary)
-            next.secondary = Array((previous.secondary + [RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 2048)]).suffix(8))
+            next.secondary = BoundedDiagnostics.appending(error.localizedDescription, primary: previous.primary, secondary: previous.secondary)
             next.manualRepairRequired = previous.manualRepairRequired
             failure = next; recoveryAttempt = nil; summarize(); return failure!
         }
@@ -421,10 +427,7 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         fileprivate let ticket: CommitTicket<CommitReceipt>
         fileprivate init(_ ticket: CommitTicket<CommitReceipt>) { self.ticket = ticket }
         func value(cancellable: Bool = true) async throws -> CommitReceipt {
-            if !cancellable { return try await withCheckedThrowingContinuation { ticket.attach($0) } }
-            return try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { ticket.attach($0) }
-            } onCancel: { self.ticket.cancel() }
+            try await ticket.value(cancellable: cancellable)
         }
     }
     func submit(_ snapshot: Snapshot, retainingEvidence: Bool = false, transaction: UUID? = nil, recovery: RecoveryToken? = nil, cancellable: Bool = true) -> Submission {
