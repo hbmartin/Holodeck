@@ -313,20 +313,12 @@ nonisolated struct RequestRecoveryStore: Codable, Sendable {
         var primaryDiagnostic: String?
         var secondaryDiagnostics: [String]?
         static func bounded(_ text: String, bytes: Int) -> String {
-            var result = text
-            if result.utf8.count > bytes {
-                result = String(decoding: result.utf8.prefix(bytes), as: UTF8.self)
-                while result.utf8.count > bytes || result.last == "\u{fffd}" { result.removeLast() }
-            }
-            return result
+            BoundedDiagnostics.bounded(text, bytes: bytes)
         }
         mutating func appendDiagnostic(_ detail: String) {
             let primary = Self.bounded(primaryDiagnostic ?? message, bytes: 8192)
             primaryDiagnostic = primary
-            let bounded = Self.bounded(detail, bytes: 2048)
-            var additional = secondaryDiagnostics ?? []
-            if Self.bounded(detail, bytes: 8192) != primary && !additional.contains(bounded) { additional.append(bounded) }
-            secondaryDiagnostics = Array(additional.suffix(8))
+            secondaryDiagnostics = BoundedDiagnostics.appending(detail, primary: primary, secondary: secondaryDiagnostics ?? [])
             message = ([primary] + (secondaryDiagnostics ?? []).map { "Additional recovery error: " + $0 }).joined(separator: "\n")
         }
     }

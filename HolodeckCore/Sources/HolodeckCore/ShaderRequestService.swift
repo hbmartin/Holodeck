@@ -179,14 +179,14 @@ public actor ShaderRequestService {
             Task { await self.hostOwnershipChanged() }
         }
     }
-    private func hostOwnershipChanged() {
-        if !hostOwners.mayDispatch, let request = pendingPublication {
+    private func hostOwnershipChanged() { emitUpdates(); kick() }
+    private func pauseOwnerlessPublication() {
+        if let request = pendingPublication {
             pendingPublication = nil
             retryPublicationForce = (retryPublicationForce ?? false) || request.force
             let error = ShaderRequestError.unavailable("Library preparation is paused until a local host reconnects.")
             for waiter in request.waiters { waiter.continuation.resume(throwing: error) }
         }
-        emitUpdates(); kick()
     }
 
     private struct DispatchState: Codable, Sendable, Equatable {
@@ -423,10 +423,9 @@ public actor ShaderRequestService {
     }
     private func scheduleRetirement() {
         guard !pendingRetirements.isEmpty, persistenceFailure == nil, retirementTask == nil else { return }
-        retirementTask = Task { [weak self] in
-            guard let self else { return }
-            do { try await self.retirePendingWorkers() } catch { await self.progressPersistenceFailed(error) }
-            await self.finishRetirementTask()
+        retirementTask = Task { [self] in
+            do { try await self.retirePendingWorkers() } catch { self.progressPersistenceFailed(error) }
+            self.finishRetirementTask()
         }
     }
     private var storageCommit: UUID?
@@ -519,6 +518,24 @@ public actor ShaderRequestService {
     private var activeRetryJournals: [String: UUID] = [:]
     private var recoveryID: UUID?
     nonisolated let runtimeID = UUID()
+    private var hostRecoveryObservers: [UUID: @Sendable (ShaderRequestService, UInt64, Bool) async -> Void] = [:]
+    private var hostRecoveryRevision: UInt64 = 0
+    private var lastHostRecoveryRequirement: Bool?
+    private var requiresHostRecoveryPin: Bool {
+        persistenceFailure != nil || startupFinalizationFailure != nil || !recovery.entries.isEmpty || !pendingRetirements.isEmpty || retirementTask != nil
+    }
+    func observeHostRecovery(id: UUID, changed: @escaping @Sendable (ShaderRequestService, UInt64, Bool) async -> Void) {
+        hostRecoveryObservers[id] = changed
+        let required = requiresHostRecoveryPin, revision = hostRecoveryRevision
+        Task { await changed(self, revision, required) }
+    }
+    private func publishHostRecoveryRequirement() {
+        let required = requiresHostRecoveryPin
+        guard required != lastHostRecoveryRequirement else { return }
+        lastHostRecoveryRequirement = required; hostRecoveryRevision &+= 1
+        let revision = hostRecoveryRevision
+        for observer in hostRecoveryObservers.values { Task { await observer(self, revision, required) } }
+    }
     private var revocationRegistration = UUID()
     private var revocationApplications: [UUID: TrustedRevocationApplication] = [:]
     private var pendingRevocations: [UUID: RequestRevocationIntent] = [:]
@@ -2288,6 +2305,7 @@ public actor ShaderRequestService {
                      canDisableRequests: canDisableRequests(), setup: acceptedSetupSnapshot())
     }
     private func emitUpdates() {
+        publishHostRecoveryRequirement()
         scheduleMaintenanceProposals()
         guard !observers.isEmpty || !localObservers.isEmpty else { return }
         let jobs = allJobs()
@@ -2560,7 +2578,7 @@ public actor ShaderRequestService {
                                         publicationRevision: await catalog.publicationRevisionValue())
     }
     private func kick() {
-        guard hostOwners.mayDispatch else { return }
+        guard hostOwners.mayDispatch else { pauseOwnerlessPublication(); return }
         if let startupFinalizationFailure { failPendingPublicationForRecovery(startupFinalizationFailure); return }
         if let persistenceFailure { failPendingPublicationForRecovery(persistenceFailure); return }
         guard loaded, initialized, !suspended, !maintenanceBusy, activeID == nil, workerTask == nil else { return }

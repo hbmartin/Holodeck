@@ -20,6 +20,24 @@ private final class TrustedWriteGate: @unchecked Sendable {
     func release() { condition.lock(); open = true; condition.broadcast(); condition.unlock() }
 }
 
+private final class LifecycleCounter: @unchecked Sendable {
+    private let lock = NSLock(); private var count = 0
+    func add() { lock.withLock { count += 1 } }
+    var value: Int { lock.withLock { count } }
+}
+
+private final class LifecycleClientSecrets: @unchecked Sendable {
+    private let lock = NSLock(); private var values: [String: Data] = [:]; private var endpoint: UInt16 = 0
+    var port: UInt16 { get { lock.withLock { endpoint } } set { lock.withLock { endpoint = newValue } } }
+    func read(_ key: String) -> Data? { lock.withLock { values[key] } }
+    func write(_ value: Data, _ key: String) { lock.withLock { values[key] = value } }
+    func remove(_ key: String) { lock.withLock { values[key] = nil } }
+    func token(_ namespace: String) -> String? {
+        guard let bytes = read(namespace + "-pairing"), let value = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { return nil }
+        return value["token"] as? String
+    }
+}
+
 @MainActor final class TrustedLifecycleTests: XCTestCase {
     private struct Fixture { let root: URL; let catalog: DirectoryCatalog; let service: ShaderRequestService }
     private func fixture(gate: TrustedWriteGate? = nil, fail: Bool = false) async throws -> Fixture {
@@ -321,6 +339,179 @@ private final class TrustedWriteGate: @unchecked Sendable {
         try await accept(target); service = nil
         try await wait { standalone == nil }
         await one.discardTestingCacheIfIdle()
+    }
+
+    func testSuccessfulMutationClearsTrustedDiagnosticAndUsesFreshRevision() async throws {
+        let fixture = try await fixture(), backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [ApprovedTV(id: "A", name: "A", tokenHash: "A"), ApprovedTV(id: "B", name: "B", tokenHash: "B")]).encoded())
+        let reads = LifecycleCounter(), authority = TrustedApprovalsCoordinator(read: { reads.add(); return backend.read() }, write: { try backend.write($0) })
+        let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "clear-trusted-" + UUID().uuidString, trustedApprovals: authority)
+        addTeardownBlock { try await server.clearTestSecrets() }
+        await server.setRequestService(fixture.service); try await server.start()
+        try await wait { await server.currentState.message.contains("Serving") }
+        XCTAssertEqual(reads.value, 1)
+        backend.failWrites(true)
+        do { try await server.revoke("A"); XCTFail("Failed write succeeded") } catch let error as POSIXError { XCTAssertEqual(error.code, .EIO) }
+        let failed = await server.currentState; XCTAssertTrue(failed.message.contains(POSIXError(.EIO).localizedDescription))
+        backend.failWrites(false); try await server.revoke("A")
+        let recovered = await server.currentState; XCTAssertEqual(recovered.message, "Serving shaders on the local network.")
+        XCTAssertEqual(reads.value, 1); XCTAssertEqual(backend.writes, 2)
+        let before = await authority.observation
+        try await server.revoke("unapproved")
+        let after = await authority.observation
+        XCTAssertEqual(before.encodings, after.encodings); XCTAssertEqual(before.writes, after.writes)
+        XCTAssertEqual(reads.value, 1)
+    }
+    func testAcceptedControlReplyInterruptedByRebindingRemainsDurable() async throws {
+        let gate = TrustedWriteGate(), fixture = try await fixture(gate: gate), device = UUID().uuidString, token = "valid-token"
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [ApprovedTV(id: device, name: "TV", tokenHash: CatalogHash.sha256(Data(token.utf8)))]).encoded())
+        let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "late-control-" + UUID().uuidString, trustedApprovals: backend.coordinator())
+        addTeardownBlock { gate.release(); try await server.clearTestSecrets() }
+        await server.setRequestService(fixture.service); try await server.start()
+        let client = try await tls(server); try await authenticate(client, device: device, token: token)
+        let request = ShaderRequest(prompt: "Accepted once", context: try context()), payload = try JSONEncoder().encode(ShaderRequestControl(request: request))
+        gate.arm(); let reply = Task { try await client.exchange(LocalPacket(message: .init(operation: "requestSubmit"), payload: payload)) }
+        try await wait { gate.entered }; await server.setRequestService(fixture.service); gate.release()
+        do { _ = try await reply.value; XCTFail("Obsolete control reply returned") }
+        catch LocalCatalogError.disconnected {} catch is NWError {} catch { XCTFail("Unexpected transport outcome: \(error)") }
+        let jobs = await fixture.service.allJobs(); XCTAssertEqual(jobs.map(\.id), [request.id]); XCTAssertEqual(jobs.first?.stage, .queued)
+        let next = try await tls(server); try await authenticate(next, device: device, token: token)
+    }
+    func testOwnerlessInternalAuthorizationRetainsExplicitInvalidation() {
+        let authorization = TrustedRequestAuthorization(coordinator: UUID(), deviceID: "internal")
+        XCTAssertTrue(authorization.isCurrent); authorization.invalidate(); XCTAssertFalse(authorization.isCurrent)
+    }
+    func testCommittedRemovalRetainsFailureAndRetriesExactFenceWithoutAnotherWrite() async throws {
+        let fixture = try await fixture(), gate = TrustedWriteGate(), intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(revocations: [intent]).encoded())
+        let authority = TrustedApprovalsCoordinator(read: { backend.read() }, write: { _ = gate.wait(); try backend.write($0) })
+        let owner = TrustedOwnerRecorder()
+        try await accept(authority.register(owner.owner(service: fixture.service)))
+        gate.arm(); let replay = Task { try await authority.replay() }
+        try await wait { gate.entered }
+        let replacement = UUID()
+        await fixture.service.registerRevocationCoordinator(id: replacement) {}
+        try await fixture.service.loadTrustedRevocations([intent], revision: .init(coordinator: replacement, sequence: 0))
+        gate.release()
+        do { try await replay.value; XCTFail("Stale removal appeared to release the fence") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("service registration")) }
+        XCTAssertEqual(backend.writes, 1); XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
+        do { try await submit(fixture); XCTFail("Stale completion cleared the replacement fence") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("revocation")) }
+        try await accept(authority.register(owner.owner(service: fixture.service)))
+        try await authority.replay()
+        XCTAssertEqual(backend.writes, 1) // Reuse the actual committed removal receipt.
+        try await submit(fixture)
+    }
+    func testTLSClientKeepsSavedTokenThroughReplacementAndRejectsGenuineRevocation() async throws {
+        let fixture = try await fixture(), backend = TrustedBackendFixture(nil), authority = backend.coordinator(), secrets = LifecycleClientSecrets()
+        let namespace = "client-handoff-" + UUID().uuidString
+        let first = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: namespace, trustedApprovals: authority)
+        let second = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: namespace, trustedApprovals: authority)
+        addTeardownBlock { try await first.clearTestSecrets(); try await second.clearTestSecrets() }
+        await first.setRequestService(fixture.service); try await first.start()
+        try await wait { await (first.listeningPort ?? 0) > 0 }
+        let firstPort = await first.listeningPort; secrets.port = try XCTUnwrap(firstPort)
+        let firstID = await first.serverID; let serverID = try XCTUnwrap(firstID)
+        let mac = LocalMac(id: serverID, name: "TLS lifecycle Mac", endpoint: .service(name: "test", type: LocalProtocol.serviceType, domain: "local.", interface: nil), interface: nil, version: LocalProtocol.version)
+        var dependencies = LocalClientDependencies()
+        dependencies.usesSystemBrowser = false; dependencies.initialMacs = [mac]
+        dependencies.readSecret = secrets.read; dependencies.writeSecret = secrets.write; dependencies.removeSecret = secrets.remove
+        dependencies.resolve = { _ in ResolvedMac(address: "127.0.0.1", port: secrets.port) }
+        let client = LocalCatalogClient(testingNamespace: namespace, dependencies: dependencies)
+        addTeardownBlock { await client.stop() }
+        await client.start()
+        try await wait { await !first.currentState.pending.isEmpty }
+        let proposed = await first.currentState.pending.first; let initial = try XCTUnwrap(proposed)
+        try await first.approve(initial.id)
+        try await wait { if case .connected = await client.currentState.status { return true }; return false }
+        let original = try XCTUnwrap(secrets.token(namespace)), device = try XCTUnwrap(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).approvals.first?.id)
+        await second.setRequestService(fixture.service); try await second.start()
+        try await wait { await (second.listeningPort ?? 0) > 0 }
+        let secondPort = await second.listeningPort; secrets.port = try XCTUnwrap(secondPort)
+        try await wait { await first.listeningPort == nil }
+        XCTAssertEqual(secrets.token(namespace), original)
+        await client.stop(); await client.start()
+        try await wait { if case .connected = await client.currentState.status { return true }; return false }
+        XCTAssertEqual(secrets.token(namespace), original)
+        let pending = await second.currentState.pending; XCTAssertTrue(pending.isEmpty)
+        try await second.revoke(device)
+        // Authentication with the actual old credential must now be permanently rejected.
+        let stale = try await tls(second)
+        var auth = LocalMessage(operation: "authenticate"); auth.deviceID = device; auth.token = original
+        let rejection = try await stale.exchange(LocalPacket(message: auth)); XCTAssertEqual(rejection.message.error, "revoked")
+        await client.stop(); await client.start()
+        try await wait { secrets.token(namespace) == nil }
+    }
+
+    func testIdleAccountRegistryPrunesWeakAuthorities() {
+        let registry = TrustedAuthorityRegistry.shared, before = TrustedAuthorityRegistry.shared.count
+        for _ in 0..<100 {
+            var authority: TrustedApprovalsCoordinator? = .keychain(namespace: "idle-account-" + UUID().uuidString)
+            weak let released = authority
+            XCTAssertNotNil(authority); authority = nil; XCTAssertNil(released)
+        }
+        XCTAssertEqual(registry.count, before)
+    }
+    func testAuthorityRetainsUnresolvedStorageRecoveryButReleasesHealthyIdleService() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString), gate = TrustedWriteGate()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { gate.release(); try? FileManager.default.removeItem(at: root) }
+        var service: ShaderRequestService? = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root, workerScript: root.appendingPathComponent("unused.py"),
+            beforePersistenceReplacement: { if $0.lastPathComponent == "journal.json", gate.wait() { throw POSIXError(.EIO) } })
+        weak let retained = service
+        await service!.suspend(); try await service!.initialize(configuration: .init(repository: root.path, enabled: true))
+        let authority = TrustedBackendFixture(nil).coordinator(), owner = TrustedOwnerRecorder()
+        try await accept(authority.register(owner.owner(service: service)))
+        let request = ShaderRequest(prompt: "Rejected storage proposal", context: try context())
+        gate.arm(); let submission = Task { [target = service!] in try await target.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "A") }
+        try await wait { gate.entered }; gate.release()
+        do { _ = try await submission.value; XCTFail("Storage fault accepted") } catch is RequestPersistence.Fault {}
+        try await wait { await authority.observation.recoveryPins == 1 }
+        service = nil; XCTAssertNotNil(retained)
+        // The authority's weak metadata would otherwise lose the writer's RAM before-images.
+        try await retained!.retryReconciliation()
+        try await wait { await authority.observation.recoveryPins == 0 }
+        try await wait { retained == nil }
+    }
+
+    func testRetirementBeforeRevocationWriteAdmissionPreservesApprovals() async throws {
+        let fixture = try await fixture(), gate = RecoveryGate()
+        let original = try TrustedTVApprovals(approvals: [ApprovedTV(id: "A", name: "A", tokenHash: "A")]).encoded()
+        let backend = TrustedBackendFixture(original), authority = backend.coordinator()
+        let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "retire-write-" + UUID().uuidString,
+            beforeTrustedCommit: { _ in try await gate.wait() }, trustedApprovals: authority)
+        await server.setRequestService(fixture.service); try await server.start()
+        let revoke = Task { try await server.revoke("A") }
+        try await wait { await gate.hasEntered }
+        let shutdown = Task { await server.shutdown() }
+        try await wait { await server.listeningPort == nil }
+        await gate.release()
+        do { try await revoke.value; XCTFail("Retired lifetime started a trusted write") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("replaced")) }
+        await shutdown.value
+        XCTAssertEqual(backend.read(), original); XCTAssertEqual(backend.writes, 0)
+        try await server.clearTestSecrets()
+    }
+
+    func testFailedReinspectionTransfersUnresolvedTargetPinToNewEpoch() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var service: ShaderRequestService? = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root)
+        weak let retained = service
+        await service!.suspend(); try await service!.initialize(configuration: .init(repository: root.path, enabled: true))
+        let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(revocations: [intent]).encoded()), authority = backend.coordinator(), owner = TrustedOwnerRecorder()
+        try await accept(authority.register(owner.owner(service: service)))
+        await service!.registerRevocationCoordinator(id: UUID()) {}
+        backend.failReads(true)
+        do { try await accept(authority.register(owner.owner(service: service))); XCTFail("Failed reinspection accepted") }
+        catch let error as POSIXError { XCTAssertEqual(error.code, .EACCES) }
+        service = nil; XCTAssertNotNil(retained)
+        backend.failReads(false)
+        try await retained!.retryReconciliation()
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
+        try await wait { retained == nil }
     }
 
 }

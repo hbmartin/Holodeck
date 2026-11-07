@@ -196,7 +196,11 @@ actor TrustedOwnerRecorder {
         do { try await authority.replay(); XCTFail("Failed replay accepted") }
         catch { XCTAssertEqual(error.localizedDescription, POSIXError(.EIO).localizedDescription) }
         _ = try await binding(authority.register(TrustedOwnerRecorder().owner(service: service, beforeReplay: { _ in throw POSIXError(.EACCES) })))
-        do { try await authority.replay(); XCTFail("Secondary replay fault accepted") }
+        // Transport replacement retains the old failure without retrying the same target.
+        do { try await authority.replay(); XCTFail("Unresolved replay accepted") }
+        catch { XCTAssertEqual(error.localizedDescription, POSIXError(.EIO).localizedDescription) }
+        // Explicit recovery admits exactly one new attempt for that target.
+        do { try await service.retryReconciliation(); XCTFail("Secondary replay fault accepted") }
         catch {
             XCTAssertTrue(error.localizedDescription.hasPrefix(POSIXError(.EIO).localizedDescription))
             XCTAssertTrue(error.localizedDescription.contains("Additional trusted failure: " + POSIXError(.EACCES).localizedDescription))

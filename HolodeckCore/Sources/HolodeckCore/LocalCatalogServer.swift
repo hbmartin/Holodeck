@@ -32,13 +32,14 @@ nonisolated struct RequestRevocationIntent: Codable, Sendable, Equatable {
 /// Held by authenticated calls across actor hops. Revocation invalidates the old
 /// approval even if its queued call reaches the request actor after replay finishes.
 nonisolated final class TrustedRequestAuthorization: @unchecked Sendable {
-    let coordinator: UUID
+    private let standaloneCoordinator: UUID
+    var coordinator: UUID { owner?.authority ?? standaloneCoordinator }
     let deviceID: String
     private let lock = NSLock()
     private var current = true
     private let owner: TrustedOwnerPermit?
     init(coordinator: UUID, deviceID: String, owner: TrustedOwnerPermit? = nil) {
-        self.coordinator = coordinator; self.deviceID = deviceID; self.owner = owner
+        self.standaloneCoordinator = coordinator; self.deviceID = deviceID; self.owner = owner
     }
     var isCurrent: Bool { lock.withLock { current } && (owner?.isCurrent ?? true) }
     func invalidate() { lock.withLock { current = false } }
@@ -76,7 +77,12 @@ public actor LocalCatalogServer {
             guard try await registerTrustedBinding(service: service) else { return }
             try await trusted.replay()
         } catch is CancellationError { }
-        catch { publish(error.localizedDescription) }
+        catch {
+            let detail = BoundedDiagnostics.bounded(error.localizedDescription, bytes: 8192)
+            // The authority publishes an intent/write failure while it still owns
+            // the transition. Only preparation errors need a local publication.
+            if trustedDiagnostic?.contains(detail) != true { trustedDiagnostic = detail; publish() }
+        }
     }
     private let instanceID = UUID()
     private let trusted: TrustedApprovalsCoordinator
@@ -151,7 +157,8 @@ public actor LocalCatalogServer {
         }
         approved = snapshot.approvals; self.binding = binding; retired = false
         for (session, record) in authenticated where approved[record.id]?.tokenHash != record.tokenHash { cancelSession(session) }
-        publish(snapshot.diagnostic)
+        trustedDiagnostic = snapshot.diagnostic
+        publish()
     }
     private func retireTrustedBinding() {
         retired = true; serviceOwner?.release(); serviceOwner = nil; ownerServiceID = nil
@@ -181,6 +188,8 @@ public actor LocalCatalogServer {
     private let beforeTrustedCommit: @Sendable (RequestRevocationIntent) async throws -> Void
     private let beforeRevocationReplay: @Sendable (RequestRevocationIntent) async throws -> Void
     private var state = LocalServerState()
+    private var transportMessage = LocalServerState().message
+    private var trustedDiagnostic: String?
     private var observers: [UUID: AsyncStream<LocalServerState>.Continuation] = [:]
     private var identity: LocalServerIdentity?
 
@@ -235,7 +244,8 @@ public actor LocalCatalogServer {
     }
     private func removeObserver(_ id: UUID) { observers[id] = nil }
     private func publish(_ message: String? = nil) {
-        if let message { state.message = message }
+        if let message { transportMessage = message }
+        state.message = trustedDiagnostic ?? transportMessage
         state.pending = pending.values.map(\.approval).sorted { $0.name < $1.name }
         state.approved = approved.values.sorted { $0.name < $1.name }
         for observer in observers.values { observer.yield(state) }

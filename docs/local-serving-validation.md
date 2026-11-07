@@ -899,3 +899,38 @@ An earlier full run timed out in the existing manual-supervision-retry fixture a
 Evidence: `/tmp/trusted-core-verified.log`, `/tmp/trusted-debug-verified.log`, `/tmp/trusted-final-release.log`, `/tmp/trusted-final-races.log`, `/tmp/trusted-worker-isolation.log`, `/tmp/trusted-final-counts-{debug,release}.log`, `/tmp/trusted-mac-verified.log`, `/tmp/trusted-final-tv-build.log`, and `/tmp/trusted-final-source.json`. Frozen runtime and regression hashes matched the final verification. The six full-suite skips cover three unrelated catalog profiles, live Bonjour/LAN discovery, real Codex publication and supervision profiling. Isolated loopback TLS tests did run.
 
 Desktop UI runtime checks remain **blocked at the user's instruction**. Physical Apple TV and tvOS simulator execution were not run. Worker/checker/shader sources, checker artifacts and locks are unchanged; their separate Python, compile-all-Metal and GPU-profile suites were not rerun for this trusted-state coordination change. Linux CI, network messages and journal/envelope formats are unchanged. Coordination is within one app process; it adds neither interprocess locking nor a persisted handoff log.
+
+
+## PR #44 follow-up — replay receipts and server lifecycles (2026-11-07)
+
+Trusted revocation replay now records a durable cancellation receipt for each request-service runtime and registration epoch. Removal waits for every required target, including a prior service with unresolved cancellation or storage recovery. A transport replacement using the same service reuses successful applications; a failed application or trusted removal is retried through explicit recovery. A committed removal whose fence finalization was rejected retains its receipt and evidence, so recovery can finish without another trusted write. Late completion cannot clear a different authority's fence.
+
+Credential validity, binding generation and continuing server lifetime are separate. Rebinding, retirement and interrupted post-read/post-control replies close transport transiently; permanent `revoked` replies require rejected credentials. Failed/cancelled initial registration and vacancy rejection can be retried, while retired lifetimes cannot upgrade queued mutations after reactivation. Final teardown invalidates pending registration and listener starts. Ordinary stop/sleep keeps the accepted registration.
+
+Pairing eligibility is checked at trusted write admission, ordered against final retirement. Closure, expiry or decline before admission prevents the write. Once admitted, persistence finishes its actual outcome. If issuance then becomes impossible, the approval stays saved and the local caller receives an explicit re-pairing error. Actual TLS client coverage verifies that saved tokens survive replacement, then fail permanently after genuine revocation.
+
+All actual Keychain approval accounts share authorities keyed by service/account; custom backends still explicitly inject a shared authority. Long-lived metadata uses weak request-service handles. Local server/model leases pause new dispatch after the last owner disappears, without interrupting admitted execution, publication or settlement. Queued/waiting records stay durable. Retirement tasks and versioned recovery pins retain services while ownership or writer before-images remain unresolved, then release healthy idle services. The account registry prunes weak idle entries. Trusted diagnostics are separate from serving status, and clearing a failure restores the current transport message. Bounded diagnostic composition and cancellable ticket awaiting are shared.
+
+Final-source validation on macOS 27.0.1, Xcode 27.2 / Swift 6.4.2:
+
+- Full Swift core/native and packaged-resource suite: **515 tests, 6 opt-in skips, zero failures**, with `HOLODECK_AUTHORING_FIXTURE` and the core GPU fixture enabled.
+- Final focused Release lifecycle, persistence and publication selection: **73 tests, zero failures**. Final focused Debug boundaries also passed.
+- **20 optimized repetitions, 640 test executions, zero failures**, covering all authority/lifecycle cases plus ownerless publication boundaries. Every subprocess had a deadline.
+- Both unsigned Release app builds succeeded. The bundled native tool's artifact identity and resource integrity were checked locally.
+- Structural assertions cover no encoding/writes for ineligible pairing or stale owners, no-op revokes, exact trusted bytes, two writes per completed revoke/removal, retry admission, account sharing, bounded weak registry entries and recovery-pin release. Gated writes witness unrelated queries and accepted-owner state before their gates are released; there are no CI timing thresholds.
+
+The same 200-revocation profile ran against merged PR #44 (`0e77898`) and this change, using the same Swift interpreter/compiler, injected trusted backend and filesystem. Seven Release samples per version, median:
+
+| Work | PR #44 | Current |
+| --- | ---: | ---: |
+| Trusted backend reads | 202 | 1 |
+| Successful trusted writes | 400 | 400 |
+| Envelope candidate encodings | 400 | 400 |
+| Timed authority work, ms | 97.85 | 70.15 |
+| Whole test-process user / system CPU, seconds | 0.15 / 0.02 | 0.12 / 0.02 |
+
+Normal replay reuses a freshly inspected or successfully written authority revision; registration and explicit recovery still inspect storage. These measurements isolate authority coordination and work counts, not real Keychain latency. Gates, exact outcomes and structural counts enforce responsiveness and write bounds without asserting wall-time improvements.
+
+Evidence: `/tmp/lifecycle-final-core.log`, `/tmp/lifecycle-final-release.log`, `/tmp/lifecycle-final-boundaries.log`, `/tmp/lifecycle-races-summary.json`, `/tmp/lifecycle-races-*.log`, `/tmp/lifecycle-profile-{baseline,current}.json`, `/tmp/lifecycle-final-{mac,tv}-build.log`, `/tmp/lifecycle-final-artifact.json`, and `/tmp/lifecycle-final-source.json`. Frozen Swift hashes matched verification, repetitions and builds. Earlier development failures are excluded from these acceptance totals.
+
+Desktop UI runtime checks remain **blocked at the user's instruction**. Live Bonjour/LAN discovery, physical Apple TV and tvOS simulator execution were not run. The six full-suite skips cover three unrelated catalog profiles, live discovery, real Codex publication and worker-supervision profiling. Isolated loopback TLS tests did run. Worker/checker/shader sources, artifacts and locks are unchanged; their separate Python, checker release, compile-all-Metal and GPU-profile suites were not rerun. Linux CI, network messages and journal/envelope formats are unchanged. No live installation, request enabling, merge or deployment occurred.

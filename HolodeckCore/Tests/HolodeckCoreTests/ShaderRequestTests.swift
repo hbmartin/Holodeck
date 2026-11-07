@@ -5746,3 +5746,37 @@ extension ShaderRequestTests {
     }
 }
 #endif
+
+#if os(macOS)
+extension ShaderRequestTests {
+    func testLastHostOwnerFinishesPublicationAndRetainsQueuedWork() async throws {
+        let gate = RequestPreparationGate(), f = try await publicationRecoveryFixture(gate: gate), owner = f.service.retainOwner()
+        addTeardownBlock { await gate.release(); await f.service.suspend() }
+        let publication = Task { try await f.service.ensurePublication(force: true) }
+        await f.service.resume(); try await waitFor { await gate.entered }
+        let queued = ShaderRequest(prompt: "Wait for the next host", context: try context())
+        _ = try await f.service.control(operation: "requestSubmit", payload: .init(request: queued), deviceID: "TV")
+        owner.release(); await gate.release(); try await publication.value
+        let accepted = await f.service.publicationStatus(); XCTAssertNotNil(accepted)
+        try await waitFor { !(await f.service.hasActiveCheckoutWork) }
+        let jobs = await f.service.allJobs(); XCTAssertEqual(jobs.first?.stage, .queued)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(f.root.appendingPathComponent(queued.id.uuidString).appendingPathComponent("worker-started")))
+    }
+    func testOwnerlessPublicationWaitersFailPromptlyAndNewOwnerCanRebuild() async throws {
+        let f = try await publicationRecoveryFixture(), owner = f.service.retainOwner()
+        let pending = Task { try await f.service.ensurePublication(force: true) }
+        try await waitFor { await f.service.pendingPublicationWaiterCount == 1 }
+        owner.release()
+        do { try await pending.value; XCTFail("Ownerless publication succeeded") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("local host reconnects")) }
+        // A waiter created after the release notification has the same bounded outcome.
+        do { try await f.service.ensurePublication(); XCTFail("Later ownerless publication succeeded") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("local host reconnects")) }
+        let replacement = f.service.retainOwner()
+        let resumed = Task { try await f.service.ensurePublication(force: true) }
+        await f.service.resume(); try await resumed.value
+        let accepted = await f.service.publicationStatus(); XCTAssertNotNil(accepted)
+        replacement.release(); await f.service.suspend()
+    }
+}
+#endif
