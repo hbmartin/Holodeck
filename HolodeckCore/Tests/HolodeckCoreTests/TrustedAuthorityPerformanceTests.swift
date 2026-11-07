@@ -31,6 +31,9 @@ private final class ProfileTrustedStore: @unchecked Sendable {
         for index in 0..<count { try await authority.revoke("TV-\(index)", permit: binding.permit) { _ in } }
         let elapsed = ProcessInfo.processInfo.systemUptime - start, work = await authority.observation
         let actual = store.counts
+        let reservations = await service.trustedReservationCount
+        XCTAssertEqual(reservations, 0); XCTAssertEqual(work.obligations, 0); XCTAssertEqual(work.departures, 0)
+        XCTAssertEqual(work.targets, 1); XCTAssertEqual(work.inspections, 1)
         XCTAssertEqual(actual.writes, count * 2); XCTAssertEqual(work.writes, count * 2); XCTAssertEqual(work.encodings, count * 2)
         // The identical opt-in profile is also run against PR #44, which intentionally rereads.
         if !profiling { XCTAssertEqual(actual.reads, 1) }

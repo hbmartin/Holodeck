@@ -1,6 +1,17 @@
 #if os(macOS)
 import Foundation
 
+/// Shared synchronization only; each credential, binding and lifetime owns its token.
+nonisolated final class TrustedInvalidationToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = true
+    var isCurrent: Bool { lock.withLock { current } }
+    func invalidate() { lock.withLock { current = false } }
+    func withCurrent<T>(_ body: () throws -> T) rethrows -> T? {
+        try lock.withLock { guard current else { return nil }; return try body() }
+    }
+}
+
 /// A local host owns dispatch eligibility; releasing it never cancels an admitted execution.
 nonisolated public final class RequestServiceOwnerLease: @unchecked Sendable {
     private let lock = NSLock()
@@ -41,6 +52,9 @@ nonisolated final class TrustedApprovalEligibility: @unchecked Sendable {
             guard state == .eligible, withinDeadline() else { throw LocalCatalogError.disconnected }
             state = .admitted
         }
+    }
+    func restoreAfterFailedWrite() {
+        lock.withLock { if state == .admitted, withinDeadline() { state = .eligible } }
     }
     var canIssue: Bool { lock.withLock { state == .admitted && withinDeadline() } }
     func close() { lock.withLock { state = .closed } }

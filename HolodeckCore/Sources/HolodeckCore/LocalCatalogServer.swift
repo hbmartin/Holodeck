@@ -19,6 +19,8 @@ nonisolated public struct ApprovedTV: Identifiable, Codable, Sendable {
 }
 nonisolated public struct LocalServerState: Sendable {
     public var message = "Choose a shader folder to start sharing."
+    public var trustedMessage: String?
+    public var transportFailure: String?
     public var pending: [TVApproval] = []
     public var approved: [ApprovedTV] = []
     public init() {}
@@ -32,19 +34,17 @@ nonisolated struct RequestRevocationIntent: Codable, Sendable, Equatable {
 /// Held by authenticated calls across actor hops. Revocation invalidates the old
 /// approval even if its queued call reaches the request actor after replay finishes.
 nonisolated final class TrustedRequestAuthorization: @unchecked Sendable {
-    private let standaloneCoordinator: UUID
-    var coordinator: UUID { owner?.authority ?? standaloneCoordinator }
+    let coordinator: UUID
     let deviceID: String
-    private let lock = NSLock()
-    private var current = true
+    private let token = TrustedInvalidationToken()
     private let owner: TrustedOwnerPermit?
     init(coordinator: UUID, deviceID: String, owner: TrustedOwnerPermit? = nil) {
-        self.standaloneCoordinator = coordinator; self.deviceID = deviceID; self.owner = owner
+        self.coordinator = owner?.authority ?? coordinator; self.deviceID = deviceID; self.owner = owner
     }
-    var isCurrent: Bool { lock.withLock { current } && (owner?.isCurrent ?? true) }
-    func invalidate() { lock.withLock { current = false } }
+    var isCurrent: Bool { token.isCurrent && (owner?.isCurrent ?? true) }
+    func invalidate() { token.invalidate() }
 }
-nonisolated struct TrustedRevocationRevision: Sendable {
+nonisolated struct TrustedRevocationRevision: Sendable, Equatable {
     let coordinator: UUID
     let sequence: UInt64
 }
@@ -81,7 +81,10 @@ public actor LocalCatalogServer {
             let detail = BoundedDiagnostics.bounded(error.localizedDescription, bytes: 8192)
             // The authority publishes an intent/write failure while it still owns
             // the transition. Only preparation errors need a local publication.
-            if trustedDiagnostic?.contains(detail) != true { trustedDiagnostic = detail; publish() }
+            let identity = (error as? any TrustedReportedDiagnostic)?.diagnosticID
+            if identity == nil || identity != trustedDiagnosticID {
+                trustedDiagnostic = detail; trustedDiagnosticID = identity ?? UUID(); publish()
+            }
         }
     }
     private let instanceID = UUID()
@@ -89,20 +92,23 @@ public actor LocalCatalogServer {
     private var binding: TrustedApprovalsCoordinator.Binding?
     private enum RegistrationState: Equatable { case idle, pending(UUID), superseded }
     private var registrationState: RegistrationState = .idle
+    private var registrationEligibility = TrustedOwnerLifetime()
     private weak var proposedService: ShaderRequestService?
     private var serviceOwner: RequestServiceOwnerLease?
     private var ownerServiceID: UUID?
     private var retired = false
     private var startGeneration: UInt64 = 0
+    private var startup: (generation: UInt64, task: Task<Void, Error>)?
     private var lifetimeRevision: UInt64 = 0
     private var registrationTicket: (id: UUID, ticket: TrustedApprovalsCoordinator.Registration)?
     private func trustedOwner(service: ShaderRequestService?) -> TrustedApprovalsCoordinator.Owner {
         let revision = lifetimeRevision
         return .init(serverID: instanceID, service: service,
               changed: { [weak self] in await self?.acceptTrustedSnapshot($0, binding: $1, lifetime: revision) },
-              retired: { [weak self] in await self?.retireTrustedBinding() }, beforeReplay: beforeRevocationReplay)
+              retired: { [weak self] in await self?.retireTrustedBinding() }, beforeReplay: beforeRevocationReplay, eligibility: registrationEligibility)
     }
     private func registerTrustedBinding(service: ShaderRequestService?, onlyIfVacant: Bool = false) async throws -> Bool {
+        if !registrationEligibility.isCurrent { registrationEligibility = .init() }
         let attempt = UUID(), previous = registrationState, revision = lifetimeRevision
         registrationState = .pending(attempt); proposedService = service
         let registration: TrustedApprovalsCoordinator.Registration
@@ -157,7 +163,7 @@ public actor LocalCatalogServer {
         }
         approved = snapshot.approvals; self.binding = binding; retired = false
         for (session, record) in authenticated where approved[record.id]?.tokenHash != record.tokenHash { cancelSession(session) }
-        trustedDiagnostic = snapshot.diagnostic
+        trustedDiagnostic = snapshot.diagnostic; trustedDiagnosticID = snapshot.diagnosticID
         publish()
     }
     private func retireTrustedBinding() {
@@ -190,6 +196,8 @@ public actor LocalCatalogServer {
     private var state = LocalServerState()
     private var transportMessage = LocalServerState().message
     private var trustedDiagnostic: String?
+    private var trustedDiagnosticID: UUID?
+    private var transportFailure: String?
     private var observers: [UUID: AsyncStream<LocalServerState>.Continuation] = [:]
     private var identity: LocalServerIdentity?
 
@@ -244,8 +252,10 @@ public actor LocalCatalogServer {
     }
     private func removeObserver(_ id: UUID) { observers[id] = nil }
     private func publish(_ message: String? = nil) {
-        if let message { transportMessage = message }
-        state.message = trustedDiagnostic ?? transportMessage
+        if let message { transportMessage = message; transportFailure = nil }
+        state.trustedMessage = trustedDiagnostic; state.transportFailure = transportFailure
+        state.message = [transportFailure, trustedDiagnostic].compactMap { $0 }.joined(separator: "\n")
+        if state.message.isEmpty { state.message = transportMessage }
         state.pending = pending.values.map(\.approval).sorted { $0.name < $1.name }
         state.approved = approved.values.sorted { $0.name < $1.name }
         for observer in observers.values { observer.yield(state) }
@@ -253,11 +263,28 @@ public actor LocalCatalogServer {
 
     public func start() async throws {
         if listener != nil, binding?.permit.isCurrent == true { return }
-        startGeneration &+= 1; let generation = startGeneration
-        _ = try await ensureBinding(explicitStart: true)
-        try Task.checkCancellation()
-        guard generation == startGeneration else { throw CancellationError() }
-        guard listener == nil else { return }
+        let task: Task<Void, Error>
+        if let startup { task = startup.task }
+        else {
+            startGeneration &+= 1; let generation = startGeneration
+            task = Task { try await self.performStart(generation) }
+            startup = (generation, task)
+        }
+        // Each caller owns its waiter; cancelling it cannot cancel other starts.
+        let waiter = RequestPersistence.CommitTicket<Void>()
+        Task {
+            do { try await task.value; waiter.complete(.success(())) }
+            catch { waiter.complete(.failure(error)) }
+        }
+        try await waiter.value()
+    }
+    private func performStart(_ generation: UInt64) async throws {
+        defer { if startup?.generation == generation { startup = nil } }
+        do {
+            _ = try await ensureBinding(explicitStart: true)
+            try Task.checkCancellation()
+        } catch is CancellationError where generation != startGeneration { return }
+        guard generation == startGeneration, listener == nil else { return }
         if identity == nil {
             identity = try LocalServerIdentity.load(account: secretNamespace + "-tls-identity")
         }
@@ -282,30 +309,33 @@ public actor LocalCatalogServer {
     }
 
     public func stop() {
-        startGeneration &+= 1
+        startGeneration &+= 1; startup?.task.cancel(); startup = nil
         requestAuthorizations.values.forEach { $0.invalidate() }; requestAuthorizations.removeAll()
         listenerID = nil; listener?.cancel(); listener = nil
         for id in sessions.keys { cancelSession(id) }
         publish("Local sharing is stopped.")
     }
     public func shutdown() async {
-        lifetimeRevision &+= 1
+        lifetimeRevision &+= 1; registrationEligibility.invalidate()
         registrationTicket?.ticket.completion.cancel(); registrationTicket = nil
         let prior = binding
         prior?.permit.invalidate(); prior?.permit.lifetime.invalidate()
         binding = nil; retired = true; proposedService = nil
         serviceOwner?.release(); serviceOwner = nil; ownerServiceID = nil
         stop()
-        if let prior { await trusted.releaseBinding(prior.permit) }
+        let eligibility = registrationEligibility, serverID = instanceID, trusted = trusted
+        Task { await trusted.withdraw(serverID: serverID, eligibility: eligibility) }
     }
     deinit {
-        let trusted = trusted, permit = binding?.permit
+        let trusted = trusted, permit = binding?.permit, eligibility = registrationEligibility, serverID = instanceID
+        eligibility.invalidate()
         permit?.invalidate(); permit?.lifetime.invalidate()
-        Task { if let permit { await trusted.releaseBinding(permit) } }
+        Task { await trusted.withdraw(serverID: serverID, eligibility: eligibility) }
     }
     func clearTestSecrets() async throws {
         precondition(secretNamespace != Self.productionNamespace)
         await shutdown()
+        await trusted.withdraw(serverID: instanceID, eligibility: registrationEligibility)
         try LocalServerIdentity.remove(account: secretNamespace + "-tls-identity")
         try LocalSecrets.remove(TrustedApprovalsCoordinator.approvalsAccount(secretNamespace))
         await trusted.discardTestingCacheIfIdle()
@@ -322,9 +352,11 @@ public actor LocalCatalogServer {
         default: break
         }
     }
-    private func publishFailure(_ error: NWError) {
-            if LocalProtocol.isPermissionDenied(error) { publish(LocalCatalogError.permissionDenied.localizedDescription) }
-            else { publish("Local sharing failed: \(error.localizedDescription)") }
+    func publishFailure(_ error: NWError) {
+        transportFailure = LocalProtocol.isPermissionDenied(error)
+            ? LocalCatalogError.permissionDenied.localizedDescription
+            : "Local sharing failed: \(error.localizedDescription)"
+        publish()
     }
 
     public func approve(_ id: UUID) async throws {
