@@ -5196,6 +5196,101 @@ extension ShaderRequestTests {
         _ = try await service.control(operation: "requestSubmit", payload: .init(request: next), deviceID: "TV")
     }
 
+    func testCoordinatorReplacementBeforeAcknowledgmentRetainsIntentForReplay() async throws {
+        let (root, script) = try recoveryFixture(), writer = DraftReplacementGate(failAfterRelease: false)
+        let reader = DraftReplacementGate(failAfterRelease: false), catalog = DirectoryCatalog(directory: root.appendingPathComponent("catalog"))
+        let service = ShaderRequestService(catalog: catalog, directory: root, workerScript: script, beforePersistenceReplacement: { try writer.before($0) })
+        await service.suspend(); try await service.initialize(configuration: .init(repository: root.path, enabled: true))
+        let request = ShaderRequest(prompt: "Old approval work", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "A")
+        let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        let original = try TrustedTVApprovals(approvals: [ApprovedTV(id: "A", name: "Reapproved", tokenHash: "new-token")], revocations: [intent]).encoded()
+        let trusted = TrustedApprovalFixture(original), approvals = root.appendingPathComponent("trusted-approvals")
+        let first = LocalCatalogServer(catalog: catalog, testingNamespace: "old-owner", readApprovals: { trusted.read() }, writeApprovals: { try trusted.write($0) })
+        writer.arm(root.appendingPathComponent("journal.json"))
+        defer { writer.release(); reader.release() }
+        let oldReplay = Task { await first.setRequestService(service) }
+        try await waitFor { writer.entered } // The first owner has already entered request cancellation.
+        reader.arm(approvals)
+        let second = LocalCatalogServer(catalog: catalog, testingNamespace: "new-owner", readApprovals: {
+            try reader.before(approvals); return trusted.read()
+        }, writeApprovals: { try trusted.write($0) })
+        let newReplay = Task { await second.setRequestService(service) }
+        try await waitFor { reader.entered } // Replacement registration is complete, before its trusted read.
+        writer.release(); await oldReplay.value
+        XCTAssertEqual(trusted.read(), original, "A stale owner must not remove the new coordinator's replay evidence")
+        reader.release(); await newReplay.value
+        let completed = try TrustedTVApprovals.decode(XCTUnwrap(trusted.read()))
+        XCTAssertTrue(completed.revocations.isEmpty); XCTAssertEqual(completed.approvals.first?.tokenHash, "new-token")
+        let jobs = await service.allJobs(); XCTAssertEqual(jobs.first?.stage, .cancelled)
+        try await service.retryReconciliation()
+        let statuses = await service.recoveryStatuses(); XCTAssertTrue(statuses.isEmpty)
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: ShaderRequest(prompt: "After handoff", context: try context())), deviceID: "A")
+    }
+
+    func testCoordinatorHandoffWaitsForTrustedRemovalWithoutBlockingUnrelatedWork() async throws {
+        let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script), owner = UUID(), nextOwner = UUID()
+        let revision = TrustedRevocationRevision(coordinator: owner, sequence: 1), next = TrustedRevocationRevision(coordinator: nextOwner, sequence: 0)
+        let first = RequestRevocationIntent(operationID: UUID(), deviceID: "A"), remaining = RequestRevocationIntent(operationID: UUID(), deviceID: "B")
+        let trusted = TrustedApprovalFixture(try TrustedTVApprovals(revocations: [first, remaining]).encoded())
+        await service.registerRevocationCoordinator(id: owner) {}
+        try await service.loadTrustedRevocations([first, remaining], revision: revision)
+        try await service.applyTrustedRevocation(first, revision: revision)
+        let writer = DraftReplacementGate(failAfterRelease: false), file = root.appendingPathComponent("trusted-approvals")
+        writer.arm(file); defer { writer.release() }
+        let bytes = try TrustedTVApprovals(revocations: [remaining]).encoded()
+        let completion = Task { try await service.acknowledgeTrustedRevocation(first, revision: revision) {
+            try writer.before(file); try trusted.write(bytes)
+        } }
+        try await waitFor { writer.entered }
+        let handoff = Task {
+            await service.registerRevocationCoordinator(id: nextOwner) {}
+            try await service.loadTrustedRevocations([remaining], revision: next)
+        }
+        let request = ShaderRequest(prompt: "During slow trusted write", context: try context())
+        do { _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "A"); XCTFail("Completion released the device fence before persistence") } catch {}
+        // Also proves the request actor remains responsive while the write is paused.
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "C")
+        XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(trusted.read())).revocations, [first, remaining])
+        completion.cancel() // A started trusted write must still finish its actual outcome.
+        writer.release(); try await completion.value; try await handoff.value
+        XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(trusted.read())).revocations, [remaining])
+        do { try await service.loadTrustedRevocations([], revision: next); XCTFail("Handoff discarded an intent still requiring replay") } catch { XCTAssertTrue(error.localizedDescription.contains("omitted an unacknowledged durable revocation")) }
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: ShaderRequest(prompt: "Completed device", context: try context())), deviceID: "A")
+        let pending = ShaderRequest(prompt: "Still pending device", context: try context())
+        do { _ = try await service.control(operation: "requestSubmit", payload: .init(request: pending), deviceID: "B"); XCTFail("Handoff lost the other device's fence") } catch { XCTAssertTrue(error.localizedDescription.contains("revocation")) }
+    }
+
+    func testFailedTrustedRemovalDuringHandoffKeepsIntentAndFenceUntilRetry() async throws {
+        let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script), owner = UUID(), nextOwner = UUID()
+        let revision = TrustedRevocationRevision(coordinator: owner, sequence: 1), next = TrustedRevocationRevision(coordinator: nextOwner, sequence: 0)
+        let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A"), writer = DraftReplacementGate(failAfterRelease: false)
+        let original = try TrustedTVApprovals(revocations: [intent]).encoded(), trusted = TrustedApprovalFixture(original)
+        await service.registerRevocationCoordinator(id: owner) {}
+        try await service.loadTrustedRevocations([intent], revision: revision)
+        try await service.applyTrustedRevocation(intent, revision: revision)
+        let file = root.appendingPathComponent("trusted-approvals"), empty = try TrustedTVApprovals().encoded()
+        trusted.fail(at: 1); writer.arm(file); defer { writer.release() }
+        let completion = Task { try await service.acknowledgeTrustedRevocation(intent, revision: revision) {
+            try writer.before(file); try trusted.write(empty)
+        } }
+        try await waitFor { writer.entered }
+        let handoff = Task {
+            await service.registerRevocationCoordinator(id: nextOwner) {}
+            try await service.loadTrustedRevocations([intent], revision: next)
+        }
+        writer.release()
+        do { try await completion.value; XCTFail("Failed trusted write was acknowledged") } catch { XCTAssertEqual((error as? POSIXError)?.code, .EIO) }
+        try await handoff.value
+        XCTAssertEqual(trusted.read(), original)
+        let request = ShaderRequest(prompt: "Wait for durable removal", context: try context())
+        do { _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "A"); XCTFail("Failed write released the fence") } catch {}
+        trusted.fail(at: nil)
+        try await service.applyTrustedRevocation(intent, revision: next)
+        try await service.acknowledgeTrustedRevocation(intent, revision: next) { try trusted.write(empty) }
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "A")
+    }
+
     func testRejectedTrustedRevocationLeavesApprovalsAndRequestAcceptanceIntact() async throws {
         let (root, script) = try recoveryFixture(), service = try await recoveryService(root, script: script)
         let bytes = try JSONEncoder().encode([ApprovedTV(id: "TV", name: "Keep access", tokenHash: "token")])
@@ -5358,12 +5453,12 @@ extension ShaderRequestTests {
         try await service.reserveRevocation(first, revision: revision); try await service.reserveRevocation(second, revision: revision)
         try await service.commitTrustedRevocation(second, revision: revision)
         try await service.loadTrustedRevocations([second], revision: revision)
-        try await service.acknowledgeTrustedRevocation(second, revision: revision)
+        try await service.acknowledgeTrustedRevocation(second, revision: revision) {}
         await service.revocationReplaySucceeded(revision: revision)
         let cleared = await service.recoveryStatuses(); XCTAssertTrue(cleared.isEmpty)
         try await service.commitTrustedRevocation(first, revision: revision)
         do { try await service.loadTrustedRevocations([], revision: revision); XCTFail("Durable uncertainty disappeared") } catch {}
-        do { try await service.acknowledgeTrustedRevocation(first, revision: .init(coordinator: UUID(), sequence: 99)); XCTFail("Foreign coordinator cleared evidence") } catch {}
+        do { try await service.acknowledgeTrustedRevocation(first, revision: .init(coordinator: UUID(), sequence: 99)) {}; XCTFail("Foreign coordinator cleared evidence") } catch {}
         let retained = await service.recoveryStatuses(); XCTAssertFalse(retained.isEmpty)
     }
     func testRevocationCapacityFailurePrecedesReservationAndTrustedReplacement() async throws {
@@ -5598,7 +5693,7 @@ extension ShaderRequestTests {
         try await service.loadTrustedRevocations([intent], revision: fresh)
         try await service.applyTrustedRevocation(intent, revision: old)
         do { try await service.loadTrustedRevocations([], revision: old); XCTFail("Stale snapshot cleared the current intent") } catch {}
-        try await service.acknowledgeTrustedRevocation(intent, revision: fresh)
+        try await service.acknowledgeTrustedRevocation(intent, revision: fresh) {}
         let statuses = await service.recoveryStatuses(); XCTAssertTrue(statuses.isEmpty)
     }
     func testRevokedCheckoutCleanupPrecedesUnrelatedJobAndMacPublication() async throws {

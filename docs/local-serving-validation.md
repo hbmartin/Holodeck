@@ -855,3 +855,22 @@ The delayed-storage fixture is slower in these samples. These measurements estab
 Evidence is `/tmp/revocation-{python39,python315,core-verified,release,races,model,ui-build,mac-build,tv-build,package,metal,gpu}.log`, `/tmp/revocation-ui-build.xcresult`, `/tmp/revocation-native-progress.json`, and `/tmp/revocation-profile{39,315,-slow}.json`. Frozen runtime hashes matched final core, app/native verification, Release repetitions and profiles. Earlier development failures are excluded from acceptance totals.
 
 The six full-core skips cover three unrelated catalog profiles, live LAN/TLS, real Codex publication and supervision profiling performed separately in Release. A tvOS 27 simulator is available, but simulator execution was not run; no physical Apple TV was connected. Linux CI, checker artifacts/locks, network messages, journal formats, root aliases, supervision/retry rules, termination budgets and template-edit restrictions remain unchanged. No live installation replacement, enabling of live requests, merge or deployment occurred.
+
+
+## PR #42 review follow-up — revocation completion and coordinator handoff (2026-11-06)
+
+Exact revocation acknowledgment now owns the trusted-removal completion boundary. It validates the current coordinator and durable intent before invoking the storage write, retains the device fence until that write succeeds, and retires the intent before releasing a waiting coordinator registration. Trusted I/O runs outside the request actor. The server publishes its remaining-intent list and sequence only after successful completion. A write failure leaves the persisted intent and device fence intact.
+
+A replacement arriving before completion admission prevents the old owner from removing trusted evidence; the new owner replays the unchanged intent. A replacement arriving during completion waits for its actual outcome before inspecting the trusted snapshot. This closes the lost-acknowledgment interval without clearing unresolved durable IDs or introducing persisted tombstones. Other pending device intents survive handoff, and missing durable evidence still requires recovery.
+
+Three new gated regressions cover replacement after request cancellation has begun, handoff during slow trusted removal, and failed trusted removal followed by retry. They assert exact retained trusted bytes, preserved reapproval tokens, device fencing, unrelated request acceptance during slow I/O, cancellation after the write starts, preservation of another pending intent, and successful Retry Recovery.
+
+Validation:
+
+- Full Swift core and packaged-resource suite: **481 tests, six skips, zero failures**, with the authoring/GPU fixture enabled.
+- Final focused Debug and Release selections: **nine tests passed in each configuration**, including TLS reapproval and the strengthened distinct-request fence assertion.
+- Final optimized handoff/revocation/TLS selection: **20 repetitions, 180 test executions, zero failures**.
+- Unsigned Mac Release app: **build succeeded**.
+- Structural checks retain two trusted candidate encodings per completed revoke/removal and no extra trusted write for completion or handoff.
+
+Evidence: `/tmp/pr42-handoff-core.log`, `/tmp/pr42-handoff-final-{debug,release,races}.log`, and `/tmp/pr42-handoff-mac-build.log`. The Python worker, checker and shaders were unchanged and their separate suites were not rerun for this Mac coordination fix. Desktop UI runtime checks remain blocked under the existing user instruction; no UI runtime result is claimed.
