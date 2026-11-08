@@ -540,6 +540,7 @@ public actor ShaderRequestService {
         let id: UUID
         let predecessor: TrustedApprovalsCoordinator
         let registration: UUID
+        let departure: TrustedAuthorityDeparture
     }
     private weak var trustedAuthority: TrustedApprovalsCoordinator?
     private var authorityTransfer: UUID?
@@ -549,10 +550,10 @@ public actor ShaderRequestService {
         guard authorityTransfer == nil else { throw ShaderRequestError.unavailable("A trusted authority handoff is pending; retry after it finishes.") }
         let ticket = UUID(); authorityTransfer = ticket; emitUpdates()
         do {
-            try await predecessor.prepareDeparture(self, ticket: ticket)
+            let departure = try await predecessor.prepareDeparture(self, ticket: ticket)
             try Task.checkCancellation()
-            return AuthorityTransfer(id: ticket, predecessor: predecessor, registration: revocationRegistration)
-        } catch { await predecessor.cancelDeparture(self, ticket: ticket); authorityTransfer = nil; emitUpdates(); throw error }
+            return AuthorityTransfer(id: ticket, predecessor: predecessor, registration: revocationRegistration, departure: departure)
+        } catch { await predecessor.cancelDeparture(serviceID: runtimeID, ticket: ticket); authorityTransfer = nil; emitUpdates(); throw error }
     }
     func settleTrustedAuthorityDeparture() async throws {
         if let activeID, records[activeID]?.revoked == true, let workerTask { await workerTask.value }
@@ -570,7 +571,7 @@ public actor ShaderRequestService {
     }
     func cancelTrustedAuthority(_ transfer: AuthorityTransfer) async {
         guard authorityTransfer == transfer.id else { return }
-        await transfer.predecessor.cancelDeparture(self, ticket: transfer.id)
+        await transfer.predecessor.cancelDeparture(serviceID: runtimeID, ticket: transfer.id)
         authorityTransfer = nil; emitUpdates()
     }
     private var revocationReservations: [UUID: TrustedRevocationReservation] = [:]
@@ -616,12 +617,17 @@ public actor ShaderRequestService {
     }
     func installTrustedAuthority(_ transfer: AuthorityTransfer, id: UUID, intents: [RequestRevocationIntent], revision: TrustedRevocationRevision,
                                  coordinator: @escaping @Sendable () async throws -> Void) throws -> (UUID, TrustedRevocationInspection) {
-        guard authorityTransfer == transfer.id, revocationRegistration == transfer.registration, durableRevocations.isEmpty else {
-            throw ShaderRequestError.unavailable("The previous authority changed during handoff; retain its registration and retry recovery.")
+        try transfer.departure.activate {
+            guard authorityTransfer == transfer.id, revocationRegistration == transfer.registration,
+                  transfer.departure.registrationID == revocationRegistration, durableRevocations.isEmpty,
+                  revision.coordinator == id else {
+                throw ShaderRequestError.unavailable("The previous authority changed during handoff; retain its registration and retry recovery.")
+            }
+            // No suspension between validating departure, changing registration and
+            // loading the already validated replacement authority snapshot.
+            let registration = bindRevocationCoordinator(id: id, coordinator)
+            return (registration, try loadTrustedRevocations(intents, revision: revision))
         }
-        // No suspension between changing registration and loading the validated snapshot.
-        let registration = bindRevocationCoordinator(id: id, coordinator)
-        return (registration, try loadTrustedRevocations(intents, revision: revision))
     }
     @discardableResult func registerRevocationCoordinator(id: UUID, _ coordinator: @escaping @Sendable () async throws -> Void) async -> UUID {
         bindRevocationCoordinator(id: id, coordinator)
