@@ -1491,6 +1491,38 @@ final class ShaderRequestTests: XCTestCase {
         publication.cancel(); do { try await publication.value; XCTFail("Cancelled publication succeeded") } catch is CancellationError {}
     }
 
+    func testPendingPublicationWaitsForHealthyTransferWithWaitingRequest() async throws {
+        let f = try await publicationRecoveryFixture()
+        let original = try String(contentsOf: f.script, encoding: .utf8)
+        try ("""
+        import json,sys
+        if sys.argv[1]=='run':
+            print(json.dumps(dict(event='clarification',question='Choose',options=['A','B'])),flush=True)
+            raise SystemExit(0)
+        """ + "\n" + original).write(to: f.script, atomically: true, encoding: .utf8)
+        let old = TrustedBackendFixture(nil).coordinator()
+        _ = try await old.register(TrustedOwnerRecorder().owner(service: f.service)).value()
+        let request = ShaderRequest(prompt: "Wait for input", context: try context())
+        _ = try await f.service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "B")
+        await f.service.activateScheduling(); await f.service.resume()
+        try await waitFor { await f.service.allJobs().first?.stage == .awaitingClarification }
+        try await waitFor { !(await f.service.hasActiveCheckoutWork) }
+        let backend = TrustedBackendFixture(nil), gate = TrustedReadGate(); backend.gateReads(gate)
+        addTeardownBlock { gate.release(); await f.service.suspend() }
+        let next = backend.coordinator(), moving = try await next.register(TrustedOwnerRecorder().owner(service: f.service))
+        addTeardownBlock { moving.completion.cancel(); gate.release() }
+        try await waitFor { gate.entered }
+        let publication = Task { try await f.service.ensurePublication(force: true) }
+        addTeardownBlock { publication.cancel(); gate.release() }
+        try await waitFor { await f.service.pendingPublicationWaiterCount == 1 }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.root.appendingPathComponent("publication/publication-count").path))
+        gate.release()
+        guard case .accepted = try await moving.value() else { return XCTFail("Healthy transfer superseded") }
+        try await publication.value
+        let status = await f.service.publicationStatus(); XCTAssertNotNil(status)
+        let jobs = await f.service.allJobs(); XCTAssertEqual(jobs.first?.stage, .awaitingClarification)
+    }
+
     func testHealthyPublicationCanContinueThroughAuthorityTransfer() async throws {
         let f = try await publicationRecoveryFixture()
         let original = try String(contentsOf: f.script, encoding: .utf8)

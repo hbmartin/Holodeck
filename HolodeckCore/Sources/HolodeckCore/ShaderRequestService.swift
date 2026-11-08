@@ -614,11 +614,17 @@ public actor ShaderRequestService {
     private var revocationFailures: [UUID: String] = [:]
     private var unknownRevocationBlocker: String? {
         if authorityTransfer != nil { return "TV authority handoff is pending; requests are fenced until cancellation settles." }
+        return approvalInspectionBlocker
+    }
+    private var approvalInspectionBlocker: String? {
         if let revocationFailure { return "TV approval inspection requires recovery: " + revocationFailure }
         return revocationInspectionPending ? "TV approvals have not been inspected. TV requests are paused; choose Retry Recovery." : nil
     }
     private func revocationBlocker(for deviceID: String) -> String? {
         if let unknownRevocationBlocker { return unknownRevocationBlocker }
+        return pendingRevocationBlocker(for: deviceID)
+    }
+    private func pendingRevocationBlocker(for deviceID: String) -> String? {
         guard let intent = pendingRevocations.values.first(where: { $0.deviceID == deviceID }) else { return nil }
         if let failure = revocationFailures[intent.operationID] { return "TV revocation recovery required for " + deviceID + ": " + failure }
         return "TV access revocation is pending for " + deviceID + "; request cancellation must be durably replayed. Choose Retry Recovery if it does not finish."
@@ -630,7 +636,8 @@ public actor ShaderRequestService {
     }
     private var revocationCheckoutBlocker: String? {
         records.values.first { record in
-            guard record.detached != true, revocationBlocker(for: record.status.deviceID) != nil else { return false }
+            guard record.detached != true,
+                  approvalInspectionBlocker != nil || pendingRevocationBlocker(for: record.status.deviceID) != nil else { return false }
             return record.cleanupPending == true || record.dispatch?.launched == true ||
                 (!record.status.stage.terminal && ![.queued, .awaitingActivation].contains(record.status.stage))
         }.map { "TV revocation must settle its owned checkout before starting other checkout work: " + $0.status.deviceID }
@@ -1662,23 +1669,40 @@ public actor ShaderRequestService {
 
     public func retryReconciliation() async throws { try await retryReconciliation(replayTrusted: true) }
     func retryReconciliation(replayTrusted: Bool) async throws {
-        var localFailure: Error?
-        do { try await recoverLocalMetadata() }
-        catch is CancellationError { throw CancellationError() }
-        catch { localFailure = error }
         try Task.checkCancellation()
-        // The maintenance lease has ended. Trusted inspection can recover even
-        // when a separate local journal remains blocked, without recursive replay.
+        // Admission refusal is not a failed recovery phase: no trusted pass may
+        // start on behalf of a requester that still owns active checkout work.
+        guard activeID == nil, !maintenanceBusy, localRecoveryAttempt == nil else { throw TrustedRecoveryAdmissionError() }
+        let attempt = UUID(); localRecoveryAttempt = attempt
+        defer {
+            if localRecoveryAttempt == attempt { localRecoveryAttempt = nil; emitUpdates(); scheduleWakeup() }
+        }
+        var localFailure: Error?
+        let phase: TrustedRecoveryPhase
+        do { try await recoverLocalMetadata(); phase = .completed }
+        catch {
+            try Task.checkCancellation()
+            if error is CancellationError || error is TrustedRecoveryInterrupted {
+                let interruption = TrustedRecoveryInterrupted()
+                localFailure = interruption; phase = .interrupted(interruption.localizedDescription)
+            } else {
+                localFailure = error
+                let detail = BoundedDiagnostics.bounded(error.localizedDescription, bytes: 8192)
+                phase = error is TrustedRecoveryAdmissionError ? .refused(detail) : .failed(detail)
+            }
+        }
+        try Task.checkCancellation()
+        // The maintenance lease has ended. Ownership interruption is a partial
+        // result, not cancellation intent; independent safe inspection may continue.
         if replayTrusted, let coordinator = revocationCoordinator {
-            let local = TrustedLocalRecovery(failure: localFailure.map { BoundedDiagnostics.bounded($0.localizedDescription, bytes: 8192) })
-            try await coordinator(local)
+            try await coordinator(TrustedLocalRecovery(phase: phase))
         }
         if let localFailure { throw localFailure }
     }
     private func recoverLocalMetadata() async throws {
-        guard activeID == nil, !maintenanceBusy else { throw ShaderRequestError.unavailable("Wait for active checkout work to finish.") }
-        let lease = try beginMaintenance(); localRecoveryAttempt = lease
-        defer { localRecoveryAttempt = nil; endMaintenance(lease) }
+        guard activeID == nil, !maintenanceBusy else { throw TrustedRecoveryAdmissionError() }
+        let lease = try beginMaintenance()
+        defer { endMaintenance(lease) }
         // Invalidate the previous observer before storage recovery's first await;
         // its late result must not publish a new failure into the restored state.
         try await drainReconciliation(lease: lease); try await resetPersistenceFailure()
@@ -1715,7 +1739,10 @@ public actor ShaderRequestService {
                     try await journalChange("restart recovered operation", in: journal) { try RequestWorkerOperation.restartPaused(in: journal, configuration: target, repairLegacyMismatch: true) }
                 }
                 try await persist()
-            } catch is CancellationError { throw CancellationError() }
+            } catch is CancellationError {
+                try Task.checkCancellation()
+                throw TrustedRecoveryInterrupted()
+            }
             catch {
                 failures.append(entry.journal + ": " + error.localizedDescription)
                 await appendRecoveryFailure(journal: URL(fileURLWithPath: entry.journal), configuration: entry.configuration, error: error)
@@ -2688,6 +2715,15 @@ public actor ShaderRequestService {
                                         publicationRevision: await catalog.publicationRevisionValue())
     }
     private func kick() {
+        // Host loss concerns new waiters, including ones queued behind an active
+        // worker. It never cancels an already admitted publication or execution.
+        if !hostOwners.mayDispatch {
+            let stable = startupFinalizationFailure ?? persistenceFailure ??
+                (localRecoveryAttempt == nil ? reconciliationFailure ?? blockingRecoveryEntry?.message : nil)
+            if let stable { failPendingPublicationForRecovery(stable) }
+            else { pauseOwnerlessPublication() }
+            return
+        }
         // A recovery attempt owns its publication waiters until its result is
         // known. Active worker/maintenance entries are not settled blockers.
         guard localRecoveryAttempt == nil else { return }
@@ -2696,7 +2732,6 @@ public actor ShaderRequestService {
         guard !maintenanceBusy, activeID == nil, workerTask == nil else { return }
         if let reconciliationFailure { failPendingPublicationForRecovery(reconciliationFailure); return }
         if let entry = blockingRecoveryEntry { failPendingPublicationForRecovery(entry.message); return }
-        guard hostOwners.mayDispatch else { pauseOwnerlessPublication(); return }
         guard loaded, initialized, !suspended else { return }
         if storageCommit != nil || pendingCommits != 0 || !pendingRetirements.isEmpty || retirementTask != nil { schedulingDeferred = true; return }
         if !reconciled {
@@ -2735,6 +2770,9 @@ public actor ShaderRequestService {
             failPendingPublicationForRecovery(failure ?? "Checkout cleanup is required."); return
         }
         else if let revocationCheckoutBlocker { failPendingPublicationForRecovery(revocationCheckoutBlocker); return }
+        // Required cleanup above may make this transfer safe. New publication
+        // admission waits for acceptance instead of reporting checkout recovery.
+        else if authorityTransfer != nil { return }
         else if pendingPublication != nil || (retryPublicationForce != nil && configuration.enabled) { work = .publication }
         else if schedulingActive, configuration.enabled, let id = ShaderRequestScheduling.next(in: eligible, recoveringID: recoveryID) { work = .execute(id) }
         else { return }
