@@ -100,6 +100,7 @@ public actor LocalCatalogServer {
     private var startGeneration: UInt64 = 0
     private var startup: (generation: UInt64, task: Task<Void, Error>)?
     private var lifetimeRevision: UInt64 = 0
+    private var withdrawal: TrustedWithdrawalReceipt?
     private var registrationTicket: (id: UUID, ticket: TrustedApprovalsCoordinator.Registration)?
     private func trustedOwner(service: ShaderRequestService?) -> TrustedApprovalsCoordinator.Owner {
         let revision = lifetimeRevision
@@ -108,7 +109,7 @@ public actor LocalCatalogServer {
               retired: { [weak self] in await self?.retireTrustedBinding() }, beforeReplay: beforeRevocationReplay, eligibility: registrationEligibility)
     }
     private func registerTrustedBinding(service: ShaderRequestService?, onlyIfVacant: Bool = false) async throws -> Bool {
-        if !registrationEligibility.isCurrent { registrationEligibility = .init() }
+        if !registrationEligibility.isCurrent { registrationEligibility = .init(); withdrawal = nil }
         let attempt = UUID(), previous = registrationState, revision = lifetimeRevision
         registrationState = .pending(attempt); proposedService = service
         let registration: TrustedApprovalsCoordinator.Registration
@@ -315,7 +316,9 @@ public actor LocalCatalogServer {
         for id in sessions.keys { cancelSession(id) }
         publish("Local sharing is stopped.")
     }
-    public func shutdown() async {
+    public func shutdown() async { _ = shutdownReceipt() }
+    func shutdownReceipt() -> TrustedWithdrawalReceipt {
+        if let withdrawal { return withdrawal }
         lifetimeRevision &+= 1; registrationEligibility.invalidate()
         registrationTicket?.ticket.completion.cancel(); registrationTicket = nil
         let prior = binding
@@ -324,18 +327,20 @@ public actor LocalCatalogServer {
         serviceOwner?.release(); serviceOwner = nil; ownerServiceID = nil
         stop()
         let eligibility = registrationEligibility, serverID = instanceID, trusted = trusted
-        Task { await trusted.withdraw(serverID: serverID, eligibility: eligibility) }
+        let completion = Task { await trusted.withdraw(serverID: serverID, eligibility: eligibility) }
+        let receipt = TrustedWithdrawalReceipt(serverID: serverID, lifetime: eligibility, completion: completion)
+        withdrawal = receipt
+        return receipt
     }
     deinit {
         let trusted = trusted, permit = binding?.permit, eligibility = registrationEligibility, serverID = instanceID
         eligibility.invalidate()
         permit?.invalidate(); permit?.lifetime.invalidate()
-        Task { await trusted.withdraw(serverID: serverID, eligibility: eligibility) }
+        if withdrawal == nil { Task { await trusted.withdraw(serverID: serverID, eligibility: eligibility) } }
     }
     func clearTestSecrets() async throws {
         precondition(secretNamespace != Self.productionNamespace)
-        await shutdown()
-        await trusted.withdraw(serverID: instanceID, eligibility: registrationEligibility)
+        try await shutdownReceipt().value()
         try LocalServerIdentity.remove(account: secretNamespace + "-tls-identity")
         try LocalSecrets.remove(TrustedApprovalsCoordinator.approvalsAccount(secretNamespace))
         await trusted.discardTestingCacheIfIdle()

@@ -518,23 +518,36 @@ public actor ShaderRequestService {
     private var activeRetryJournals: [String: UUID] = [:]
     private var recoveryID: UUID?
     nonisolated let runtimeID = UUID()
-    private var hostRecoveryObservers: [UUID: @Sendable (ShaderRequestService, UInt64, Bool) async -> Void] = [:]
+    private struct HostRecoveryObserver {
+        let subscription: TrustedRecoverySubscription
+        let changed: @Sendable (ShaderRequestService, UInt64, Bool) async -> Void
+    }
+    private var hostRecoveryObservers: [UUID: HostRecoveryObserver] = [:]
     private var hostRecoveryRevision: UInt64 = 0
     private var lastHostRecoveryRequirement: Bool?
     private var requiresHostRecoveryPin: Bool {
         persistenceFailure != nil || startupFinalizationFailure != nil || !recovery.entries.isEmpty || !pendingRetirements.isEmpty || retirementTask != nil
     }
-    func observeHostRecovery(id: UUID, changed: @escaping @Sendable (ShaderRequestService, UInt64, Bool) async -> Void) {
-        hostRecoveryObservers[id] = changed
+    func observeHostRecovery(_ subscription: TrustedRecoverySubscription, changed: @escaping @Sendable (ShaderRequestService, UInt64, Bool) async -> Void) {
+        guard subscription.serviceID == runtimeID else { return }
+        hostRecoveryObservers[subscription.authority]?.subscription.invalidate()
+        hostRecoveryObservers[subscription.authority] = .init(subscription: subscription, changed: changed)
         let required = requiresHostRecoveryPin, revision = hostRecoveryRevision
-        Task { await changed(self, revision, required) }
+        Task { if subscription.isCurrent { await changed(self, revision, required) } }
+    }
+    func removeHostRecoveryObserver(_ subscription: TrustedRecoverySubscription) {
+        subscription.invalidate()
+        guard hostRecoveryObservers[subscription.authority]?.subscription === subscription else { return }
+        hostRecoveryObservers[subscription.authority] = nil
     }
     private func publishHostRecoveryRequirement() {
         let required = requiresHostRecoveryPin
         guard required != lastHostRecoveryRequirement else { return }
         lastHostRecoveryRequirement = required; hostRecoveryRevision &+= 1
         let revision = hostRecoveryRevision
-        for observer in hostRecoveryObservers.values { Task { await observer(self, revision, required) } }
+        for observer in hostRecoveryObservers.values {
+            Task { if observer.subscription.isCurrent { await observer.changed(self, revision, required) } }
+        }
     }
     struct AuthorityTransfer: Sendable {
         let id: UUID
@@ -573,7 +586,8 @@ public actor ShaderRequestService {
     func finishTrustedAuthority(_ transfer: AuthorityTransfer, authority: TrustedApprovalsCoordinator) {
         guard authorityTransfer == transfer.id else { return }
         trustedAuthority = authority; authorityTransfer = nil; emitUpdates(); scheduleWakeup()
-        Task { await transfer.predecessor.finishDeparture(self, ticket: transfer.id) }
+        let serviceID = runtimeID
+        Task { await transfer.predecessor.finishDeparture(serviceID: serviceID, ticket: transfer.id) }
     }
     func cancelTrustedAuthority(_ transfer: AuthorityTransfer) async {
         guard authorityTransfer == transfer.id else { return }

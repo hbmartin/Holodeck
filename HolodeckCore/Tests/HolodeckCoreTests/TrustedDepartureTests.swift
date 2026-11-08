@@ -5,10 +5,11 @@ import XCTest
 
 @MainActor final class TrustedDepartureTests: XCTestCase {
     private struct Fixture { let root: URL; let service: ShaderRequestService }
-    private func fixture() async throws -> Fixture {
+    private func fixture(fault: DepartureStorageFault? = nil) async throws -> Fixture {
         let root = URL(fileURLWithPath: "/private/tmp/pr47-departure-" + UUID().uuidString)
         let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")),
-            directory: root, workerScript: root.appendingPathComponent("unused.py"), reconcileWorker: { _ in })
+            directory: root, workerScript: root.appendingPathComponent("unused.py"), reconcileWorker: { _ in },
+            beforePersistenceReplacement: { if $0.lastPathComponent == "journal.json", fault?.enabled == true { throw POSIXError(.EIO) } })
         await service.suspend(); try await service.initialize(configuration: .init(repository: root.path, enabled: true))
         addTeardownBlock { await service.suspend(); try? FileManager.default.removeItem(at: root) }
         return Fixture(root: root, service: service)
@@ -148,6 +149,52 @@ import XCTest
         try await wait { FileManager.default.fileExists(atPath: job.appendingPathComponent("started").path) }
         try Data().write(to: job.appendingPathComponent("release")); await a.service.suspend()
     }
+    func testPreparingCrossAuthorityRegistrationReturnsSupersededInsteadOfCancellation() async throws {
+        let fixture = try await fixture(), old = TrustedBackendFixture(nil).coordinator()
+        let prior = try await accept(old.register(TrustedOwnerRecorder().owner(service: fixture.service)))
+        let backend = TrustedBackendFixture(nil), gate = TrustedReadGate(); backend.gateReads(gate)
+        addTeardownBlock { gate.release() }
+        let next = backend.coordinator(), first = try await next.register(TrustedOwnerRecorder().owner(service: fixture.service))
+        try await wait { gate.entered }
+        let latest = try await Task(priority: .background) { try await next.register(TrustedOwnerRecorder().owner()) }.value
+        let admitted = await next.observation; XCTAssertEqual(admitted.queuedGeneration, latest.generation)
+        gate.release()
+        guard case .superseded = try await first.value() else { return XCTFail("Older preparation activated") }
+        _ = try await accept(latest)
+        let previous = await old.observation; XCTAssertEqual(previous.departures, 0); XCTAssertTrue(prior.permit.isCurrent)
+    }
+    func testTransferredServiceCannotRepinItsOldAuthorityOnALaterFault() async throws {
+        let fault = DepartureStorageFault(), fixture = try await fixture(fault: fault)
+        let old = TrustedBackendFixture(nil).coordinator(), next = TrustedBackendFixture(nil).coordinator()
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: fixture.service)))
+        _ = try await accept(next.register(TrustedOwnerRecorder().owner(service: fixture.service)))
+        try await wait { await old.observation.departures == 0 }
+        fault.enabled = true
+        do { try await submit(fixture.service); XCTFail("Fixture storage fault missing") } catch is RequestPersistence.Fault {}
+        try await wait { await next.observation.recoveryPins == 1 }
+        let obsolete = await old.observation
+        XCTAssertEqual(obsolete.targets, 0); XCTAssertEqual(obsolete.recoverySubscriptions, 0); XCTAssertEqual(obsolete.recoveryPins, 0)
+        let current = await next.observation; XCTAssertEqual(current.recoverySubscriptions, 1)
+    }
+    func testAbandonedDepartureCanBeClosedByIdentityWithoutItsService() async throws {
+        let root = URL(fileURLWithPath: "/private/tmp/pr47-abandon-" + UUID().uuidString)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        var service: ShaderRequestService? = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")),
+            directory: root, workerScript: root.appendingPathComponent("unused.py"), reconcileWorker: { _ in })
+        let weakService = WeakRequestService(service), authority = TrustedBackendFixture(nil).coordinator()
+        let departure: TrustedAuthorityDeparture
+        do {
+            let target = try XCTUnwrap(service)
+            await target.suspend(); try await target.initialize(configuration: .init(repository: root.path))
+            _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: target)))
+            departure = try await authority.prepareDeparture(target, ticket: UUID())
+        }
+        service = nil
+        try await wait { weakService.value == nil }
+        await authority.cancelDeparture(serviceID: departure.serviceID, ticket: departure.id)
+        let retired = await authority.observation
+        XCTAssertEqual(retired.departures, 0); XCTAssertEqual(retired.recoveryPins, 0); XCTAssertEqual(retired.recoverySubscriptions, 0)
+    }
     func testDepartureAdmissionCannotActivateAfterInspectionInvalidation() throws {
         let departure = TrustedAuthorityDeparture(id: UUID(), serviceID: UUID(), registrationID: UUID())
         departure.prepared(); departure.invalidatePreparation()
@@ -157,5 +204,9 @@ import XCTest
         departure.invalidatePreparation(); XCTAssertTrue(departure.activated)
         departure.close(); XCTAssertThrowsError(try departure.activate {})
     }
+}
+private final class DepartureStorageFault: @unchecked Sendable {
+    private let lock = NSLock(); private var value = false
+    var enabled: Bool { get { lock.withLock { value } } set { lock.withLock { value = newValue } } }
 }
 #endif
