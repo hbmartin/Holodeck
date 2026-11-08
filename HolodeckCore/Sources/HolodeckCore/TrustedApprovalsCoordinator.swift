@@ -51,6 +51,14 @@ struct TrustedPartialRecovery: LocalizedError, Sendable {
         remaining.joined(separator: "\n") + "\nPartial recovery: completed phases were committed; unresolved local or trusted recovery remains."
     }
 }
+struct TrustedDepartureRecoveryError: LocalizedError, Sendable, TrustedReportedDiagnostic {
+    let diagnosticID: UUID
+    let serviceID: UUID
+    var errorDescription: String? {
+        "Authority departure " + diagnosticID.uuidString + " for service " + serviceID.uuidString +
+        " requires receipt recovery. Retain its evidence and choose Retry Recovery; unverifiable receipts require manual repair."
+    }
+}
 struct TrustedRevocationApplication: Sendable, Equatable {
     let serviceID: UUID
     let registrationID: UUID
@@ -330,8 +338,7 @@ actor TrustedApprovalsCoordinator {
     }
     private func requireAuthorityReady() throws {
         if let ticket = departureRecovery.values.min(by: { $0.id.uuidString < $1.id.uuidString }) {
-            throw Self.unavailable("Authority departure " + ticket.id.uuidString +
-                " requires receipt recovery. Retain its evidence and choose Retry Recovery; unverifiable receipts require manual repair.")
+            throw TrustedDepartureRecoveryError(diagnosticID: ticket.id, serviceID: ticket.serviceID)
         }
     }
     private func invalidateBaseline() {
@@ -479,7 +486,12 @@ actor TrustedApprovalsCoordinator {
                 }
                 if key.service != requester {
                     guard let target = targets[key]?.service else { continue }
-                    try await target.retryReconciliation(replayTrusted: false)
+                    let outcome = try await target.trustedRecoveryOutcome()
+                    guard outcome.completed else {
+                        suppressApplications(to: key)
+                        errors.append("Service \(key.service): " + (outcome.failure ?? "Recovery did not complete."))
+                        continue
+                    }
                     completed.append(key.service)
                 }
                 failedApplications = failedApplications.filter { $0.target != key }
@@ -623,7 +635,7 @@ actor TrustedApprovalsCoordinator {
         for key in targets.keys where key.service == serviceID && key.registration == departure.registrationID {
             if let target = targets[key]?.service { targetPins[key] = target }
         }
-        await recordMutationFailure(Self.unavailable("A transferred authority has unresolved cancellation receipts. Retain the exact evidence and choose Retry Recovery; unverifiable receipts require manual repair."), operation: ticket, context: "Authority departure")
+        await recordMutationFailure(TrustedDepartureRecoveryError(diagnosticID: ticket, serviceID: serviceID), operation: ticket, context: "Authority departure")
         advanceAdmission()
     }
     private func finishRecoveredDepartures() async {

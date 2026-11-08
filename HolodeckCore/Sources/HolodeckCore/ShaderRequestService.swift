@@ -1699,6 +1699,22 @@ public actor ShaderRequestService {
         }
         if let localFailure { throw localFailure }
     }
+    /// Coordinator recovery is nonrecursive and reports the target's actual
+    /// phase without using an error's class as cancellation intent.
+    func trustedRecoveryOutcome() async throws -> TrustedLocalRecovery {
+        do {
+            try await retryReconciliation(replayTrusted: false)
+            return .init(phase: .completed)
+        } catch {
+            try Task.checkCancellation()
+            let detail = BoundedDiagnostics.bounded(error.localizedDescription, bytes: 8192)
+            if error is TrustedRecoveryAdmissionError { return .init(phase: .refused(detail)) }
+            if error is TrustedRecoveryInterrupted || error is CancellationError {
+                return .init(phase: .interrupted(TrustedRecoveryInterrupted().localizedDescription))
+            }
+            return .init(phase: .failed(detail))
+        }
+    }
     private func recoverLocalMetadata() async throws {
         guard activeID == nil, !maintenanceBusy else { throw TrustedRecoveryAdmissionError() }
         let lease = try beginMaintenance()
@@ -2718,7 +2734,8 @@ public actor ShaderRequestService {
         // Host loss concerns new waiters, including ones queued behind an active
         // worker. It never cancels an already admitted publication or execution.
         if !hostOwners.mayDispatch {
-            let stable = startupFinalizationFailure ?? persistenceFailure ??
+            let cleanupFailure = records.values.filter { $0.cleanupPending == true }.sorted { $0.status.id.uuidString < $1.status.id.uuidString }.compactMap(\.cleanupFailure).first
+            let stable = startupFinalizationFailure ?? persistenceFailure ?? cleanupFailure ??
                 (localRecoveryAttempt == nil ? reconciliationFailure ?? blockingRecoveryEntry?.message : nil)
             if let stable { failPendingPublicationForRecovery(stable) }
             else { pauseOwnerlessPublication() }
