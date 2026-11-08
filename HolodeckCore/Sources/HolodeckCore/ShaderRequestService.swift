@@ -704,7 +704,7 @@ public actor ShaderRequestService {
         if !durableRevocations.isSubset(of: ids) {
             throw ShaderRequestError.unavailable("Trusted TV storage omitted an unacknowledged durable revocation. Retain the approval evidence and retry recovery.")
         }
-        let receipt = TrustedRevocationInspection(registrationID: revocationRegistration, revision: revision)
+        let receipt = TrustedRevocationInspection(registrationID: revocationRegistration)
         revocationInspectionPending = false; revocationFailure = nil; emitUpdates(); scheduleWakeup()
         return receipt
     }
