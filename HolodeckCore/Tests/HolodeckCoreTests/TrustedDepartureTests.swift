@@ -112,6 +112,42 @@ import XCTest
         let recovered = try await a.service.control(operation: "requestStatus", payload: .init(), deviceID: "B")
         XCTAssertTrue(recovered.enabled)
     }
+    func testUnchangedTrustedInspectionPreservesPreparedDeparture() async throws {
+        let a = try await fixture(), b = try await fixture(), backend = TrustedBackendFixture(nil), old = backend.coordinator()
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: b.service)))
+        let nextBackend = TrustedBackendFixture(nil), gate = TrustedReadGate(); nextBackend.gateReads(gate)
+        addTeardownBlock { gate.release() }
+        let next = nextBackend.coordinator(), ticket = try await next.register(TrustedOwnerRecorder().owner(service: a.service))
+        try await wait { gate.entered }
+        let before = backend.reads
+        try await b.service.retryReconciliation()
+        XCTAssertEqual(backend.reads, before + 1)
+        gate.release(); _ = try await accept(ticket)
+        try await wait { await old.observation.departures == 0 }
+        let obsolete = await old.observation, current = await next.observation
+        XCTAssertEqual(obsolete.targets, 1); XCTAssertEqual(current.targets, 1)
+        XCTAssertEqual(backend.writes, 0); XCTAssertEqual(nextBackend.writes, 0)
+    }
+    func testExceptionalActivatedDepartureClosesAdmissionButRetainsRecovery() async throws {
+        let fixture = try await fixture()
+        let bytes = try TrustedTVApprovals(approvals: [ApprovedTV(id: "B", name: "B", tokenHash: "old")]).encoded()
+        let backend = TrustedBackendFixture(bytes), authority = backend.coordinator()
+        let binding = try await accept(authority.register(TrustedOwnerRecorder().owner(service: fixture.service)))
+        let departure = try await authority.prepareDeparture(fixture.service, ticket: UUID())
+        // Defensive invariant injection, not a reproduced production producer of
+        // post-activation obligations. The actual binding is deliberately intact.
+        try departure.activate {}
+        await authority.retainDepartureRecovery(serviceID: fixture.service.runtimeID, ticket: departure.id)
+        let closed = await authority.observation; XCTAssertEqual(closed.departures, 0)
+        do { try await authority.revoke("B", permit: binding.permit) { _ in }; XCTFail("Recovery blocker ignored") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("receipt recovery")); XCTAssertTrue(error.localizedDescription.contains(departure.id.uuidString)) }
+        XCTAssertEqual(backend.read(), bytes); XCTAssertEqual(backend.writes, 0)
+        try await fixture.service.retryReconciliation()
+        let settled = await authority.observation; XCTAssertEqual(settled.targets, 0); XCTAssertEqual(settled.recoverySubscriptions, 0)
+        try await authority.revoke("B", permit: binding.permit) { _ in }
+        XCTAssertEqual(backend.writes, 1) // No remaining request target requires a removal write.
+    }
     func testFreshInspectionInvalidatesPreparedDepartureAndRetainsNewObligations() async throws {
         let a = try await fixture(), b = try await fixture(); try await submit(a.service); try await submit(b.service)
         let backend = TrustedBackendFixture(nil), old = backend.coordinator()
@@ -233,8 +269,7 @@ import XCTest
         try await wait { await old.observation.queuedRevocations == 1 }
         _ = try await accept(old.register(TrustedOwnerRecorder().owner()))
         gate.release()
-        do { _ = try await ticket.value(); XCTFail("Stale prepared transfer activated") }
-        catch { XCTAssertTrue(error.localizedDescription.contains("inspection changed during handoff")) }
+        _ = try await accept(ticket)
         do { try await revoking.value; XCTFail("Retired queued caller wrote approvals") }
         catch { XCTAssertTrue(error.localizedDescription.contains("replaced")) }
         XCTAssertEqual(backend.read(), bytes); XCTAssertEqual(backend.writes, 0)
@@ -303,10 +338,10 @@ import XCTest
     }
     func testDepartureAdmissionCannotActivateAfterInspectionInvalidation() throws {
         let departure = TrustedAuthorityDeparture(id: UUID(), serviceID: UUID(), registrationID: UUID())
-        departure.prepared(); departure.invalidatePreparation()
+        departure.prepared(.init(baseline: 1, registration: departure.registrationID, obligations: [])); departure.invalidatePreparation()
         var applied = false
         XCTAssertThrowsError(try departure.activate { applied = true }); XCTAssertFalse(applied)
-        departure.prepared(); try departure.activate { applied = true }; XCTAssertTrue(applied)
+        departure.prepared(.init(baseline: 1, registration: departure.registrationID, obligations: [])); try departure.activate { applied = true }; XCTAssertTrue(applied)
         departure.invalidatePreparation(); XCTAssertTrue(departure.activated)
         departure.close(); XCTAssertThrowsError(try departure.activate {})
     }
