@@ -156,6 +156,46 @@ private final class LifecycleClientSecrets: @unchecked Sendable {
         let old = await first.listeningPort; XCTAssertNil(old)
         try await wait { await (second.listeningPort ?? 0) > 0 }
     }
+    func testShutdownWithdrawalReceiptWaitsForExactWriteAndHasIndependentWaiters() async throws {
+        let fixture = try await fixture(), gate = TrustedWriteGate()
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [ApprovedTV(id: "A", name: "A", tokenHash: "old")]).encoded())
+        let authority = TrustedApprovalsCoordinator(read: { backend.read() }, write: { _ = gate.wait(); try backend.write($0) })
+        let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "withdrawal-" + UUID().uuidString, trustedApprovals: authority)
+        let replacement = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "withdrawal-next-" + UUID().uuidString, trustedApprovals: authority)
+        addTeardownBlock { gate.release(); try await replacement.clearTestSecrets(); try await server.clearTestSecrets() }
+        await server.setRequestService(fixture.service); try await server.start()
+        try await wait { await (server.listeningPort ?? 0) > 0 }
+        let generation = await authority.observation.acceptedGeneration
+        gate.arm(); let writing = Task { try await server.revoke("A") }
+        addTeardownBlock { gate.release(); _ = try? await writing.value }
+        try await wait { gate.entered }
+        let receipt = await server.shutdownReceipt(), repeated = await server.shutdownReceipt()
+        XCTAssertTrue(receipt === repeated)
+        let port = await server.listeningPort; XCTAssertNil(port)
+        let held = await authority.observation; XCTAssertEqual(held.acceptedGeneration, generation)
+        let cancelled = Task { try await receipt.value() }; cancelled.cancel()
+        do { try await cancelled.value; XCTFail("Cancelled receipt waiter completed") } catch is CancellationError {}
+        let released = LifecycleCounter(), premature = expectation(description: "withdrawal cannot precede admitted trusted write")
+        premature.isInverted = true
+        let draining = Task { try await receipt.value(); if released.value == 0 { premature.fulfill() } }
+        addTeardownBlock { draining.cancel(); gate.release(); _ = try? await draining.value }
+        await fulfillment(of: [premature], timeout: 0.05)
+        released.add(); gate.release(); try await writing.value; try await draining.value
+        let withdrawn = await authority.observation; XCTAssertNil(withdrawn.acceptedGeneration)
+        try await replacement.revoke("not-approved") // Vacancy admission now sees the completed withdrawal.
+    }
+    func testOldWithdrawalReceiptCannotClearAnExplicitReactivation() async throws {
+        let fixture = try await fixture(), authority = TrustedBackendFixture(nil).coordinator()
+        let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "withdrawal-reactivation-" + UUID().uuidString, trustedApprovals: authority)
+        addTeardownBlock { try await server.clearTestSecrets() }
+        await server.setRequestService(fixture.service)
+        let receipt = await server.shutdownReceipt(); try await receipt.value()
+        await server.setRequestService(fixture.service)
+        let accepted = await authority.observation.acceptedGeneration; XCTAssertNotNil(accepted)
+        await authority.withdraw(serverID: receipt.serverID, eligibility: receipt.lifetime)
+        try await receipt.value()
+        let retained = await authority.observation.acceptedGeneration; XCTAssertEqual(retained, accepted)
+    }
     func testStopInvalidatesInitialStartAcrossInspectionAwait() async throws {
         let fixture = try await fixture(), backend = TrustedBackendFixture(nil), gate = TrustedWriteGate()
         let authority = TrustedApprovalsCoordinator(read: { _ = gate.wait(); return backend.read() }, write: { try backend.write($0) })

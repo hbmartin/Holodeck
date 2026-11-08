@@ -5,7 +5,7 @@ import XCTest
 
 @MainActor final class TrustedTargetRecoveryTests: XCTestCase {
     private struct Fixture { let root: URL; let service: ShaderRequestService }
-    private func fixture(fault: TargetStorageFault? = nil, repair: TargetRepairCounter? = nil) async throws -> Fixture {
+    private func fixture(fault: TargetStorageFault? = nil, repair: TargetRepairCounter? = nil, repairFailure: TargetStorageFault? = nil) async throws -> Fixture {
         let root = URL(fileURLWithPath: "/private/tmp").appendingPathComponent("pr46-" + UUID().uuidString)
         if repair != nil {
             let journal = root.appendingPathComponent("own-entry")
@@ -15,7 +15,7 @@ import XCTest
             try recovery.encoded().write(to: root.appendingPathComponent("recovery.json"))
         }
         let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root,
-            workerScript: root.appendingPathComponent("unused.py"), reconcileWorker: { if $0.lastPathComponent == "own-entry" { repair?.add() } },
+            workerScript: root.appendingPathComponent("unused.py"), reconcileWorker: { if $0.lastPathComponent == "own-entry" { repair?.add(); if repairFailure?.enabled == true { throw POSIXError(.EIO) } } },
             beforePersistenceReplacement: { if $0.lastPathComponent == "journal.json", fault?.enabled == true { throw POSIXError(.EIO) } })
         await service.suspend(); try await service.initialize(configuration: .init(repository: root.path, enabled: true))
         addTeardownBlock { await service.suspend(); try? FileManager.default.removeItem(at: root) }
@@ -122,6 +122,37 @@ import XCTest
         fault.enabled = false; try await own.service.retryReconciliation()
         XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
     }
+    func testTrustedInspectionRecoversEvenWhenLocalJournalStillFails() async throws {
+        let failure = TargetStorageFault(), counter = TargetRepairCounter()
+        let own = try await fixture(repair: counter, repairFailure: failure)
+        let backend = TrustedBackendFixture(nil), authority = backend.coordinator()
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: own.service)))
+        backend.failReads(true)
+        do { _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: own.service))); XCTFail("Failed inspection accepted") }
+        catch let error as POSIXError { XCTAssertEqual(error.code, .EACCES) }
+        failure.enabled = true
+        let reads = backend.reads
+        do { try await own.service.retryReconciliation(); XCTFail("Both recovery failures accepted") }
+        catch let error as TrustedPartialRecovery {
+            XCTAssertFalse(error.completedServices.contains(own.service.runtimeID))
+            XCTAssertTrue(error.remaining.joined().contains(POSIXError(.EIO).localizedDescription))
+            XCTAssertTrue(error.remaining.joined().contains(POSIXError(.EACCES).localizedDescription))
+        }
+        XCTAssertGreaterThan(backend.reads, reads)
+        backend.failReads(false)
+        let nextReads = backend.reads
+        do { try await own.service.retryReconciliation(); XCTFail("Local recovery failure accepted") }
+        catch let error as TrustedPartialRecovery {
+            XCTAssertFalse(error.completedServices.contains(own.service.runtimeID))
+            XCTAssertTrue(error.remaining.joined().contains(POSIXError(.EIO).localizedDescription))
+            XCTAssertFalse(error.remaining.joined().contains(POSIXError(.EACCES).localizedDescription))
+        }
+        XCTAssertGreaterThan(backend.reads, nextReads)
+        let statuses = await own.service.recoveryStatuses()
+        XCTAssertFalse(statuses.contains { $0.message.contains("TV approval inspection requires recovery") })
+        failure.enabled = false; try await own.service.retryReconciliation()
+        let restored = await own.service.recoveryStatuses(); XCTAssertTrue(restored.isEmpty)
+    }
     func testFailedCandidateShutdownCannotReplaceTheLiveOwnerOnRetry() async throws {
         let fixture = try await fixture(), backend = TrustedBackendFixture(try TrustedTVApprovals().encoded()), authority = backend.coordinator()
         let catalog = DirectoryCatalog(directory: fixture.root.appendingPathComponent("catalog"))
@@ -189,6 +220,40 @@ import XCTest
         let one = TrustedRevocationApplication(serviceID: service, registrationID: UUID(), authority: authority, intent: intent)
         let two = TrustedRevocationApplication(serviceID: service, registrationID: UUID(), authority: authority, intent: intent)
         XCTAssertThrowsError(try TrustedRevocationRemoval.checked(authority: authority, intent: intent, proofs: [one, two]))
+    }
+    func testFreshTargetReceivesExistingIntentFailureWithoutAnotherTrustedWrite() async throws {
+        let a = try await fixture(), b = try await fixture(), intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        let detail = "Specific retained cancellation failure " + intent.operationID.uuidString
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(revocations: [intent]).encoded()), authority = backend.coordinator()
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a.service, beforeReplay: { _ in throw ShaderRequestError.unavailable(detail) })))
+        do { try await authority.replay(); XCTFail("Replay should retain failure") }
+        catch { XCTAssertEqual((error as? any TrustedReportedDiagnostic)?.diagnosticID, intent.operationID) }
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: b.service)))
+        let original = try await a.service.control(operation: "requestStatus", payload: .init(), deviceID: "A")
+        let fresh = try await b.service.control(operation: "requestStatus", payload: .init(), deviceID: "A")
+        XCTAssertTrue(original.message.contains(detail)); XCTAssertTrue(fresh.message.contains(detail))
+        XCTAssertFalse(fresh.enabled); XCTAssertEqual(backend.writes, 0)
+        XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations, [intent])
+    }
+    func testSharedRemovalFailureRemainsADepartureDependencyAfterLocalApplication() async throws {
+        let fault = TargetStorageFault(), a = try await fixture(), b = try await fixture(fault: fault)
+        try await submit(a.service); try await submit(b.service)
+        let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(revocations: [intent]).encoded()), old = backend.coordinator()
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
+        let prior = try await accept(old.register(TrustedOwnerRecorder().owner(service: b.service)))
+        fault.enabled = true
+        do { try await old.replay(); XCTFail("Shared removal ignored failed target") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        let applied = await a.service.allJobs(); XCTAssertEqual(applied.first?.stage, .cancelled)
+        let next = TrustedBackendFixture(nil).coordinator()
+        do { _ = try await accept(next.register(TrustedOwnerRecorder().owner(service: a.service))); XCTFail("Unfinished shared removal allowed departure") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        XCTAssertTrue(prior.permit.isCurrent); XCTAssertEqual(backend.writes, 0)
+        XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations, [intent])
+        fault.enabled = false; try await b.service.retryReconciliation()
+        _ = try await accept(next.register(TrustedOwnerRecorder().owner(service: a.service)))
+        let cancelled = await b.service.allJobs(); XCTAssertEqual(cancelled.first?.stage, .cancelled)
     }
     func testReplayFailureAndSnapshotCarryTheSameExplicitIdentity() async throws {
         let fixture = try await fixture(), intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")

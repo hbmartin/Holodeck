@@ -34,8 +34,9 @@ private final class ProfileTrustedStore: @unchecked Sendable {
         let reservations = await service.trustedReservationCount
         XCTAssertEqual(reservations, 0); XCTAssertEqual(work.obligations, 0); XCTAssertEqual(work.departures, 0)
         XCTAssertEqual(work.targets, 1); XCTAssertEqual(work.inspections, 1)
+        XCTAssertEqual(work.queuedRevocations, 0); XCTAssertEqual(work.recoverySubscriptions, 1)
         XCTAssertEqual(actual.writes, count * 2); XCTAssertEqual(work.writes, count * 2); XCTAssertEqual(work.encodings, count * 2)
-        // The identical opt-in profile is also run against PR #44, which intentionally rereads.
+        // The same opt-in workload is run against the merged predecessor without timing assertions.
         if !profiling { XCTAssertEqual(actual.reads, 1) }
         print("TRUSTED_PROFILE commands=\(count) reads=\(actual.reads) writes=\(actual.writes) encodings=\(work.encodings) elapsed=\(elapsed)")
     }

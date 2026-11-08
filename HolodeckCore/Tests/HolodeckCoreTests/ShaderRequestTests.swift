@@ -1439,6 +1439,78 @@ final class ShaderRequestTests: XCTestCase {
         await service.suspend(); try Data().write(to: job.appendingPathComponent("release"))
     }
 
+    func testPublicationWaitsForOwnedAutomaticRetryBeforePreparing() async throws {
+        let (root, script) = try recoveryFixture()
+        try """
+        import json,sys,time
+        from pathlib import Path
+        job=Path(sys.argv[3])
+        if sys.argv[1]=='publication':
+            (job/'publication-reached').touch()
+            print(json.dumps(dict(event='failure',message='Publication reached after retry')),flush=True);raise SystemExit(1)
+        counter=job/'attempts';n=int(counter.read_text())+1 if counter.exists() else 1;counter.write_text(str(n))
+        if n==1:
+            print(json.dumps(dict(event='failure',failureKind='supervision',message='Original fault')),flush=True);raise SystemExit(1)
+        (job/'retry-started').touch()
+        while not (job/'release').exists():time.sleep(.005)
+        print(json.dumps(dict(event='clarification',question='Choose',options=['A','B'])),flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let service = try await recoveryService(root, script: script), request = ShaderRequest(prompt: "Retry", context: try context())
+        _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "A")
+        let job = root.appendingPathComponent(request.id.uuidString)
+        await service.resume(); try await waitFor { FileManager.default.fileExists(atPath: job.appendingPathComponent("retry-started").path) }
+        let publication = Task { try await service.ensurePublication(force: true) }
+        addTeardownBlock { publication.cancel(); try? Data().write(to: job.appendingPathComponent("release")); await service.suspend() }
+        try await waitFor { await service.pendingPublicationWaiterCount == 1 }
+        let recoveries = await service.recoveryStatuses(); XCTAssertTrue(recoveries.contains { $0.isRetrying && $0.isRunning })
+        try Data().write(to: job.appendingPathComponent("release"))
+        do { try await publication.value; XCTFail("Fixture publication succeeded") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("Publication reached after retry")); XCTAssertFalse(error.localizedDescription.contains("needs checkout recovery")) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("publication/publication-reached").path))
+        await service.suspend()
+    }
+
+    func testPublicationWaitsDuringExplicitJournalRecovery() async throws {
+        let (rawRoot, script) = try recoveryFixture(), root = URL(fileURLWithPath: RequestPaths.canonical(rawRoot))
+        let gate = RequestPreparationGate(), journal = root.appendingPathComponent("recovering")
+        try FileManager.default.createDirectory(at: journal, withIntermediateDirectories: true)
+        var store = RequestRecoveryStore(); store.legacyMigrationComplete = true
+        store.entries[journal.path] = .init(journal: journal.path, disposition: .retainResult, message: "Recovering retained result")
+        try store.encoded().write(to: root.appendingPathComponent("recovery.json"))
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root,
+            workerScript: script, reconcileWorker: { if $0.lastPathComponent == "recovering" { await gate.hold() } })
+        await service.suspend(); try await service.initialize(configuration: .init(repository: root.path))
+        let retry = Task { try await service.retryReconciliation() }
+        addTeardownBlock { retry.cancel(); await gate.release(); _ = try? await retry.value; await service.suspend() }
+        try await waitFor { await gate.entered }
+        let publication = Task { try await service.ensurePublication(force: true) }
+        addTeardownBlock { publication.cancel(); _ = try? await publication.value }
+        try await waitFor { await service.pendingPublicationWaiterCount == 1 }
+        await gate.release(); try await retry.value
+        let count = await service.pendingPublicationWaiterCount; XCTAssertEqual(count, 1)
+        publication.cancel(); do { try await publication.value; XCTFail("Cancelled publication succeeded") } catch is CancellationError {}
+    }
+
+    func testHealthyPublicationCanContinueThroughAuthorityTransfer() async throws {
+        let f = try await publicationRecoveryFixture()
+        let original = try String(contentsOf: f.script, encoding: .utf8)
+        try original.replacingOccurrences(of: "if mode=='publication':", with: """
+        if mode=='publication':
+            (job/'started').touch()
+            while not (job/'release').exists(): time.sleep(.005)
+        """).write(to: f.script, atomically: true, encoding: .utf8)
+        let old = TrustedBackendFixture(nil).coordinator(), next = TrustedBackendFixture(nil).coordinator()
+        _ = try await old.register(TrustedOwnerRecorder().owner(service: f.service)).value()
+        await f.service.resume(); let publication = Task { try await f.service.ensurePublication(force: true) }
+        let job = f.root.appendingPathComponent("publication")
+        addTeardownBlock { publication.cancel(); try? Data().write(to: job.appendingPathComponent("release")); await f.service.suspend() }
+        try await waitFor { FileManager.default.fileExists(atPath: job.appendingPathComponent("started").path) }
+        guard case .accepted = try await next.register(TrustedOwnerRecorder().owner(service: f.service)).value() else { return XCTFail("Healthy publication transfer superseded") }
+        try Data().write(to: job.appendingPathComponent("release")); try await publication.value
+        let status = await f.service.publicationStatus(); XCTAssertNotNil(status)
+        await f.service.suspend()
+    }
+
     func testCancelledInitialVerifyAllowsChangedRepositoryOrPython() async throws {
         for changeRepository in [true, false] {
             let (root, script) = try recoveryFixture(), gate = RequestPreparationGate()
@@ -5452,7 +5524,6 @@ extension ShaderRequestTests {
         try await service.commitTrustedRevocation(second, revision: revision)
         try await service.loadTrustedRevocations([second], revision: revision)
         try await service.acknowledgeTrustedRevocation(second, revision: revision) {}
-        await service.revocationReplaySucceeded(revision: revision)
         let cleared = await service.recoveryStatuses(); XCTAssertTrue(cleared.isEmpty)
         try await service.commitTrustedRevocation(first, revision: revision)
         do { try await service.loadTrustedRevocations([], revision: revision); XCTFail("Durable uncertainty disappeared") } catch {}

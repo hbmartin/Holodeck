@@ -36,6 +36,35 @@ nonisolated final class WeakRequestService: @unchecked Sendable {
     init(_ value: ShaderRequestService?) { self.value = value }
 }
 
+/// Delayed recovery callbacks must belong to the exact current registration.
+nonisolated final class TrustedRecoverySubscription: @unchecked Sendable {
+    let authority: UUID
+    let serviceID: UUID
+    let registrationID: UUID
+    private let token = TrustedInvalidationToken()
+    init(authority: UUID, serviceID: UUID, registrationID: UUID) {
+        self.authority = authority; self.serviceID = serviceID; self.registrationID = registrationID
+    }
+    var isCurrent: Bool { token.isCurrent }
+    func invalidate() { token.invalidate() }
+}
+
+/// Transport shutdown is immediate; each waiter may independently await exact
+/// authority withdrawal without cancelling the admitted transition or its drain.
+nonisolated final class TrustedWithdrawalReceipt: Sendable {
+    let serverID: UUID
+    let lifetime: TrustedOwnerLifetime
+    private let completion: Task<Void, Never>
+    init(serverID: UUID, lifetime: TrustedOwnerLifetime, completion: Task<Void, Never>) {
+        self.serverID = serverID; self.lifetime = lifetime; self.completion = completion
+    }
+    func value() async throws {
+        let waiter = RequestPersistence.CommitTicket<Void>(), completion = completion
+        Task { await completion.value; waiter.complete(.success(())) }
+        try await waiter.value()
+    }
+}
+
 nonisolated final class TrustedApprovalEligibility: @unchecked Sendable {
     private enum State { case eligible, admitted, closed }
     private let lock = NSLock()

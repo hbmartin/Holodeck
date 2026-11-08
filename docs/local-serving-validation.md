@@ -971,3 +971,44 @@ These timings describe the synthetic fixture, not real Keychain latency. Gated r
 Evidence: `/tmp/pr46-final-{core,release}.log`, `/tmp/pr46-race-status.json`, `/tmp/pr46-races-*.log`, `/tmp/pr46-profile-{baseline,current}.json`, `/tmp/pr46-final-{mac,tv}-build.log`, `/tmp/pr46-final-artifact.json`, `/tmp/pr46-final-source.json`, and `/tmp/pr46-teardown-counterexample.json`.
 
 Desktop UI runtime checks remain **blocked under the user's instruction**. Live Bonjour/LAN discovery, physical Apple TV and tvOS simulator execution were not run. Worker/checker/shader sources and artifact locks are unchanged; their separate Python, checker-release, compile-all-Metal and external GPU-profile suites were not rerun. The core Metal fixtures did run. Linux CI, network messages and persisted formats are unchanged. No live installation replacement, request enabling, merge or deployment occurred.
+
+
+## PR #46 follow-up — queued revocations and recovery boundaries (2026-11-07)
+
+This change starts from merged PR #46, `5507e8c7a2048fd81dbc3def6e0dc940e602d3fd`. New revocations wait outside the authority lane until active departure tickets settle. They prepare no candidate and reserve no device before admission. Duplicate callers share one durable intent and write pair; each queued caller can cancel independently. Ready revocations precede later departure preparations. On successful transfer the old authority removes the moved target before admitting queued revocations; on cancellation it retains that target. Queued revocations are provisional until the trusted write, rather than accepted cancellation obligations that may disappear during transfer.
+
+Departure tickets bind service and registration identities and atomically validate activation. Trusted inspection includes still-registered departing targets, and a new or inconclusive inspection invalidates prepared activation. Cancellation rereads an unknown baseline and retains an inspection failure if that read fails. Departure coordination bypasses pending registrations it must unblock, without holding both authority lanes; the opposing-transfer regression witnesses both queued replacement generations before releasing its gates. Earlier durable cancellation and shared-removal obligations still settle before transfer. A locally applied cancellation does not justify ignoring another required target's failed shared removal. The independently unrelated public-path claim in review item #9 remains qualified; the implementation now scopes departure results by the target's actual obligations.
+
+Local metadata recovery and trusted recovery attempt independent safe work and report bounded partial outcomes. Failed local recovery neither suppresses a fresh approvals inspection nor falsely counts the requester as recovered. In-flight retries and explicit recovery keep publication waiters pending until their result is known. Stable blockers still report recovery. Verified healthy publication ownership can continue through transfer, and transfer completion/cancellation schedules a coalesced wakeup for eligible work.
+
+Shutdown stops transport immediately and returns an idempotent lifetime-scoped withdrawal receipt internally. Independent receipt waiters can cancel without abandoning authority withdrawal; stale lifetimes cannot clear an explicit reactivation. Secret cleanup awaits that receipt instead of issuing a second withdrawal. Superseded preparation returns `.superseded`, while actual cancellation and the selected normal stop outcome retain their behavior. Departure cleanup can close an abandoned ticket by identity without its weak service. Exact recovery subscriptions are invalidated and removed on settled departure, so delayed notifications and later faults cannot repin an obsolete authority. Required evidence and recovery pins remain retained.
+
+Successful inspection forwards existing intent-specific diagnostics to its exact targets. Shared intent views, backend reads and deterministic failure selection replace duplicated construction; approval uncertain-write readback retains its separate semantics. Successful inspection schedules its own wakeup; the redundant replay-success broadcast/receipt map, unreachable guards and unused reservation overload are removed. Inspection epoch validation remains in place.
+
+Validation against the frozen final source:
+
+- Full Swift core/native and packaged-resource suite: **552 tests, six opt-in skips, zero failures**. `HOLODECK_AUTHORING_FIXTURE=/Volumes/Pro2T/HolodeckShaders HOLODECK_GPU_TESTS=1 swift test --package-path HolodeckCore` verified **25 local scenes**.
+- Focused optimized selection: **94 tests, zero failures**, including trusted state, publication waiting, ownership boundaries, isolated TLS and packaged resources.
+- Twenty optimized repetitions of 71 gated lifecycle, transfer, recovery, publication and isolated TLS tests: **1,420 executions, zero failures**. Gates witness admission before release; backstops bound incomplete tasks.
+- The real Mac model partial-recovery counterexample is maintained in `tools/check_mac_requests_recovery.py`. It passed under system Python 3.9 and the current interpreter with temporary storage, no listeners, Keychain writes or desktop UI. It proves accepted settings arrive through `localUpdates()` even when Retry reports partial recovery. Normal stop/start outcome tests also remain unchanged and pass.
+- Both unsigned Release app builds succeeded. The built Mac app's native `library artifact-info --json` verified the unchanged checker **1.1.1**, interface **1**, SHA-256 `8a8229c76e6e42d91d84fe9744bf53bbcda0c9dc8064ba82a41e2b15bb66ef19`.
+- Frozen runtime/test hashes matched final Debug, Release, repetitions, headless model checks and app builds. An initial new-fixture failure used a noncanonical recovery path; it was corrected before final acceptance runs. Earlier development results are excluded from these totals.
+
+The identical 200-revocation workload ran in separately built Release versions of merged PR #46 and this change, using the same compiler, injected trusted backend and `/private/tmp` filesystem. Seven alternating samples per version, medians:
+
+| Metric | Merged PR #46 | Follow-up |
+| --- | ---: | ---: |
+| Trusted reads | 1 | 1 |
+| Trusted writes | 400 | 400 |
+| Candidate encodings | 400 | 400 |
+| Workload elapsed | 67.54 ms | 66.57 ms |
+| Process user CPU | 123.46 ms | 122.20 ms |
+| Process system CPU | 23.38 ms | 22.82 ms |
+| Voluntary context switches | 3 | 3 |
+| Involuntary context switches | 1845 | 1686 |
+
+Context switches are process-level measurements, not counts of service scheduling calls. Admission waits use continuations and existing coalesced scheduling rather than polling. Current gated success/cancellation cases each completed 128 unrelated request-service status reads in 2.63–2.97 ms while transfer I/O remained held, with zero trusted writes/encodings and no extra trusted reads. Structural assertions cover two successful writes per normal revocation, zero rejected-candidate encoding, empty retired admissions/obligations, and bounded retained targets/subscriptions. These measurements impose no CI timing threshold.
+
+Evidence: `/tmp/pr47-final-{core,release,mac-build,tv-build,model39,model-current}.log`, `/tmp/pr47-race-status.json`, `/tmp/pr47-races-*.log`, `/tmp/pr47-profile-{baseline,current,gated}.json`, `/tmp/pr47-final-artifact.json`, and `/tmp/pr47-final-source.json`. The baseline archive at `/private/tmp/pr47-profile-baseline` matches `5507e8c`; the maintained headless check is reproducible from the repository after building Debug tests.
+
+Desktop UI runtime checks remain **blocked under the user's instruction**. Live Bonjour/LAN discovery, real Codex publication, physical Apple TV and tvOS simulator execution were not run. The six core skips cover three unrelated catalog profiles, live discovery, real Codex publication and worker-supervision profiling. Isolated loopback TLS and local core Metal/GPU fixtures did run. Worker/checker/shader sources and artifact locks are unchanged; their separate Python worker, checker-release, compile-all-Metal and external GPU-profile suites were not rerun. Linux CI, network messages and persisted envelope/journal formats are unchanged. No live installation replacement, request enabling, merge or deployment occurred.
