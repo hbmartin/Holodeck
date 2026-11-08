@@ -596,7 +596,6 @@ public actor ShaderRequestService {
     }
     private var revocationReservations: [UUID: TrustedRevocationReservation] = [:]
     var trustedReservationCount: Int { revocationReservations.count }
-    private var revocationInspection: TrustedRevocationInspection?
     private var revocationRegistration = UUID()
     private var revocationApplications: [UUID: TrustedRevocationApplication] = [:]
     private var pendingRevocations: [UUID: RequestRevocationIntent] = [:]
@@ -658,7 +657,7 @@ public actor ShaderRequestService {
     }
     private func bindRevocationCoordinator(id: UUID, _ coordinator: @escaping @Sendable (TrustedLocalRecovery) async throws -> Void) -> UUID {
         if revocationCoordinatorID == id { revocationCoordinator = coordinator; return revocationRegistration }
-        revocationRegistration = UUID(); revocationApplications.removeAll(); revocationInspection = nil
+        revocationRegistration = UUID(); revocationApplications.removeAll()
         controlScopes.removeAll()
         revocationCoordinatorID = id; revocationRevision = 0
         revocationCoordinator = coordinator; revocationInspectionPending = true; emitUpdates()
@@ -684,11 +683,6 @@ public actor ShaderRequestService {
         if !durableRevocations.contains(id), pendingRevocations[id] == receipt.intent { pendingRevocations[id] = nil }
         emitUpdates(); kick()
     }
-    func cancelRevocationReservation(_ intent: RequestRevocationIntent, revision: TrustedRevocationRevision) {
-        guard (try? acceptRevocationRevision(revision)) != nil else { return }
-        if !durableRevocations.contains(intent.operationID), pendingRevocations[intent.operationID] == intent { pendingRevocations[intent.operationID] = nil }
-        emitUpdates(); kick()
-    }
     func commitTrustedRevocation(_ intent: RequestRevocationIntent, revision: TrustedRevocationRevision) throws {
         try acceptRevocationRevision(revision)
         pendingRevocations[intent.operationID] = intent; durableRevocations.insert(intent.operationID)
@@ -711,8 +705,7 @@ public actor ShaderRequestService {
             throw ShaderRequestError.unavailable("Trusted TV storage omitted an unacknowledged durable revocation. Retain the approval evidence and retry recovery.")
         }
         let receipt = TrustedRevocationInspection(registrationID: revocationRegistration, revision: revision)
-        revocationInspection = receipt
-        revocationInspectionPending = false; revocationFailure = nil; emitUpdates()
+        revocationInspectionPending = false; revocationFailure = nil; emitUpdates(); scheduleWakeup()
         return receipt
     }
     @discardableResult func applyTrustedRevocation(_ intent: RequestRevocationIntent, revision: TrustedRevocationRevision) async throws -> TrustedRevocationApplication {
@@ -765,23 +758,16 @@ public actor ShaderRequestService {
             if let intent {
                 guard revision.coordinator == revocationCoordinatorID, pendingRevocations[intent.operationID] == intent else { return }
             } else if (try? acceptRevocationRevision(revision)) == nil { return }
-            if intent == nil { revocationInspection = nil }
         }
         let detail = RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 8192)
-        if let intent { revocationFailures[intent.operationID] = detail } else { revocationFailure = detail }
+        if let intent {
+            guard revocationFailures[intent.operationID] != detail else { return }
+            revocationFailures[intent.operationID] = detail
+        } else {
+            guard revocationFailure != detail else { return }
+            revocationFailure = detail
+        }
         emitUpdates(); kick()
-    }
-    func revocationReplaySucceeded(inspection: TrustedRevocationInspection) {
-        guard inspection.registrationID == revocationRegistration,
-              revocationInspection?.registrationID == inspection.registrationID,
-              revocationInspection?.revision == inspection.revision,
-              (try? acceptRevocationRevision(inspection.revision)) != nil else { return }
-        revocationFailure = nil; revocationInspectionPending = false; emitUpdates(); kick()
-    }
-    // Compatibility for existing internal callers: only an actual inspection can clear this blocker.
-    func revocationReplaySucceeded(revision: TrustedRevocationRevision) {
-        guard let inspection = revocationInspection, inspection.revision == revision else { return }
-        revocationReplaySucceeded(inspection: inspection)
     }
     private var setupMessage = "Enable shader requests in Mac Settings."
 
@@ -1174,8 +1160,11 @@ public actor ShaderRequestService {
     private func isActiveRetry(_ key: String) -> Bool {
         activeRetryJournals[key] == execution?.id && execution?.interrupted == false
     }
+    private var blockingRecoveryEntry: RequestRecoveryStore.Entry? {
+        recovery.entries.values.filter { !isActiveRetry($0.journal) }.min { $0.journal < $1.journal }
+    }
     private func refreshReconciliationFailure() {
-        if let entry = recovery.entries.values.sorted(by: { $0.journal < $1.journal }).first(where: { !isActiveRetry($0.journal) }) {
+        if let entry = blockingRecoveryEntry {
             reconciliationFailure = entry.message; reconciliationJournal = URL(fileURLWithPath: entry.journal)
             reconciliationConfiguration = entry.configuration
         } else { reconciliationFailure = nil; reconciliationJournal = nil; reconciliationConfiguration = nil }
@@ -1185,7 +1174,7 @@ public actor ShaderRequestService {
     private func checkoutRecoveryBlocker(includeRevokedCleanup: Bool) -> String? {
         if let startupFinalizationFailure { return startupFinalizationFailure }
         if let persistenceFailure { return "Mac persistence recovery required: " + persistenceFailure }
-        if let entry = recovery.entries.values.sorted(by: { $0.journal < $1.journal }).first(where: { !isActiveRetry($0.journal) }) { return "Mac checkout recovery required: " + entry.message }
+        if let entry = blockingRecoveryEntry { return "Mac checkout recovery required: " + entry.message }
         if let reconciliationFailure { return "Mac checkout recovery required: " + reconciliationFailure }
         if let record = records.values.first(where: { $0.cleanupPending == true && (includeRevokedCleanup || !$0.revoked || $0.cleanupFailure != nil) }) {
             return "Mac checkout recovery required: " + (record.cleanupFailure ?? record.cleanupMessage ?? "Checkout cleanup is pending.")
@@ -2706,13 +2695,12 @@ public actor ShaderRequestService {
         if let persistenceFailure { failPendingPublicationForRecovery(persistenceFailure); return }
         guard !maintenanceBusy, activeID == nil, workerTask == nil else { return }
         if let reconciliationFailure { failPendingPublicationForRecovery(reconciliationFailure); return }
-        if let entry = recovery.entries.values.filter({ !isActiveRetry($0.journal) }).min(by: { $0.journal < $1.journal }) { failPendingPublicationForRecovery(entry.message); return }
+        if let entry = blockingRecoveryEntry { failPendingPublicationForRecovery(entry.message); return }
         guard hostOwners.mayDispatch else { pauseOwnerlessPublication(); return }
         guard loaded, initialized, !suspended else { return }
         if storageCommit != nil || pendingCommits != 0 || !pendingRetirements.isEmpty || retirementTask != nil { schedulingDeferred = true; return }
         if !reconciled {
             guard reconciliationKickID == nil, reconciliationTask == nil else { return }
-            if let reconciliationFailure { failPendingPublicationForRecovery(reconciliationFailure); return }
             let id = UUID(); reconciliationKickID = id
             Task {
                 do {
@@ -2727,7 +2715,6 @@ public actor ShaderRequestService {
             }
             return
         }
-        if let entry = recovery.entries.values.first { failPendingPublicationForRecovery(entry.message); return }
         let eligible = records.values.filter { !$0.revoked && $0.detached != true && revocationBlocker(for: $0.status.deviceID) == nil }.map(\.status)
         if let recoveryID, let failure = records[recoveryID]?.cleanupFailure {
             failPendingPublicationForRecovery(failure); return

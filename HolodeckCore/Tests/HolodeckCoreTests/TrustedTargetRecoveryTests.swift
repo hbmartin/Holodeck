@@ -221,6 +221,40 @@ import XCTest
         let two = TrustedRevocationApplication(serviceID: service, registrationID: UUID(), authority: authority, intent: intent)
         XCTAssertThrowsError(try TrustedRevocationRemoval.checked(authority: authority, intent: intent, proofs: [one, two]))
     }
+    func testFreshTargetReceivesExistingIntentFailureWithoutAnotherTrustedWrite() async throws {
+        let a = try await fixture(), b = try await fixture(), intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        let detail = "Specific retained cancellation failure " + intent.operationID.uuidString
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(revocations: [intent]).encoded()), authority = backend.coordinator()
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a.service, beforeReplay: { _ in throw ShaderRequestError.unavailable(detail) })))
+        do { try await authority.replay(); XCTFail("Replay should retain failure") }
+        catch { XCTAssertEqual((error as? any TrustedReportedDiagnostic)?.diagnosticID, intent.operationID) }
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: b.service)))
+        let original = try await a.service.control(operation: "requestStatus", payload: .init(), deviceID: "A")
+        let fresh = try await b.service.control(operation: "requestStatus", payload: .init(), deviceID: "A")
+        XCTAssertTrue(original.message.contains(detail)); XCTAssertTrue(fresh.message.contains(detail))
+        XCTAssertFalse(fresh.enabled); XCTAssertEqual(backend.writes, 0)
+        XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations, [intent])
+    }
+    func testSharedRemovalFailureRemainsADepartureDependencyAfterLocalApplication() async throws {
+        let fault = TargetStorageFault(), a = try await fixture(), b = try await fixture(fault: fault)
+        try await submit(a.service); try await submit(b.service)
+        let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(revocations: [intent]).encoded()), old = backend.coordinator()
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
+        let prior = try await accept(old.register(TrustedOwnerRecorder().owner(service: b.service)))
+        fault.enabled = true
+        do { try await old.replay(); XCTFail("Shared removal ignored failed target") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        let applied = await a.service.allJobs(); XCTAssertEqual(applied.first?.stage, .cancelled)
+        let next = TrustedBackendFixture(nil).coordinator()
+        do { _ = try await accept(next.register(TrustedOwnerRecorder().owner(service: a.service))); XCTFail("Unfinished shared removal allowed departure") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        XCTAssertTrue(prior.permit.isCurrent); XCTAssertEqual(backend.writes, 0)
+        XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations, [intent])
+        fault.enabled = false; try await b.service.retryReconciliation()
+        _ = try await accept(next.register(TrustedOwnerRecorder().owner(service: a.service)))
+        let cancelled = await b.service.allJobs(); XCTAssertEqual(cancelled.first?.stage, .cancelled)
+    }
     func testReplayFailureAndSnapshotCarryTheSameExplicitIdentity() async throws {
         let fixture = try await fixture(), intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
         let backend = TrustedBackendFixture(try TrustedTVApprovals(revocations: [intent]).encoded()), authority = backend.coordinator(), owner = TrustedOwnerRecorder()

@@ -5524,7 +5524,6 @@ extension ShaderRequestTests {
         try await service.commitTrustedRevocation(second, revision: revision)
         try await service.loadTrustedRevocations([second], revision: revision)
         try await service.acknowledgeTrustedRevocation(second, revision: revision) {}
-        await service.revocationReplaySucceeded(revision: revision)
         let cleared = await service.recoveryStatuses(); XCTAssertTrue(cleared.isEmpty)
         try await service.commitTrustedRevocation(first, revision: revision)
         do { try await service.loadTrustedRevocations([], revision: revision); XCTFail("Durable uncertainty disappeared") } catch {}
