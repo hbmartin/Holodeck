@@ -27,11 +27,15 @@ nonisolated final class TrustedOwnerPermit: @unchecked Sendable {
 }
 
 protocol TrustedReportedDiagnostic: Error { var diagnosticID: UUID { get } }
+struct TrustedLocalRecovery: Sendable {
+    let failure: String?
+    var completed: Bool { failure == nil }
+}
 struct TrustedPartialRecovery: LocalizedError, Sendable {
     let completedServices: [UUID]
     let remaining: [String]
     var errorDescription: String? {
-        remaining.joined(separator: "\n") + "\nPartial recovery: local progress was committed; unresolved trusted targets remain."
+        remaining.joined(separator: "\n") + "\nPartial recovery: completed phases were committed; unresolved local or trusted recovery remains."
     }
 }
 struct TrustedRevocationApplication: Sendable, Equatable {
@@ -211,6 +215,7 @@ actor TrustedApprovalsCoordinator {
     private var replayTask: Task<Void, Never>?
     private var replayWaiters: [UUID: [CheckedContinuation<Void, Error>]] = [:]
     private var replayAll: [CheckedContinuation<Void, Error>] = []
+    private var departureReplay: [UUID: [CheckedContinuation<Void, Error>]] = [:]
 
     init(read: @escaping @Sendable () throws -> Data?, write: @escaping @Sendable (Data) throws -> Void,
          retainEvidence: @escaping @Sendable (TrustedApprovalsCoordinator, Bool) -> Void = { _, _ in },
@@ -288,16 +293,16 @@ actor TrustedApprovalsCoordinator {
         guard departures[serviceID] == nil else {
             throw Self.unavailable("This request service has a trusted authority handoff pending; retry registration after it finishes.")
         }
-        let callback: @Sendable () async throws -> Void = { [weak self] in
+        let callback: @Sendable (TrustedLocalRecovery) async throws -> Void = { [weak self] local in
             guard let self else { throw Self.unavailable("The trusted approval authority is unavailable.") }
-            try await self.retry(requester: serviceID)
+            try await self.retry(requester: serviceID, local: local)
         }
         let registration: UUID
         var inspection: TrustedRevocationInspection?
         if let transfer {
             (registration, inspection) = try await target.installTrustedAuthority(transfer, id: id,
                 intents: envelope.revocations + removals.values.map(\.intent), revision: revision, coordinator: callback)
-        } else { registration = await target.registerRevocationCoordinator(id: id, callback) }
+        } else { registration = await target.registerRevocationCoordinator(id: id, recovery: callback) }
         let key = TargetKey(service: serviceID, registration: registration)
         let previous = targets.keys.filter { $0.service == serviceID && $0 != key }
         for old in previous {
@@ -319,8 +324,9 @@ actor TrustedApprovalsCoordinator {
             await self?.retainRecovery(service, revision: revision, required: required)
         }
     }
-    private func retry(requester: UUID) async throws {
-        var completed: [UUID] = [requester], errors: [String] = []
+    private func retry(requester: UUID, local: TrustedLocalRecovery) async throws {
+        var completed: [UUID] = local.completed ? [requester] : []
+        var errors = local.failure.map { ["Local service \(requester): " + $0] } ?? []
         var inspectedDuringRegistration = false
         if let candidate = failedRegistration {
             if candidate.eligibility.isCurrent {
@@ -330,6 +336,7 @@ actor TrustedApprovalsCoordinator {
         }
         for key in recoveryTargets.sorted(by: { $0.service.uuidString < $1.service.uuidString }) {
             do {
+                if key.service == requester, !local.completed { continue }
                 if key.service != requester {
                     guard let target = targets[key]?.service else { continue }
                     try await target.retryReconciliation(replayTrusted: false)
@@ -439,7 +446,7 @@ actor TrustedApprovalsCoordinator {
         let needed = required.values.contains { $0.contains { $0.service == target.runtimeID } }
         release(token)
         do {
-            if needed { try await replay() }
+            if needed { try await replayDeparture(serviceID: target.runtimeID) }
             try await target.settleTrustedAuthorityDeparture()
             let check = try await acquire()
             let outstanding = required.values.contains { $0.contains { $0.service == target.runtimeID } }
@@ -679,6 +686,25 @@ actor TrustedApprovalsCoordinator {
             if replayTask == nil { replayTask = Task { await self.drainReplay() } }
         }
     }
+    private func replayDeparture(serviceID: UUID) async throws {
+        guard required.values.contains(where: { $0.contains(where: { $0.service == serviceID }) }) else { return }
+        try await withCheckedThrowingContinuation { c in
+            departureReplay[serviceID, default: []].append(c)
+            if replayTask == nil { replayTask = Task { await self.drainReplay() } }
+        }
+    }
+    private func completeSettledDepartures() {
+        for serviceID in Array(departureReplay.keys) {
+            guard !required.values.contains(where: { $0.contains(where: { $0.service == serviceID }) }) else { continue }
+            departureReplay.removeValue(forKey: serviceID)?.forEach { $0.resume() }
+        }
+    }
+    private func departureFailure(serviceID: UUID) -> Error? {
+        let intents = required.filter { $0.value.contains(where: { $0.service == serviceID }) }.keys
+        guard !intents.isEmpty else { return nil }
+        return intents.sorted(by: { $0.uuidString < $1.uuidString }).compactMap { failures[$0] }.first
+            ?? Self.unavailable("The previous authority still has cancellation or shared removal obligations for service " + serviceID.uuidString + ". Choose Retry Recovery.")
+    }
     private func record(_ error: Error, intent: RequestRevocationIntent) async -> Failure {
         let failure = failures[intent.operationID]?.appending(error) ?? Failure(error, diagnosticID: intent.operationID)
         failures[intent.operationID] = failure
@@ -715,6 +741,7 @@ actor TrustedApprovalsCoordinator {
         finalizedRemovals[intent.operationID] = nil
         required[intent.operationID] = nil; applications[intent.operationID] = nil; removals[intent.operationID] = nil; failures[intent.operationID] = nil
         failedApplications = failedApplications.filter { $0.intent != intent.operationID }
+        completeSettledDepartures()
         let retained = Set(required.values.flatMap { $0 })
         targetPins = targetPins.filter { retained.contains($0.key) }
         targets = targets.filter { $0.value.service != nil }
@@ -781,6 +808,11 @@ actor TrustedApprovalsCoordinator {
     }
     private func finishReplay(_ failed: [UUID: Failure]) {
         replayTask = nil
+        let departures = departureReplay; departureReplay.removeAll()
+        for (serviceID, waiting) in departures {
+            let error = departureFailure(serviceID: serviceID)
+            waiting.forEach { if let error { $0.resume(throwing: error) } else { $0.resume() } }
+        }
         let waiting = replayWaiters; replayWaiters.removeAll()
         for (id, values) in waiting {
             for value in values {

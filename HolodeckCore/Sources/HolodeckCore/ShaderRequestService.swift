@@ -553,26 +553,32 @@ public actor ShaderRequestService {
             let departure = try await predecessor.prepareDeparture(self, ticket: ticket)
             try Task.checkCancellation()
             return AuthorityTransfer(id: ticket, predecessor: predecessor, registration: revocationRegistration, departure: departure)
-        } catch { await predecessor.cancelDeparture(serviceID: runtimeID, ticket: ticket); authorityTransfer = nil; emitUpdates(); throw error }
+        } catch { await predecessor.cancelDeparture(serviceID: runtimeID, ticket: ticket); authorityTransfer = nil; emitUpdates(); scheduleWakeup(); throw error }
     }
     func settleTrustedAuthorityDeparture() async throws {
         if let activeID, records[activeID]?.revoked == true, let workerTask { await workerTask.value }
         if let retirementTask { await retirementTask.value }
+        let ownedExecution: Bool
+        if let activeProcess {
+            let matches = execution?.processID == ObjectIdentifier(activeProcess) && execution?.interrupted == false
+            let request = activeID.map { records[$0]?.revoked == false } == true
+            let publication = activeID == nil && activePublication != nil && maintenanceLease == execution?.id
+            ownedExecution = matches && (request || publication)
+        } else { ownedExecution = true }
         guard persistenceFailure == nil, startupFinalizationFailure == nil, recovery.entries.isEmpty,
-              pendingRetirements.isEmpty, durableRevocations.isEmpty,
-              activeProcess == nil || activeID.map({ records[$0]?.revoked != true }) == true else {
+              pendingRetirements.isEmpty, durableRevocations.isEmpty, ownedExecution else {
             throw ShaderRequestError.unavailable("Previous TV cancellation or process settlement requires recovery before changing authority.")
         }
     }
     func finishTrustedAuthority(_ transfer: AuthorityTransfer, authority: TrustedApprovalsCoordinator) {
         guard authorityTransfer == transfer.id else { return }
-        trustedAuthority = authority; authorityTransfer = nil; emitUpdates()
+        trustedAuthority = authority; authorityTransfer = nil; emitUpdates(); scheduleWakeup()
         Task { await transfer.predecessor.finishDeparture(self, ticket: transfer.id) }
     }
     func cancelTrustedAuthority(_ transfer: AuthorityTransfer) async {
         guard authorityTransfer == transfer.id else { return }
         await transfer.predecessor.cancelDeparture(serviceID: runtimeID, ticket: transfer.id)
-        authorityTransfer = nil; emitUpdates()
+        authorityTransfer = nil; emitUpdates(); scheduleWakeup()
     }
     private var revocationReservations: [UUID: TrustedRevocationReservation] = [:]
     var trustedReservationCount: Int { revocationReservations.count }
@@ -588,7 +594,8 @@ public actor ShaderRequestService {
         var users = 0
     }
     private var controlScopes: [String: ControlScope] = [:]
-    private var revocationCoordinator: (@Sendable () async throws -> Void)?
+    private var revocationCoordinator: (@Sendable (TrustedLocalRecovery) async throws -> Void)?
+    private var localRecoveryAttempt: UUID?
     private var revocationInspectionPending = false
     private var revocationFailure: String?
     private var revocationFailures: [UUID: String] = [:]
@@ -616,7 +623,7 @@ public actor ShaderRequestService {
         }.map { "TV revocation must settle its owned checkout before starting other checkout work: " + $0.status.deviceID }
     }
     func installTrustedAuthority(_ transfer: AuthorityTransfer, id: UUID, intents: [RequestRevocationIntent], revision: TrustedRevocationRevision,
-                                 coordinator: @escaping @Sendable () async throws -> Void) throws -> (UUID, TrustedRevocationInspection) {
+                                 coordinator: @escaping @Sendable (TrustedLocalRecovery) async throws -> Void) throws -> (UUID, TrustedRevocationInspection) {
         try transfer.departure.activate {
             guard authorityTransfer == transfer.id, revocationRegistration == transfer.registration,
                   transfer.departure.registrationID == revocationRegistration, durableRevocations.isEmpty,
@@ -630,9 +637,12 @@ public actor ShaderRequestService {
         }
     }
     @discardableResult func registerRevocationCoordinator(id: UUID, _ coordinator: @escaping @Sendable () async throws -> Void) async -> UUID {
-        bindRevocationCoordinator(id: id, coordinator)
+        bindRevocationCoordinator(id: id) { _ in try await coordinator() }
     }
-    private func bindRevocationCoordinator(id: UUID, _ coordinator: @escaping @Sendable () async throws -> Void) -> UUID {
+    @discardableResult func registerRevocationCoordinator(id: UUID, recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> Void) -> UUID {
+        bindRevocationCoordinator(id: id, recovery)
+    }
+    private func bindRevocationCoordinator(id: UUID, _ coordinator: @escaping @Sendable (TrustedLocalRecovery) async throws -> Void) -> UUID {
         if revocationCoordinatorID == id { revocationCoordinator = coordinator; return revocationRegistration }
         revocationRegistration = UUID(); revocationApplications.removeAll(); revocationInspection = nil
         controlScopes.removeAll()
@@ -1649,13 +1659,23 @@ public actor ShaderRequestService {
 
     public func retryReconciliation() async throws { try await retryReconciliation(replayTrusted: true) }
     func retryReconciliation(replayTrusted: Bool) async throws {
-        try await recoverLocalMetadata()
-        // Release the local maintenance lease before visiting other service targets.
-        if replayTrusted, let coordinator = revocationCoordinator { try await coordinator() }
+        var localFailure: Error?
+        do { try await recoverLocalMetadata() }
+        catch is CancellationError { throw CancellationError() }
+        catch { localFailure = error }
+        try Task.checkCancellation()
+        // The maintenance lease has ended. Trusted inspection can recover even
+        // when a separate local journal remains blocked, without recursive replay.
+        if replayTrusted, let coordinator = revocationCoordinator {
+            let local = TrustedLocalRecovery(failure: localFailure.map { BoundedDiagnostics.bounded($0.localizedDescription, bytes: 8192) })
+            try await coordinator(local)
+        }
+        if let localFailure { throw localFailure }
     }
     private func recoverLocalMetadata() async throws {
         guard activeID == nil, !maintenanceBusy else { throw ShaderRequestError.unavailable("Wait for active checkout work to finish.") }
-        let lease = try beginMaintenance(); defer { endMaintenance(lease) }
+        let lease = try beginMaintenance(); localRecoveryAttempt = lease
+        defer { localRecoveryAttempt = nil; endMaintenance(lease) }
         // Invalidate the previous observer before storage recovery's first await;
         // its late result must not publish a new failure into the restored state.
         try await drainReconciliation(lease: lease); try await resetPersistenceFailure()
@@ -2665,12 +2685,16 @@ public actor ShaderRequestService {
                                         publicationRevision: await catalog.publicationRevisionValue())
     }
     private func kick() {
+        // A recovery attempt owns its publication waiters until its result is
+        // known. Active worker/maintenance entries are not settled blockers.
+        guard localRecoveryAttempt == nil else { return }
         if let startupFinalizationFailure { failPendingPublicationForRecovery(startupFinalizationFailure); return }
         if let persistenceFailure { failPendingPublicationForRecovery(persistenceFailure); return }
+        guard !maintenanceBusy, activeID == nil, workerTask == nil else { return }
         if let reconciliationFailure { failPendingPublicationForRecovery(reconciliationFailure); return }
-        if let entry = recovery.entries.values.sorted(by: { $0.journal < $1.journal }).first { failPendingPublicationForRecovery(entry.message); return }
+        if let entry = recovery.entries.values.filter({ !isActiveRetry($0.journal) }).min(by: { $0.journal < $1.journal }) { failPendingPublicationForRecovery(entry.message); return }
         guard hostOwners.mayDispatch else { pauseOwnerlessPublication(); return }
-        guard loaded, initialized, !suspended, !maintenanceBusy, activeID == nil, workerTask == nil else { return }
+        guard loaded, initialized, !suspended else { return }
         if storageCommit != nil || pendingCommits != 0 || !pendingRetirements.isEmpty || retirementTask != nil { schedulingDeferred = true; return }
         if !reconciled {
             guard reconciliationKickID == nil, reconciliationTask == nil else { return }

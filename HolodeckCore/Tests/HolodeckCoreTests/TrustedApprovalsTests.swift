@@ -7,6 +7,7 @@ final class TrustedBackendFixture: @unchecked Sendable {
     private let lock = NSLock()
     private var data: Data?
     private var writeCount = 0
+    private var readCount = 0
     private var fail = false
     private var readFailure = false
     private var readGate: TrustedReadGate?
@@ -19,10 +20,11 @@ final class TrustedBackendFixture: @unchecked Sendable {
     func failReads(_ value: Bool) { lock.withLock { readFailure = value } }
     func checkedRead() throws -> Data? {
         lock.withLock { readGate }?.wait()
-        return try lock.withLock { if readFailure { throw POSIXError(.EACCES) }; return data }
+        return try lock.withLock { readCount += 1; if readFailure { throw POSIXError(.EACCES) }; return data }
     }
     func failWrites(_ value: Bool) { lock.withLock { fail = value } }
     var writes: Int { lock.withLock { writeCount } }
+    var reads: Int { lock.withLock { readCount } }
     func coordinator() -> TrustedApprovalsCoordinator { .init(read: { try self.checkedRead() }, write: { try self.write($0) }) }
 }
 final class TrustedReadGate: @unchecked Sendable {

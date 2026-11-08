@@ -123,6 +123,31 @@ import XCTest
         XCTAssertTrue(prior.permit.isCurrent)
         let final = await old.observation; XCTAssertEqual(final.departures, 0); XCTAssertEqual(final.obligations, 0)
     }
+    func testCancelledTransferWakesEligibleQueueWithoutAnotherClientMutation() async throws {
+        let a = try await fixture(); try await submit(a.service)
+        let jobs = await a.service.allJobs()
+        let job = a.root.appendingPathComponent(try XCTUnwrap(jobs.first?.id).uuidString)
+        let script = a.root.appendingPathComponent("unused.py")
+        try """
+        import json,sys,time
+        from pathlib import Path
+        job=Path(sys.argv[3]);(job/'started').touch()
+        while not (job/'release').exists():time.sleep(.005)
+        print(json.dumps(dict(event='clarification',question='Choose',options=['A','B'])),flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try await a.service.retryReconciliation() // Complete startup before the fence can mask a wakeup.
+        let old = TrustedBackendFixture(nil).coordinator()
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
+        let backend = TrustedBackendFixture(nil), gate = TrustedReadGate(); backend.gateReads(gate)
+        addTeardownBlock { gate.release(); try? Data().write(to: job.appendingPathComponent("release")) }
+        let next = backend.coordinator(), ticket = try await next.register(TrustedOwnerRecorder().owner(service: a.service))
+        try await wait { gate.entered }; await a.service.activateScheduling(); await a.service.resume()
+        let waiting = await a.service.allJobs(); XCTAssertEqual(waiting.first?.stage, .queued)
+        ticket.completion.cancel(); gate.release()
+        do { _ = try await ticket.value(); XCTFail("Cancelled handoff activated") } catch is CancellationError {}
+        try await wait { FileManager.default.fileExists(atPath: job.appendingPathComponent("started").path) }
+        try Data().write(to: job.appendingPathComponent("release")); await a.service.suspend()
+    }
     func testDepartureAdmissionCannotActivateAfterInspectionInvalidation() throws {
         let departure = TrustedAuthorityDeparture(id: UUID(), serviceID: UUID(), registrationID: UUID())
         departure.prepared(); departure.invalidatePreparation()
