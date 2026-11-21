@@ -39,4 +39,24 @@ struct TrustedLocalRecoveryReceipt: Sendable {
     let metadataRevision: UInt64
     let ownershipGeneration: UInt64
 }
+/// Local-only entry point remains callable after the target changed registration.
+/// Its weak authority reference cannot keep an otherwise idle account alive.
+nonisolated final class TrustedAuthorityRecoveryEndpoint: @unchecked Sendable {
+    let authorityID: UUID
+    let ticketID: UUID
+    let serviceID: UUID
+    private weak var authority: TrustedApprovalsCoordinator?
+    private let token = TrustedInvalidationToken()
+    init(authority: TrustedApprovalsCoordinator, ticketID: UUID, serviceID: UUID) {
+        self.authority = authority; authorityID = authority.id; self.ticketID = ticketID; self.serviceID = serviceID
+    }
+    var isCurrent: Bool { token.isCurrent }
+    var message: String { "Authority departure " + ticketID.uuidString + " needs receipt recovery. Choose Retry Recovery; unverifiable receipts require manual repair." }
+    func invalidate() { token.invalidate() }
+    func retry() async throws {
+        guard isCurrent else { return }
+        guard let authority else { throw ShaderRequestError.unavailable(message + " The retained authority is unavailable; preserve its trusted approval evidence for manual repair.") }
+        try await authority.recoverDeparture(serviceID: serviceID, ticket: ticketID)
+    }
+}
 #endif

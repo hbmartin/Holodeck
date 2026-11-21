@@ -140,6 +140,7 @@ actor TrustedApprovalsCoordinator {
         let progressWaiters: Int
         let recoveryPasses: Int
         let recoveryParticipants: Int
+        let departureInspectionWaiters: Int
     }
     struct Approval: Sendable {
         let record: ApprovedTV
@@ -207,6 +208,7 @@ actor TrustedApprovalsCoordinator {
         }
     }
     nonisolated let id = UUID()
+    private let beforeTargetInspection: @Sendable (UUID) async throws -> Void
     private let beforeReservation: @Sendable (UUID) async throws -> Void
     private let read: @Sendable () throws -> Data?
     private let write: @Sendable (Data) throws -> Void
@@ -247,6 +249,8 @@ actor TrustedApprovalsCoordinator {
     private var baseline: UInt64 = 0
     private var departureRecovery: [UUID: TrustedAuthorityDeparture] = [:]
     private var departures: [UUID: TrustedAuthorityDeparture] = [:]
+    private var departureEndpoints: [UUID: TrustedAuthorityRecoveryEndpoint] = [:]
+    private var endpointTargets: [UUID: [UUID: WeakRequestService]] = [:]
     private var queuedRevocations: Int { admissions[.revocation]?.count ?? 0 }
     private var required: [UUID: Set<TargetKey>] = [:]
     private var applications: [UUID: [TargetKey: TrustedRevocationApplication]] = [:]
@@ -287,7 +291,9 @@ actor TrustedApprovalsCoordinator {
 
     init(read: @escaping @Sendable () throws -> Data?, write: @escaping @Sendable (Data) throws -> Void,
          retainEvidence: @escaping @Sendable (TrustedApprovalsCoordinator, Bool) -> Void = { _, _ in },
-         beforeReservation: @escaping @Sendable (UUID) async throws -> Void = { _ in }) {
+         beforeReservation: @escaping @Sendable (UUID) async throws -> Void = { _ in },
+         beforeTargetInspection: @escaping @Sendable (UUID) async throws -> Void = { _ in }) {
+        self.beforeTargetInspection = beforeTargetInspection
         self.beforeReservation = beforeReservation
         self.read = read; self.write = write; self.retainEvidence = retainEvidence
     }
@@ -305,7 +311,7 @@ actor TrustedApprovalsCoordinator {
               queuedGeneration: pending?.registration.generation, preparingGeneration: preparing,
               mutationWaiters: (admissions[.client]?.count ?? 0) + queuedRevocations, encodings: encodings, writes: writes,
               transitionActive: lane != nil, recoveryPins: recoveryHandles.values.filter { $0.pin != nil }.count, recoverySubscriptions: recoverySubscriptions.count,
-              targets: targets.count, inspections: inspections.values.filter { $0 == baseline }.count, obligations: required.count, departures: departures.count, queuedRevocations: queuedRevocations, admissionResumes: admissionResumes, admissionAdvances: admissionAdvances, progressWaiters: admissions[.progress]?.count ?? 0, recoveryPasses: recoveryPassCount, recoveryParticipants: recoveryPass?.inputs.count ?? 0)
+              targets: targets.count, inspections: inspections.values.filter { $0 == baseline }.count, obligations: required.count, departures: departures.count, queuedRevocations: queuedRevocations, admissionResumes: admissionResumes, admissionAdvances: admissionAdvances, progressWaiters: admissions[.progress]?.count ?? 0, recoveryPasses: recoveryPassCount, recoveryParticipants: recoveryPass?.inputs.count ?? 0, departureInspectionWaiters: departures.values.reduce(0) { $0 + $1.inspectionWaiterCount })
     }
     private var outstandingIntents: [RequestRevocationIntent] {
         envelope.revocations + removals.values.map(\.intent).sorted { $0.operationID.uuidString < $1.operationID.uuidString }
@@ -586,14 +592,20 @@ actor TrustedApprovalsCoordinator {
     }
     private func inspect(_ known: Target, intents: [RequestRevocationIntent]) async throws {
         guard let target = known.service else { return }
+        let departure = departures[known.key.service]
+        let permit = departure?.beginInspection()
+        if departure != nil && permit == nil { return } // Activation already owns the target.
+        var succeeded = false
+        defer { if let permit { departure?.finishInspection(permit, succeeded: succeeded) } }
         let obligations = intents.filter { finalizedRemovals[$0.operationID]?.contains(known.key) != true }
         // Record every obligation before the first fallible target notification.
         for intent in obligations { require(intent, on: known.key, target: target) }
         inspections[known.key] = nil
         do {
+            try await beforeTargetInspection(known.key.service)
             let receipt = try await target.loadTrustedRevocations(obligations, revision: revision)
             guard receipt.registrationID == known.key.registration else { throw Self.unavailable("The inspected TV target registration changed; retry recovery.") }
-            inspections[known.key] = baseline
+            inspections[known.key] = baseline; succeeded = true
             for intent in obligations {
                 if let failure = failures[intent.operationID] {
                     await target.revocationReplayFailed(failure, intent: intent, revision: revision)
@@ -687,7 +699,36 @@ actor TrustedApprovalsCoordinator {
             if let target = targets[key]?.service { targetPins[key] = target }
         }
         await recordMutationFailure(TrustedDepartureRecoveryError(diagnosticID: ticket, serviceID: serviceID), operation: ticket, context: "Authority departure")
+        if let target = targets.values.first(where: { $0.key.service == serviceID })?.service { await attachDepartureRecovery(ticket: ticket, to: target) }
         advanceAdmission()
+    }
+    private func attachDepartureRecovery(ticket: UUID, to target: ShaderRequestService) async {
+        guard let departure = departureRecovery.values.first(where: { $0.id == ticket }) else { return }
+        let endpoint = departureEndpoints[ticket] ?? .init(authority: self, ticketID: ticket, serviceID: departure.serviceID)
+        departureEndpoints[ticket] = endpoint
+        endpointTargets[ticket, default: [:]][target.runtimeID] = .init(target)
+        await target.rememberAuthorityRecovery(endpoint)
+    }
+    /// No successful registration is required to recover an old authority's exact
+    /// ticket. Never apply an old cancellation receipt to a replacement binding.
+    func recoverDeparture(serviceID: UUID, ticket: UUID) async throws {
+        let capture = await acquireProgress()
+        guard let departure = departureRecovery[serviceID], departure.id == ticket else { release(capture); return }
+        let target = targets.values.first { $0.key.service == serviceID && $0.key.registration == departure.registrationID }?.service
+        release(capture)
+        try Task.checkCancellation()
+        try await target?.settleTrustedAuthorityDeparture()
+        let commit = await acquireProgress(); defer { release(commit) }
+        guard departureRecovery[serviceID] === departure else { return }
+        try await readFresh(target: nil)
+        let keys = Set(targets.keys.filter { $0.service == serviceID && $0.registration == departure.registrationID })
+        guard !required.values.contains(where: { !$0.isDisjoint(with: keys) }) else {
+            throw Self.unavailable("Authority departure " + ticket.uuidString + " has unverifiable cancellation receipts for its retired registration. Retain trusted approvals and request journals for manual repair; the replacement authority cannot acknowledge them.")
+        }
+        await retireDeparture(departure, keys: keys)
+        departureRecovery[serviceID] = nil
+        if mutationFailure?.operation == ticket { mutationFailure = nil }
+        await notify()
     }
     private func finishRecoveredDepartures() async {
         for departure in Array(departureRecovery.values) {
@@ -712,6 +753,9 @@ actor TrustedApprovalsCoordinator {
         if service?.runtimeID == serviceID { service = nil }
         if departures[serviceID]?.id == departure.id { departures[serviceID] = nil }
         departure.close()
+        departureEndpoints.removeValue(forKey: departure.id)?.invalidate()
+        let recipients = endpointTargets.removeValue(forKey: departure.id) ?? [:]
+        for recipient in recipients.values { await recipient.value?.forgetAuthorityRecovery(ticket: departure.id) }
     }
     private enum RegistrationAbandoned: Error { case superseded }
     private func drainRegistrations() async {
@@ -751,7 +795,17 @@ actor TrustedApprovalsCoordinator {
                     guard !request.owner.requiresService || admittedService != nil else { throw Self.unavailable("The proposed request service was released before activation.") }
                     try request.owner.eligibility.admitWrite { try request.registration.completion.beginMutation() }
                 }
-                if let target = admittedService ?? request.owner.service { try await configure(target, transfer: transfer) }
+                if let target = admittedService ?? request.owner.service {
+                    while true {
+                        do { try await configure(target, transfer: transfer); break }
+                        catch let waiting as TrustedDepartureInspectionPending {
+                            release(token)
+                            do { try await waiting.departure.waitForInspection() }
+                            catch { token = await acquireReplacement(); throw error }
+                            token = await acquireReplacement()
+                        }
+                    }
+                }
                 if transfer == nil { try await readFresh(target: request.owner.service ?? service) }
                 let preparedSequence = sequence
                 if !request.registration.completion.hasStarted {
@@ -789,6 +843,9 @@ actor TrustedApprovalsCoordinator {
                 }
                 if error is RegistrationAbandoned { request.registration.completion.complete(.success(.superseded)) }
                 else {
+                    if let recovery = error as? TrustedDepartureRecoveryError, let target = request.owner.service {
+                        await attachDepartureRecovery(ticket: recovery.diagnosticID, to: target)
+                    }
                     if request.registration.generation == generation, request.owner.eligibility.isCurrent, !(error is CancellationError) { failedRegistration = request.owner }
                     request.registration.completion.complete(.failure(error))
                 }
@@ -835,10 +892,10 @@ actor TrustedApprovalsCoordinator {
     }
     private func acceptPersisted(_ value: TrustedTVApprovals, bytes candidate: Data) {
         if candidate != bytes {
-            let predecessor = baseline
-            invalidateBaseline()
-            // This is our accepted write, not an unknown backend change. Exact
-            // notifications/receipts below preserve known target inspections.
+            let predecessor = baseline; baseline &+= 1
+            // Relevant new obligations invalidate their own target in require().
+            // A known approval or unrelated removal preserves prepared handoffs.
+            for departure in departures.values { departure.advanceBaseline(from: predecessor, to: baseline) }
             inspections = inspections.mapValues { $0 == predecessor ? baseline : $0 }
         }
         envelope = value; bytes = candidate; sequence &+= 1; writes += 1
@@ -1018,7 +1075,7 @@ actor TrustedApprovalsCoordinator {
             for intent in remainingIntents {
                 for key in required[intent.operationID] ?? [] {
                     let attempt = Attempt(intent: intent.operationID, target: key)
-                    if applications[intent.operationID]?[key] == nil, !attempted.contains(attempt), failedApplications[attempt] == nil, let target = targets[key]?.service {
+                    if !retired(key), applications[intent.operationID]?[key] == nil, !attempted.contains(attempt), failedApplications[attempt] == nil, let target = targets[key]?.service {
                         work = (intent, key, target); attempted.insert(attempt); break
                     }
                 }

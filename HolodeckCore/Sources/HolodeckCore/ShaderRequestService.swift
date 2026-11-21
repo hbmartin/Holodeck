@@ -613,6 +613,16 @@ public actor ShaderRequestService {
     private var localRecoveryResult: TrustedLocalRecovery?
     private var localRecoveryGeneration: UInt64 = 0
     private var trustedRecoveryHolds: Set<UUID> = []
+    private var authorityRecoveryEndpoints: [UUID: TrustedAuthorityRecoveryEndpoint] = [:]
+    func rememberAuthorityRecovery(_ endpoint: TrustedAuthorityRecoveryEndpoint) {
+        authorityRecoveryEndpoints[endpoint.ticketID] = endpoint; emitUpdates(); scheduleWakeup()
+    }
+    func forgetAuthorityRecovery(ticket: UUID) {
+        authorityRecoveryEndpoints[ticket] = nil; emitUpdates(); scheduleWakeup()
+    }
+    private var authorityRecoveryFailure: String? {
+        authorityRecoveryEndpoints.values.filter(\.isCurrent).min { $0.ticketID.uuidString < $1.ticketID.uuidString }?.message
+    }
     private var revocationInspectionPending = false
     private var revocationFailure: String?
     private var revocationFailures: [UUID: String] = [:]
@@ -1185,6 +1195,7 @@ public actor ShaderRequestService {
     private func checkoutRecoveryBlocker(includeRevokedCleanup: Bool) -> String? {
         if let startupFinalizationFailure { return startupFinalizationFailure }
         if let persistenceFailure { return "Mac persistence recovery required: " + persistenceFailure }
+        if let authorityRecoveryFailure { return authorityRecoveryFailure }
         if let entry = blockingRecoveryEntry { return "Mac checkout recovery required: " + entry.message }
         if let reconciliationFailure { return "Mac checkout recovery required: " + reconciliationFailure }
         if let record = records.values.first(where: { $0.cleanupPending == true && (includeRevokedCleanup || !$0.revoked || $0.cleanupFailure != nil) }) {
@@ -1292,6 +1303,10 @@ public actor ShaderRequestService {
         }
         if let revocationBlocker {
             statuses.append(ShaderRequestRecoveryStatus(id: Self.revocationStatusID, kind: .persistence, repository: "", python: "", git: "", message: revocationBlocker, isRunning: maintenanceBusy, journal: directory, blocksCheckoutWork: revocationCheckoutBlocker != nil))
+        }
+        for endpoint in authorityRecoveryEndpoints.values.filter(\.isCurrent).sorted(by: { $0.ticketID.uuidString < $1.ticketID.uuidString }) {
+            statuses.append(.init(id: endpoint.ticketID, kind: .persistence, repository: "", python: "", git: "",
+                message: endpoint.message, isRunning: localRecoveryAttempt != nil, journal: directory))
         }
         return statuses
     }
@@ -1681,13 +1696,26 @@ public actor ShaderRequestService {
         }
         let local = try await recoverLocalPhase()
         try Task.checkCancellation()
-        if replayTrusted, let coordinator = revocationCoordinator { try await coordinator(local) }
-        if let failure = local.failure {
-            throw TrustedPartialRecovery(completedServices: [], remaining: [failure])
+        var failures: [String] = []
+        if replayTrusted, let coordinator = revocationCoordinator {
+            do { try await coordinator(local) }
+            catch { try Task.checkCancellation(); failures.append(error.localizedDescription) }
         }
+        // These exact old-authority routes survive replacement of the ordinary
+        // coordinator callback. Each owns only its retained departure evidence.
+        if replayTrusted {
+            for endpoint in authorityRecoveryEndpoints.values.filter(\.isCurrent).sorted(by: { $0.ticketID.uuidString < $1.ticketID.uuidString }) {
+                try Task.checkCancellation()
+                do { try await endpoint.retry() }
+                catch { try Task.checkCancellation(); failures.append(error.localizedDescription) }
+            }
+        }
+        if let failure = local.failure { failures.insert(failure, at: 0) }
+        if !failures.isEmpty { throw TrustedPartialRecovery(completedServices: local.completed ? [runtimeID] : [], remaining: Array(failures.prefix(9))) }
     }
     private func recoverLocalPhase() async throws -> TrustedLocalRecovery {
         if let phase = localRecoveryPhase { return try await phase.task.value() }
+        if !trustedRecoveryHolds.isEmpty, let result = localRecoveryResult { return validateTrustedRecovery(result) }
         let attempt = UUID(); localRecoveryGeneration &+= 1
         let generation = localRecoveryGeneration
         let task = TrustedRecoveryTask { try await self.performLocalRecovery(attempt: attempt, generation: generation) }
@@ -2770,6 +2798,7 @@ public actor ShaderRequestService {
         guard localRecoveryAttempt == nil, trustedRecoveryHolds.isEmpty else { return }
         if let startupFinalizationFailure { failPendingPublicationForRecovery(startupFinalizationFailure); return }
         if let persistenceFailure { failPendingPublicationForRecovery(persistenceFailure); return }
+        if let authorityRecoveryFailure { failPendingPublicationForRecovery(authorityRecoveryFailure); return }
         guard !maintenanceBusy, activeID == nil, workerTask == nil else { return }
         if let reconciliationFailure { failPendingPublicationForRecovery(reconciliationFailure); return }
         if let entry = blockingRecoveryEntry { failPendingPublicationForRecovery(entry.message); return }
