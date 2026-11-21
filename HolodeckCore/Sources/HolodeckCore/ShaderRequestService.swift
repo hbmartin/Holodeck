@@ -1240,13 +1240,14 @@ public actor ShaderRequestService {
         emitPublication()
         return failure
     }
-    private func failPendingPublicationForRecovery(_ message: String) {
-        guard !suspended || persistenceFailure != nil, let request = pendingPublication else { return }
+    @discardableResult private func failPendingPublicationForRecovery(_ message: String) -> Bool {
+        guard !suspended || persistenceFailure != nil, let request = pendingPublication else { return false }
         pendingPublication = nil
         retryPublicationForce = (retryPublicationForce ?? false) || request.force
         let failure = publicationState(.failed, message: "Library preparation needs checkout recovery: " + message,
                                        recoveryRequired: true)!
         for waiter in request.waiters { waiter.continuation.resume(throwing: failure) }
+        return true
     }
     private func cancelPublicationRequests() {
         retryPublicationForce = nil
@@ -1696,10 +1697,15 @@ public actor ShaderRequestService {
         }
         let local = try await recoverLocalPhase()
         try Task.checkCancellation()
-        var failures: [String] = []
+        var failures: [String] = [], completed: Set<UUID> = local.completed ? [runtimeID] : []
         if replayTrusted, let coordinator = revocationCoordinator {
             do { try await coordinator(local) }
-            catch { try Task.checkCancellation(); failures.append(error.localizedDescription) }
+            catch {
+                try Task.checkCancellation()
+                if let partial = error as? TrustedPartialRecovery {
+                    completed.formUnion(partial.completedServices); failures += partial.remaining
+                } else { failures.append(error.localizedDescription) }
+            }
         }
         // These exact old-authority routes survive replacement of the ordinary
         // coordinator callback. Each owns only its retained departure evidence.
@@ -1711,7 +1717,10 @@ public actor ShaderRequestService {
             }
         }
         if let failure = local.failure { failures.insert(failure, at: 0) }
-        if !failures.isEmpty { throw TrustedPartialRecovery(completedServices: local.completed ? [runtimeID] : [], remaining: Array(failures.prefix(9))) }
+        if !failures.isEmpty {
+            throw TrustedPartialRecovery(completedServices: completed.sorted { $0.uuidString < $1.uuidString },
+                remaining: Array(failures.prefix(9)).map { BoundedDiagnostics.bounded($0, bytes: 8192) })
+        }
     }
     private func recoverLocalPhase() async throws -> TrustedLocalRecovery {
         if let phase = localRecoveryPhase { return try await phase.task.value() }
@@ -2786,11 +2795,16 @@ public actor ShaderRequestService {
         // Host loss concerns new waiters, including ones queued behind an active
         // worker. It never cancels an already admitted publication or execution.
         if !hostOwners.mayDispatch {
-            let cleanupFailure = records.values.filter { $0.cleanupPending == true }.sorted { $0.status.id.uuidString < $1.status.id.uuidString }.compactMap(\.cleanupFailure).first
-            let stable = startupFinalizationFailure ?? persistenceFailure ?? cleanupFailure ??
-                (localRecoveryAttempt == nil ? reconciliationFailure ?? blockingRecoveryEntry?.message : nil)
-            if let stable { failPendingPublicationForRecovery(stable) }
-            else { pauseOwnerlessPublication() }
+            let idle = !maintenanceBusy && activeID == nil && workerTask == nil &&
+                localRecoveryAttempt == nil && localRecoveryPhase == nil && trustedRecoveryHolds.isEmpty
+            let cleanupFailure = idle ? records.values.filter { $0.cleanupPending == true }
+                .sorted { $0.status.id.uuidString < $1.status.id.uuidString }.compactMap(\.cleanupFailure).first : nil
+            // Explicit metadata faults remain actionable immediately. Checkout
+            // diagnostics owned by an active attempt are not settled failures.
+            let stable = persistenceFailure ?? (idle ? startupFinalizationFailure ?? authorityRecoveryFailure ??
+                cleanupFailure ?? reconciliationFailure ?? blockingRecoveryEntry?.message : nil)
+            if let stable, failPendingPublicationForRecovery(stable) { return }
+            pauseOwnerlessPublication()
             return
         }
         // A recovery attempt owns its publication waiters until its result is

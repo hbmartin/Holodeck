@@ -107,6 +107,77 @@ import XCTest
             XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
         }
     }
+    func testOwnerlessPublicationDuringRetryPreparationPausesWithoutRecoveryFailure() async throws {
+        let gate = RecoveryGate()
+        let (service, root) = try await fixture(reconcile: { job in
+            if (try? String(contentsOf: job.appendingPathComponent("attempts"), encoding: .utf8)) == "1" { try await gate.wait() }
+        })
+        try """
+        import json,sys,time
+        from pathlib import Path
+        job=Path(sys.argv[3]);counter=job/'attempts';n=int(counter.read_text())+1 if counter.exists() else 1;counter.write_text(str(n))
+        if n==1:
+            print(json.dumps(dict(event='failure',failureKind='supervision',message='Initiating test fault')),flush=True);raise SystemExit(1)
+        (job/'retry-started').touch()
+        while not (job/'release').exists():time.sleep(.005)
+        print(json.dumps(dict(event='clarification',question='Choose',options=['A','B'])),flush=True)
+        """.write(to: root.appendingPathComponent("worker.py"), atomically: true, encoding: .utf8)
+        let owner = service.retainOwner(), id = try await submit(service), job = root.appendingPathComponent(id.uuidString)
+        addTeardownBlock { owner.release(); await gate.release(); try? Data().write(to: job.appendingPathComponent("release")) }
+        await service.resume(); try await wait { await gate.hasEntered }
+        owner.release()
+        do { try await service.ensurePublication(force: true); XCTFail("Ownerless publication admitted") }
+        catch let error as ShaderRequestError { XCTAssertTrue(error.localizedDescription.contains("local host reconnects")) }
+        let operation = await service.publicationOperationStatus()
+        XCTAssertNil(operation.failure)
+        await gate.release()
+        try await wait { FileManager.default.fileExists(atPath: job.appendingPathComponent("retry-started").path) }
+        try Data().write(to: job.appendingPathComponent("release"))
+        try await wait { await service.allJobs().first?.stage == .awaitingClarification }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("publication/started").path))
+    }
+    func testOwnerlessSuspendedFailureFallsBackToPauseAndIdleFailureKeepsItsCategory() async throws {
+        for suspended in [true, false] {
+            let fault = BoundaryFailureSwitch(), (service, _) = try await fixture(reconcile: { _ in if fault.armed { throw POSIXError(.EIO) } })
+            let owner = service.retainOwner()
+            addTeardownBlock { owner.release() }
+            fault.armed = true
+            do { try await service.retryReconciliation(); XCTFail("Injected recovery fault ignored") } catch is TrustedPartialRecovery {}
+            if !suspended { await service.resume() }
+            owner.release()
+            let result = BoundaryOutcome(), publication = Task {
+                do { try await service.ensurePublication(force: true); result.finish(ShaderRequestError.invalidRequest) }
+                catch { result.finish(error) }
+            }
+            addTeardownBlock { publication.cancel() }
+            try await wait { result.finished }
+            if suspended { XCTAssertTrue(result.error?.localizedDescription.contains("local host reconnects") == true) }
+            else {
+                let failure = try XCTUnwrap(result.error as? ShaderRequestPublicationFailure)
+                XCTAssertTrue(failure.recoveryRequired); XCTAssertTrue(failure.message.contains(POSIXError(.EIO).localizedDescription))
+            }
+            let count = await service.pendingPublicationWaiterCount; XCTAssertEqual(count, 0)
+        }
+    }
+    func testNonTaskRegistrationCancellationHasRegistrationGuidance() async throws {
+        let (a, _) = try await fixture(), (b, _) = try await fixture()
+        let backend = TrustedBackendFixture(nil), armed = BoundaryFailureSwitch()
+        let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
+            beforeTargetInspection: { id in
+                if id == a.runtimeID && armed.armed { armed.armed = false; throw CancellationError() }
+            })
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: b)))
+        backend.failReads(true)
+        do { _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a))); XCTFail("Injected inspection failure ignored") }
+        catch let error as POSIXError { XCTAssertEqual(error.code, .EACCES) }
+        backend.failReads(false); armed.armed = true
+        do { try await b.retryReconciliation(); XCTFail("Interrupted registration reported success") }
+        catch let error as TrustedPartialRecovery {
+            let message = error.remaining.joined()
+            XCTAssertTrue(message.contains("registration preparation was cancelled"))
+            XCTAssertFalse(message.contains("Detach")); XCTAssertFalse(message.contains("checkout maintenance"))
+        }
+    }
     func testSupersededRecoveryRegistrationRequiresActualInspection() async throws {
         let (a, _) = try await fixture(), (b, _) = try await fixture()
         let backend = TrustedBackendFixture(nil), authority = backend.coordinator()

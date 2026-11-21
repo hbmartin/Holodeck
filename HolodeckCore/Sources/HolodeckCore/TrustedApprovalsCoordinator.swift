@@ -42,6 +42,13 @@ struct TrustedLocalRecovery: Sendable {
 struct TrustedRecoveryAdmissionError: LocalizedError, Sendable {
     var errorDescription: String? { "Wait for active checkout work or recovery to finish." }
 }
+struct TrustedRegistrationInterrupted: LocalizedError, Sendable {
+    let lifetimeEnded: Bool
+    var errorDescription: String? {
+        lifetimeEnded ? "TV server registration ended before acceptance because its server lifetime ended. Explicitly register the intended server again." :
+            "TV server registration preparation was cancelled before acceptance. The accepted binding was retained; explicitly retry registration."
+    }
+}
 struct TrustedRecoveryInterrupted: LocalizedError, Sendable {
     var errorDescription: String? { "Local recovery was interrupted because checkout maintenance ownership changed. Retain its evidence and retry after Detach or maintenance finishes." }
 }
@@ -511,7 +518,8 @@ actor TrustedApprovalsCoordinator {
                         }
                     } catch {
                         try Task.checkCancellation()
-                        errors.append("Registration: " + error.localizedDescription)
+                        let detail = error is CancellationError ? TrustedRegistrationInterrupted(lifetimeEnded: !candidate.eligibility.isCurrent).localizedDescription : error.localizedDescription
+                        errors.append("Registration: " + detail)
                     }
                 } else { failedRegistration = nil }
             }
