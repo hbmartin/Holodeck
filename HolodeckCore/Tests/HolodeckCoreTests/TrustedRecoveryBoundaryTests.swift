@@ -42,6 +42,71 @@ import XCTest
             try await Task.sleep(for: .milliseconds(5))
         }
     }
+    func testSuccessfulLocalRecoveryWithoutIntentsDoesNotPoisonAnotherService() async throws {
+        let fault = BoundaryFailureSwitch()
+        let (a, _) = try await fixture(reconcile: { _ in if fault.armed { throw POSIXError(.EIO) } }), (b, _) = try await fixture()
+        let backend = TrustedBackendFixture(nil), authority = backend.coordinator()
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a)))
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: b)))
+        fault.armed = true
+        do { try await a.retryReconciliation(); XCTFail("Injected local failure ignored") }
+        catch let error as TrustedPartialRecovery { XCTAssertTrue(error.remaining.joined().contains(POSIXError(.EIO).localizedDescription)) }
+        fault.armed = false; try await a.retryReconciliation()
+        fault.armed = true
+        try await b.retryReconciliation()
+        let observation = await authority.observation
+        XCTAssertEqual(observation.obligations, 0); XCTAssertEqual(backend.writes, 0)
+    }
+    func testSuppressedApplicationCannotReportReplaySuccess() async throws {
+        let fault = BoundaryFailureSwitch()
+        let (service, _) = try await fixture(reconcile: { _ in if fault.armed { throw POSIXError(.EIO) } })
+        let backend = TrustedBackendFixture(nil), authority = backend.coordinator()
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: service)))
+        let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        try backend.write(TrustedTVApprovals(revocations: [intent]).encoded()); let retained = backend.read()
+        fault.armed = true
+        do { try await service.retryReconciliation(); XCTFail("Injected failure ignored") } catch is TrustedPartialRecovery {}
+        do { try await authority.replay(); XCTFail("Suppressed cancellation reported success") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        XCTAssertEqual(backend.read(), retained)
+        let status = try await service.control(operation: "requestStatus", payload: .init(), deviceID: "A")
+        XCTAssertFalse(status.enabled); XCTAssertTrue(status.message.contains(POSIXError(.EIO).localizedDescription))
+        fault.armed = false; try await service.retryReconciliation()
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
+    }
+    func testConcurrentRecoverySharesTrustedPassAndIndependentCancellation() async throws {
+        for cancelFirst in [false, true] {
+            let fault = BoundaryFailureSwitch()
+            let (a, _) = try await fixture(reconcile: { _ in if fault.armed { throw POSIXError(.EIO) } }), (b, _) = try await fixture()
+            let backend = TrustedBackendFixture(nil), authority = backend.coordinator()
+            _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a)))
+            _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: b)))
+            let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+            try backend.write(TrustedTVApprovals(revocations: [intent]).encoded())
+            fault.armed = true
+            do { try await a.retryReconciliation(); XCTFail("Injected failure ignored") } catch is TrustedPartialRecovery {}
+            fault.armed = false
+            let gate = TrustedReadGate(); backend.gateReads(gate)
+            addTeardownBlock { gate.release() }
+            let passes = await authority.observation.recoveryPasses
+            let first = Task { try await a.retryReconciliation() }
+            addTeardownBlock { first.cancel(); gate.release() }
+            try await wait { gate.entered }
+            let second = Task { try await b.retryReconciliation() }
+            addTeardownBlock { second.cancel(); gate.release() }
+            try await wait { await authority.observation.recoveryParticipants == 2 }
+            if cancelFirst {
+                first.cancel()
+                do { try await first.value; XCTFail("Cancelled waiter succeeded") } catch is CancellationError {}
+            }
+            gate.release()
+            if !cancelFirst { try await first.value }
+            try await second.value
+            let observation = await authority.observation
+            XCTAssertEqual(observation.recoveryPasses, passes + 1); XCTAssertEqual(observation.obligations, 0)
+            XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
+        }
+    }
     func testSupersededRecoveryRegistrationRequiresActualInspection() async throws {
         let (a, _) = try await fixture(), (b, _) = try await fixture()
         let backend = TrustedBackendFixture(nil), authority = backend.coordinator()

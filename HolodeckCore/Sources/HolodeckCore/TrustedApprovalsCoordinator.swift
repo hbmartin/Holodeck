@@ -35,6 +35,7 @@ enum TrustedRecoveryPhase: Sendable {
 }
 struct TrustedLocalRecovery: Sendable {
     let phase: TrustedRecoveryPhase
+    var receipt: TrustedLocalRecoveryReceipt? = nil
     var failure: String? { phase.failure }
     var completed: Bool { if case .completed = phase { return true }; return false }
 }
@@ -137,6 +138,8 @@ actor TrustedApprovalsCoordinator {
         let admissionResumes: Int
         let admissionAdvances: Int
         let progressWaiters: Int
+        let recoveryPasses: Int
+        let recoveryParticipants: Int
     }
     struct Approval: Sendable {
         let record: ApprovedTV
@@ -252,7 +255,7 @@ actor TrustedApprovalsCoordinator {
     private var removals: [UUID: TrustedRevocationRemoval] = [:]
     private var finalizedRemovals: [UUID: Set<TargetKey>] = [:]
     private var recoveryTargets: Set<TargetKey> = []
-    private var failedApplications: Set<Attempt> = []
+    private var failedApplications: [Attempt: String] = [:]
     private var failedRemovalWrites: Set<UUID> = []
     private var generation: UInt64 = 0
     private var pending: Request?
@@ -267,6 +270,17 @@ actor TrustedApprovalsCoordinator {
     private var failures: [UUID: Failure] = [:]
     private var mutationFailure: (operation: UUID, message: String)?
     private var replayTask: Task<Void, Never>?
+    private struct RecoveryPass {
+        let id: UUID
+        let task: TrustedRecoveryTask<RecoveryResult>
+        var inputs: [UUID: TrustedLocalRecovery]
+    }
+    private struct RecoveryResult: Sendable {
+        let completed: [UUID]
+        let errors: [String]
+    }
+    private var recoveryPass: RecoveryPass?
+    private var recoveryPassCount = 0
     private var replayWaiters: [UUID: [CheckedContinuation<Void, Error>]] = [:]
     private var replayAll: [CheckedContinuation<Void, Error>] = []
     private var departureReplay: [UUID: [CheckedContinuation<Void, Error>]] = [:]
@@ -291,7 +305,7 @@ actor TrustedApprovalsCoordinator {
               queuedGeneration: pending?.registration.generation, preparingGeneration: preparing,
               mutationWaiters: (admissions[.client]?.count ?? 0) + queuedRevocations, encodings: encodings, writes: writes,
               transitionActive: lane != nil, recoveryPins: recoveryHandles.values.filter { $0.pin != nil }.count, recoverySubscriptions: recoverySubscriptions.count,
-              targets: targets.count, inspections: inspections.values.filter { $0 == baseline }.count, obligations: required.count, departures: departures.count, queuedRevocations: queuedRevocations, admissionResumes: admissionResumes, admissionAdvances: admissionAdvances, progressWaiters: admissions[.progress]?.count ?? 0)
+              targets: targets.count, inspections: inspections.values.filter { $0 == baseline }.count, obligations: required.count, departures: departures.count, queuedRevocations: queuedRevocations, admissionResumes: admissionResumes, admissionAdvances: admissionAdvances, progressWaiters: admissions[.progress]?.count ?? 0, recoveryPasses: recoveryPassCount, recoveryParticipants: recoveryPass?.inputs.count ?? 0)
     }
     private var outstandingIntents: [RequestRevocationIntent] {
         envelope.revocations + removals.values.map(\.intent).sorted { $0.operationID.uuidString < $1.operationID.uuidString }
@@ -426,7 +440,7 @@ actor TrustedApprovalsCoordinator {
         let previous = targets.keys.filter { $0.service == serviceID && $0 != key }
         for old in previous {
             targets[old] = nil; inspections[old] = nil; targetPins[old] = nil; recoveryTargets.remove(old)
-            failedApplications = failedApplications.filter { $0.target != old }
+            failedApplications = failedApplications.filter { $0.key.target != old }
             for intent in required.keys where required[intent]?.contains(old) == true {
                 required[intent]?.remove(old); required[intent]?.insert(key); targetPins[key] = target
                 applications[intent]?[old] = nil; finalizedRemovals[intent]?.remove(old)
@@ -459,77 +473,114 @@ actor TrustedApprovalsCoordinator {
         return pass.baseline == current.baseline && pass.targets == current.targets
     }
     private func retry(requester: UUID, local: TrustedLocalRecovery) async throws {
-        var completed: [UUID] = local.completed ? [requester] : []
+        try Task.checkCancellation()
+        if recoveryPass == nil || recoveryPass?.task.isCancelled == true {
+            let passID = UUID()
+            let task = TrustedRecoveryTask { try await self.recoverTrusted(passID) }
+            recoveryPass = .init(id: passID, task: task, inputs: [requester: local])
+            recoveryPassCount += 1
+        } else { recoveryPass?.inputs[requester] = local }
+        let pass = recoveryPass!
+        let result = try await pass.task.value()
         var errors = local.failure.map { ["Local service \(requester): " + $0] } ?? []
-        var registrationInspection: InspectionPass?
-        try Task.checkCancellation()
-        if let candidate = failedRegistration {
-            if candidate.eligibility.isCurrent {
-                do {
-                    switch try await register(candidate).value() {
-                    case .accepted(let binding):
-                        if binding.permit.isCurrent { registrationInspection = currentInspection() }
-                    case .superseded: break // No inspection receipt was accepted.
-                    }
-                } catch {
-                    try Task.checkCancellation()
-                    let detail = error is CancellationError ? TrustedRecoveryInterrupted().localizedDescription : error.localizedDescription
-                    errors.append("Registration: " + detail)
-                }
-            } else { failedRegistration = nil }
-        }
-        for key in recoveryTargets.sorted(by: { $0.service.uuidString < $1.service.uuidString }) {
-            try Task.checkCancellation()
-            do {
-                if key.service == requester, !local.completed {
-                    suppressApplications(to: key); continue
-                }
-                if key.service != requester {
-                    guard let target = targets[key]?.service else { continue }
-                    let outcome = try await target.trustedRecoveryOutcome()
-                    guard outcome.completed else {
-                        suppressApplications(to: key)
-                        errors.append("Service \(key.service): " + (outcome.failure ?? "Recovery did not complete."))
-                        continue
-                    }
-                    completed.append(key.service)
-                }
-                failedApplications = failedApplications.filter { $0.target != key }
-            } catch {
-                try Task.checkCancellation()
-                suppressApplications(to: key)
-                let detail = error is CancellationError ? TrustedRecoveryInterrupted().localizedDescription : error.localizedDescription
-                errors.append("Service \(key.service): " + detail)
-            }
-        }
-        try Task.checkCancellation()
-        let inspection = await acquireProgress()
-        if !matches(registrationInspection) {
-            do { try await readFresh(target: service) }
-            catch { errors.append("Inspection: " + error.localizedDescription) }
-        }
-        release(inspection)
-        if !local.completed {
-            for key in targets.keys where key.service == requester { suppressApplications(to: key) }
-        }
-        failedRemovalWrites.removeAll()
-        try Task.checkCancellation()
-        if loaded {
-            do { try await replay() } catch { errors.append(error.localizedDescription) }
-        }
-        try Task.checkCancellation()
-        let finishing = await acquireProgress()
-        await finishRecoveredDepartures()
-        do { try requireAuthorityReady() } catch { errors.append(error.localizedDescription) }
-        release(finishing)
+        errors += result.errors
         if !errors.isEmpty {
-            throw TrustedPartialRecovery(completedServices: completed,
+            throw TrustedPartialRecovery(completedServices: result.completed,
                 remaining: Array(errors.prefix(9)).map { BoundedDiagnostics.bounded($0, bytes: 8192) })
         }
     }
-    private func suppressApplications(to key: TargetKey) {
-        for intent in required where intent.value.contains(key) {
-            failedApplications.insert(.init(intent: intent.key, target: key))
+    private func recoverTrusted(_ passID: UUID) async throws -> RecoveryResult {
+        var completed: Set<UUID> = [], errors: [String] = []
+        var heldTargets: [UUID: ShaderRequestService] = [:]
+        do {
+            var registrationInspection: InspectionPass?
+            try Task.checkCancellation()
+            if let candidate = failedRegistration {
+                if candidate.eligibility.isCurrent {
+                    do {
+                        switch try await register(candidate).value() {
+                        case .accepted(let binding):
+                            if binding.permit.isCurrent { registrationInspection = currentInspection() }
+                        case .superseded: break
+                        }
+                    } catch {
+                        try Task.checkCancellation()
+                        errors.append("Registration: " + error.localizedDescription)
+                    }
+                } else { failedRegistration = nil }
+            }
+            try Task.checkCancellation()
+            let obligated = Set(required.values.flatMap { $0 })
+            recoveryTargets.formIntersection(obligated)
+            // Explicit callers supply their local phase; another target is recovered
+            // only when an actual cancellation obligation requires that recovery.
+            let inputServices = Set(recoveryPass?.id == passID ? recoveryPass!.inputs.keys : Dictionary<UUID, TrustedLocalRecovery>().keys)
+            let recovering = recoveryTargets.union(obligated.filter { inputServices.contains($0.service) })
+            for key in recovering.sorted(by: { ($0.service.uuidString, $0.registration.uuidString) < ($1.service.uuidString, $1.registration.uuidString) }) {
+                try Task.checkCancellation()
+                guard let target = targets[key]?.service else { continue }
+                let outcome: TrustedLocalRecovery
+                if let supplied = recoveryPass?.id == passID ? recoveryPass?.inputs[key.service] : nil {
+                    heldTargets[key.service] = target
+                    outcome = await target.validateTrustedRecovery(supplied, pass: passID)
+                } else {
+                    heldTargets[key.service] = target
+                    outcome = try await target.trustedRecoveryOutcome(pass: passID)
+                }
+                let commit = await acquireProgress()
+                guard targets[key]?.service === target else { release(commit); continue }
+                if outcome.completed {
+                    completed.insert(key.service)
+                    failedApplications = failedApplications.filter { $0.key.target != key }
+                    recoveryTargets.remove(key)
+                } else { suppressApplications(to: key, outcome: outcome) }
+                release(commit)
+            }
+            try Task.checkCancellation()
+            let inspection = await acquireProgress()
+            if !matches(registrationInspection) {
+                do { try await readFresh(target: service) }
+                catch { errors.append("Inspection: " + error.localizedDescription) }
+            }
+            release(inspection)
+            // Inputs can arrive while a target-local phase is awaited. Apply a
+            // late failed phase before replay; it may never silently skip work.
+            let commit = await acquireProgress()
+            if recoveryPass?.id == passID {
+                for (serviceID, input) in recoveryPass!.inputs {
+                    if input.completed { completed.insert(serviceID) }
+                    else {
+                        for key in targets.keys where key.service == serviceID { suppressApplications(to: key, outcome: input) }
+                    }
+                }
+            }
+            failedRemovalWrites.removeAll()
+            release(commit)
+            if loaded {
+                do { try await replay() } catch { errors.append(error.localizedDescription) }
+            }
+            try Task.checkCancellation()
+            let finishing = await acquireProgress()
+            await finishRecoveredDepartures()
+            do { try requireAuthorityReady() } catch { errors.append(error.localizedDescription) }
+            release(finishing)
+        } catch {
+            for target in heldTargets.values { await target.finishTrustedRecovery(pass: passID) }
+            if recoveryPass?.id == passID { recoveryPass = nil }
+            throw error
+        }
+        for target in heldTargets.values { await target.finishTrustedRecovery(pass: passID) }
+        if recoveryPass?.id == passID { recoveryPass = nil }
+        return .init(completed: completed.sorted { $0.uuidString < $1.uuidString }, errors: errors)
+    }
+    private func suppressApplications(to key: TargetKey, outcome: TrustedLocalRecovery) {
+        let intents = required.filter { $0.value.contains(key) }
+        guard !intents.isEmpty else { recoveryTargets.remove(key); return }
+        for intent in intents {
+            let detail = "Service " + key.service.uuidString + ": " + (outcome.failure ?? "Local recovery did not complete.")
+            failedApplications[.init(intent: intent.key, target: key)] = detail
+            let error = Self.unavailable(detail)
+            failures[intent.key] = failures[intent.key]?.appending(error) ?? Failure(error, diagnosticID: intent.key)
         }
         recoveryTargets.insert(key)
     }
@@ -657,7 +708,7 @@ actor TrustedApprovalsCoordinator {
             await target?.removeHostRecoveryObserver(subscription)
         }
         for key in retiredKeys { targets[key] = nil; inspections[key] = nil; targetPins[key] = nil; recoveryTargets.remove(key) }
-        failedApplications = failedApplications.filter { !retiredKeys.contains($0.target) }
+        failedApplications = failedApplications.filter { !retiredKeys.contains($0.key.target) }
         if service?.runtimeID == serviceID { service = nil }
         if departures[serviceID]?.id == departure.id { departures[serviceID] = nil }
         departure.close()
@@ -948,7 +999,7 @@ actor TrustedApprovalsCoordinator {
         }
         finalizedRemovals[intent.operationID] = nil
         required[intent.operationID] = nil; applications[intent.operationID] = nil; removals[intent.operationID] = nil; failures[intent.operationID] = nil
-        failedApplications = failedApplications.filter { $0.intent != intent.operationID }
+        failedApplications = failedApplications.filter { $0.key.intent != intent.operationID }
         completeSettledDepartures()
         let retained = Set(required.values.flatMap { $0 })
         targetPins = targetPins.filter { retained.contains($0.key) || departureRecovery[$0.key.service]?.registrationID == $0.key.registration }
@@ -967,7 +1018,7 @@ actor TrustedApprovalsCoordinator {
             for intent in remainingIntents {
                 for key in required[intent.operationID] ?? [] {
                     let attempt = Attempt(intent: intent.operationID, target: key)
-                    if applications[intent.operationID]?[key] == nil, !attempted.contains(attempt), !failedApplications.contains(attempt), let target = targets[key]?.service {
+                    if applications[intent.operationID]?[key] == nil, !attempted.contains(attempt), failedApplications[attempt] == nil, let target = targets[key]?.service {
                         work = (intent, key, target); attempted.insert(attempt); break
                     }
                 }
@@ -983,7 +1034,7 @@ actor TrustedApprovalsCoordinator {
                 let remaining = Set(envelope.revocations.map(\.operationID)).union(removals.keys)
                 failed = failed.filter { remaining.contains($0.key) }
                 // A successful target cannot erase another target's unresolved application.
-                for id in remaining where failed[id] == nil { failed[id] = failures[id] }
+                for id in remaining where failed[id] == nil { failed[id] = outstandingFailure(id) ?? failures[id] }
                 finishReplay(failed); release(token); return
             }
             let hook = accepted?.owner.beforeReplay, appliedRevision = revision
@@ -1005,11 +1056,27 @@ actor TrustedApprovalsCoordinator {
             } catch {
                 let commit = await acquireProgress()
                 recoveryTargets.insert(key)
-                failedApplications.insert(.init(intent: intent.operationID, target: key))
+                failedApplications[.init(intent: intent.operationID, target: key)] = error.localizedDescription
                 failed[intent.operationID] = await record(error, intent: intent)
                 release(commit)
             }
         }
+    }
+    /// Diagnostics explain unresolved obligations; they are not the source of
+    /// truth for whether cancellation or removal has actually completed.
+    private func outstandingFailure(_ id: UUID) -> Failure? {
+        guard let needed = required[id], !needed.isEmpty else { return nil }
+        if let failure = failures[id] { return failure }
+        let proofs = applications[id] ?? [:]
+        let pending = needed.sorted { $0.service.uuidString < $1.service.uuidString }
+        let detail = pending.compactMap { key -> String? in
+            if proofs[key] == nil {
+                let cause = failedApplications[.init(intent: id, target: key)] ?? "Cancellation application is unverified."
+                return "Service " + key.service.uuidString + ": " + cause
+            }
+            return finalizedRemovals[id]?.contains(key) == true ? nil : "Service " + key.service.uuidString + ": trusted removal finalization remains pending."
+        }.prefix(8).joined(separator: "\n")
+        return Failure(Self.unavailable("TV intent " + id.uuidString + " remains unresolved. " + detail), diagnosticID: id)
     }
     private func finishReplay(_ failed: [UUID: Failure]) {
         replayTask = nil
