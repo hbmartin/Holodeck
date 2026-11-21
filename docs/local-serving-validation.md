@@ -1051,3 +1051,63 @@ An identical optimized queued harness also ran seven alternating samples at each
 The current sequential and drain medians were higher; no throughput improvement is claimed. The measured queue operations grow linearly, and correctness/structural assertions impose no CI timing threshold. The unmodified baseline has no resume counter, so its resume/advance counts are unavailable. Process context switches in the raw profiles are distinct from admission resumes. Exact samples and CPU/context-switch data are retained in `/tmp/pr48-sequential-{baseline,current}.json` and `/tmp/pr48-queued-summary.json`; repeat results are in `/tmp/pr48-race-status.json`. Both optimized harnesses use identical workload source and differ only in the linked core objects.
 
 Desktop UI runtime checks remain **blocked by the existing user instruction**. Live Bonjour/LAN, a real Codex publication fixture, physical Apple TV and tvOS simulator execution were not run. The six core skips comprise three catalog performance fixtures, live Bonjour, real Codex publication and the separate worker-supervision idle profile. Worker/checker/shader implementation and checker locks are unchanged; separate full Python worker, checker-release, compile-all-Metal and external GPU-profile suites were not rerun. Linux CI and network/persisted formats are unchanged. No live installation was replaced, requests enabled, merge or deployment performed.
+
+
+## PR #48 follow-up — recovery completion and departure evidence (2026-11-21)
+
+This change starts from merged PR #48, `d80b980fd59f356bb8c2835c7ab523ecf261b90e`. Each service produces an attempt-scoped local recovery receipt, preserving its typed initiating error and metadata/ownership generation. Overlapping callers join one trusted pass with independent cancellation. A target joins its actual local phase, rather than treating a caller already awaiting trusted recovery as refused. Cancelled local phases which are still settling remain interrupted target outcomes; they cannot cancel an unrelated requester's pass. Last-waiter cancellation removes unadmitted authority preparation before another backend read or candidate encoding. Local-only persistence failures retain their original fault identity/generation; partial results describe independently completed and unresolved phases.
+
+Application recovery membership follows outstanding intent/target obligations. A failed local recovery with no revocation intent does not retain the service as another caller's retry target. Suppression carries its attempt, generation and bounded diagnostic. Successful local recovery cannot clear a newer application blocker, and replay completion checks required applications/removal receipts even when no earlier diagnostic was recorded. Persisted intents and device fences remain retained until their matching applications and finalization complete.
+
+Known approval writes and compatible removals advance prepared departure evidence. Unknown changes and inconclusive inspections invalidate it. Departure permits cover the complete backend read and target-notification window; activation waits asynchronously outside both authority lanes and revalidates before switching registration. Exact old-authority recovery endpoints survive service replacement and are attached to blocked registration proposals, so the existing Retry Recovery action can retire verified receipts without a successful new binding. Their local rows retain the original journal URL; they never substitute the replacement's directory. Unverifiable obligations retain their pins and manual-repair guidance. The exceptional post-activation state remains defensive fault-injection coverage: no normal production producer has been established. Likewise, the injected read/target failures exercise stale-evidence prevention without claiming an observed unsafe production activation.
+
+Ownerless publication waiters pause during active work/recovery rather than creating sticky checkout-recovery failures. Idle recovery errors retain precedence, genuine storage faults remain actionable, and a suspended failure helper cannot silently leave a waiter pending. Already admitted work continues. Non-task registration interruption has registration-specific guidance. Admission regressions now use asynchronous preparation/reservation gates instead of blocking isolated service actors; no two-core runner failure is claimed or available for this pass.
+
+Validation against the final frozen source manifest `/tmp/pr49-final-source.json` (98 runtime/test/app Swift files):
+
+- Full Swift core/native and packaged-resource suite: **579 tests, six opt-in skips, zero failures**. Local Metal/GPU fixtures verified **25 scenes** at catalog revision `8348af807717ea0e436208e957c333ec271e935380a9ea68b1db5aca56df13a5` with `HOLODECK_AUTHORING_FIXTURE=/Volumes/Pro2T/HolodeckShaders HOLODECK_GPU_TESTS=1 swift test --package-path HolodeckCore`.
+- Focused Release suite: **137 tests, zero failures**, covering trusted state, publication/recovery boundaries, packaged resources and isolated TLS/client recovery.
+- **Twenty optimized strict-pool repetitions of 90 tests: 1,800 executions, zero failures.** Gates witness actual queue/inspection admission; backstops and task cancellation cannot turn a deadlock into success. Coverage includes opposing transfers, exact receipts, failed inspections, shared-pass cancellation, queued cancellation before I/O and normal stop/supersession counterexamples.
+- Maintained headless Mac-model partial-recovery checks passed using system Python **3.9.6** and current Python **3.15.0**. They use isolated storage, no production approvals, listeners or desktop UI. Accepted settings continue arriving through observation.
+- Both unsigned Release app builds succeeded with Xcode **27.2** / Apple Swift **6.4.2**, using temporary DerivedData `/tmp/HolodeckPR49Validation`. Packaged native `library artifact-info --json` verified unchanged checker **1.1.1**, interface **1**, source `58ed409e023b9b1ccbc08dcedd5b38c1090e14fc`, SHA-256 `8a8229c76e6e42d91d84fe9744bf53bbcda0c9dc8064ba82a41e2b15bb66ef19`.
+- Frozen hashes matched final Debug, Release, app builds, model checks and repetitions/profiles. The complete baseline archive's 106 tracked Swift files were also compared byte-for-byte with `d80b980`. Development runs exposed a typed-persistence-error compatibility regression; it was corrected and the existing identity/generation assertion passes. Earlier development results are excluded from these acceptance totals.
+
+Release profiles used the same compiler and `/private/tmp` filesystem, an injected in-memory trusted backend, isolated real request journals, and seven alternating samples per version. The exact baseline is `/private/tmp/pr49-baseline`. Timing values are medians, with no CI timing threshold or general throughput claim.
+
+For 200 sequential revocations, both versions retained **one trusted read, 400 candidate encodings and 400 trusted writes**:
+
+| Sequential median | Merged PR #48 | Follow-up |
+| --- | ---: | ---: |
+| Workload elapsed | 67.66 ms | 68.15 ms |
+| Process user CPU | 124.81 ms | 125.95 ms |
+| Process system CPU | 24.56 ms | 24.49 ms |
+| Process wall time | 149.14 ms | 149.80 ms |
+
+The maintained queued workload registers two original-authority targets, holds transfer inspection, admits actions in witnessed order, performs 32 unrelated service-status calls and releases transfer. Queue construction includes deliberate admission waits; drain timing begins at gate release. Both original-authority backends use two reads and 2N encodings/writes. The replacement's separate backend is outside those counters. Grant/advance counts are identical in both versions and grow linearly:
+
+| Actions | Baseline drain | Follow-up drain | Resumes, both | Advances, both | Follow-up 32 status calls while held |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 50 | 12.04 ms | 13.65 ms | 152 | 255 | 0.61 ms |
+| 100 | 34.21 ms | 34.12 ms | 302 | 505 | 0.75 ms |
+| 200 | 115.17 ms | 114.59 ms | 602 | 1005 | 0.79 ms |
+
+Ordinary revocation timings are close to baseline, with mixed small differences. Queued raw process CPU/wall values cover the whole queued test process, not an individual row. Cancelled head/middle/tail tests also pass; rejected candidates encode nothing, and completed normal revocations retain one revoke/removal write pair.
+
+A separate identical optimized fixture fails A's local recovery with no intents, repairs A, then performs 100 explicit retries from B. The counters distinguish reconciler calls from whole local-phase counts. The maintained concurrency regression separately asserts one actual local phase per participating service and one shared trusted pass:
+
+| 100-retry recovery workload | Merged PR #48 | Follow-up |
+| --- | ---: | ---: |
+| Unrelated A reconciler calls | 200 | 0 |
+| Requesting B reconciler calls | 200 | 200 |
+| Trusted reads | 100 | 100 |
+| Trusted writes | 0 | 0 |
+| Candidate encodings | 0 | 0 |
+| Metadata replacements | 1 | 1 |
+| Retained registered targets | 2 | 2 |
+| Workload median | 57.21 ms | 35.10 ms |
+
+This fixture removes the 200 unrelated reconciliation calls while preserving requester recovery and trusted/durable work counts. It does not measure live Keychain latency or network round trips. Structural assertions, rather than timing thresholds, enforce the intended work reduction and bounded queues/targets.
+
+Evidence: `/tmp/pr49-core-acceptance.log`, `/tmp/pr49-release-acceptance.log`, `/tmp/pr49-{mac,tv}-acceptance-build.log`, `/tmp/pr49-model{39,-current}-acceptance.log`, `/tmp/pr49-artifact-acceptance.json`, `/tmp/pr49-races.json`, `/tmp/pr49-race-*.log`, `/tmp/pr49-profile-{raw,summary}.json` and `/tmp/pr49-recovery-profile-raw.json`. The identical standalone recovery workload is `/tmp/pr49-recovery-profile.swift`; queued/sequential structural workloads remain in the test suite.
+
+Desktop UI runtime checks remain **blocked under the user's instruction**. Live Bonjour/LAN, real Codex publication, physical Apple TV and tvOS simulator execution were not run. The six core skips cover three catalog profiles, live Bonjour, real Codex publication and the separate worker-supervision idle profile. Isolated loopback TLS and local Metal/GPU fixtures did run. Worker/checker/shader code and locks are unchanged; their separate Python worker, checker-release, compile-all-Metal and external GPU-profile suites were not rerun. Linux CI, network messages and persisted formats are unchanged. No live installation replacement, request enabling, merge or deployment occurred.

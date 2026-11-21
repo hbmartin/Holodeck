@@ -84,6 +84,31 @@ import XCTest
             XCTAssertEqual(backend.writes, 0); XCTAssertEqual(nextBackend.writes, 0)
         }
     }
+    func testBackendInspectionFailureCannotBeOvertakenByActivation() async throws {
+        let a = try await fixture(), b = try await fixture(), backend = TrustedBackendFixture(nil)
+        let armed = DepartureStorageFault(), reading = RecoveryGate()
+        addTeardownBlock { await reading.release() }
+        let old = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
+            beforeInspectionRead: { if armed.enabled { try await reading.wait() } })
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: b.service)))
+        let nextBackend = TrustedBackendFixture(nil), gate = TrustedReadGate(); nextBackend.gateReads(gate)
+        addTeardownBlock { gate.release() }
+        let next = nextBackend.coordinator(), ticket = try await next.register(TrustedOwnerRecorder().owner(service: a.service))
+        addTeardownBlock { ticket.completion.cancel(); gate.release(); await reading.release() }
+        try await wait { gate.entered }; armed.enabled = true
+        let recovery = Task { try await b.service.retryReconciliation() }
+        addTeardownBlock { recovery.cancel(); await reading.release() }
+        try await wait { await reading.hasEntered }
+        gate.release()
+        try await wait { await old.observation.departureInspectionWaiters > 0 }
+        backend.failReads(true); await reading.release()
+        do { try await recovery.value; XCTFail("Unreadable trusted storage accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EACCES).localizedDescription)) }
+        do { _ = try await ticket.value(); XCTFail("Activation overtook an inconclusive backend inspection") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("inspection changed during handoff")) }
+        XCTAssertEqual(backend.writes, 0); XCTAssertEqual(nextBackend.writes, 0)
+    }
     func testMovedSoleTargetUsesExactOldAuthorityRecoveryEndpoint() async throws {
         let a = try await fixture(), backend = TrustedBackendFixture(nil), old = backend.coordinator(), next = TrustedBackendFixture(nil).coordinator()
         _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
@@ -112,6 +137,8 @@ import XCTest
         catch let error as TrustedDepartureRecoveryError { XCTAssertEqual(error.diagnosticID, departure.id) }
         let statuses = await b.service.recoveryStatuses()
         XCTAssertTrue(statuses.contains { $0.id == departure.id })
+        XCTAssertEqual(statuses.first { $0.id == departure.id }?.journal, a.root)
+        XCTAssertNotEqual(statuses.first { $0.id == departure.id }?.journal, b.root)
         try await b.service.retryReconciliation()
         _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: b.service)))
         let recovered = await b.service.recoveryStatuses(); XCTAssertFalse(recovered.contains { $0.id == departure.id })

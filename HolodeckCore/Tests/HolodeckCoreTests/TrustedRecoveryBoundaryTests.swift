@@ -50,7 +50,7 @@ import XCTest
         _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: b)))
         fault.armed = true
         do { try await a.retryReconciliation(); XCTFail("Injected local failure ignored") }
-        catch let error as TrustedPartialRecovery { XCTAssertTrue(error.remaining.joined().contains(POSIXError(.EIO).localizedDescription)) }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
         fault.armed = false; try await a.retryReconciliation()
         fault.armed = true
         try await b.retryReconciliation()
@@ -89,6 +89,7 @@ import XCTest
             let gate = TrustedReadGate(); backend.gateReads(gate)
             addTeardownBlock { gate.release() }
             let passes = await authority.observation.recoveryPasses
+            let aPhases = await a.localRecoveryPhaseCount, bPhases = await b.localRecoveryPhaseCount
             let first = Task { try await a.retryReconciliation() }
             addTeardownBlock { first.cancel(); gate.release() }
             try await wait { gate.entered }
@@ -104,6 +105,8 @@ import XCTest
             try await second.value
             let observation = await authority.observation
             XCTAssertEqual(observation.recoveryPasses, passes + 1); XCTAssertEqual(observation.obligations, 0)
+            let finalA = await a.localRecoveryPhaseCount, finalB = await b.localRecoveryPhaseCount
+            XCTAssertEqual(finalA, aPhases + 1); XCTAssertEqual(finalB, bPhases + 1)
             XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
         }
     }
@@ -142,7 +145,8 @@ import XCTest
             let owner = service.retainOwner()
             addTeardownBlock { owner.release() }
             fault.armed = true
-            do { try await service.retryReconciliation(); XCTFail("Injected recovery fault ignored") } catch is TrustedPartialRecovery {}
+            do { try await service.retryReconciliation(); XCTFail("Injected recovery fault ignored") }
+            catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
             if !suspended { await service.resume() }
             owner.release()
             let result = BoundaryOutcome(), publication = Task {
@@ -177,6 +181,83 @@ import XCTest
             XCTAssertTrue(message.contains("registration preparation was cancelled"))
             XCTAssertFalse(message.contains("Detach")); XCTAssertFalse(message.contains("checkout maintenance"))
         }
+    }
+    func testCancelledLocalPhaseDoesNotCancelAnotherServicesTrustedPass() async throws {
+        let armed = BoundaryFailureSwitch(), gate = NoncancellingRecoveryGate()
+        let (a, _) = try await fixture(reconcile: { _ in if armed.armed { await gate.wait() } }), (b, _) = try await fixture()
+        let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(revocations: [intent]).encoded()), authority = backend.coordinator()
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a)))
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: b, beforeReplay: { _ in throw POSIXError(.EIO) })))
+        do { try await authority.replay(); XCTFail("Injected replay fault ignored") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: b)))
+        armed.armed = true
+        let cancelled = Task { try await a.retryReconciliation() }
+        addTeardownBlock { cancelled.cancel(); await gate.release() }
+        try await wait { await gate.entered }
+        cancelled.cancel()
+        do { try await cancelled.value; XCTFail("Cancelled caller succeeded") } catch is CancellationError {}
+        do { try await a.retryReconciliation(); XCTFail("Still-settling phase admitted another requester") }
+        catch is TrustedRecoveryAdmissionError {}
+        let reads = backend.reads
+        do { try await b.retryReconciliation(); XCTFail("Unresolved target reported success") }
+        catch let partial as TrustedPartialRecovery {
+            XCTAssertTrue(partial.completedServices.contains(b.runtimeID))
+            XCTAssertTrue(partial.remaining.joined().contains("previous local recovery was cancelled"))
+        }
+        XCTAssertGreaterThan(backend.reads, reads)
+        XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations, [intent])
+        armed.armed = false; await gate.release()
+        try await wait { await a.canDisableRequests() }
+        try await a.retryReconciliation()
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
+    }
+    func testLastCancelledRecoveryWaiterRemovesQueuedPreparationBeforeInspection() async throws {
+        let (service, _) = try await fixture(), backend = TrustedBackendFixture(nil), authority = backend.coordinator(), gate = RecoveryGate()
+        let binding = try await accept(authority.register(TrustedOwnerRecorder().owner(service: service)))
+        let occupying = Task { try await authority.approve(binding.permit) { try await gate.wait(); return nil } }
+        addTeardownBlock { occupying.cancel(); await gate.release() }
+        try await wait { await gate.hasEntered }
+        let reads = backend.reads
+        let recovery = Task { try await service.retryReconciliation() }
+        addTeardownBlock { recovery.cancel(); await gate.release() }
+        try await wait { await authority.observation.progressWaiters == 1 }
+        recovery.cancel()
+        do { try await recovery.value; XCTFail("Cancelled recovery reported success") } catch is CancellationError {}
+        try await wait { await authority.observation.progressWaiters == 0 }
+        await gate.release(); _ = try await occupying.value
+        XCTAssertEqual(backend.reads, reads); XCTAssertEqual(backend.writes, 0)
+        let observed = await authority.observation; XCTAssertEqual(observed.encodings, 0)
+    }
+    func testSharedTaskAdmitsWaitersBeforeTheirAwaitIsScheduled() async throws {
+        let gate = RecoveryGate()
+        addTeardownBlock { await gate.release() }
+        let shared = TrustedRecoveryTask { try await gate.wait(); return 42 }
+        let first = shared.subscribe(), admitted = shared.subscribe()
+        let cancelled = Task { try await first.value() }
+        addTeardownBlock { cancelled.cancel(); await gate.release() }
+        try await wait { await gate.hasEntered }
+        cancelled.cancel()
+        do { _ = try await cancelled.value; XCTFail("Cancelled subscription succeeded") } catch is CancellationError {}
+        XCTAssertFalse(shared.isCancelled)
+        await gate.release()
+        let result = try await admitted.value(); XCTAssertEqual(result, 42); XCTAssertEqual(shared.waiterCount, 0)
+    }
+    func testRecoveryReceiptRejectsChangedRegistration() async throws {
+        let (service, _) = try await fixture()
+        let authority = UUID(), pass = UUID()
+        _ = await service.registerRevocationCoordinator(id: authority) {}
+        let result = try await service.trustedRecoveryOutcome(pass: pass)
+        defer { Task { await service.finishTrustedRecovery(pass: pass) } }
+        XCTAssertTrue(result.completed)
+        _ = await service.registerRevocationCoordinator(id: UUID()) {}
+        let rejected = await service.validateTrustedRecovery(result)
+        XCTAssertFalse(rejected.completed); XCTAssertTrue(rejected.failure?.contains("evidence changed") == true)
+        let failed = TrustedLocalRecovery(phase: .failed("Retained initiating fault"), receipt: result.receipt, initiatingError: POSIXError(.EIO))
+        let staleFailure = await service.validateTrustedRecovery(failed)
+        XCTAssertTrue(staleFailure.failure?.contains("Retained initiating fault") == true)
+        XCTAssertEqual((staleFailure.initiatingError as? POSIXError)?.code, .EIO)
     }
     func testSupersededRecoveryRegistrationRequiresActualInspection() async throws {
         let (a, _) = try await fixture(), (b, _) = try await fixture()
@@ -282,6 +363,13 @@ import XCTest
         do { try await retry.value; XCTFail("Cancelled recovery succeeded") } catch is CancellationError {}
         XCTAssertEqual(backend.reads, reads)
     }
+}
+private actor NoncancellingRecoveryGate {
+    private(set) var entered = false
+    private var open = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    func wait() async { entered = true; if open { return }; await withCheckedContinuation { continuation = $0 } }
+    func release() { open = true; continuation?.resume(); continuation = nil }
 }
 @MainActor private final class BoundaryOutcome {
     private(set) var finished = false

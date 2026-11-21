@@ -612,8 +612,10 @@ public actor ShaderRequestService {
     private var localRecoveryPhase: (id: UUID, task: TrustedRecoveryTask<TrustedLocalRecovery>)?
     private var localRecoveryResult: TrustedLocalRecovery?
     private var localRecoveryGeneration: UInt64 = 0
+    var localRecoveryPhaseCount: UInt64 { localRecoveryGeneration }
     private var trustedRecoveryHolds: Set<UUID> = []
     private var authorityRecoveryEndpoints: [UUID: TrustedAuthorityRecoveryEndpoint] = [:]
+    func trustedRecoveryJournal() -> URL { directory }
     func rememberAuthorityRecovery(_ endpoint: TrustedAuthorityRecoveryEndpoint) {
         authorityRecoveryEndpoints[endpoint.ticketID] = endpoint; emitUpdates(); scheduleWakeup()
     }
@@ -1307,7 +1309,7 @@ public actor ShaderRequestService {
         }
         for endpoint in authorityRecoveryEndpoints.values.filter(\.isCurrent).sorted(by: { $0.ticketID.uuidString < $1.ticketID.uuidString }) {
             statuses.append(.init(id: endpoint.ticketID, kind: .persistence, repository: "", python: "", git: "",
-                message: endpoint.message, isRunning: localRecoveryAttempt != nil, journal: directory))
+                message: endpoint.message, isRunning: localRecoveryAttempt != nil, journal: endpoint.journal))
         }
         return statuses
     }
@@ -1690,7 +1692,8 @@ public actor ShaderRequestService {
     public func retryReconciliation() async throws { try await retryReconciliation(replayTrusted: true) }
     func retryReconciliation(replayTrusted: Bool) async throws {
         try Task.checkCancellation()
-        guard activeID == nil, !maintenanceBusy, localRecoveryAttempt == nil else { throw TrustedRecoveryAdmissionError() }
+        guard activeID == nil, !maintenanceBusy, localRecoveryAttempt == nil,
+              localRecoveryPhase?.task.isCancelled != true else { throw TrustedRecoveryAdmissionError() }
         let attempt = UUID(); localRecoveryAttempt = attempt
         defer {
             if localRecoveryAttempt == attempt { localRecoveryAttempt = nil; localRecoveryResult = nil; emitUpdates(); scheduleWakeup() }
@@ -1698,6 +1701,7 @@ public actor ShaderRequestService {
         let local = try await recoverLocalPhase()
         try Task.checkCancellation()
         var failures: [String] = [], completed: Set<UUID> = local.completed ? [runtimeID] : []
+        let hasIndependentPhase = replayTrusted && (revocationCoordinator != nil || authorityRecoveryEndpoints.values.contains(where: \.isCurrent))
         if replayTrusted, let coordinator = revocationCoordinator {
             do { try await coordinator(local) }
             catch {
@@ -1716,36 +1720,42 @@ public actor ShaderRequestService {
                 catch { try Task.checkCancellation(); failures.append(error.localizedDescription) }
             }
         }
-        if let failure = local.failure { failures.insert(failure, at: 0) }
         if !failures.isEmpty {
+            if let failure = local.failure { failures.insert(failure, at: 0) }
             throw TrustedPartialRecovery(completedServices: completed.sorted { $0.uuidString < $1.uuidString },
                 remaining: Array(failures.prefix(9)).map { BoundedDiagnostics.bounded($0, bytes: 8192) })
         }
+        if hasIndependentPhase, let failure = local.failure { throw TrustedPartialRecovery(completedServices: [], remaining: [failure]) }
+        if let original = local.initiatingError { throw original }
+        if let failure = local.failure { throw TrustedPartialRecovery(completedServices: [], remaining: [failure]) }
     }
     private func recoverLocalPhase() async throws -> TrustedLocalRecovery {
-        if let phase = localRecoveryPhase { return try await phase.task.value() }
+        if let phase = localRecoveryPhase { return try await phase.task.subscribe().value() }
         if !trustedRecoveryHolds.isEmpty, let result = localRecoveryResult { return validateTrustedRecovery(result) }
         let attempt = UUID(); localRecoveryGeneration &+= 1
         let generation = localRecoveryGeneration
         let task = TrustedRecoveryTask { try await self.performLocalRecovery(attempt: attempt, generation: generation) }
         localRecoveryPhase = (attempt, task)
-        return try await task.value()
+        return try await task.subscribe().value()
     }
     private func performLocalRecovery(attempt: UUID, generation: UInt64) async throws -> TrustedLocalRecovery {
         defer { if localRecoveryPhase?.id == attempt { localRecoveryPhase = nil } }
         let phase: TrustedRecoveryPhase
+        var initiatingError: (any Error)?
         do { try await recoverLocalMetadata(); phase = .completed }
         catch {
             try Task.checkCancellation()
+            initiatingError = error
             let detail = BoundedDiagnostics.bounded(error.localizedDescription, bytes: 8192)
             if error is TrustedRecoveryAdmissionError { phase = .refused(detail) }
             else if error is TrustedRecoveryInterrupted || error is CancellationError {
-                phase = .interrupted(TrustedRecoveryInterrupted().localizedDescription)
+                let interruption = TrustedRecoveryInterrupted()
+                initiatingError = interruption; phase = .interrupted(interruption.localizedDescription)
             } else { phase = .failed(detail) }
         }
         let outcome = TrustedLocalRecovery(phase: phase, receipt: .init(serviceID: runtimeID,
             registrationID: revocationRegistration, authority: revocationCoordinatorID, attemptID: attempt,
-            generation: generation, metadataRevision: persistenceRevision, ownershipGeneration: reconciliationEpoch))
+            generation: generation, metadataRevision: persistenceRevision, ownershipGeneration: reconciliationEpoch), initiatingError: initiatingError)
         localRecoveryResult = outcome
         return outcome
     }
@@ -1754,13 +1764,17 @@ public actor ShaderRequestService {
               receipt.registrationID == revocationRegistration, receipt.authority == revocationCoordinatorID,
               receipt.generation == localRecoveryGeneration, receipt.metadataRevision == persistenceRevision,
               receipt.ownershipGeneration == reconciliationEpoch else {
-            return .init(phase: .interrupted("Local recovery evidence changed before trusted cancellation; retry recovery."))
+            let original = outcome.failure.map { " Original local recovery error: " + $0 } ?? ""
+            return .init(phase: .interrupted(BoundedDiagnostics.bounded("Local recovery evidence changed before trusted cancellation; retry recovery." + original, bytes: 8192)), initiatingError: outcome.initiatingError)
         }
         if let pass { trustedRecoveryHolds.insert(pass) }
         return outcome
     }
     /// Join only the local phase, never the authority pass which is asking us.
     func trustedRecoveryOutcome(pass: UUID? = nil) async throws -> TrustedLocalRecovery {
+        if localRecoveryPhase?.task.isCancelled == true {
+            return .init(phase: .interrupted("A previous local recovery was cancelled and is still settling. Retry when it finishes."))
+        }
         if localRecoveryPhase == nil, let result = localRecoveryResult,
            localRecoveryAttempt != nil || !trustedRecoveryHolds.isEmpty {
             return validateTrustedRecovery(result)
@@ -1769,7 +1783,12 @@ public actor ShaderRequestService {
             return .init(phase: .refused(TrustedRecoveryAdmissionError().localizedDescription))
         }
         if let pass { trustedRecoveryHolds.insert(pass) }
-        return try await recoverLocalPhase()
+        do { return try await recoverLocalPhase() }
+        catch {
+            try Task.checkCancellation()
+            let detail = error is CancellationError ? "The joined local recovery was cancelled before completion. Retry after it settles." : error.localizedDescription
+            return .init(phase: .interrupted(BoundedDiagnostics.bounded(detail, bytes: 8192)), initiatingError: error)
+        }
     }
     func finishTrustedRecovery(pass: UUID) {
         trustedRecoveryHolds.remove(pass)
