@@ -1012,3 +1012,42 @@ Context switches are process-level measurements, not counts of service schedulin
 Evidence: `/tmp/pr47-final-{core,release,mac-build,tv-build,model39,model-current}.log`, `/tmp/pr47-race-status.json`, `/tmp/pr47-races-*.log`, `/tmp/pr47-profile-{baseline,current,gated}.json`, `/tmp/pr47-final-artifact.json`, and `/tmp/pr47-final-source.json`. The baseline archive at `/private/tmp/pr47-profile-baseline` matches `5507e8c`; the maintained headless check is reproducible from the repository after building Debug tests.
 
 Desktop UI runtime checks remain **blocked under the user's instruction**. Live Bonjour/LAN discovery, real Codex publication, physical Apple TV and tvOS simulator execution were not run. The six core skips cover three unrelated catalog profiles, live discovery, real Codex publication and worker-supervision profiling. Isolated loopback TLS and local core Metal/GPU fixtures did run. Worker/checker/shader sources and artifact locks are unchanged; their separate Python worker, checker-release, compile-all-Metal and external GPU-profile suites were not rerun. Linux CI, network messages and persisted envelope/journal formats are unchanged. No live installation replacement, request enabling, merge or deployment occurred.
+
+## PR #47 follow-up — admission and recovery boundaries (2026-11-08)
+
+This change starts from merged PR #47, `64e057e83c9adb44600332dfe88f44df836e4df1`. Authority admission now distinguishes client actions, replacement activation, new departure preparation and internal progress. Replay, receipt settlement, inspection completion and withdrawal cannot wait behind registrations they must unblock. Ready revocations have FIFO priority over later departure preparation and unstarted activation. Waiting revocations remain provisional until transfers settle; cancelled waiters prepare no candidate. The next eligible waiter receives the lane directly, with indexed cancellation and no broadcast wakeup loop. Latest-admitted replacement ordering, explicit re-registration for superseded servers and the normal stop outcome remain intact.
+
+Departure preparation records its trusted baseline, exact registration and empty obligation set. Unchanged successful reads preserve it; changed or inconclusive evidence invalidates it before activation. Target inspection receipts are consumed by departure and recovery decisions. An accepted registration can supply inspection evidence only while its baseline and target registrations still match; supersession supplies no receipt. Exceptional activated-but-unresolved departure handling closes the live admission gate, retains exact obligations/pins and exposes a typed receipt-recovery failure. Its regression injects the invariant failure; no reachable production producer of that state has been established.
+
+Recovery admission refuses an active requester before either phase. Once admitted, local completion, refusal, ordinary failure and non-task maintenance interruption are explicit target outcomes. Only actual task cancellation aborts the remaining preparation. A concurrent Detach cannot masquerade as user cancellation or suppress an independent approvals inspection. Failed/interrupted targets keep their application suppression and original diagnostics while other safe work completes. The recovery pass retains its publication waiters until its outcome is known. A healthy transfer also retains new publication waiters, required revoked-work cleanup keeps priority, and loss of the last host rejects new pending publications even while already admitted work finishes.
+
+Validation used the frozen runtime/test/helper manifest `/tmp/pr48-final-source.json`:
+
+- Full Swift core/native and packaged-resource coverage: **564 tests, six opt-in skips, zero failures**, with **25 local Metal scenes** verified at catalog revision `8348af807717ea0e436208e957c333ec271e935380a9ea68b1db5aca56df13a5` (`HOLODECK_AUTHORING_FIXTURE=/Volumes/Pro2T/HolodeckShaders HOLODECK_GPU_TESTS=1 swift test --package-path HolodeckCore`).
+- Focused Release selection: **106 tests, zero failures**, including trusted state, recovery, publication, isolated TLS and packaged resources.
+- Twenty optimized repetitions of 83 admission, lifecycle, recovery, publication and isolated TLS tests: **1,660 executions, zero failures**. Both opposing-transfer regressions witness queued/preparing generations on both sides before releasing gates. Task completion must precede a bounded backstop; cancelling a stalled receipt cannot turn a timeout into success.
+- Maintained Release contention coverage passed with 50, 100 and 200 queued actions, plus cancelled head/middle/tail actions. Structural assertions cover zero pre-admission encoding/writes, exact retained approvals, one write pair per completed revoke, empty retired queues/obligations and linear grant/advance counts.
+- The real Mac model headless partial-recovery check passed under system Python **3.9** and the current interpreter. Accepted settings still arrive through observation after partial recovery. This check uses isolated temporary storage and does not run desktop UI.
+- Both unsigned Release app builds succeeded with Xcode **27.2** / Apple Swift **6.4.2**. The built Mac app's `library artifact-info --json` verified unchanged checker **1.1.1**, interface **1**, source `58ed409e023b9b1ccbc08dcedd5b38c1090e14fc`, SHA-256 `8a8229c76e6e42d91d84fe9744bf53bbcda0c9dc8064ba82a41e2b15bb66ef19`.
+- Frozen hashes matched Debug, Release, app builds, headless checks and final repetitions/profiles. During development, the existing later-departure priority test identified an admission-priority omission; it was corrected before these final runs. Earlier development results are excluded from acceptance totals.
+
+Release profiling compared an isolated exact archive of merged PR #47 against the frozen current source, using the same compiler, `/private/tmp` filesystem and injected in-memory trusted backend. Seven alternating samples per version retained one initial trusted read and **400 encodings / 400 writes** for 200 sequential revocations:
+
+| Sequential median | Merged PR #47 | Follow-up |
+| --- | ---: | ---: |
+| Workload elapsed | 72.36 ms | 78.34 ms |
+| Process user CPU | 126.49 ms | 133.29 ms |
+| Process system CPU | 29.94 ms | 32.67 ms |
+| Process wall time | 157.32 ms | 163.26 ms |
+
+An identical optimized queued harness also ran seven alternating samples at each size. It creates two registered targets, holds transfer inspection, queues actions in witnessed order, performs 128 unrelated status queries, then releases transfer. Queue construction intentionally waits for admission receipts; drain time starts when the transfer gate opens. Each version used **two registration reads**, **2N encodings** and **2N writes**, with no additional read while queued or replaying its own accepted writes.
+
+| Queued count | Baseline drain | Follow-up drain | Follow-up resumes | Follow-up advances | Follow-up 128 status queries while held |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 50 | 12.76 ms | 13.41 ms | 152 | 255 | 3.33 ms |
+| 100 | 32.60 ms | 37.60 ms | 302 | 505 | 3.27 ms |
+| 200 | 103.19 ms | 136.89 ms | 602 | 1005 | 2.25 ms |
+
+The current sequential and drain medians were higher; no throughput improvement is claimed. The measured queue operations grow linearly, and correctness/structural assertions impose no CI timing threshold. The unmodified baseline has no resume counter, so its resume/advance counts are unavailable. Process context switches in the raw profiles are distinct from admission resumes. Exact samples and CPU/context-switch data are retained in `/tmp/pr48-sequential-{baseline,current}.json` and `/tmp/pr48-queued-summary.json`; repeat results are in `/tmp/pr48-race-status.json`. Both optimized harnesses use identical workload source and differ only in the linked core objects.
+
+Desktop UI runtime checks remain **blocked by the existing user instruction**. Live Bonjour/LAN, a real Codex publication fixture, physical Apple TV and tvOS simulator execution were not run. The six core skips comprise three catalog performance fixtures, live Bonjour, real Codex publication and the separate worker-supervision idle profile. Worker/checker/shader implementation and checker locks are unchanged; separate full Python worker, checker-release, compile-all-Metal and external GPU-profile suites were not rerun. Linux CI and network/persisted formats are unchanged. No live installation was replaced, requests enabled, merge or deployment performed.
