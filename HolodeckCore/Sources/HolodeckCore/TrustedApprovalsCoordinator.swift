@@ -275,6 +275,11 @@ actor TrustedApprovalsCoordinator {
     // Retain that outcome and its pins until exact fence finalization succeeds.
     private var removals: [UUID: TrustedRevocationRemoval] = [:]
     private var finalizedRemovals: [UUID: Set<TargetKey>] = [:]
+    private struct RemovalAdmission {
+        let keys: Set<TargetKey>
+        let completion = TrustedCompletionSignal()
+    }
+    private var removalAdmissions: [UUID: RemovalAdmission] = [:]
     private var recoveryTargets: Set<TargetKey> = []
     private struct ApplicationBlocker {
         let generation: UInt64
@@ -483,8 +488,8 @@ actor TrustedApprovalsCoordinator {
         var inspection: TrustedRevocationInspection?
         if let transfer {
             (registration, inspection) = try await target.installTrustedAuthority(transfer, id: id,
-                intents: outstandingIntents, revision: revision, coordinator: callback)
-        } else { registration = await target.registerRevocationCoordinator(id: id, recovery: callback) }
+                intents: outstandingIntents, revision: revision, coordinator: callback, authority: self)
+        } else { registration = try await target.installRevocationCoordinator(authority: self, recovery: callback) }
         let key = TargetKey(service: serviceID, registration: registration)
         let previous = targets.keys.filter { $0.service == serviceID && $0 != key }
         for old in previous {
@@ -514,8 +519,13 @@ actor TrustedApprovalsCoordinator {
     /// Target-local preparation runs outside the authority lane, but publishes
     /// its epoch before it can mutate metadata or invalidate application evidence.
     func beginTargetRecovery(_ target: ShaderRequestService, registration: UUID, attempt: UUID) async throws -> Bool {
-        let token = try await acquire(.progress); defer { release(token) }
         let key = TargetKey(service: target.runtimeID, registration: registration)
+        // Read-only lane holders cannot delay a local fence. An already-admitted
+        // removal, however, owns these exact proofs until its write settles.
+        while let admission = removalAdmissions.values.first(where: { $0.keys.contains(key) }) {
+            try await admission.completion.wait()
+        }
+        try Task.checkCancellation()
         guard targets[key]?.service === target, !retired(key) else { return false }
         recoveryEpochs[key] = attempt; preparingRecovery[key] = attempt
         for intent in required.keys where required[intent]?.contains(key) == true && removals[intent] == nil {
@@ -527,7 +537,6 @@ actor TrustedApprovalsCoordinator {
         return true
     }
     func endTargetRecovery(serviceID: UUID, registration: UUID, attempt: UUID, outcome: TrustedLocalRecovery?) async {
-        let token = await acquireProgress(); defer { release(token) }
         let key = TargetKey(service: serviceID, registration: registration)
         guard preparingRecovery[key] == attempt else { return }
         preparingRecovery[key] = nil
@@ -998,6 +1007,17 @@ actor TrustedApprovalsCoordinator {
                 if let target = admittedService ?? request.owner.service {
                     while true {
                         do { try await configure(target, transfer: transfer); break }
+                        catch let waiting as TrustedLocalPreparationPending {
+                            release(token)
+                            do { try await waiting.preparation.wait() }
+                            catch { token = await acquireReplacement(); throw error }
+                            token = await acquireReplacement()
+                            try request.registration.completion.check()
+                            guard request.registration.completion.hasStarted || request.registration.generation == generation else {
+                                throw RegistrationAbandoned.superseded
+                            }
+                            if currentInspection() == nil { try await readFresh(target: target) }
+                        }
                         catch let waiting as TrustedDepartureInspectionPending {
                             release(token)
                             do { try await waiting.departure.waitForInspection() }
@@ -1256,8 +1276,21 @@ actor TrustedApprovalsCoordinator {
             }
             try await target.validateTrustedRevocation(proof)
         }
+        if removals[intent.operationID] == nil {
+            guard needed.allSatisfy({ key in
+                let attempt = Attempt(intent: intent.operationID, target: key)
+                guard let epoch = applicationEpochs[attempt] else { return false }
+                return applications[intent.operationID]?[key] == proofs[key] && applicationIsCurrent(attempt, epoch: epoch)
+            }) else { return false }
+        }
         let removal = try TrustedRevocationRemoval.checked(authority: id, intent: intent,
             proofs: needed.compactMap { proofs[$0] })
+        let admission = RemovalAdmission(keys: needed)
+        removalAdmissions[intent.operationID] = admission
+        defer {
+            removalAdmissions[intent.operationID] = nil
+            admission.completion.finish()
+        }
         if removals[intent.operationID] == nil {
             var value = envelope; value.revocations.removeAll { $0.operationID == intent.operationID }
             do { try await persist(value, bytes: prepare(value)) }

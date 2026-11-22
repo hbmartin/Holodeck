@@ -65,6 +65,47 @@ nonisolated final class TrustedRecoveryTask<Value: Sendable>: @unchecked Sendabl
     }
 }
 
+/// Each waiter owns cancellation; completing a boundary never cancels its owner.
+nonisolated final class TrustedCompletionSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var finished = false
+    private var waiters: [UUID: RequestPersistence.CommitTicket<Void>] = [:]
+    var waiterCount: Int { lock.withLock { waiters.count } }
+    func wait(cancellable: Bool = true) async throws {
+        let id = UUID(), receipt = RequestPersistence.CommitTicket<Void>()
+        lock.withLock {
+            if finished { receipt.complete(.success(())) }
+            else { waiters[id] = receipt }
+        }
+        defer { lock.withLock { _ = waiters.removeValue(forKey: id) } }
+        try await receipt.value(cancellable: cancellable)
+    }
+    func finish() {
+        let pending = lock.withLock {
+            finished = true
+            let pending = Array(waiters.values); waiters.removeAll(); return pending
+        }
+        pending.forEach { $0.complete(.success(())) }
+    }
+}
+/// Metadata preparation owns its binding only until the local phase settles.
+nonisolated final class TrustedLocalPreparation: Sendable {
+    let serviceID: UUID
+    let authority: UUID?
+    let registration: UUID
+    let attempt: UUID
+    let generation: UInt64
+    private let completion = TrustedCompletionSignal()
+    init(serviceID: UUID, authority: UUID?, registration: UUID, attempt: UUID, generation: UInt64) {
+        self.serviceID = serviceID; self.authority = authority; self.registration = registration
+        self.attempt = attempt; self.generation = generation
+    }
+    var waiterCount: Int { completion.waiterCount }
+    func wait(cancellable: Bool = true) async throws { try await completion.wait(cancellable: cancellable) }
+    func finish() { completion.finish() }
+}
+struct TrustedLocalPreparationPending: Error, Sendable { let preparation: TrustedLocalPreparation }
+
 struct TrustedLocalRecoveryReceipt: Sendable {
     let serviceID: UUID
     let registrationID: UUID
