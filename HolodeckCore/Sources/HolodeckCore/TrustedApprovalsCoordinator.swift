@@ -220,6 +220,7 @@ actor TrustedApprovalsCoordinator {
         }
     }
     nonisolated let id = UUID()
+    private let beforeReplayApplication: (@Sendable (UUID) async throws -> Void)?
     private let beforeRecoverySealing: @Sendable () async throws -> Void
     private let beforeInspectionRead: @Sendable () async throws -> Void
     private let beforeAuthorityPreparation: @Sendable (UUID) async throws -> Void
@@ -350,7 +351,9 @@ actor TrustedApprovalsCoordinator {
          beforeTargetInspection: @escaping @Sendable (UUID) async throws -> Void = { _ in },
          beforeAuthorityPreparation: @escaping @Sendable (UUID) async throws -> Void = { _ in },
          beforeInspectionRead: @escaping @Sendable () async throws -> Void = {},
-         beforeRecoverySealing: @escaping @Sendable () async throws -> Void = {}) {
+         beforeRecoverySealing: @escaping @Sendable () async throws -> Void = {},
+         beforeReplayApplication: (@Sendable (UUID) async throws -> Void)? = nil) {
+        self.beforeReplayApplication = beforeReplayApplication
         self.beforeRecoverySealing = beforeRecoverySealing
         self.beforeInspectionRead = beforeInspectionRead
         self.beforeAuthorityPreparation = beforeAuthorityPreparation
@@ -787,7 +790,12 @@ actor TrustedApprovalsCoordinator {
     }
     private func clearApplicationBlockers(on key: TargetKey, matching: (Attempt, ApplicationBlocker) -> Bool) {
         failedApplications = failedApplications.filter { $0.key.target != key || !matching($0.key, $0.value) }
-        if !failedApplications.keys.contains(where: { $0.target == key }) { recoveryTargets.remove(key) }
+        if !failedApplications.keys.contains(where: { $0.target == key }),
+           preparingRecovery[key] == nil, pendingRecoveryOutcomes[key] == nil {
+            recoveryTargets.remove(key)
+        } else if required.values.contains(where: { $0.contains(key) }) {
+            recoveryTargets.insert(key)
+        }
     }
     private func suppressApplications(to key: TargetKey, outcome: TrustedLocalRecovery) {
         let intents = required.filter { $0.value.contains(key) }
@@ -1453,6 +1461,7 @@ actor TrustedApprovalsCoordinator {
             let hook = accepted?.owner.beforeReplay, appliedRevision = revision
             release(token)
             do {
+                if let beforeReplayApplication { try await beforeReplayApplication(key.service) }
                 try await hook?(intent)
                 let admission = await acquireProgress()
                 let attempt = Attempt(intent: intent.operationID, target: key)

@@ -13,7 +13,7 @@ import XCTest
         return service
     }
     private func accept(_ registration: TrustedApprovalsCoordinator.Registration) async throws -> TrustedApprovalsCoordinator.Binding {
-        guard case .accepted(let binding) = try await registration.value() else { throw ShaderRequestError.invalidRequest }
+        guard case .accepted(let binding) = try await completed({ try await registration.value() }) else { throw ShaderRequestError.invalidRequest }
         return binding
     }
     private func wait(_ condition: () async -> Bool) async throws {
@@ -22,6 +22,16 @@ import XCTest
             guard ContinuousClock.now < deadline else { throw ShaderRequestError.unavailable("Recovery ownership backstop") }
             try await Task.sleep(for: .milliseconds(5))
         }
+    }
+    private func completed<Value: Sendable>(_ body: @escaping @MainActor @Sendable () async throws -> Value) async throws -> Value {
+        let result = RecoveryOwnershipCompletion<Value>()
+        let task = Task {
+            do { result.value = .success(try await body()) }
+            catch { result.value = .failure(error) }
+        }
+        addTeardownBlock { task.cancel() }
+        try await wait { result.value != nil }
+        return try XCTUnwrap(result.value).get()
     }
     func testLocalPreparationStartsWhileRegistrationHoldsTrustedRead() async throws {
         let armed = RecoveryOwnershipSwitch(), repairing = RecoveryGate(), read = TrustedReadGate()
@@ -40,7 +50,7 @@ import XCTest
         let held = await authority.observation
         XCTAssertTrue(held.transitionActive)
         armed.on = false; await repairing.release(); read.release(); backend.gateReads(nil)
-        _ = try await accept(registration); try await recovery.value
+        _ = try await accept(registration); try await completed { try await recovery.value }
         XCTAssertEqual(backend.writes, 0)
     }
     func testHandoffWaitsForMetadataButNotTrustedResultHold() async throws {
@@ -58,7 +68,7 @@ import XCTest
         try await wait { await a.localPreparationWaiters == 1 }
         let pending = await next.observation; XCTAssertNil(pending.acceptedGeneration)
         armed.on = false; await repairing.release()
-        let outcome = try await local.value
+        let outcome = try await completed { try await local.value }
         XCTAssertEqual(outcome.receipt?.authority, old.id)
         _ = try await accept(registration)
         let checked = await a.validateTrustedRecovery(outcome)
@@ -78,7 +88,7 @@ import XCTest
         addTeardownBlock { registration.completion.cancel(); await repairing.release() }
         try await wait { await a.localPreparationWaiters == 1 }
         armed.on = false; await repairing.release()
-        let outcome = try await local.value
+        let outcome = try await completed { try await local.value }
         XCTAssertNil(outcome.receipt?.authority)
         _ = try await accept(registration)
         let checked = await a.validateTrustedRecovery(outcome); XCTAssertFalse(checked.completed)
@@ -99,11 +109,11 @@ import XCTest
         addTeardownBlock { local.cancel(); writing.release(); await repairing.release() }
         try await wait { await a.localRecoveryPhaseCount == before + 1 }
         let started = await repairing.hasEntered; XCTAssertFalse(started)
-        writing.release(); try await replay.value
+        writing.release(); try await completed { try await replay.value }
         try await wait { await repairing.hasEntered }
         XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
         armed.on = false; await repairing.release()
-        let completed = try await local.value; XCTAssertTrue(completed.completed)
+        let outcome = try await completed { try await local.value }; XCTAssertTrue(outcome.completed)
         XCTAssertEqual(backend.writes, 1)
     }
     func testDepartureReusesOwnedLocalOutcomeIncludingFailure() async throws {
@@ -124,9 +134,9 @@ import XCTest
             let after = await a.localRecoveryPhaseCount; XCTAssertEqual(after, phases)
             await callback.release()
             if fail {
-                do { try await requester.value; XCTFail("Failed local outcome lost") }
+                do { try await completed { try await requester.value }; XCTFail("Failed local outcome lost") }
                 catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
-            } else { try await requester.value }
+            } else { try await completed { try await requester.value } }
         }
     }
     func testLocalOnlyCompletionDoesNotLeavePreparingApplicationBlocker() async throws {
@@ -153,6 +163,35 @@ import XCTest
         try await a.retryReconciliation()
         XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
     }
+    func testCancelledLateOutcomeIsRecoveredByAnotherRequester() async throws {
+        let a = try await fixture(), b = try await fixture(), requester = try await fixture()
+        let gate = RecoveryOwnershipApplicationGate(), backend = TrustedBackendFixture(nil)
+        addTeardownBlock { await gate.release() }
+        let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
+            beforeReplayApplication: { try await gate.call($0) })
+        for target in [a, b, requester] { _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: target))) }
+        let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "TV")
+        try backend.write(TrustedTVApprovals(revocations: [intent]).encoded())
+        let first = Task { try await requester.retryReconciliation() }
+        addTeardownBlock { first.cancel(); await gate.release() }
+        try await wait { await gate.serviceID != nil }
+        let selected = await gate.serviceID
+        let lateTarget = selected == a.runtimeID ? b : a
+        let late = Task { try await lateTarget.retryReconciliation() }
+        addTeardownBlock { late.cancel(); await gate.release() }
+        try await wait { await authority.observation.successorParticipants == 1 }
+        late.cancel()
+        do { try await completed { try await late.value }; XCTFail("Cancelled successor succeeded") } catch is CancellationError {}
+        try await wait { await authority.observation.successorParticipants == 0 }
+        await gate.release()
+        do { try await completed { try await first.value }; XCTFail("Old pass accepted the unadmitted outcome") } catch is TrustedPartialRecovery {}
+        XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations, [intent])
+        let phases = await lateTarget.localRecoveryPhaseCount
+        try await requester.retryReconciliation()
+        let after = await lateTarget.localRecoveryPhaseCount
+        XCTAssertEqual(after, phases + 1)
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
+    }
     func testRequesterDoesNotReintroduceExcludedTrustedCompletion() async throws {
         let a = try await fixture()
         _ = await a.registerRevocationCoordinator(id: UUID(), recovery: { _ in
@@ -166,6 +205,16 @@ import XCTest
     }
 
 }
+private actor RecoveryOwnershipApplicationGate {
+    private(set) var serviceID: UUID?
+    private let completion = TrustedCompletionSignal()
+    func call(_ service: UUID) async throws {
+        guard serviceID == nil else { return }
+        serviceID = service; try await completion.wait()
+    }
+    func release() { completion.finish() }
+}
+@MainActor private final class RecoveryOwnershipCompletion<Value: Sendable> { var value: Result<Value, Error>? }
 private final class RecoveryOwnershipSwitch: @unchecked Sendable {
     private let lock = NSLock(); private var value = false
     var on: Bool { get { lock.withLock { value } } set { lock.withLock { value = newValue } } }

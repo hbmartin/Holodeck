@@ -1,11 +1,11 @@
 #if os(macOS)
 import Foundation
 
-/// Independent waiters share preparation; the last cancelled waiter stops only
-/// work which has not crossed its existing noncancellable acceptance boundary.
 struct TrustedRecoveryTaskClosed: LocalizedError, Sendable {
     var errorDescription: String? { "The cancelled recovery phase is still settling; join its successor after settlement." }
 }
+/// Independent waiters share preparation; the last cancelled waiter stops only
+/// work which has not crossed its existing noncancellable acceptance boundary.
 nonisolated final class TrustedRecoveryTask<Value: Sendable>: @unchecked Sendable {
     private let task: Task<Value, Error>
     private let lock = NSLock()
