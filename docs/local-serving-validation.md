@@ -1111,3 +1111,67 @@ This fixture removes the 200 unrelated reconciliation calls while preserving req
 Evidence: `/tmp/pr49-core-acceptance.log`, `/tmp/pr49-release-acceptance.log`, `/tmp/pr49-{mac,tv}-acceptance-build.log`, `/tmp/pr49-model{39,-current}-acceptance.log`, `/tmp/pr49-artifact-acceptance.json`, `/tmp/pr49-races.json`, `/tmp/pr49-race-*.log`, `/tmp/pr49-profile-{raw,summary}.json` and `/tmp/pr49-recovery-profile-raw.json`. The identical standalone recovery workload is `/tmp/pr49-recovery-profile.swift`; queued/sequential structural workloads remain in the test suite.
 
 Desktop UI runtime checks remain **blocked under the user's instruction**. Live Bonjour/LAN, real Codex publication, physical Apple TV and tvOS simulator execution were not run. The six core skips cover three catalog profiles, live Bonjour, real Codex publication and the separate worker-supervision idle profile. Isolated loopback TLS and local Metal/GPU fixtures did run. Worker/checker/shader code and locks are unchanged; their separate Python worker, checker-release, compile-all-Metal and external GPU-profile suites were not rerun. Linux CI, network messages and persisted formats are unchanged. No live installation replacement, request enabling, merge or deployment occurred.
+
+
+## PR #49 follow-up — recovery admission and evidence boundaries (2026-11-21)
+
+This follow-up uses `d3f16d85e4a9b1c8f08204bef9dd5520602ae5d2` (merged PR #49; tree `d0c4a5af7c759209db23449be09f2302483bd7bb`) as its baseline. Trusted passes seal input admission before replay; later callers keep their immediate local repair and queue for one successor pass. Target recovery epochs invalidate applications before metadata repair, after replay hooks and after application returns. Removal validation and persistence retain the authority lane, so admitted trusted writes finish their actual outcome.
+
+A cached valid receipt now retains the same pass hold as a live receipt. Last-waiter cancellation closes task subscription admission under the waiter lock, then cancels outside it. A cancelled pass drains the local preparation it owns before promoting its successor. Completion reports exclude superseded epochs. Rejected or cancelled successor waiters cannot cancel another caller's active pass.
+
+Destination activation rechecks inspection evidence after reacquiring its lane. A valid snapshot is reused; failed destination inspection retains the source binding. Exact old-authority recovery endpoints share original-target local repair outside authority lanes before checking settlement. Missing targets and unverifiable old receipts remain blocked with manual-repair guidance. The exceptional departure state remains fault-injected coverage: no normal production producer is claimed.
+
+Departure completion assertions now use separately observed, bounded results. Timeout/cancellation fails the test. The replacement publication worker assertion checks its actual `attempts` marker. Existing transport, supersession, opposing-transfer, retained-file and per-TV fencing counterexamples remain covered.
+
+### Frozen-source validation
+
+The final validation snapshot covers 108 tracked Swift files (`/tmp/pr50-final-source.json`); hashes were rechecked after validation. Apple Swift 6.4.2, macOS 27.0.1, Xcode toolchain under `/Applications/Xcode.app/Contents/Developer`. All test work uses isolated temporary state. No live installation was replaced and requests were not enabled.
+
+| Check | Result |
+| --- | --- |
+| Full Debug core, process, persistence, packaging and native-fixture suite | 588 tests, six skips, zero failures; 120.880 seconds of tests |
+| Local native scenes | 25 scenes verified at catalog revision `8348af807717ea0e436208e957c333ec271e935380a9ea68b1db5aca56df13a5` |
+| Release trusted coordination, isolated TLS/client recovery and packaged-resource selection | 146 tests, zero failures |
+| Optimized races with `SWIFT_CONCURRENCY_THREADPOOL_STRICT=1` | 20 runs × 99 tests = 1,980 executions, zero failures; 90-second per-run backstop |
+| Actual headless Mac model | Passed on system Python 3.9.6 and current Python 3.15.0; partial recovery updates accepted settings through observation |
+| Unsigned Release builds | HolodeckMac for macOS and Holodeck for generic tvOS both succeeded, reconfirmed after the final source changes |
+| Bundled artifact identity | Checker 1.1.1/interface 1, source `58ed409e023b9b1ccbc08dcedd5b38c1090e14fc`, SHA-256 `8a8229c76e6e42d91d84fe9744bf53bbcda0c9dc8064ba82a41e2b15bb66ef19` unchanged |
+
+Commands:
+
+```sh
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer HOLODECK_AUTHORING_FIXTURE=/Volumes/Pro2T/HolodeckShaders HOLODECK_GPU_TESTS=1 swift test --package-path HolodeckCore --skip-update
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --package-path HolodeckCore -c release --skip-update --filter 'Trusted|ShaderLibraryToolTests|CatalogNetworkTests|LocalClientRecoveryTests'
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer /usr/bin/python3 tools/check_mac_requests_recovery.py
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer /opt/homebrew/bin/python3 tools/check_mac_requests_recovery.py
+```
+
+Unsigned builds use `/tmp/HolodeckPR50Validation`, `CODE_SIGNING_ALLOWED=NO`, `-disableAutomaticPackageResolution`, and `OTHER_CPLUSPLUSFLAGS=$(inherited) -isystem $(SDKROOT)/usr/include/c++/v1`. They build schemes `HolodeckMac` at `platform=macOS` and `Holodeck` at `generic/platform=tvOS` without launching either app.
+
+### Release comparison against merged PR #49
+
+Seven alternating samples per version/workload use the same compiler and `/private/tmp` filesystem. Trusted backends are injected in-memory stores; request metadata uses real temporary journals. These measurements describe isolated fixture work, not live Keychain latency. Other host work can affect timings; CI asserts structural counts, with no timing threshold or general throughput claim.
+
+| Workload | PR #49 median ms | Follow-up median ms | Structural result |
+| --- | ---: | ---: | --- |
+| 200 sequential revocations | 70.199 | 73.218 | Both: one read, 400 writes, 400 encodings |
+| 100 no-intent recoveries | 62.991 | 71.960 | Both: 100 reads, zero trusted writes/encodings, zero unrelated reconciler calls, 200 requester reconciler calls, one metadata replacement |
+| 100 late-caller pairs | 282.801 | 284.446 | Both: 200 local phases, 100 writes/encodings, two targets and zero remaining obligations/pins |
+
+For late-caller pairs, the baseline admitted the late result into an already-replaying pass and completed the first caller using superseded evidence. The follow-up reports the first pass's superseded application and completes the late caller in its successor. Reads/passes change from 100/100 to 200/200 by design; internal admission resumes/advances change from 800/1600 to 2300/4600. The local metadata phase is not repeated. No additional trusted write or envelope encoding is introduced.
+
+| Queued revocations | PR #49 drain ms | Follow-up drain ms | Admission resumes, baseline → follow-up | Admission advances, baseline → follow-up |
+| --- | ---: | ---: | ---: | ---: |
+| 50 | 13.785 | 14.528 | 152 → 202 | 255 → 355 |
+| 100 | 35.885 | 42.293 | 302 → 402 | 505 → 705 |
+| 200 | 118.966 | 136.140 | 602 → 802 | 1005 → 1405 |
+
+Both versions retain two reads and exactly two writes/encodings per queued revocation, zero remaining obligations and one remaining target after handoff. The follow-up adds one internal eligibility admission per application; queue bookkeeping remains linear. Each workload also performs 32 unrelated status calls while the handoff is gated, without trusted reads. Cancellation of queued head/middle/tail entries remains covered. No rejected candidate is encoded before admission.
+
+Evidence: `/tmp/pr50-core-final.log`, `/tmp/pr50-release-acceptance.log`, `/tmp/pr50-races.json`, `/tmp/pr50-race-*.log`, `/tmp/pr50-model39-final.log`, `/tmp/pr50-model-current-final.log`, `/tmp/pr50-app-builds-final.json`, `/tmp/pr50-artifact-info.json`, `/tmp/pr50-profile-{raw,summary}.json`, `/tmp/pr50-profile-local-{raw,summary}.json`, `/tmp/pr50-successor-profile.swift`, `/tmp/pr50-compile-profiles.py` and `/tmp/pr50-races-profiles.py`. The baseline archive is `/private/tmp/pr50-baseline`. Earlier development runs are excluded from the final acceptance counts; they exposed and corrected pre-admission cancellation release, exact preparation-blocker clearing and test-gate placement.
+
+### Limits
+
+Desktop UI runtime checks remain blocked by instruction. Live Bonjour/LAN, real Codex publication, physical Apple TV and tvOS simulator execution were not run. The six core skips are three catalog-performance fixtures, live Bonjour discovery, real Codex publication and the separate worker-supervision idle profile. Isolated TLS, headless Mac-model recovery, native fixtures and the unsigned tvOS build did run.
+
+The worker, checker, shader sources, artifact bytes, locks and Linux CI are unchanged. Their separate full Python worker/checker suites, compile-all external shader-library run and standalone GPU profiles were not rerun. The full core run still exercises existing worker/process regressions and the 25 local native scenes. No deployment, merge, live installation replacement or request enabling was performed.

@@ -3,14 +3,22 @@ import Foundation
 
 /// Independent waiters share preparation; the last cancelled waiter stops only
 /// work which has not crossed its existing noncancellable acceptance boundary.
+struct TrustedRecoveryTaskClosed: LocalizedError, Sendable {
+    var errorDescription: String? { "The cancelled recovery phase is still settling; join its successor after settlement." }
+}
 nonisolated final class TrustedRecoveryTask<Value: Sendable>: @unchecked Sendable {
     private let task: Task<Value, Error>
     private let lock = NSLock()
     private var waiters: [UUID: RequestPersistence.CommitTicket<Value>] = [:]
     private var result: Result<Value, Error>?
-    var isCancelled: Bool { task.isCancelled }
+    private var admissionClosed = false
+    private let beforeCancellation: @Sendable () -> Void
+    var isCancelled: Bool { lock.withLock { admissionClosed } || task.isCancelled }
     var waiterCount: Int { lock.withLock { waiters.count } }
-    init(_ work: @escaping @Sendable () async throws -> Value) {
+    /// A cancelled owner drains its admitted work without opening subscriptions.
+    func settle() async { _ = await task.result }
+    init(beforeCancellation: @escaping @Sendable () -> Void = {}, _ work: @escaping @Sendable () async throws -> Value) {
+        self.beforeCancellation = beforeCancellation
         task = Task { try await work() }
         // One relay per shared phase, rather than a suspended Task per waiter.
         Task { [weak self, task] in
@@ -35,6 +43,7 @@ nonisolated final class TrustedRecoveryTask<Value: Sendable>: @unchecked Sendabl
         let id = UUID(), receipt = RequestPersistence.CommitTicket<Value>()
         lock.withLock {
             if let result { receipt.complete(result) }
+            else if admissionClosed { receipt.complete(.failure(TrustedRecoveryTaskClosed())) }
             else { waiters[id] = receipt }
         }
         return .init(owner: self, id: id, receipt: receipt)
@@ -47,8 +56,12 @@ nonisolated final class TrustedRecoveryTask<Value: Sendable>: @unchecked Sendabl
         pending.forEach { $0.complete(value) }
     }
     private func remove(_ id: UUID, cancelling: Bool) {
-        let cancel = lock.withLock { waiters.removeValue(forKey: id) != nil && cancelling && waiters.isEmpty }
-        if cancel { task.cancel() }
+        let cancel = lock.withLock {
+            guard waiters.removeValue(forKey: id) != nil, cancelling, waiters.isEmpty else { return false }
+            admissionClosed = true
+            return true
+        }
+        if cancel { beforeCancellation(); task.cancel() }
     }
 }
 
