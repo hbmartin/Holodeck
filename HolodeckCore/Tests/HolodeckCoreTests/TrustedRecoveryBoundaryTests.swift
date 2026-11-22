@@ -292,10 +292,6 @@ import XCTest
         backend.failReads(true)
         do { _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a))); XCTFail("Failed read accepted") }
         catch let error as POSIXError { XCTAssertEqual(error.code, .EACCES) }
-        let held = UUID()
-        let local = try await b.trustedRecoveryOutcome(pass: held)
-        XCTAssertTrue(local.completed)
-        addTeardownBlock { await b.finishTrustedRecovery(pass: held) }
         let gate = TrustedReadGate(); backend.failReads(false); backend.gateReads(gate)
         addTeardownBlock { gate.release() }
         let occupying = Task { try await authority.approve(binding.permit) { nil } }

@@ -22,6 +22,21 @@ import XCTest
             try await Task.sleep(for: .milliseconds(5))
         }
     }
+    func testCompletionGateReleasesAllWaitersAndCancelsOnlyOne() async throws {
+        let gate = AdmissionCompletionGate(), completed = AdmissionWaiterCompletions()
+        let first = Task { await gate.wait(); completed.count += 1 }
+        let second = Task { await gate.wait(); completed.count += 1 }
+        let cancelled = Task { try await gate.waitCancellably() }
+        addTeardownBlock { first.cancel(); second.cancel(); cancelled.cancel(); await gate.release() }
+        try await wait { await gate.waiterCount == 3 }
+        cancelled.cancel()
+        do { try await cancelled.value; XCTFail("Cancelled gate waiter succeeded") } catch is CancellationError {}
+        try await wait { await gate.waiterCount == 2 }
+        await gate.release()
+        try await wait { completed.count == 2 }
+        await first.value; await second.value
+        let remaining = await gate.waiterCount; XCTAssertEqual(remaining, 0)
+    }
     func testCancellationClosesAdmissionBeforeCallingTaskCancel() async throws {
         let gap = TrustedReadGate(), work = RecoveryGate()
         addTeardownBlock { gap.release(); await work.release() }
@@ -168,14 +183,20 @@ import XCTest
         XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
     }
 }
+@MainActor private final class AdmissionWaiterCompletions { var count = 0 }
 private final class AdmissionFailureSwitch: @unchecked Sendable {
     private let lock = NSLock(); private var value = false
     var on: Bool { get { lock.withLock { value } } set { lock.withLock { value = newValue } } }
 }
 private actor AdmissionCompletionGate {
-    private(set) var entered = false; private var open = false
-    private var continuation: CheckedContinuation<Void, Never>?
-    func wait() async { entered = true; if open { return }; await withCheckedContinuation { continuation = $0 } }
-    func release() { open = true; continuation?.resume(); continuation = nil }
+    private(set) var entered = false
+    private let completion = TrustedCompletionSignal()
+    var waiterCount: Int { completion.waiterCount }
+    // Existing settlement regressions deliberately keep physical work alive
+    // after cancellation. Cancellable waiters exercise the same shared signal.
+    func wait() async { entered = true; try? await completion.wait(cancellable: false) }
+    func waitCancellably() async throws { entered = true; try await completion.wait() }
+    func release() { completion.finish() }
 }
+
 #endif

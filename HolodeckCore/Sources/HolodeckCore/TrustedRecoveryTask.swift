@@ -1,11 +1,11 @@
 #if os(macOS)
 import Foundation
 
-/// Independent waiters share preparation; the last cancelled waiter stops only
-/// work which has not crossed its existing noncancellable acceptance boundary.
 struct TrustedRecoveryTaskClosed: LocalizedError, Sendable {
     var errorDescription: String? { "The cancelled recovery phase is still settling; join its successor after settlement." }
 }
+/// Independent waiters share preparation; the last cancelled waiter stops only
+/// work which has not crossed its existing noncancellable acceptance boundary.
 nonisolated final class TrustedRecoveryTask<Value: Sendable>: @unchecked Sendable {
     private let task: Task<Value, Error>
     private let lock = NSLock()
@@ -63,6 +63,59 @@ nonisolated final class TrustedRecoveryTask<Value: Sendable>: @unchecked Sendabl
         }
         if cancel { beforeCancellation(); task.cancel() }
     }
+}
+
+/// Each waiter owns cancellation; completing a boundary never cancels its owner.
+nonisolated final class TrustedCompletionSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var finished = false
+    private var waiters: [UUID: RequestPersistence.CommitTicket<Void>] = [:]
+    var waiterCount: Int { lock.withLock { waiters.count } }
+    func wait(cancellable: Bool = true) async throws {
+        let id = UUID(), receipt = RequestPersistence.CommitTicket<Void>()
+        lock.withLock {
+            if finished { receipt.complete(.success(())) }
+            else { waiters[id] = receipt }
+        }
+        defer { lock.withLock { _ = waiters.removeValue(forKey: id) } }
+        try await receipt.value(cancellable: cancellable)
+    }
+    func finish() {
+        let pending = lock.withLock {
+            finished = true
+            let pending = Array(waiters.values); waiters.removeAll(); return pending
+        }
+        pending.forEach { $0.complete(.success(())) }
+    }
+}
+/// Metadata preparation owns its binding only until the local phase settles.
+nonisolated final class TrustedLocalPreparation: Sendable {
+    let serviceID: UUID
+    let authority: UUID?
+    let registration: UUID
+    let attempt: UUID
+    let generation: UInt64
+    let requiresTrustedPass: Bool
+    private let completion = TrustedCompletionSignal()
+    init(serviceID: UUID, authority: UUID?, registration: UUID, attempt: UUID, generation: UInt64, consumerAuthority: UUID?) {
+        self.serviceID = serviceID; self.authority = authority; self.registration = registration
+        self.attempt = attempt; self.generation = generation
+        requiresTrustedPass = consumerAuthority != nil && consumerAuthority == authority
+    }
+    var waiterCount: Int { completion.waiterCount }
+    func wait(cancellable: Bool = true) async throws { try await completion.wait(cancellable: cancellable) }
+    func finish() { completion.finish() }
+}
+struct TrustedLocalPreparationPending: Error, Sendable { let preparation: TrustedLocalPreparation }
+
+struct TrustedDepartureRetirement: Sendable, Equatable {
+    let serviceID: UUID
+    let registration: UUID
+    let authority: UUID?
+    let metadataRevision: UInt64
+    let ownershipGeneration: UInt64
+    let recoveryGeneration: UInt64
+    let executionID: UUID?
 }
 
 struct TrustedLocalRecoveryReceipt: Sendable {
