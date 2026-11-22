@@ -33,6 +33,116 @@ import XCTest
             try await Task.sleep(for: .milliseconds(5))
         }
     }
+    func testKnownApprovalWritePreservesPreparedDeparture() async throws {
+        let a = try await fixture(), b = try await fixture(), backend = TrustedBackendFixture(nil), old = backend.coordinator()
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
+        let binding = try await accept(old.register(TrustedOwnerRecorder().owner(service: b.service)))
+        let nextBackend = TrustedBackendFixture(nil), gate = TrustedReadGate(); nextBackend.gateReads(gate)
+        addTeardownBlock { gate.release() }
+        let next = nextBackend.coordinator(), ticket = try await next.register(TrustedOwnerRecorder().owner(service: a.service))
+        addTeardownBlock { ticket.completion.cancel(); gate.release() }
+        try await wait { gate.entered }
+        _ = try await old.approve(binding.permit) { .init(record: ApprovedTV(id: "C", name: "C", tokenHash: "new-token"), token: "new-token", eligibility: .init()) }
+        XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).approvals.first?.tokenHash, "new-token")
+        gate.release(); _ = try await accept(ticket)
+        try await wait { await old.observation.departures == 0 }
+        let retired = await old.observation
+        XCTAssertEqual(retired.targets, 1); XCTAssertEqual(backend.writes, 1)
+    }
+    func testActivationWaitsForInspectionAndRejectsFailedEvidence() async throws {
+        for fail in [false, true] {
+            let a = try await fixture(), b = try await fixture(), backend = TrustedBackendFixture(nil)
+            let armed = DepartureStorageFault(), inspection = RecoveryGate()
+            addTeardownBlock { await inspection.release() }
+            let old = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
+                beforeTargetInspection: { id in if id == a.service.runtimeID && armed.enabled {
+                    try await inspection.wait(); if fail { throw POSIXError(.EIO) }
+                } })
+            _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
+            _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: b.service)))
+            let nextBackend = TrustedBackendFixture(nil), gate = TrustedReadGate(); nextBackend.gateReads(gate)
+            addTeardownBlock { gate.release() }
+            let next = nextBackend.coordinator(), ticket = try await next.register(TrustedOwnerRecorder().owner(service: a.service))
+            addTeardownBlock { ticket.completion.cancel(); gate.release(); await inspection.release() }
+            try await wait { gate.entered }; armed.enabled = true
+            let recovering = Task { try await b.service.retryReconciliation() }
+            addTeardownBlock { recovering.cancel(); await inspection.release() }
+            try await wait { await inspection.hasEntered }
+            gate.release()
+            try await wait { await old.observation.departureInspectionWaiters > 0 }
+            let pending = await next.observation
+            XCTAssertNil(pending.acceptedGeneration); XCTAssertEqual(pending.targets, 0)
+            await inspection.release()
+            if fail {
+                do { try await recovering.value; XCTFail("Failed target inspection accepted") }
+                catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+                do { _ = try await ticket.value(); XCTFail("Invalid inspection activated") }
+                catch { XCTAssertTrue(error.localizedDescription.contains("inspection changed during handoff")) }
+            } else {
+                try await recovering.value; _ = try await accept(ticket)
+            }
+            XCTAssertEqual(backend.writes, 0); XCTAssertEqual(nextBackend.writes, 0)
+        }
+    }
+    func testBackendInspectionFailureCannotBeOvertakenByActivation() async throws {
+        let a = try await fixture(), b = try await fixture(), backend = TrustedBackendFixture(nil)
+        let armed = DepartureStorageFault(), reading = RecoveryGate()
+        addTeardownBlock { await reading.release() }
+        let old = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
+            beforeInspectionRead: { if armed.enabled { try await reading.wait() } })
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: b.service)))
+        let nextBackend = TrustedBackendFixture(nil), gate = TrustedReadGate(); nextBackend.gateReads(gate)
+        addTeardownBlock { gate.release() }
+        let next = nextBackend.coordinator(), ticket = try await next.register(TrustedOwnerRecorder().owner(service: a.service))
+        addTeardownBlock { ticket.completion.cancel(); gate.release(); await reading.release() }
+        try await wait { gate.entered }; armed.enabled = true
+        let recovery = Task { try await b.service.retryReconciliation() }
+        addTeardownBlock { recovery.cancel(); await reading.release() }
+        try await wait { await reading.hasEntered }
+        gate.release()
+        try await wait { await old.observation.departureInspectionWaiters > 0 }
+        backend.failReads(true); await reading.release()
+        do { try await recovery.value; XCTFail("Unreadable trusted storage accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EACCES).localizedDescription)) }
+        do { _ = try await ticket.value(); XCTFail("Activation overtook an inconclusive backend inspection") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("inspection changed during handoff")) }
+        XCTAssertEqual(backend.writes, 0); XCTAssertEqual(nextBackend.writes, 0)
+    }
+    func testMovedSoleTargetUsesExactOldAuthorityRecoveryEndpoint() async throws {
+        let a = try await fixture(), backend = TrustedBackendFixture(nil), old = backend.coordinator(), next = TrustedBackendFixture(nil).coordinator()
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
+        let prepared = try await a.service.prepareTrustedAuthority(id: next.id)
+        let transfer = try XCTUnwrap(prepared)
+        // Inject the exceptional path after a real binding switch. No normal
+        // producer of post-activation obligations is claimed by this regression.
+        _ = try await a.service.installTrustedAuthority(transfer, id: next.id, intents: [], revision: .init(coordinator: next.id, sequence: 0), coordinator: { _ in })
+        await old.retainDepartureRecovery(serviceID: a.service.runtimeID, ticket: transfer.id)
+        await a.service.finishTrustedAuthority(transfer, authority: next)
+        let pending = await a.service.recoveryStatuses()
+        XCTAssertTrue(pending.contains { $0.id == transfer.id })
+        try await a.service.retryReconciliation()
+        let recovered = await old.observation, statuses = await a.service.recoveryStatuses()
+        XCTAssertEqual(recovered.targets, 0); XCTAssertEqual(recovered.recoverySubscriptions, 0)
+        XCTAssertFalse(statuses.contains { $0.id == transfer.id })
+        try await old.recoverDeparture(serviceID: a.service.runtimeID, ticket: transfer.id) // stale receipt is harmless
+        XCTAssertEqual(backend.writes, 0)
+    }
+    func testBlockedRegistrationReceivesAuthorityRecoveryWithoutAcceptedBinding() async throws {
+        let a = try await fixture(), b = try await fixture(), backend = TrustedBackendFixture(nil), old = backend.coordinator()
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
+        let departure = try await old.prepareDeparture(a.service, ticket: UUID())
+        try departure.activate {}; await old.retainDepartureRecovery(serviceID: a.service.runtimeID, ticket: departure.id)
+        do { _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: b.service))); XCTFail("Exceptional recovery ignored") }
+        catch let error as TrustedDepartureRecoveryError { XCTAssertEqual(error.diagnosticID, departure.id) }
+        let statuses = await b.service.recoveryStatuses()
+        XCTAssertTrue(statuses.contains { $0.id == departure.id })
+        XCTAssertEqual(statuses.first { $0.id == departure.id }?.journal, a.root)
+        XCTAssertNotEqual(statuses.first { $0.id == departure.id }?.journal, b.root)
+        try await b.service.retryReconciliation()
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: b.service)))
+        let recovered = await b.service.recoveryStatuses(); XCTAssertFalse(recovered.contains { $0.id == departure.id })
+    }
     func testQueuedRevocationUsesTargetsAfterSuccessfulAndCancelledHandoff() async throws {
         for cancel in [false, true] {
             let a = try await fixture(), b = try await fixture(); try await submit(a.service); try await submit(b.service)

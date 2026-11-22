@@ -62,29 +62,33 @@ import XCTest
         let a = try await fixture(), b = try await fixture()
         let bytes = try TrustedTVApprovals(approvals: [ApprovedTV(id: "B", name: "B", tokenHash: "old")]).encoded()
         let firstBackend = TrustedBackendFixture(bytes), secondBackend = TrustedBackendFixture(bytes)
-        let first = firstBackend.coordinator(), second = secondBackend.coordinator()
+        let firstPreparation = RecoveryGate(), secondPreparation = RecoveryGate()
+        let firstReservation = RecoveryGate(), secondReservation = RecoveryGate()
+        addTeardownBlock {
+            await firstPreparation.release(); await secondPreparation.release()
+            await firstReservation.release(); await secondReservation.release()
+        }
+        let first = TrustedApprovalsCoordinator(read: { try firstBackend.checkedRead() }, write: { try firstBackend.write($0) },
+            beforeReservation: { _ in try await firstReservation.wait() },
+            beforeAuthorityPreparation: { id in if id == b.runtimeID { try await firstPreparation.wait() } })
+        let second = TrustedApprovalsCoordinator(read: { try secondBackend.checkedRead() }, write: { try secondBackend.write($0) },
+            beforeReservation: { _ in try await secondReservation.wait() },
+            beforeAuthorityPreparation: { id in if id == a.runtimeID { try await secondPreparation.wait() } })
         let initialFirst = try await accept(first.register(TrustedOwnerRecorder().owner(service: a)))
         let initialSecond = try await accept(second.register(TrustedOwnerRecorder().owner(service: b)))
-        // Hold only the service actors, not either authority lane. This witnesses
-        // both registration drivers awaiting source preparation before queueing replacements.
-        let aGate = AdmissionActorGate(), bGate = AdmissionActorGate()
-        addTeardownBlock { aGate.release(); bGate.release() }
-        let heldA = Task.detached { await holdAdmissionActor(a, gate: aGate) }
-        let heldB = Task.detached { await holdAdmissionActor(b, gate: bGate) }
-        try await wait { aGate.entered && bGate.entered }
         let movingA = try await second.register(TrustedOwnerRecorder().owner(service: a))
         let movingB = try await first.register(TrustedOwnerRecorder().owner(service: b))
-        try await wait { await first.observation.preparingGeneration == movingB.generation }
-        try await wait { await second.observation.preparingGeneration == movingA.generation }
+        try await wait { await firstPreparation.hasEntered }
+        try await wait { await secondPreparation.hasEntered }
         let latestFirst = try await first.register(TrustedOwnerRecorder().owner())
         let latestSecond = try await second.register(TrustedOwnerRecorder().owner())
         let firstRevocation = Task { try await first.revoke("B", permit: initialFirst.permit) { _ in } }
         let secondRevocation = Task { try await second.revoke("B", permit: initialSecond.permit) { _ in } }
         addTeardownBlock { firstRevocation.cancel(); secondRevocation.cancel(); [movingA, movingB, latestFirst, latestSecond].forEach { $0.completion.cancel() } }
-        // Ready revocations can already be admitted: they no longer wait behind
-        // pending registrations. Actor holds keep their target notifications gated.
-        try await wait { await first.observation.transitionActive }
-        try await wait { await second.observation.transitionActive }
+        // Witness both admitted revocations while preparation is suspended at
+        // its real boundary. No cooperative worker or service actor is blocked.
+        try await wait { await firstReservation.hasEntered }
+        try await wait { await secondReservation.hasEntered }
         let heldFirst = await first.observation, heldSecond = await second.observation
         XCTAssertEqual(heldFirst.queuedGeneration, latestFirst.generation); XCTAssertEqual(heldSecond.queuedGeneration, latestSecond.generation)
         XCTAssertEqual(firstBackend.writes, 0); XCTAssertEqual(secondBackend.writes, 0)
@@ -98,7 +102,8 @@ import XCTest
             } catch { await result.finish(error) }
         }
         addTeardownBlock { completion.cancel() }
-        aGate.release(); bGate.release(); await heldA.value; await heldB.value
+        await firstPreparation.release(); await secondPreparation.release()
+        await firstReservation.release(); await secondReservation.release()
         try await wait { await result.finished }; try await result.check()
         let finalFirst = await first.observation, finalSecond = await second.observation
         XCTAssertEqual(finalFirst.queuedRevocations, 0); XCTAssertEqual(finalSecond.queuedRevocations, 0)
@@ -111,16 +116,4 @@ private actor AdmissionResult {
     func finish(_ error: Error?) { self.error = error; finished = true }
     func check() throws { if let error { throw error } }
 }
-private final class AdmissionActorGate: @unchecked Sendable {
-    private let condition = NSCondition()
-    private var open = false, reached = false
-    var entered: Bool { condition.lock(); defer { condition.unlock() }; return reached }
-    func wait() {
-        condition.lock(); defer { condition.unlock() }; reached = true
-        let deadline = Date().addingTimeInterval(12)
-        while !open { if !condition.wait(until: deadline) { return } }
-    }
-    func release() { condition.lock(); open = true; condition.broadcast(); condition.unlock() }
-}
-private func holdAdmissionActor(_ service: isolated ShaderRequestService, gate: AdmissionActorGate) { gate.wait() }
 #endif
