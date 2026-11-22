@@ -95,16 +95,28 @@ nonisolated final class TrustedLocalPreparation: Sendable {
     let registration: UUID
     let attempt: UUID
     let generation: UInt64
+    let requiresTrustedPass: Bool
     private let completion = TrustedCompletionSignal()
-    init(serviceID: UUID, authority: UUID?, registration: UUID, attempt: UUID, generation: UInt64) {
+    init(serviceID: UUID, authority: UUID?, registration: UUID, attempt: UUID, generation: UInt64, consumerAuthority: UUID?) {
         self.serviceID = serviceID; self.authority = authority; self.registration = registration
         self.attempt = attempt; self.generation = generation
+        requiresTrustedPass = consumerAuthority != nil && consumerAuthority == authority
     }
     var waiterCount: Int { completion.waiterCount }
     func wait(cancellable: Bool = true) async throws { try await completion.wait(cancellable: cancellable) }
     func finish() { completion.finish() }
 }
 struct TrustedLocalPreparationPending: Error, Sendable { let preparation: TrustedLocalPreparation }
+
+struct TrustedDepartureRetirement: Sendable, Equatable {
+    let serviceID: UUID
+    let registration: UUID
+    let authority: UUID?
+    let metadataRevision: UInt64
+    let ownershipGeneration: UInt64
+    let recoveryGeneration: UInt64
+    let executionID: UUID?
+}
 
 struct TrustedLocalRecoveryReceipt: Sendable {
     let serviceID: UUID

@@ -190,6 +190,106 @@ import XCTest
         XCTAssertFalse(statuses.contains { $0.id == departure.id }); XCTAssertTrue(original.enabled)
         XCTAssertEqual(backend.writes, 0)
     }
+    func testExceptionalUnverifiableObligationsFailBeforeOriginalRepair() async throws {
+        let a = try await fixture(), backend = TrustedBackendFixture(nil), authority = backend.coordinator()
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a.service, beforeReplay: { _ in throw POSIXError(.EIO) })))
+        let departure = try await authority.prepareDeparture(a.service, ticket: UUID())
+        let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "B")
+        try backend.write(TrustedTVApprovals(revocations: [intent]).encoded())
+        do { try await a.service.retryReconciliation(); XCTFail("Injected replay failure ignored") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        do { try departure.activate {}; XCTFail("Real obligations allowed activation") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("inspection changed during handoff")) }
+        // Deliberately violate the prepared-evidence invariant to cover the
+        // defensive endpoint. No production producer is asserted.
+        departure.prepared(.init(baseline: 0, registration: departure.registrationID, obligations: []))
+        try departure.activate {}; await authority.retainDepartureRecovery(serviceID: a.service.runtimeID, ticket: departure.id)
+        let phases = await a.service.localRecoveryPhaseCount, reads = backend.reads, retained = backend.read()
+        do { try await completed { try await authority.recoverDeparture(serviceID: a.service.runtimeID, ticket: departure.id) }; XCTFail("Retired receipts accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("unverifiable cancellation receipts")); XCTAssertTrue(error.localizedDescription.contains(departure.id.uuidString)) }
+        let after = await a.service.localRecoveryPhaseCount
+        XCTAssertEqual(after, phases); XCTAssertEqual(backend.reads, reads); XCTAssertEqual(backend.read(), retained)
+    }
+    func testCleanExceptionalDepartureReusesVerifiedMetadataAndInspection() async throws {
+        let a = try await fixture(), backend = TrustedBackendFixture(nil), authority = backend.coordinator()
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a.service)))
+        try await a.service.retryReconciliation()
+        let departure = try await authority.prepareDeparture(a.service, ticket: UUID())
+        // Defensive injection, not a normal producer of exceptional departure state.
+        try departure.activate {}; await authority.retainDepartureRecovery(serviceID: a.service.runtimeID, ticket: departure.id)
+        let phases = await a.service.localRecoveryPhaseCount, reads = backend.reads
+        try await completed { try await authority.recoverDeparture(serviceID: a.service.runtimeID, ticket: departure.id) }
+        let after = await a.service.localRecoveryPhaseCount, observation = await authority.observation
+        XCTAssertEqual(after, phases); XCTAssertEqual(backend.reads, reads)
+        XCTAssertEqual(observation.targets, 0); XCTAssertEqual(observation.recoverySubscriptions, 0)
+    }
+    func testCleanExceptionalDepartureRetiresDuringHealthyAdmittedWork() async throws {
+        let a = try await fixture(); try await submit(a.service)
+        let jobs = await a.service.allJobs(), job = a.root.appendingPathComponent(try XCTUnwrap(jobs.first?.id).uuidString)
+        let script = a.root.appendingPathComponent("unused.py")
+        try """
+        import json,sys,time
+        from pathlib import Path
+        job=Path(sys.argv[3]);(job/'started').touch()
+        while not (job/'release').exists():time.sleep(.005)
+        print(json.dumps(dict(event='clarification',question='Choose',options=['A','B'])),flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        addTeardownBlock { try? Data().write(to: job.appendingPathComponent("release")) }
+        try await a.service.retryReconciliation()
+        let backend = TrustedBackendFixture(nil), authority = backend.coordinator()
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a.service)))
+        await a.service.activateScheduling(); await a.service.resume()
+        try await wait { FileManager.default.fileExists(atPath: job.appendingPathComponent("started").path) }
+        let departure = try await authority.prepareDeparture(a.service, ticket: UUID())
+        // Defensive injection while the accepted work and ownership remain intact.
+        try departure.activate {}; await authority.retainDepartureRecovery(serviceID: a.service.runtimeID, ticket: departure.id)
+        let phases = await a.service.localRecoveryPhaseCount
+        try await completed { try await authority.recoverDeparture(serviceID: a.service.runtimeID, ticket: departure.id) }
+        let after = await a.service.localRecoveryPhaseCount, observation = await authority.observation, active = await a.service.allJobs()
+        XCTAssertEqual(after, phases); XCTAssertEqual(observation.targets, 0)
+        XCTAssertEqual(active.first?.stage, .implementing)
+        try Data().write(to: job.appendingPathComponent("release"))
+        try await wait { await a.service.allJobs().first?.stage == .awaitingClarification }
+    }
+    func testCancelledDepartureQueuesIndependentSuccessorUntilPhysicalSettlement() async throws {
+        let fault = DepartureStorageFault(), armed = DepartureStorageFault(), settling = DepartureSettlementGate()
+        let a = try await fixture(fault: fault, faultFile: "preferences.json", reconcile: { _ in if armed.enabled { await settling.wait() } })
+        let backend = TrustedBackendFixture(nil), authority = backend.coordinator()
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a.service)))
+        let departure = try await authority.prepareDeparture(a.service, ticket: UUID())
+        // Defensive injection ensures real original-target metadata repair is required.
+        try departure.activate {}; await authority.retainDepartureRecovery(serviceID: a.service.runtimeID, ticket: departure.id)
+        fault.enabled = true
+        do { try await a.service.disable(); XCTFail("Storage fault ignored") } catch is RequestPersistence.Fault {}
+        fault.enabled = false; armed.enabled = true
+        let first = Task { try await authority.recoverDeparture(serviceID: a.service.runtimeID, ticket: departure.id) }
+        addTeardownBlock { first.cancel(); await settling.release() }
+        try await wait { await settling.entered }; first.cancel()
+        do { try await first.value; XCTFail("Cancelled participant succeeded") } catch is CancellationError {}
+        let phases = await a.service.localRecoveryPhaseCount
+        let second = Task { try await authority.recoverDeparture(serviceID: a.service.runtimeID, ticket: departure.id) }
+        let cancelled = Task { try await authority.recoverDeparture(serviceID: a.service.runtimeID, ticket: departure.id) }
+        addTeardownBlock { second.cancel(); cancelled.cancel(); await settling.release() }
+        try await wait { await authority.observation.departureRecoverySuccessors == 2 }
+        cancelled.cancel()
+        do { try await cancelled.value; XCTFail("Cancelled successor succeeded") } catch is CancellationError {}
+        try await wait { await authority.observation.departureRecoverySuccessors == 1 }
+        let held = await a.service.localRecoveryPhaseCount; XCTAssertEqual(held, phases)
+        armed.enabled = false; await settling.release()
+        try await completed { try await second.value }
+        let done = await authority.observation
+        XCTAssertEqual(done.targets, 0); XCTAssertEqual(done.departureRecoveryParticipants, 0)
+        XCTAssertEqual(done.departureRecoverySuccessors, 0)
+    }
+    func testDepartureRetirementRejectsAChangedGeneration() async throws {
+        let a = try await fixture()
+        try await a.service.retryReconciliation()
+        let receipt = await a.service.departureRetirementAssessment()
+        let captured = try XCTUnwrap(receipt)
+        try await a.service.retryReconciliation()
+        let current = await a.service.validateDepartureRetirement(captured)
+        XCTAssertFalse(current)
+    }
     func testMovedSoleTargetUsesExactOldAuthorityRecoveryEndpoint() async throws {
         let a = try await fixture(), backend = TrustedBackendFixture(nil), old = backend.coordinator(), next = TrustedBackendFixture(nil).coordinator()
         _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
@@ -200,6 +300,9 @@ import XCTest
         _ = try await a.service.installTrustedAuthority(transfer, id: next.id, intents: [], revision: .init(coordinator: next.id, sequence: 0), coordinator: { _ in })
         await old.retainDepartureRecovery(serviceID: a.service.runtimeID, ticket: transfer.id)
         await a.service.finishTrustedAuthority(transfer, authority: next)
+        // Complete the destination's real target registration before asking it
+        // to publish a recovery fence for the newly installed binding.
+        _ = try await accept(next.register(TrustedOwnerRecorder().owner(service: a.service)))
         let pending = await a.service.recoveryStatuses()
         XCTAssertTrue(pending.contains { $0.id == transfer.id })
         try await a.service.retryReconciliation()
@@ -543,5 +646,11 @@ import XCTest
 private final class DepartureStorageFault: @unchecked Sendable {
     private let lock = NSLock(); private var value = false
     var enabled: Bool { get { lock.withLock { value } } set { lock.withLock { value = newValue } } }
+}
+private actor DepartureSettlementGate {
+    private(set) var entered = false
+    private let completion = TrustedCompletionSignal()
+    func wait() async { entered = true; try? await completion.wait(cancellable: false) }
+    func release() { completion.finish() }
 }
 #endif
