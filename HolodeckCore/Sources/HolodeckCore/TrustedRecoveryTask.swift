@@ -15,6 +15,8 @@ nonisolated final class TrustedRecoveryTask<Value: Sendable>: @unchecked Sendabl
     private let beforeCancellation: @Sendable () -> Void
     var isCancelled: Bool { lock.withLock { admissionClosed } || task.isCancelled }
     var waiterCount: Int { lock.withLock { waiters.count } }
+    /// A cancelled owner drains its admitted work without opening subscriptions.
+    func settle() async { _ = await task.result }
     init(beforeCancellation: @escaping @Sendable () -> Void = {}, _ work: @escaping @Sendable () async throws -> Value) {
         self.beforeCancellation = beforeCancellation
         task = Task { try await work() }

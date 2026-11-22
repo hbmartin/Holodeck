@@ -614,6 +614,7 @@ actor TrustedApprovalsCoordinator {
     }
     private func recoverTrusted(_ passID: UUID) async throws -> RecoveryResult {
         var completed: Set<UUID> = [], errors: [String] = []
+        var completedReceipts: [UUID: TrustedLocalRecoveryReceipt] = [:]
         var heldTargets: [UUID: ShaderRequestService] = [:]
         do {
             var registrationInspection: InspectionPass?
@@ -655,7 +656,9 @@ actor TrustedApprovalsCoordinator {
                 let commit = try await acquire(.progress)
                 guard targets[key]?.service === target else { release(commit); continue }
                 applyRecoveryOutcome(outcome, to: key, priorBlockers: priorBlockers)
-                if outcome.completed { completed.insert(key.service) }
+                if outcome.completed, let receipt = outcome.receipt {
+                    completed.insert(key.service); completedReceipts[key.service] = receipt
+                }
                 release(commit)
             }
             try Task.checkCancellation()
@@ -681,7 +684,9 @@ actor TrustedApprovalsCoordinator {
                     let outcome = await target.validateTrustedRecovery(input, pass: passID)
                     if targets[key]?.service === target {
                         applyRecoveryOutcome(outcome, to: key, priorBlockers: priorBlockers)
-                        if outcome.completed { completed.insert(serviceID) } else { completed.remove(serviceID) }
+                        if outcome.completed, let receipt = outcome.receipt {
+                            completed.insert(serviceID); completedReceipts[serviceID] = receipt
+                        } else { completed.remove(serviceID); completedReceipts[serviceID] = nil }
                     }
                     release(commit)
                 }
@@ -695,6 +700,12 @@ actor TrustedApprovalsCoordinator {
             }
             try Task.checkCancellation()
             let finishing = try await acquire(.progress)
+            if recoveryPass?.id == passID { recoveryPass?.state = .finishing }
+            completed = completed.filter { serviceID in
+                guard let receipt = completedReceipts[serviceID] else { return false }
+                let key = TargetKey(service: serviceID, registration: receipt.registrationID)
+                return recoveryEpochs[key] == receipt.attemptID && preparingRecovery[key] == nil
+            }
             if !errors.isEmpty, !required.isEmpty {
                 let remaining = required.sorted { $0.key.uuidString < $1.key.uuidString }.prefix(8).map { intent, targets in
                     "Intent " + intent.uuidString + ": " + targets.map(\.service.uuidString).sorted().joined(separator: ", ")

@@ -139,7 +139,7 @@ import XCTest
         try await wait { FileManager.default.fileExists(atPath: job.appendingPathComponent("retry-started").path) }
         try Data().write(to: job.appendingPathComponent("release"))
         try await wait { await service.allJobs().first?.stage == .awaitingClarification }
-        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("publication/started").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("publication/attempts").path))
     }
     func testOwnerlessSuspendedFailureFallsBackToPauseAndIdleFailureKeepsItsCategory() async throws {
         for suspended in [true, false] {

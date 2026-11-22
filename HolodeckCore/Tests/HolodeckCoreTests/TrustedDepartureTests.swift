@@ -34,6 +34,16 @@ import XCTest
             try await Task.sleep(for: .milliseconds(5))
         }
     }
+    private func completed<Value: Sendable>(_ body: @escaping @MainActor @Sendable () async throws -> Value) async throws -> Value {
+        let result = DepartureCompletion<Value>()
+        let task = Task {
+            do { result.value = .success(try await body()) }
+            catch { result.value = .failure(error) }
+        }
+        addTeardownBlock { task.cancel() }
+        try await wait { result.value != nil }
+        return try XCTUnwrap(result.value).get()
+    }
     func testKnownApprovalWritePreservesPreparedDeparture() async throws {
         let a = try await fixture(), b = try await fixture(), backend = TrustedBackendFixture(nil), old = backend.coordinator()
         _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
@@ -45,7 +55,7 @@ import XCTest
         try await wait { gate.entered }
         _ = try await old.approve(binding.permit) { .init(record: ApprovedTV(id: "C", name: "C", tokenHash: "new-token"), token: "new-token", eligibility: .init()) }
         XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).approvals.first?.tokenHash, "new-token")
-        gate.release(); _ = try await accept(ticket)
+        gate.release(); _ = try await completed { try await self.accept(ticket) }
         try await wait { await old.observation.departures == 0 }
         let retired = await old.observation
         XCTAssertEqual(retired.targets, 1); XCTAssertEqual(backend.writes, 1)
@@ -75,12 +85,12 @@ import XCTest
             XCTAssertNil(pending.acceptedGeneration); XCTAssertEqual(pending.targets, 0)
             await inspection.release()
             if fail {
-                do { try await recovering.value; XCTFail("Failed target inspection accepted") }
+                do { try await completed { try await recovering.value }; XCTFail("Failed target inspection accepted") }
                 catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
-                do { _ = try await ticket.value(); XCTFail("Invalid inspection activated") }
+                do { _ = try await completed { try await ticket.value() }; XCTFail("Invalid inspection activated") }
                 catch { XCTAssertTrue(error.localizedDescription.contains("inspection changed during handoff")) }
             } else {
-                try await recovering.value; _ = try await accept(ticket)
+                try await completed { try await recovering.value }; _ = try await completed { try await self.accept(ticket) }
             }
             XCTAssertEqual(backend.writes, 0); XCTAssertEqual(nextBackend.writes, 0)
         }
@@ -104,9 +114,9 @@ import XCTest
         gate.release()
         try await wait { await old.observation.departureInspectionWaiters > 0 }
         backend.failReads(true); await reading.release()
-        do { try await recovery.value; XCTFail("Unreadable trusted storage accepted") }
+        do { try await completed { try await recovery.value }; XCTFail("Unreadable trusted storage accepted") }
         catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EACCES).localizedDescription)) }
-        do { _ = try await ticket.value(); XCTFail("Activation overtook an inconclusive backend inspection") }
+        do { _ = try await completed { try await ticket.value() }; XCTFail("Activation overtook an inconclusive backend inspection") }
         catch { XCTAssertTrue(error.localizedDescription.contains("inspection changed during handoff")) }
         XCTAssertEqual(backend.writes, 0); XCTAssertEqual(nextBackend.writes, 0)
     }
@@ -137,14 +147,14 @@ import XCTest
                 do { try await destination.service.retryReconciliation(); XCTFail("Failed destination inspection accepted") }
                 catch let error as TrustedPartialRecovery { XCTAssertTrue(error.remaining.joined().contains(POSIXError(.EACCES).localizedDescription)) }
             }
-            await inspection.release(); try await recovering.value
+            await inspection.release(); try await completed { try await recovering.value }
             if fail {
-                do { _ = try await ticket.value(); XCTFail("Invalidated destination accepted") }
+                do { _ = try await completed { try await ticket.value() }; XCTFail("Invalidated destination accepted") }
                 catch let error as POSIXError { XCTAssertEqual(error.code, .EACCES) }
                 XCTAssertTrue(oldBinding.permit.isCurrent)
                 XCTAssertGreaterThan(backend.reads, reads)
             } else {
-                _ = try await accept(ticket)
+                _ = try await completed { try await self.accept(ticket) }
                 XCTAssertEqual(backend.reads, reads, "Valid destination evidence must not add another read")
             }
             XCTAssertEqual(backend.writes, 0)
@@ -173,7 +183,7 @@ import XCTest
         let second = Task { try await c.service.retryReconciliation() }
         addTeardownBlock { second.cancel(); await gate.release() }
         try await wait { await old.observation.departureRecoveryParticipants == 2 }
-        await gate.release(); try await first.value; try await second.value
+        await gate.release(); try await completed { try await first.value }; try await completed { try await second.value }
         let after = await a.service.localRecoveryPhaseCount
         XCTAssertEqual(after, phases + 1)
         let statuses = await b.service.recoveryStatuses(), original = await a.service.configurationValue()
@@ -526,6 +536,9 @@ import XCTest
         departure.invalidatePreparation(); XCTAssertTrue(departure.activated)
         departure.close(); XCTAssertThrowsError(try departure.activate {})
     }
+}
+@MainActor private final class DepartureCompletion<Value: Sendable> {
+    var value: Result<Value, Error>?
 }
 private final class DepartureStorageFault: @unchecked Sendable {
     private let lock = NSLock(); private var value = false
