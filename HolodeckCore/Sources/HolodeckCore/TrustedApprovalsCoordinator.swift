@@ -40,6 +40,9 @@ struct TrustedLocalRecovery: Sendable {
     var failure: String? { phase.failure }
     var completed: Bool { if case .completed = phase { return true }; return false }
 }
+struct TrustedSetupPending: LocalizedError, Sendable {
+    var errorDescription: String? { "Shader request setup is still loading. The accepted TV authority was retained; finish setup and explicitly retry registration." }
+}
 struct TrustedRecoveryAdmissionError: LocalizedError, Sendable {
     var errorDescription: String? { "Wait for active checkout work or recovery to finish." }
 }
@@ -220,6 +223,7 @@ actor TrustedApprovalsCoordinator {
         }
     }
     nonisolated let id = UUID()
+    private let afterTargetInstallation: (@Sendable (UUID) async throws -> Void)?
     private let beforeReplayApplication: (@Sendable (UUID) async throws -> Void)?
     private let beforeRecoverySealing: @Sendable () async throws -> Void
     private let beforeInspectionRead: @Sendable () async throws -> Void
@@ -259,6 +263,7 @@ actor TrustedApprovalsCoordinator {
         updateRetention()
     }
     private var targets: [TargetKey: Target] = [:]
+    private var targetInstallations: [TargetKey: TrustedTargetInstallation] = [:]
     // Each successful target inspection proves this exact accepted baseline and
     // registration. Consumers must not infer inspection from registration success.
     private var inspections: [TargetKey: UInt64] = [:]
@@ -352,7 +357,9 @@ actor TrustedApprovalsCoordinator {
          beforeAuthorityPreparation: @escaping @Sendable (UUID) async throws -> Void = { _ in },
          beforeInspectionRead: @escaping @Sendable () async throws -> Void = {},
          beforeRecoverySealing: @escaping @Sendable () async throws -> Void = {},
-         beforeReplayApplication: (@Sendable (UUID) async throws -> Void)? = nil) {
+         beforeReplayApplication: (@Sendable (UUID) async throws -> Void)? = nil,
+         afterTargetInstallation: (@Sendable (UUID) async throws -> Void)? = nil) {
+        self.afterTargetInstallation = afterTargetInstallation
         self.beforeReplayApplication = beforeReplayApplication
         self.beforeRecoverySealing = beforeRecoverySealing
         self.beforeInspectionRead = beforeInspectionRead
@@ -505,13 +512,32 @@ actor TrustedApprovalsCoordinator {
             guard let self else { throw Self.unavailable("The trusted approval authority is unavailable.") }
             return try await self.retry(requester: serviceID, local: local)
         }
-        let registration: UUID
+        let installation = await target.prepareTargetInstallation(authority: id)
+        let registration = installation.registration
+        let key = TargetKey(service: serviceID, registration: registration)
+        // The service may admit local preparation before this actor resumes from
+        // installation. Its exact target must already exist when that happens.
+        targets[key] = Target(service: target, key: key)
+        targetInstallations[key] = installation
+        if recoveryEpochs[key] == nil { recoveryEpochs[key] = UUID() }
+        for intent in outstandingIntents { require(intent, on: key, target: target) }
+        defer {
+            if targetInstallations[key] === installation {
+                targetInstallations[key] = nil
+                if !installation.isPublished {
+                    targets[key] = nil; inspections[key] = nil; recoveryEpochs[key] = nil; targetPins[key] = nil
+                    for intent in Array(required.keys) where required[intent]?.contains(key) == true {
+                        required[intent]?.remove(key)
+                        if required[intent]?.isEmpty == true { required[intent] = nil }
+                    }
+                }
+            }
+        }
         var inspection: TrustedRevocationInspection?
         if let transfer {
-            (registration, inspection) = try await target.installTrustedAuthority(transfer, id: id,
-                intents: outstandingIntents, revision: revision, completion: callback, authority: self)
-        } else { registration = try await target.installRevocationCoordinator(authority: self, recovery: callback) }
-        let key = TargetKey(service: serviceID, registration: registration)
+            (_, inspection) = try await target.installTrustedAuthority(transfer, id: id,
+                intents: outstandingIntents, revision: revision, completion: callback, authority: self, installation: installation)
+        } else { _ = try await target.installRevocationCoordinator(authority: self, installation: installation, recovery: callback) }
         let previous = targets.keys.filter { $0.service == serviceID && $0 != key }
         for old in previous {
             targets[old] = nil; inspections[old] = nil; targetPins[old] = nil; recoveryTargets.remove(old)
@@ -530,6 +556,7 @@ actor TrustedApprovalsCoordinator {
         for intent in outstandingIntents {
             require(intent, on: key, target: target)
         }
+        if let afterTargetInstallation { try await afterTargetInstallation(serviceID) }
         await target.rememberTrustedAuthority(self)
         let subscription = TrustedRecoverySubscription(authority: id, serviceID: serviceID, registrationID: registration)
         recoverySubscriptions[serviceID]?.invalidate(); recoverySubscriptions[serviceID] = subscription
@@ -549,7 +576,7 @@ actor TrustedApprovalsCoordinator {
         }
         try Task.checkCancellation()
         guard preparation.authority == id, preparation.serviceID == target.runtimeID,
-              targets[key]?.service === target else { return false }
+              targets[key]?.service === target, targetInstallations[key]?.isPublished != false else { return false }
         // An exact exceptional target whose binding is still current may repair
         // metadata without authorizing its retired cancellation proofs.
         if retired(key), departureRecovery[key.service]?.registrationID != key.registration ||

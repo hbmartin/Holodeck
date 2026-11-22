@@ -108,6 +108,25 @@ nonisolated final class TrustedLocalPreparation: Sendable {
 }
 struct TrustedLocalPreparationPending: Error, Sendable { let preparation: TrustedLocalPreparation }
 
+/// The authority records this exact target before the service publishes it.
+nonisolated final class TrustedTargetInstallation: @unchecked Sendable {
+    let serviceID: UUID
+    let authority: UUID
+    let predecessorAuthority: UUID?
+    let predecessorRegistration: UUID
+    let registration: UUID
+    private let lock = NSLock()
+    private var published: Bool
+    init(serviceID: UUID, authority: UUID, predecessorAuthority: UUID?, predecessorRegistration: UUID) {
+        self.serviceID = serviceID; self.authority = authority
+        self.predecessorAuthority = predecessorAuthority; self.predecessorRegistration = predecessorRegistration
+        registration = predecessorAuthority == authority ? predecessorRegistration : UUID()
+        published = predecessorAuthority == authority
+    }
+    var isPublished: Bool { lock.withLock { published } }
+    func publish() { lock.withLock { published = true } }
+}
+
 struct TrustedDepartureRetirement: Sendable, Equatable {
     let serviceID: UUID
     let registration: UUID

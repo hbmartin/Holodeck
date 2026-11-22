@@ -561,6 +561,7 @@ public actor ShaderRequestService {
     func prepareTrustedAuthority(id: UUID) async throws -> AuthorityTransfer? {
         guard let prior = revocationCoordinatorID, prior != id, let predecessor = trustedAuthority, predecessor.id != id else { return nil }
         guard authorityTransfer == nil else { throw ShaderRequestError.unavailable("A trusted authority handoff is pending; retry after it finishes.") }
+        guard acceptedMetadataAvailable || loaded else { throw TrustedSetupPending() }
         let ticket = UUID(); authorityTransfer = ticket; emitUpdates()
         do {
             let departure = try await predecessor.prepareDeparture(self, ticket: ticket)
@@ -571,8 +572,13 @@ public actor ShaderRequestService {
     func settleTrustedAuthorityDeparture() async throws {
         if let activeID, records[activeID]?.revoked == true, let workerTask { await workerTask.value }
         if let retirementTask { await retirementTask.value }
+        try requireDepartureOwnership()
+    }
+    private func requireDepartureOwnership() throws {
         guard departureOwnershipVerified else {
-            throw ShaderRequestError.unavailable("Previous TV cancellation or process settlement requires recovery before changing authority.")
+            let detail = persistenceFailure ?? startupFinalizationFailure ?? recoveryBlocker ??
+                "Previous TV cancellation or process settlement requires recovery before changing authority."
+            throw ShaderRequestError.unavailable(detail)
         }
     }
     private var departureOwnershipVerified: Bool {
@@ -684,8 +690,10 @@ public actor ShaderRequestService {
     }
     func installTrustedAuthority(_ transfer: AuthorityTransfer, id: UUID, intents: [RequestRevocationIntent], revision: TrustedRevocationRevision,
                                  completion: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion,
-                                 authority: TrustedApprovalsCoordinator? = nil) throws -> (UUID, TrustedRevocationInspection) {
+                                 authority: TrustedApprovalsCoordinator? = nil,
+                                 installation: TrustedTargetInstallation? = nil) throws -> (UUID, TrustedRevocationInspection) {
         try requireLocalPreparationFinished(changingTo: id)
+        if let installation { try validateTargetInstallation(installation, authority: id) }
         return try transfer.departure.activate {
             guard authorityTransfer == transfer.id, revocationRegistration == transfer.registration,
                   transfer.departure.registrationID == revocationRegistration, durableRevocations.isEmpty,
@@ -694,8 +702,10 @@ public actor ShaderRequestService {
             }
             // No suspension between validating departure, changing registration and
             // loading the already validated replacement authority snapshot.
-            let registration = bindRevocationCoordinator(id: id, completion)
+            try requireDepartureOwnership()
+            let registration = bindRevocationCoordinator(id: id, registration: installation?.registration, completion)
             if let authority { trustedAuthority = authority }
+            installation?.publish()
             return (registration, try loadTrustedRevocations(intents, revision: revision))
         }
     }
@@ -725,16 +735,29 @@ public actor ShaderRequestService {
             throw TrustedLocalPreparationPending(preparation: preparation)
         }
     }
+    func prepareTargetInstallation(authority: UUID) -> TrustedTargetInstallation {
+        .init(serviceID: runtimeID, authority: authority, predecessorAuthority: revocationCoordinatorID,
+              predecessorRegistration: revocationRegistration)
+    }
+    private func validateTargetInstallation(_ installation: TrustedTargetInstallation, authority: UUID) throws {
+        guard installation.serviceID == runtimeID, installation.authority == authority,
+              installation.predecessorAuthority == revocationCoordinatorID,
+              installation.predecessorRegistration == revocationRegistration else {
+            throw ShaderRequestError.unavailable("The request-service registration changed before binding installation; explicitly retry registration.")
+        }
+    }
     func installRevocationCoordinator(authority: TrustedApprovalsCoordinator,
+                                     installation: TrustedTargetInstallation? = nil,
                                      recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) throws -> UUID {
         try requireLocalPreparationFinished(changingTo: authority.id)
-        let registration = bindRevocationCoordinator(id: authority.id, recovery)
-        trustedAuthority = authority
+        if let installation { try validateTargetInstallation(installation, authority: authority.id) }
+        let registration = bindRevocationCoordinator(id: authority.id, registration: installation?.registration, recovery)
+        trustedAuthority = authority; installation?.publish()
         return registration
     }
-    private func bindRevocationCoordinator(id: UUID, _ coordinator: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) -> UUID {
+    private func bindRevocationCoordinator(id: UUID, registration: UUID? = nil, _ coordinator: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) -> UUID {
         if revocationCoordinatorID == id { revocationCoordinator = coordinator; return revocationRegistration }
-        revocationRegistration = UUID(); revocationApplications.removeAll()
+        revocationRegistration = registration ?? UUID(); revocationApplications.removeAll()
         controlScopes.removeAll()
         revocationCoordinatorID = id; revocationRevision = 0
         revocationCoordinator = coordinator; revocationInspectionPending = true; emitUpdates()
