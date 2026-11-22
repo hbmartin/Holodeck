@@ -106,6 +106,65 @@ import XCTest
         let completed = try await local.value; XCTAssertTrue(completed.completed)
         XCTAssertEqual(backend.writes, 1)
     }
+    func testDepartureReusesOwnedLocalOutcomeIncludingFailure() async throws {
+        for fail in [false, true] {
+            let armed = RecoveryOwnershipSwitch(), callback = RecoveryGate()
+            addTeardownBlock { await callback.release() }
+            let a = try await fixture(reconcile: { _ in if fail && armed.on { throw POSIXError(.EIO) } })
+            _ = await a.registerRevocationCoordinator(id: UUID(), recovery: { _ in try await callback.wait() })
+            armed.on = true
+            let requester = Task { try await a.retryReconciliation() }
+            addTeardownBlock { requester.cancel(); await callback.release() }
+            try await wait { await callback.hasEntered }
+            let original = try await a.trustedRecoveryOutcome(), phases = await a.localRecoveryPhaseCount
+            let departure = try await a.recoverDepartureLocal()
+            let validated = await a.validateTrustedRecovery(original)
+            XCTAssertEqual(departure.receipt?.attemptID, original.receipt?.attemptID)
+            XCTAssertEqual(departure.completed, !fail); XCTAssertEqual(validated.completed, !fail)
+            let after = await a.localRecoveryPhaseCount; XCTAssertEqual(after, phases)
+            await callback.release()
+            if fail {
+                do { try await requester.value; XCTFail("Failed local outcome lost") }
+                catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+            } else { try await requester.value }
+        }
+    }
+    func testLocalOnlyCompletionDoesNotLeavePreparingApplicationBlocker() async throws {
+        let a = try await fixture(), intent = RequestRevocationIntent(operationID: UUID(), deviceID: "TV")
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(revocations: [intent]).encoded()), authority = backend.coordinator()
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a)))
+        let local = try await a.recoverDepartureLocal(); XCTAssertTrue(local.completed)
+        try await authority.replay()
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
+        let observation = await authority.observation
+        XCTAssertEqual(observation.obligations, 0); XCTAssertEqual(backend.writes, 1)
+    }
+    func testLocalOnlyCompletionPreservesIndependentApplicationFailure() async throws {
+        let a = try await fixture(), intent = RequestRevocationIntent(operationID: UUID(), deviceID: "TV")
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(revocations: [intent]).encoded()), authority = backend.coordinator()
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a, beforeReplay: { _ in throw POSIXError(.EIO) })))
+        do { try await authority.replay(); XCTFail("Injected failure ignored") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        let local = try await a.recoverDepartureLocal(); XCTAssertTrue(local.completed)
+        do { try await authority.replay(); XCTFail("Unrelated failure was cleared") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations, [intent])
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a)))
+        try await a.retryReconciliation()
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
+    }
+    func testRequesterDoesNotReintroduceExcludedTrustedCompletion() async throws {
+        let a = try await fixture()
+        _ = await a.registerRevocationCoordinator(id: UUID(), recovery: { _ in
+            throw TrustedPartialRecovery(completedServices: [], remaining: ["The requester epoch was superseded."])
+        })
+        do { try await a.retryReconciliation(); XCTFail("Partial result ignored") }
+        catch let error as TrustedPartialRecovery {
+            XCTAssertFalse(error.completedServices.contains(a.runtimeID))
+            XCTAssertTrue(error.remaining.joined().contains("epoch was superseded"))
+        }
+    }
+
 }
 private final class RecoveryOwnershipSwitch: @unchecked Sendable {
     private let lock = NSLock(); private var value = false

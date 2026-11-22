@@ -53,6 +53,7 @@ struct TrustedRegistrationInterrupted: LocalizedError, Sendable {
 struct TrustedRecoveryInterrupted: LocalizedError, Sendable {
     var errorDescription: String? { "Local recovery was interrupted because checkout maintenance ownership changed. Retain its evidence and retry after Detach or maintenance finishes." }
 }
+struct TrustedRecoveryCompletion: Sendable { let completedServices: [UUID] }
 struct TrustedPartialRecovery: LocalizedError, Sendable {
     let completedServices: [UUID]
     let remaining: [String]
@@ -307,6 +308,7 @@ actor TrustedApprovalsCoordinator {
         let requester: UUID
         let local: TrustedLocalRecovery
         let receipt: RequestPersistence.CommitTicket<RecoveryResult>
+        let sequence: UInt64
     }
     private struct RecoveryPass {
         let id = UUID()
@@ -314,7 +316,10 @@ actor TrustedApprovalsCoordinator {
         var participants: [UUID: RecoveryParticipant] = [:]
         var task: Task<Void, Never>?
         var inputs: [UUID: TrustedLocalRecovery] {
-            Dictionary(participants.values.map { ($0.requester, $0.local) }, uniquingKeysWith: { _, latest in latest })
+            let latest = Dictionary(participants.values.map { ($0.requester, $0) }, uniquingKeysWith: {
+                $0.sequence > $1.sequence ? $0 : $1
+            })
+            return latest.mapValues(\.local)
         }
     }
     private struct RecoveryResult: Sendable {
@@ -324,6 +329,7 @@ actor TrustedApprovalsCoordinator {
     private var recoveryPass: RecoveryPass?
     private var successorRecoveryPass: RecoveryPass?
     private var recoveryPassCount = 0
+    private var recoveryParticipantSequence: UInt64 = 0
     private var replayWaiters: [UUID: [CheckedContinuation<Void, Error>]] = [:]
     private var replayAll: [CheckedContinuation<Void, Error>] = []
     private var departureReplay: [UUID: [CheckedContinuation<Void, Error>]] = [:]
@@ -480,15 +486,15 @@ actor TrustedApprovalsCoordinator {
         guard departures[serviceID] == nil else {
             throw Self.unavailable("This request service has a trusted authority handoff pending; retry registration after it finishes.")
         }
-        let callback: @Sendable (TrustedLocalRecovery) async throws -> Void = { [weak self] local in
+        let callback: @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion = { [weak self] local in
             guard let self else { throw Self.unavailable("The trusted approval authority is unavailable.") }
-            try await self.retry(requester: serviceID, local: local)
+            return try await self.retry(requester: serviceID, local: local)
         }
         let registration: UUID
         var inspection: TrustedRevocationInspection?
         if let transfer {
             (registration, inspection) = try await target.installTrustedAuthority(transfer, id: id,
-                intents: outstandingIntents, revision: revision, coordinator: callback, authority: self)
+                intents: outstandingIntents, revision: revision, completion: callback, authority: self)
         } else { registration = try await target.installRevocationCoordinator(authority: self, recovery: callback) }
         let key = TargetKey(service: serviceID, registration: registration)
         let previous = targets.keys.filter { $0.service == serviceID && $0 != key }
@@ -531,7 +537,8 @@ actor TrustedApprovalsCoordinator {
         for intent in required.keys where required[intent]?.contains(key) == true && removals[intent] == nil {
             applications[intent]?[key] = nil
             applicationEpochs[.init(intent: intent, target: key)] = nil
-            blockApplication(.init(intent: intent, target: key), diagnostic: "Target local recovery is still preparing.", localAttempt: attempt)
+            // Preparation is provisional, not an application failure. Keep an
+            // existing diagnostic instead of overwriting it with transient text.
             recoveryTargets.insert(key)
         }
         return true
@@ -541,9 +548,11 @@ actor TrustedApprovalsCoordinator {
         guard preparingRecovery[key] == attempt else { return }
         preparingRecovery[key] = nil
         if let outcome {
-            if !outcome.completed { suppressApplications(to: key, outcome: outcome) }
+            if outcome.completed {
+                clearApplicationBlockers(on: key) { _, blocker in blocker.localAttempt == attempt }
+            } else { suppressApplications(to: key, outcome: outcome) }
         } else {
-            suppressApplications(to: key, outcome: .init(phase: .interrupted("A previous local recovery was cancelled and is still settling. Retry when it finishes.")))
+            suppressApplications(to: key, outcome: .init(phase: .interrupted("Local recovery was cancelled. Choose Retry Recovery to complete it.")))
         }
     }
     private func applicationIsCurrent(_ attempt: Attempt, epoch: UUID) -> Bool {
@@ -563,10 +572,11 @@ actor TrustedApprovalsCoordinator {
         guard let pass, let current = currentInspection() else { return false }
         return pass.baseline == current.baseline && pass.targets == current.targets
     }
-    private func retry(requester: UUID, local: TrustedLocalRecovery) async throws {
+    private func retry(requester: UUID, local: TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion {
         try Task.checkCancellation()
         let participantID = UUID(), receipt = RequestPersistence.CommitTicket<RecoveryResult>()
-        let participant = RecoveryParticipant(requester: requester, local: local, receipt: receipt)
+        recoveryParticipantSequence &+= 1
+        let participant = RecoveryParticipant(requester: requester, local: local, receipt: receipt, sequence: recoveryParticipantSequence)
         let passID: UUID
         if recoveryPass == nil {
             recoveryPass = RecoveryPass()
@@ -581,13 +591,22 @@ actor TrustedApprovalsCoordinator {
             successorRecoveryPass!.participants[participantID] = participant
             passID = successorRecoveryPass!.id
         }
-        let result = try await withTaskCancellationHandler {
-            try await receipt.value()
-        } onCancel: { Task { await self.cancelRecoveryParticipant(participantID, pass: passID) } }
+        let result: RecoveryResult
+        do {
+            result = try await withTaskCancellationHandler {
+                try await receipt.value()
+            } onCancel: { Task { await self.cancelRecoveryParticipant(participantID, pass: passID) } }
+        } catch {
+            // Retire on this actor before the caller can re-enter. The callback
+            // remains necessary to wake a suspended participant promptly.
+            cancelRecoveryParticipant(participantID, pass: passID)
+            throw error
+        }
         if !result.errors.isEmpty {
             throw TrustedPartialRecovery(completedServices: result.completed,
                 remaining: Array(result.errors.prefix(9)).map { BoundedDiagnostics.bounded($0, bytes: 8192) })
         }
+        return .init(completedServices: result.completed)
     }
     private func cancelRecoveryParticipant(_ id: UUID, pass: UUID) {
         if recoveryPass?.id == pass {
@@ -737,13 +756,15 @@ actor TrustedApprovalsCoordinator {
     }
     private func applyRecoveryOutcome(_ outcome: TrustedLocalRecovery, to key: TargetKey, priorBlockers: [Attempt: ApplicationBlocker]) {
         if outcome.completed {
-            failedApplications = failedApplications.filter {
-                $0.key.target != key ||
-                    (priorBlockers[$0.key]?.generation != $0.value.generation &&
-                     (outcome.receipt?.attemptID == nil || $0.value.localAttempt != outcome.receipt?.attemptID))
+            clearApplicationBlockers(on: key) { attempt, blocker in
+                priorBlockers[attempt]?.generation == blocker.generation ||
+                    (outcome.receipt?.attemptID != nil && blocker.localAttempt == outcome.receipt?.attemptID)
             }
-            if !failedApplications.keys.contains(where: { $0.target == key }) { recoveryTargets.remove(key) }
         } else { suppressApplications(to: key, outcome: outcome) }
+    }
+    private func clearApplicationBlockers(on key: TargetKey, matching: (Attempt, ApplicationBlocker) -> Bool) {
+        failedApplications = failedApplications.filter { $0.key.target != key || !matching($0.key, $0.value) }
+        if !failedApplications.keys.contains(where: { $0.target == key }) { recoveryTargets.remove(key) }
     }
     private func suppressApplications(to key: TargetKey, outcome: TrustedLocalRecovery) {
         let intents = required.filter { $0.value.contains(key) }
@@ -1391,7 +1412,8 @@ actor TrustedApprovalsCoordinator {
         let pending = needed.sorted { $0.service.uuidString < $1.service.uuidString }
         let detail = pending.compactMap { key -> String? in
             if proofs[key] == nil {
-                let cause = failedApplications[.init(intent: id, target: key)]?.diagnostic ?? "Cancellation application is unverified."
+                let cause = failedApplications[.init(intent: id, target: key)]?.diagnostic ??
+                    (preparingRecovery[key] == nil ? "Cancellation application is unverified." : "Target local recovery is still preparing.")
                 return "Service " + key.service.uuidString + ": " + cause
             }
             return finalizedRemovals[id]?.contains(key) == true ? nil : "Service " + key.service.uuidString + ": trusted removal finalization remains pending."

@@ -607,7 +607,7 @@ public actor ShaderRequestService {
         var users = 0
     }
     private var controlScopes: [String: ControlScope] = [:]
-    private var revocationCoordinator: (@Sendable (TrustedLocalRecovery) async throws -> Void)?
+    private var revocationCoordinator: (@Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion)?
     private var localRecoveryAttempt: UUID?
     private var localRecoveryPhase: (id: UUID, task: TrustedRecoveryTask<TrustedLocalRecovery>)?
     private var localRecoveryResult: TrustedLocalRecovery?
@@ -663,6 +663,12 @@ public actor ShaderRequestService {
     func installTrustedAuthority(_ transfer: AuthorityTransfer, id: UUID, intents: [RequestRevocationIntent], revision: TrustedRevocationRevision,
                                  coordinator: @escaping @Sendable (TrustedLocalRecovery) async throws -> Void,
                                  authority: TrustedApprovalsCoordinator? = nil) throws -> (UUID, TrustedRevocationInspection) {
+        try installTrustedAuthority(transfer, id: id, intents: intents, revision: revision,
+            completion: { local in try await coordinator(local); return .init(completedServices: []) }, authority: authority)
+    }
+    func installTrustedAuthority(_ transfer: AuthorityTransfer, id: UUID, intents: [RequestRevocationIntent], revision: TrustedRevocationRevision,
+                                 completion: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion,
+                                 authority: TrustedApprovalsCoordinator? = nil) throws -> (UUID, TrustedRevocationInspection) {
         try requireLocalPreparationFinished(changingTo: id)
         return try transfer.departure.activate {
             guard authorityTransfer == transfer.id, revocationRegistration == transfer.registration,
@@ -672,7 +678,7 @@ public actor ShaderRequestService {
             }
             // No suspension between validating departure, changing registration and
             // loading the already validated replacement authority snapshot.
-            let registration = bindRevocationCoordinator(id: id, coordinator)
+            let registration = bindRevocationCoordinator(id: id, completion)
             if let authority { trustedAuthority = authority }
             return (registration, try loadTrustedRevocations(intents, revision: revision))
         }
@@ -684,7 +690,11 @@ public actor ShaderRequestService {
         // Compatibility callers do not own an authority lane. Production uses
         // the throwing admission below and releases its lane before waiting.
         while revocationCoordinatorID != id, let preparation = localPreparation { try? await preparation.wait(cancellable: false) }
-        return bindRevocationCoordinator(id: id, recovery)
+        return bindRevocationCoordinator(id: id) { local in
+            try await recovery(local)
+            let valid = await self.validateTrustedRecovery(local)
+            return .init(completedServices: valid.completed ? [self.runtimeID] : [])
+        }
     }
     private func requireLocalPreparationFinished(changingTo id: UUID) throws {
         if revocationCoordinatorID != id, let preparation = localPreparation {
@@ -692,13 +702,13 @@ public actor ShaderRequestService {
         }
     }
     func installRevocationCoordinator(authority: TrustedApprovalsCoordinator,
-                                     recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> Void) throws -> UUID {
+                                     recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) throws -> UUID {
         try requireLocalPreparationFinished(changingTo: authority.id)
         let registration = bindRevocationCoordinator(id: authority.id, recovery)
         trustedAuthority = authority
         return registration
     }
-    private func bindRevocationCoordinator(id: UUID, _ coordinator: @escaping @Sendable (TrustedLocalRecovery) async throws -> Void) -> UUID {
+    private func bindRevocationCoordinator(id: UUID, _ coordinator: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) -> UUID {
         if revocationCoordinatorID == id { revocationCoordinator = coordinator; return revocationRegistration }
         revocationRegistration = UUID(); revocationApplications.removeAll()
         controlScopes.removeAll()
@@ -1724,10 +1734,11 @@ public actor ShaderRequestService {
         }
         let local = try await recoverLocalPhase()
         try Task.checkCancellation()
-        var failures: [String] = [], completed: Set<UUID> = local.completed ? [runtimeID] : []
+        let hasTrustedPhase = replayTrusted && revocationCoordinator != nil
+        var failures: [String] = [], completed: Set<UUID> = !hasTrustedPhase && local.completed ? [runtimeID] : []
         let hasIndependentPhase = replayTrusted && (revocationCoordinator != nil || authorityRecoveryEndpoints.values.contains(where: \.isCurrent))
         if replayTrusted, let coordinator = revocationCoordinator {
-            do { try await coordinator(local) }
+            do { completed.formUnion(try await coordinator(local).completedServices) }
             catch {
                 try Task.checkCancellation()
                 if let partial = error as? TrustedPartialRecovery {
@@ -1753,12 +1764,18 @@ public actor ShaderRequestService {
         if let original = local.initiatingError { throw original }
         if let failure = local.failure { throw TrustedPartialRecovery(completedServices: [], remaining: [failure]) }
     }
-    private func recoverLocalPhase() async throws -> TrustedLocalRecovery {
-        if let phase = localRecoveryPhase { return try await phase.task.subscribe().value() }
-        if !trustedRecoveryHolds.isEmpty, let result = localRecoveryResult {
-            let validated = validateTrustedRecovery(result)
-            if validated.completed { return validated }
+    private func cachedRecoveryOutcome(pass: UUID? = nil) -> TrustedLocalRecovery? {
+        guard localRecoveryPhase == nil, let result = localRecoveryResult,
+              localRecoveryAttempt != nil || !trustedRecoveryHolds.isEmpty else { return nil }
+        return validateTrustedRecovery(result, pass: pass)
+    }
+    private func recoverLocalPhase(pass: UUID? = nil) async throws -> TrustedLocalRecovery {
+        if let phase = localRecoveryPhase {
+            if let pass { trustedRecoveryHolds.insert(pass) }
+            return try await phase.task.subscribe().value()
         }
+        if let cached = cachedRecoveryOutcome(pass: pass) { return cached }
+        if let pass { trustedRecoveryHolds.insert(pass) }
         let attempt = UUID(); localRecoveryGeneration &+= 1
         let generation = localRecoveryGeneration
         let task = TrustedRecoveryTask { try await self.performLocalRecovery(attempt: attempt, generation: generation) }
@@ -1840,15 +1857,11 @@ public actor ShaderRequestService {
         if localRecoveryPhase?.task.isCancelled == true {
             return .init(phase: .interrupted("A previous local recovery was cancelled and is still settling. Retry when it finishes."))
         }
-        if localRecoveryPhase == nil, let result = localRecoveryResult,
-           localRecoveryAttempt != nil || !trustedRecoveryHolds.isEmpty {
-            return validateTrustedRecovery(result, pass: pass)
-        }
+        if let cached = cachedRecoveryOutcome(pass: pass) { return cached }
         guard localRecoveryPhase != nil || (activeID == nil && !maintenanceBusy) else {
             return .init(phase: .refused(TrustedRecoveryAdmissionError().localizedDescription))
         }
-        if let pass { trustedRecoveryHolds.insert(pass) }
-        do { return try await recoverLocalPhase() }
+        do { return try await recoverLocalPhase(pass: pass) }
         catch {
             try Task.checkCancellation()
             let detail = error is CancellationError ? "The joined local recovery was cancelled before completion. Retry after it settles." : error.localizedDescription
