@@ -5,11 +5,12 @@ import XCTest
 
 @MainActor final class TrustedDepartureTests: XCTestCase {
     private struct Fixture { let root: URL; let service: ShaderRequestService }
-    private func fixture(fault: DepartureStorageFault? = nil) async throws -> Fixture {
+    private func fixture(fault: DepartureStorageFault? = nil, faultFile: String = "journal.json",
+                         reconcile: @escaping @Sendable (URL) async throws -> Void = { _ in }) async throws -> Fixture {
         let root = URL(fileURLWithPath: "/private/tmp/pr47-departure-" + UUID().uuidString)
         let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")),
-            directory: root, workerScript: root.appendingPathComponent("unused.py"), reconcileWorker: { _ in },
-            beforePersistenceReplacement: { if $0.lastPathComponent == "journal.json", fault?.enabled == true { throw POSIXError(.EIO) } })
+            directory: root, workerScript: root.appendingPathComponent("unused.py"), reconcileWorker: reconcile,
+            beforePersistenceReplacement: { if $0.lastPathComponent == faultFile, fault?.enabled == true { throw POSIXError(.EIO) } })
         await service.suspend(); try await service.initialize(configuration: .init(repository: root.path, enabled: true))
         addTeardownBlock { await service.suspend(); try? FileManager.default.removeItem(at: root) }
         return Fixture(root: root, service: service)
@@ -108,6 +109,76 @@ import XCTest
         do { _ = try await ticket.value(); XCTFail("Activation overtook an inconclusive backend inspection") }
         catch { XCTAssertTrue(error.localizedDescription.contains("inspection changed during handoff")) }
         XCTAssertEqual(backend.writes, 0); XCTAssertEqual(nextBackend.writes, 0)
+    }
+    func testDestinationInspectionMustRemainValidAfterWaitingForSource() async throws {
+        for fail in [false, true] {
+            let a = try await fixture(), b = try await fixture(), destination = try await fixture()
+            let sourceBytes = TrustedBackendFixture(nil), armed = DepartureStorageFault(), inspection = RecoveryGate()
+            addTeardownBlock { await inspection.release() }
+            let old = TrustedApprovalsCoordinator(read: { try sourceBytes.checkedRead() }, write: { try sourceBytes.write($0) },
+                beforeTargetInspection: { id in if id == a.service.runtimeID && armed.enabled { try await inspection.wait() } })
+            _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
+            let oldBinding = try await accept(old.register(TrustedOwnerRecorder().owner(service: b.service)))
+            let backend = TrustedBackendFixture(nil), next = backend.coordinator()
+            _ = try await accept(next.register(TrustedOwnerRecorder().owner(service: destination.service)))
+            let read = TrustedReadGate(); backend.gateReads(read)
+            addTeardownBlock { read.release() }
+            let ticket = try await next.register(TrustedOwnerRecorder().owner(service: a.service))
+            addTeardownBlock { ticket.completion.cancel(); read.release(); await inspection.release() }
+            try await wait { read.entered }; armed.enabled = true
+            let recovering = Task { try await b.service.retryReconciliation() }
+            addTeardownBlock { recovering.cancel(); await inspection.release() }
+            try await wait { await inspection.hasEntered }; read.release()
+            try await wait { await old.observation.departureInspectionWaiters > 0 }
+            backend.gateReads(nil)
+            let reads = backend.reads
+            if fail {
+                backend.failReads(true)
+                do { try await destination.service.retryReconciliation(); XCTFail("Failed destination inspection accepted") }
+                catch let error as TrustedPartialRecovery { XCTAssertTrue(error.remaining.joined().contains(POSIXError(.EACCES).localizedDescription)) }
+            }
+            await inspection.release(); try await recovering.value
+            if fail {
+                do { _ = try await ticket.value(); XCTFail("Invalidated destination accepted") }
+                catch let error as POSIXError { XCTAssertEqual(error.code, .EACCES) }
+                XCTAssertTrue(oldBinding.permit.isCurrent)
+                XCTAssertGreaterThan(backend.reads, reads)
+            } else {
+                _ = try await accept(ticket)
+                XCTAssertEqual(backend.reads, reads, "Valid destination evidence must not add another read")
+            }
+            XCTAssertEqual(backend.writes, 0)
+        }
+    }
+    func testReplacementRetryRepairsOriginalStorageFaultAndSharesExactTicket() async throws {
+        let fault = DepartureStorageFault(), repairing = DepartureStorageFault(), gate = RecoveryGate()
+        let a = try await fixture(fault: fault, faultFile: "preferences.json", reconcile: { _ in if repairing.enabled { try await gate.wait() } })
+        let b = try await fixture(), c = try await fixture(), backend = TrustedBackendFixture(nil), old = backend.coordinator()
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
+        let departure = try await old.prepareDeparture(a.service, ticket: UUID())
+        // Defensive injection: no normal producer of this exceptional state is claimed.
+        try departure.activate {}; await old.retainDepartureRecovery(serviceID: a.service.runtimeID, ticket: departure.id)
+        fault.enabled = true
+        do { try await a.service.disable(); XCTFail("Failed preferences write accepted") } catch is RequestPersistence.Fault {}
+        fault.enabled = false
+        for replacement in [b.service, c.service] {
+            do { _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: replacement))); XCTFail("Departure recovery ignored") }
+            catch let error as TrustedDepartureRecoveryError { XCTAssertEqual(error.diagnosticID, departure.id) }
+        }
+        let phases = await a.service.localRecoveryPhaseCount
+        repairing.enabled = true
+        let first = Task { try await b.service.retryReconciliation() }
+        addTeardownBlock { first.cancel(); await gate.release() }
+        try await wait { await gate.hasEntered }
+        let second = Task { try await c.service.retryReconciliation() }
+        addTeardownBlock { second.cancel(); await gate.release() }
+        try await wait { await old.observation.departureRecoveryParticipants == 2 }
+        await gate.release(); try await first.value; try await second.value
+        let after = await a.service.localRecoveryPhaseCount
+        XCTAssertEqual(after, phases + 1)
+        let statuses = await b.service.recoveryStatuses(), original = await a.service.configurationValue()
+        XCTAssertFalse(statuses.contains { $0.id == departure.id }); XCTAssertTrue(original.enabled)
+        XCTAssertEqual(backend.writes, 0)
     }
     func testMovedSoleTargetUsesExactOldAuthorityRecoveryEndpoint() async throws {
         let a = try await fixture(), backend = TrustedBackendFixture(nil), old = backend.coordinator(), next = TrustedBackendFixture(nil).coordinator()

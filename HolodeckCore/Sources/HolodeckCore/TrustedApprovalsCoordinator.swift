@@ -150,6 +150,7 @@ actor TrustedApprovalsCoordinator {
         let recoveryParticipants: Int
         let successorParticipants: Int
         let departureInspectionWaiters: Int
+        let departureRecoveryParticipants: Int
     }
     struct Approval: Sendable {
         let record: ApprovedTV
@@ -260,6 +261,7 @@ actor TrustedApprovalsCoordinator {
     private var inspections: [TargetKey: UInt64] = [:]
     private var baseline: UInt64 = 0
     private var departureRecovery: [UUID: TrustedAuthorityDeparture] = [:]
+    private var departureRecoveryTasks: [UUID: TrustedRecoveryTask<Void>] = [:]
     private var departures: [UUID: TrustedAuthorityDeparture] = [:]
     private var departureEndpoints: [UUID: TrustedAuthorityRecoveryEndpoint] = [:]
     private var endpointTargets: [UUID: [UUID: WeakRequestService]] = [:]
@@ -352,7 +354,7 @@ actor TrustedApprovalsCoordinator {
               queuedGeneration: pending?.registration.generation, preparingGeneration: preparing,
               mutationWaiters: (admissions[.client]?.count ?? 0) + queuedRevocations, encodings: encodings, writes: writes,
               transitionActive: lane != nil, recoveryPins: recoveryHandles.values.filter { $0.pin != nil }.count, recoverySubscriptions: recoverySubscriptions.count,
-              targets: targets.count, inspections: inspections.values.filter { $0 == baseline }.count, obligations: required.count, departures: departures.count, queuedRevocations: queuedRevocations, admissionResumes: admissionResumes, admissionAdvances: admissionAdvances, progressWaiters: admissions[.progress]?.count ?? 0, recoveryPasses: recoveryPassCount, recoveryParticipants: recoveryPass?.inputs.count ?? 0, successorParticipants: successorRecoveryPass?.participants.count ?? 0, departureInspectionWaiters: departures.values.reduce(0) { $0 + $1.inspectionWaiterCount })
+              targets: targets.count, inspections: inspections.values.filter { $0 == baseline }.count, obligations: required.count, departures: departures.count, queuedRevocations: queuedRevocations, admissionResumes: admissionResumes, admissionAdvances: admissionAdvances, progressWaiters: admissions[.progress]?.count ?? 0, recoveryPasses: recoveryPassCount, recoveryParticipants: recoveryPass?.inputs.count ?? 0, successorParticipants: successorRecoveryPass?.participants.count ?? 0, departureInspectionWaiters: departures.values.reduce(0) { $0 + $1.inspectionWaiterCount }, departureRecoveryParticipants: departureRecoveryTasks.values.reduce(0) { $0 + $1.waiterCount })
     }
     private var outstandingIntents: [RequestRevocationIntent] {
         envelope.revocations + removals.values.map(\.intent).sorted { $0.operationID.uuidString < $1.operationID.uuidString }
@@ -699,9 +701,13 @@ actor TrustedApprovalsCoordinator {
                 }.joined(separator: "\n")
                 errors.append("Remaining trusted targets:\n" + remaining)
             }
-            await finishRecoveredDepartures()
-            do { try requireAuthorityReady() } catch { errors.append(error.localizedDescription) }
             release(finishing)
+            // Original-target repair must never run while this authority owns
+            // the lane or recursively join the trusted pass calling it.
+            errors += await finishRecoveredDepartures()
+            let readiness = try await acquire(.progress)
+            do { try requireAuthorityReady() } catch { errors.append(error.localizedDescription) }
+            release(readiness)
         } catch {
             for target in heldTargets.values { await target.finishTrustedRecovery(pass: passID) }
             throw error
@@ -863,12 +869,37 @@ actor TrustedApprovalsCoordinator {
     /// No successful registration is required to recover an old authority's exact
     /// ticket. Never apply an old cancellation receipt to a replacement binding.
     func recoverDeparture(serviceID: UUID, ticket: UUID) async throws {
+        let task: TrustedRecoveryTask<Void>
+        if let current = departureRecoveryTasks[ticket] { task = current }
+        else {
+            task = TrustedRecoveryTask {
+                do {
+                    try await self.performDepartureRecovery(serviceID: serviceID, ticket: ticket)
+                    await self.finishedDepartureRecovery(ticket)
+                } catch {
+                    await self.finishedDepartureRecovery(ticket)
+                    throw error
+                }
+            }
+            departureRecoveryTasks[ticket] = task
+        }
+        try await task.subscribe().value()
+    }
+    private func finishedDepartureRecovery(_ ticket: UUID) { departureRecoveryTasks[ticket] = nil }
+    private func performDepartureRecovery(serviceID: UUID, ticket: UUID) async throws {
         let capture = try await acquire(.progress)
         guard let departure = departureRecovery[serviceID], departure.id == ticket else { release(capture); return }
         let target = targets.values.first { $0.key.service == serviceID && $0.key.registration == departure.registrationID }?.service
         release(capture)
         try Task.checkCancellation()
-        try await target?.settleTrustedAuthorityDeparture()
+        guard let target else {
+            throw Self.unavailable("Authority departure " + ticket.uuidString + " cannot access its original request service. Retain its exact journal and trusted evidence for manual repair; a replacement folder cannot establish ownership.")
+        }
+        let local = try await target.recoverDepartureLocal()
+        guard local.completed else {
+            throw TrustedPartialRecovery(completedServices: [], remaining: ["Original departure target " + serviceID.uuidString + ": " + (local.failure ?? "Local recovery is unverified.")])
+        }
+        try await target.settleTrustedAuthorityDeparture()
         let commit = try await acquire(.progress); defer { release(commit) }
         guard departureRecovery[serviceID] === departure else { return }
         try await readFresh(target: nil)
@@ -881,14 +912,14 @@ actor TrustedApprovalsCoordinator {
         if mutationFailure?.operation == ticket { mutationFailure = nil }
         await notify()
     }
-    private func finishRecoveredDepartures() async {
-        for departure in Array(departureRecovery.values) {
-            let keys = Set(targets.keys.filter { $0.service == departure.serviceID && $0.registration == departure.registrationID })
-            guard !required.values.contains(where: { !$0.isDisjoint(with: keys) }) else { continue }
-            await retireDeparture(departure, keys: keys)
-            departureRecovery[departure.serviceID] = nil
-            if mutationFailure?.operation == departure.id { mutationFailure = nil }
+    private func finishRecoveredDepartures() async -> [String] {
+        var failures: [String] = []
+        let pending = departureRecovery.values.map { ($0.serviceID, $0.id) }
+        for (serviceID, ticket) in pending {
+            do { try await recoverDeparture(serviceID: serviceID, ticket: ticket) }
+            catch { failures.append(error.localizedDescription) }
         }
+        return failures
     }
     private func retireDeparture(_ departure: TrustedAuthorityDeparture, keys retiredKeys: Set<TargetKey>) async {
         let serviceID = departure.serviceID
@@ -961,6 +992,9 @@ actor TrustedApprovalsCoordinator {
                             do { try await waiting.departure.waitForInspection() }
                             catch { token = await acquireReplacement(); throw error }
                             token = await acquireReplacement()
+                            // Destination evidence may have failed while this
+                            // registration was waiting on source inspection.
+                            if currentInspection() == nil { try await readFresh(target: target) }
                         }
                     }
                 }

@@ -1777,6 +1777,18 @@ public actor ShaderRequestService {
         if fenced { await authority?.endTargetRecovery(serviceID: runtimeID, registration: registration, attempt: attempt, outcome: outcome) }
         return outcome
     }
+    /// Exact departure endpoints may repair this target without entering either
+    /// its current trusted pass or its own endpoint callbacks.
+    func recoverDepartureLocal() async throws -> TrustedLocalRecovery {
+        guard localRecoveryPhase != nil || (activeID == nil && !maintenanceBusy) else {
+            return .init(phase: .refused(TrustedRecoveryAdmissionError().localizedDescription))
+        }
+        do { return validateTrustedRecovery(try await recoverLocalPhase()) }
+        catch {
+            try Task.checkCancellation()
+            return .init(phase: .interrupted(error.localizedDescription), initiatingError: error)
+        }
+    }
     func validateTrustedRecovery(_ outcome: TrustedLocalRecovery, pass: UUID? = nil) -> TrustedLocalRecovery {
         guard let receipt = outcome.receipt, receipt.serviceID == runtimeID,
               receipt.registrationID == revocationRegistration, receipt.authority == revocationCoordinatorID,
