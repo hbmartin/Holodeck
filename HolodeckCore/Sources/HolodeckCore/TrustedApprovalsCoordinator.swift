@@ -156,6 +156,8 @@ actor TrustedApprovalsCoordinator {
         let departureInspectionWaiters: Int
         let departureRecoveryParticipants: Int
         let departureRecoverySuccessors: Int
+        let pendingLocalOutcomes: Int
+        let applicationRecoveryTargets: Int
     }
     struct Approval: Sendable {
         let record: ApprovedTV
@@ -223,6 +225,8 @@ actor TrustedApprovalsCoordinator {
         }
     }
     nonisolated let id = UUID()
+    private let beforeRemovalFinalization: (@Sendable (UUID, UUID) async throws -> Void)?
+    private let beforeDepartureRetirementAdmission: (@Sendable (UUID) async throws -> Void)?
     private let afterTargetInstallation: (@Sendable (UUID) async throws -> Void)?
     private let beforeReplayApplication: (@Sendable (UUID) async throws -> Void)?
     private let beforeRecoverySealing: @Sendable () async throws -> Void
@@ -286,7 +290,11 @@ actor TrustedApprovalsCoordinator {
     private var applications: [UUID: [TargetKey: TrustedRevocationApplication]] = [:]
     private var recoveryEpochs: [TargetKey: UUID] = [:]
     private var preparingRecovery: [TargetKey: UUID] = [:]
-    private var pendingRecoveryOutcomes: [TargetKey: UUID] = [:]
+    private struct PendingRecoveryOutcome {
+        let attempt: UUID
+        var intents: Set<UUID>
+    }
+    private var pendingRecoveryOutcomes: [TargetKey: PendingRecoveryOutcome] = [:]
     private var applicationEpochs: [Attempt: UUID] = [:]
     // A trusted removal may have committed even when a target rejected its stale completion.
     // Retain that outcome and its pins until exact fence finalization succeeds.
@@ -358,7 +366,11 @@ actor TrustedApprovalsCoordinator {
          beforeInspectionRead: @escaping @Sendable () async throws -> Void = {},
          beforeRecoverySealing: @escaping @Sendable () async throws -> Void = {},
          beforeReplayApplication: (@Sendable (UUID) async throws -> Void)? = nil,
-         afterTargetInstallation: (@Sendable (UUID) async throws -> Void)? = nil) {
+         afterTargetInstallation: (@Sendable (UUID) async throws -> Void)? = nil,
+         beforeRemovalFinalization: (@Sendable (UUID, UUID) async throws -> Void)? = nil,
+         beforeDepartureRetirementAdmission: (@Sendable (UUID) async throws -> Void)? = nil) {
+        self.beforeRemovalFinalization = beforeRemovalFinalization
+        self.beforeDepartureRetirementAdmission = beforeDepartureRetirementAdmission
         self.afterTargetInstallation = afterTargetInstallation
         self.beforeReplayApplication = beforeReplayApplication
         self.beforeRecoverySealing = beforeRecoverySealing
@@ -387,7 +399,8 @@ actor TrustedApprovalsCoordinator {
               mutationWaiters: (admissions[.client]?.count ?? 0) + queuedRevocations, encodings: encodings, writes: writes,
               transitionActive: lane != nil, recoveryPins: recoveryHandles.values.filter { $0.pin != nil }.count, recoverySubscriptions: recoverySubscriptions.count,
               targets: targets.count, inspections: inspections.values.filter { $0 == baseline }.count, obligations: required.count, departures: departures.count, queuedRevocations: queuedRevocations, admissionResumes: admissionResumes, admissionAdvances: admissionAdvances, progressWaiters: admissions[.progress]?.count ?? 0, recoveryPasses: recoveryPassCount, recoveryParticipants: recoveryPass?.inputs.count ?? 0, successorParticipants: successorRecoveryPass?.participants.count ?? 0, departureInspectionWaiters: departures.values.reduce(0) { $0 + $1.inspectionWaiterCount }, departureRecoveryParticipants: departureRecoveryTasks.values.reduce(0) { $0 + $1.participants.count },
-              departureRecoverySuccessors: departureRecoverySuccessors.values.reduce(0) { $0 + $1.participants.count })
+              departureRecoverySuccessors: departureRecoverySuccessors.values.reduce(0) { $0 + $1.participants.count },
+              pendingLocalOutcomes: pendingRecoveryOutcomes.count, applicationRecoveryTargets: recoveryTargets.count)
     }
     private var outstandingIntents: [RequestRevocationIntent] {
         envelope.revocations + removals.values.map(\.intent).sorted { $0.operationID.uuidString < $1.operationID.uuidString }
@@ -599,7 +612,7 @@ actor TrustedApprovalsCoordinator {
         if let outcome {
             if outcome.completed {
                 if requiresTrustedPass, required.values.contains(where: { $0.contains(key) }) {
-                    pendingRecoveryOutcomes[key] = attempt
+                    pendingRecoveryOutcomes[key] = .init(attempt: attempt, intents: Set(required.filter { $0.value.contains(key) }.keys))
                 }
                 clearApplicationBlockers(on: key) { _, blocker in blocker.localAttempt == attempt }
             } else { suppressApplications(to: key, outcome: outcome) }
@@ -808,7 +821,7 @@ actor TrustedApprovalsCoordinator {
     }
     private func applyRecoveryOutcome(_ outcome: TrustedLocalRecovery, to key: TargetKey, priorBlockers: [Attempt: ApplicationBlocker]) {
         if outcome.completed {
-            if pendingRecoveryOutcomes[key] == outcome.receipt?.attemptID { pendingRecoveryOutcomes[key] = nil }
+            if pendingRecoveryOutcomes[key]?.attempt == outcome.receipt?.attemptID { pendingRecoveryOutcomes[key] = nil }
             clearApplicationBlockers(on: key) { attempt, blocker in
                 priorBlockers[attempt]?.generation == blocker.generation ||
                     (outcome.receipt?.attemptID != nil && blocker.localAttempt == outcome.receipt?.attemptID)
@@ -1002,6 +1015,7 @@ actor TrustedApprovalsCoordinator {
             if departureRecoveryTasks[ticket]?.participants.isEmpty == true {
                 departureRecoveryTasks[ticket]?.closing = true
                 departureRecoveryTasks[ticket]?.task?.cancel()
+                publishDepartureSettlement(ticket, settling: true)
             }
         } else if departureRecoverySuccessors[ticket]?.id == job {
             departureRecoverySuccessors[ticket]?.participants[participant] = nil
@@ -1026,8 +1040,15 @@ actor TrustedApprovalsCoordinator {
         guard departureRecoveryTasks[ticket]?.id == job else { return }
         let waiting = departureRecoveryTasks[ticket]!.participants.values
         departureRecoveryTasks[ticket] = departureRecoverySuccessors.removeValue(forKey: ticket)
+        publishDepartureSettlement(ticket, settling: false)
         waiting.forEach { $0.complete(result) }
         startDepartureRecovery(ticket)
+    }
+    private func publishDepartureSettlement(_ ticket: UUID, settling: Bool) {
+        guard let endpoint = departureEndpoints[ticket], endpoint.setSettling(settling) else { return }
+        for target in endpointTargets[ticket]?.values ?? Dictionary<UUID, WeakRequestService>().values {
+            if let service = target.value { Task { await service.authorityRecoveryChanged(endpoint) } }
+        }
     }
     private func departureObligations(_ keys: Set<TargetKey>) -> Bool {
         required.values.contains { !$0.isDisjoint(with: keys) }
@@ -1066,6 +1087,10 @@ actor TrustedApprovalsCoordinator {
         guard !departureObligations(keys) else { throw unverifiableDeparture(ticket) }
         guard await target.validateDepartureRetirement(assessment) else {
             throw Self.unavailable("Original departure target evidence changed during retirement inspection. Retain its journal and choose Retry Recovery.")
+        }
+        if let beforeDepartureRetirementAdmission { try await beforeDepartureRetirementAdmission(serviceID) }
+        guard assessment.admit() else {
+            throw Self.unavailable("Original departure ownership changed before retirement admission. Retain its journal and choose Retry Recovery.")
         }
         await retireDeparture(departure, keys: keys)
         departureRecovery[serviceID] = nil
@@ -1441,6 +1466,7 @@ actor TrustedApprovalsCoordinator {
             guard let target = targets[key]?.service, let proof = proofs[key] else {
                 throw Self.unavailable("The target of a committed trusted removal is unavailable. Retain its recovery evidence.")
             }
+            if let beforeRemovalFinalization { try await beforeRemovalFinalization(intent.operationID, key.service) }
             try await target.finalizeTrustedRevocation(proof, removal: removal)
             finalizedRemovals[intent.operationID, default: []].insert(key)
         }
@@ -1448,6 +1474,12 @@ actor TrustedApprovalsCoordinator {
         required[intent.operationID] = nil; applications[intent.operationID] = nil; removals[intent.operationID] = nil; failures[intent.operationID] = nil
         applicationEpochs = applicationEpochs.filter { $0.key.intent != intent.operationID }
         failedApplications = failedApplications.filter { $0.key.intent != intent.operationID }
+        for key in needed {
+            if var pending = pendingRecoveryOutcomes[key], pending.intents.remove(intent.operationID) != nil {
+                pendingRecoveryOutcomes[key] = pending.intents.isEmpty ? nil : pending
+            }
+            clearApplicationBlockers(on: key) { _, _ in false }
+        }
         completeSettledDepartures()
         let retained = Set(required.values.flatMap { $0 })
         targetPins = targetPins.filter { retained.contains($0.key) || departureRecovery[$0.key.service]?.registrationID == $0.key.registration }
