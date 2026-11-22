@@ -192,6 +192,63 @@ import XCTest
         XCTAssertEqual(after, phases + 1)
         XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
     }
+    func testFreshRetryDoesNotAdoptUnownedDepartureFailure() async throws {
+        let fault = RecoveryOwnershipSwitch()
+        let service = try await fixture(reconcile: { _ in if fault.on { throw POSIXError(.EIO) } })
+        fault.on = true
+        let failed = try await service.recoverDepartureLocal()
+        XCTAssertFalse(failed.completed)
+        let phases = await service.localRecoveryPhaseCount
+        fault.on = false
+        try await service.retryReconciliation()
+        let after = await service.localRecoveryPhaseCount
+        XCTAssertEqual(after, phases + 1)
+        let remaining = await service.recoveryStatuses()
+        XCTAssertTrue(remaining.isEmpty)
+    }
+    func testGenericTrustedFailureKeepsVerifiedLocalCompletion() async throws {
+        let service = try await fixture()
+        _ = await service.registerRevocationCoordinator(id: UUID(), recovery: { _ in throw POSIXError(.EIO) })
+        do { try await service.retryReconciliation(); XCTFail("Injected coordinator error ignored") }
+        catch let error as TrustedPartialRecovery {
+            XCTAssertEqual(error.completedServices, [service.runtimeID])
+            XCTAssertTrue(error.remaining.joined().contains(POSIXError(.EIO).localizedDescription))
+        }
+    }
+    func testFailedRequesterKeepsOtherVerifiedCompletions() async throws {
+        let fault = RecoveryOwnershipSwitch()
+        let a = try await fixture(reconcile: { _ in if fault.on { throw POSIXError(.EIO) } }), b = try await fixture()
+        let backend = TrustedBackendFixture(nil), authority = backend.coordinator()
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: b, beforeReplay: { _ in throw POSIXError(.EIO) })))
+        let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "TV")
+        try backend.write(TrustedTVApprovals(revocations: [intent]).encoded())
+        do { try await b.retryReconciliation(); XCTFail("Injected replay failure ignored") } catch is TrustedPartialRecovery {}
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a)))
+        fault.on = true
+        do { try await a.retryReconciliation(); XCTFail("Local requester fault ignored") }
+        catch let error as TrustedPartialRecovery {
+            XCTAssertFalse(error.completedServices.contains(a.runtimeID))
+            XCTAssertTrue(error.completedServices.contains(b.runtimeID))
+            XCTAssertTrue(error.remaining.joined().contains(POSIXError(.EIO).localizedDescription))
+        }
+        XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations, [intent])
+    }
+    func testCompatibilityRegistrationDoesNotRetainIdleService() async throws {
+        for withOutcome in [false, true] {
+            let root = URL(fileURLWithPath: "/private/tmp/pr52-weak-service-" + UUID().uuidString)
+            addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+            weak var retained: ShaderRequestService?
+            do {
+                let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")),
+                    directory: root, workerScript: root.appendingPathComponent("unused.py"), reconcileWorker: { _ in })
+                await service.suspend(); try await service.initialize(configuration: .init(repository: root.path, enabled: true))
+                if withOutcome { _ = await service.registerRevocationCoordinator(id: UUID(), recovery: { _ in }) }
+                else { _ = await service.registerRevocationCoordinator(id: UUID(), {}) }
+                retained = service
+            }
+            try await wait { retained == nil }
+        }
+    }
     func testRequesterDoesNotReintroduceExcludedTrustedCompletion() async throws {
         let a = try await fixture()
         _ = await a.registerRevocationCoordinator(id: UUID(), recovery: { _ in

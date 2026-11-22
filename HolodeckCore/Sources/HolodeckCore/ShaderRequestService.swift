@@ -680,7 +680,7 @@ public actor ShaderRequestService {
                                  coordinator: @escaping @Sendable (TrustedLocalRecovery) async throws -> Void,
                                  authority: TrustedApprovalsCoordinator? = nil) throws -> (UUID, TrustedRevocationInspection) {
         try installTrustedAuthority(transfer, id: id, intents: intents, revision: revision,
-            completion: { local in try await coordinator(local); return .init(completedServices: []) }, authority: authority)
+            completion: validatedRecoveryCompletion(coordinator), authority: authority)
     }
     func installTrustedAuthority(_ transfer: AuthorityTransfer, id: UUID, intents: [RequestRevocationIntent], revision: TrustedRevocationRevision,
                                  completion: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion,
@@ -706,10 +706,18 @@ public actor ShaderRequestService {
         // Compatibility callers do not own an authority lane. Production uses
         // the throwing admission below and releases its lane before waiting.
         while revocationCoordinatorID != id, let preparation = localPreparation { try? await preparation.wait(cancellable: false) }
-        return bindRevocationCoordinator(id: id) { local in
+        return bindRevocationCoordinator(id: id, validatedRecoveryCompletion(recovery))
+    }
+    private func validatedRecoveryCompletion(_ recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> Void)
+        -> @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion {
+        let serviceID = runtimeID
+        return { [weak self] local in
             try await recovery(local)
+            guard let self else {
+                throw ShaderRequestError.unavailable("The local recovery service ended before completion could be verified.")
+            }
             let valid = await self.validateTrustedRecovery(local)
-            return .init(completedServices: valid.completed ? [self.runtimeID] : [])
+            return .init(completedServices: valid.completed ? [serviceID] : [])
         }
     }
     private func requireLocalPreparationFinished(changingTo id: UUID) throws {
@@ -1740,6 +1748,9 @@ public actor ShaderRequestService {
         try Task.checkCancellation()
         guard activeID == nil, !maintenanceBusy, localRecoveryAttempt == nil,
               localRecoveryPhase?.task.isCancelled != true else { throw TrustedRecoveryAdmissionError() }
+        // New requester ownership cannot adopt an outcome which had no owner
+        // before admission. Existing trusted-pass holds still permit sharing.
+        if localRecoveryPhase == nil, trustedRecoveryHolds.isEmpty { localRecoveryResult = nil }
         let attempt = UUID(); localRecoveryAttempt = attempt
         defer {
             if localRecoveryAttempt == attempt {
@@ -1759,7 +1770,10 @@ public actor ShaderRequestService {
                 try Task.checkCancellation()
                 if let partial = error as? TrustedPartialRecovery {
                     completed.formUnion(partial.completedServices); failures += partial.remaining
-                } else { failures.append(error.localizedDescription) }
+                } else {
+                    if validateTrustedRecovery(local).completed { completed.insert(runtimeID) }
+                    failures.append(error.localizedDescription)
+                }
             }
         }
         // These exact old-authority routes survive replacement of the ordinary
@@ -1776,7 +1790,9 @@ public actor ShaderRequestService {
             throw TrustedPartialRecovery(completedServices: completed.sorted { $0.uuidString < $1.uuidString },
                 remaining: Array(failures.prefix(9)).map { BoundedDiagnostics.bounded($0, bytes: 8192) })
         }
-        if hasIndependentPhase, let failure = local.failure { throw TrustedPartialRecovery(completedServices: [], remaining: [failure]) }
+        if hasIndependentPhase, let failure = local.failure {
+            throw TrustedPartialRecovery(completedServices: completed.sorted { $0.uuidString < $1.uuidString }, remaining: [failure])
+        }
         if let original = local.initiatingError { throw original }
         if let failure = local.failure { throw TrustedPartialRecovery(completedServices: [], remaining: [failure]) }
     }
