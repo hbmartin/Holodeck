@@ -78,7 +78,9 @@ import XCTest
         for cancelFirst in [false, true] {
             let fault = BoundaryFailureSwitch()
             let (a, _) = try await fixture(reconcile: { _ in if fault.armed { throw POSIXError(.EIO) } }), (b, _) = try await fixture()
-            let backend = TrustedBackendFixture(nil), authority = backend.coordinator()
+            let backend = TrustedBackendFixture(nil), gate = RecoveryGate(), sealing = BoundaryFailureSwitch()
+            let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
+                beforeRecoverySealing: { if sealing.armed { try await gate.wait() } })
             _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a)))
             _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: b)))
             let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
@@ -86,21 +88,21 @@ import XCTest
             fault.armed = true
             do { try await a.retryReconciliation(); XCTFail("Injected failure ignored") } catch is TrustedPartialRecovery {}
             fault.armed = false
-            let gate = TrustedReadGate(); backend.gateReads(gate)
-            addTeardownBlock { gate.release() }
+            sealing.armed = true
+            addTeardownBlock { await gate.release() }
             let passes = await authority.observation.recoveryPasses
             let aPhases = await a.localRecoveryPhaseCount, bPhases = await b.localRecoveryPhaseCount
             let first = Task { try await a.retryReconciliation() }
-            addTeardownBlock { first.cancel(); gate.release() }
-            try await wait { gate.entered }
+            addTeardownBlock { first.cancel(); await gate.release() }
+            try await wait { await gate.hasEntered }
             let second = Task { try await b.retryReconciliation() }
-            addTeardownBlock { second.cancel(); gate.release() }
+            addTeardownBlock { second.cancel(); await gate.release() }
             try await wait { await authority.observation.recoveryParticipants == 2 }
             if cancelFirst {
                 first.cancel()
                 do { try await first.value; XCTFail("Cancelled waiter succeeded") } catch is CancellationError {}
             }
-            gate.release()
+            await gate.release()
             if !cancelFirst { try await first.value }
             try await second.value
             let observation = await authority.observation
@@ -230,6 +232,30 @@ import XCTest
         XCTAssertEqual(backend.reads, reads); XCTAssertEqual(backend.writes, 0)
         let observed = await authority.observation; XCTAssertEqual(observed.encodings, 0)
     }
+    func testCachedRecoveryKeepsPublicationHeldAfterOriginalCallerCancels() async throws {
+        let (service, root) = try await fixture(), callback = RecoveryGate(), pass = UUID()
+        _ = await service.registerRevocationCoordinator(id: UUID(), recovery: { _ in try await callback.wait() })
+        let caller = Task { try await service.retryReconciliation() }
+        addTeardownBlock { caller.cancel(); await callback.release(); await service.finishTrustedRecovery(pass: pass) }
+        try await wait { await callback.hasEntered }
+        let cached = try await service.trustedRecoveryOutcome(pass: pass)
+        XCTAssertTrue(cached.completed)
+        caller.cancel()
+        do { try await caller.value; XCTFail("Cancelled caller succeeded") } catch is CancellationError {}
+        let host = service.retainOwner(); await service.resume()
+        let publication = Task { try await service.ensurePublication(force: true) }
+        addTeardownBlock {
+            host.release(); publication.cancel(); await service.finishTrustedRecovery(pass: pass)
+            try? Data().write(to: root.appendingPathComponent("publication/release"))
+        }
+        try await wait { await service.pendingPublicationWaiterCount == 1 }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("publication/started").path))
+        await service.finishTrustedRecovery(pass: pass)
+        try await wait { FileManager.default.fileExists(atPath: root.appendingPathComponent("publication/started").path) }
+        try Data().write(to: root.appendingPathComponent("publication/release"))
+        publication.cancel(); await service.suspend()
+    }
     func testSharedTaskAdmitsWaitersBeforeTheirAwaitIsScheduled() async throws {
         let gate = RecoveryGate()
         addTeardownBlock { await gate.release() }
@@ -266,6 +292,10 @@ import XCTest
         backend.failReads(true)
         do { _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a))); XCTFail("Failed read accepted") }
         catch let error as POSIXError { XCTAssertEqual(error.code, .EACCES) }
+        let held = UUID()
+        let local = try await b.trustedRecoveryOutcome(pass: held)
+        XCTAssertTrue(local.completed)
+        addTeardownBlock { await b.finishTrustedRecovery(pass: held) }
         let gate = TrustedReadGate(); backend.failReads(false); backend.gateReads(gate)
         addTeardownBlock { gate.release() }
         let occupying = Task { try await authority.approve(binding.permit) { nil } }

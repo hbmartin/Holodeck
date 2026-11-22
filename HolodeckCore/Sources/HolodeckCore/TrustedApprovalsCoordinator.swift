@@ -217,6 +217,7 @@ actor TrustedApprovalsCoordinator {
         }
     }
     nonisolated let id = UUID()
+    private let beforeRecoverySealing: @Sendable () async throws -> Void
     private let beforeInspectionRead: @Sendable () async throws -> Void
     private let beforeAuthorityPreparation: @Sendable (UUID) async throws -> Void
     private let beforeTargetInspection: @Sendable (UUID) async throws -> Void
@@ -265,6 +266,9 @@ actor TrustedApprovalsCoordinator {
     private var queuedRevocations: Int { admissions[.revocation]?.count ?? 0 }
     private var required: [UUID: Set<TargetKey>] = [:]
     private var applications: [UUID: [TargetKey: TrustedRevocationApplication]] = [:]
+    private var recoveryEpochs: [TargetKey: UUID] = [:]
+    private var preparingRecovery: [TargetKey: UUID] = [:]
+    private var applicationEpochs: [Attempt: UUID] = [:]
     // A trusted removal may have committed even when a target rejected its stale completion.
     // Retain that outcome and its pins until exact fence finalization succeeds.
     private var removals: [UUID: TrustedRevocationRemoval] = [:]
@@ -322,7 +326,9 @@ actor TrustedApprovalsCoordinator {
          beforeReservation: @escaping @Sendable (UUID) async throws -> Void = { _ in },
          beforeTargetInspection: @escaping @Sendable (UUID) async throws -> Void = { _ in },
          beforeAuthorityPreparation: @escaping @Sendable (UUID) async throws -> Void = { _ in },
-         beforeInspectionRead: @escaping @Sendable () async throws -> Void = {}) {
+         beforeInspectionRead: @escaping @Sendable () async throws -> Void = {},
+         beforeRecoverySealing: @escaping @Sendable () async throws -> Void = {}) {
+        self.beforeRecoverySealing = beforeRecoverySealing
         self.beforeInspectionRead = beforeInspectionRead
         self.beforeAuthorityPreparation = beforeAuthorityPreparation
         self.beforeTargetInspection = beforeTargetInspection
@@ -332,6 +338,9 @@ actor TrustedApprovalsCoordinator {
     private func updateRetention() {
         targets = targets.filter { $0.value.service != nil }
         inspections = inspections.filter { targets[$0.key] != nil }
+        recoveryEpochs = recoveryEpochs.filter { targets[$0.key] != nil }
+        preparingRecovery = preparingRecovery.filter { targets[$0.key] != nil }
+        applicationEpochs = applicationEpochs.filter { targets[$0.key.target] != nil && required[$0.key.intent] != nil }
         recoveryHandles = recoveryHandles.filter { $0.value.reference.value != nil }
         for (serviceID, subscription) in recoverySubscriptions where !targets.keys.contains(where: { $0.service == serviceID && $0.registration == subscription.registrationID }) {
             subscription.invalidate(); recoverySubscriptions[serviceID] = nil
@@ -478,6 +487,8 @@ actor TrustedApprovalsCoordinator {
         let previous = targets.keys.filter { $0.service == serviceID && $0 != key }
         for old in previous {
             targets[old] = nil; inspections[old] = nil; targetPins[old] = nil; recoveryTargets.remove(old)
+            recoveryEpochs[old] = nil; preparingRecovery[old] = nil
+            applicationEpochs = applicationEpochs.filter { $0.key.target != old }
             failedApplications = failedApplications.filter { $0.key.target != old }
             for intent in required.keys where required[intent]?.contains(old) == true {
                 required[intent]?.remove(old); required[intent]?.insert(key); targetPins[key] = target
@@ -485,6 +496,7 @@ actor TrustedApprovalsCoordinator {
             }
         }
         targets[key] = Target(service: target, key: key)
+        if recoveryEpochs[key] == nil { recoveryEpochs[key] = UUID() }
         if inspection?.registrationID == registration { inspections[key] = baseline }
         // A new target cannot disappear from the quorum while fresh inspection awaits.
         for intent in outstandingIntents {
@@ -496,6 +508,36 @@ actor TrustedApprovalsCoordinator {
         await target.observeHostRecovery(subscription) { [weak self] service, revision, required in
             await self?.retainRecovery(service, subscription: subscription, revision: revision, required: required)
         }
+    }
+    /// Target-local preparation runs outside the authority lane, but publishes
+    /// its epoch before it can mutate metadata or invalidate application evidence.
+    func beginTargetRecovery(_ target: ShaderRequestService, registration: UUID, attempt: UUID) async throws -> Bool {
+        let token = try await acquire(.progress); defer { release(token) }
+        let key = TargetKey(service: target.runtimeID, registration: registration)
+        guard targets[key]?.service === target, !retired(key) else { return false }
+        recoveryEpochs[key] = attempt; preparingRecovery[key] = attempt
+        for intent in required.keys where required[intent]?.contains(key) == true && removals[intent] == nil {
+            applications[intent]?[key] = nil
+            applicationEpochs[.init(intent: intent, target: key)] = nil
+            blockApplication(.init(intent: intent, target: key), diagnostic: "Target local recovery is still preparing.", localAttempt: attempt)
+            recoveryTargets.insert(key)
+        }
+        return true
+    }
+    func endTargetRecovery(serviceID: UUID, registration: UUID, attempt: UUID, outcome: TrustedLocalRecovery?) async {
+        let token = await acquireProgress(); defer { release(token) }
+        let key = TargetKey(service: serviceID, registration: registration)
+        guard preparingRecovery[key] == attempt else { return }
+        preparingRecovery[key] = nil
+        if let outcome {
+            if !outcome.completed { suppressApplications(to: key, outcome: outcome) }
+        } else {
+            suppressApplications(to: key, outcome: .init(phase: .interrupted("A previous local recovery was cancelled and is still settling. Retry when it finishes.")))
+        }
+    }
+    private func applicationIsCurrent(_ attempt: Attempt, epoch: UUID) -> Bool {
+        recoveryEpochs[attempt.target] == epoch && preparingRecovery[attempt.target] == nil &&
+            failedApplications[attempt] == nil && !retired(attempt.target)
     }
     private struct InspectionPass {
         let baseline: UInt64
@@ -622,6 +664,8 @@ actor TrustedApprovalsCoordinator {
             }
             release(inspection)
             try Task.checkCancellation()
+            try await beforeRecoverySealing()
+            try Task.checkCancellation()
             // Seal synchronously on the authority actor. Later callers belong
             // only to the successor, even while this pass is awaiting a target.
             if recoveryPass?.id == passID { recoveryPass?.state = .sealed }
@@ -668,7 +712,9 @@ actor TrustedApprovalsCoordinator {
     private func applyRecoveryOutcome(_ outcome: TrustedLocalRecovery, to key: TargetKey, priorBlockers: [Attempt: ApplicationBlocker]) {
         if outcome.completed {
             failedApplications = failedApplications.filter {
-                $0.key.target != key || priorBlockers[$0.key]?.generation != $0.value.generation
+                $0.key.target != key ||
+                    (priorBlockers[$0.key]?.generation != $0.value.generation &&
+                     (outcome.receipt?.attemptID == nil || $0.value.localAttempt != outcome.receipt?.attemptID))
             }
             if !failedApplications.keys.contains(where: { $0.target == key }) { recoveryTargets.remove(key) }
         } else { suppressApplications(to: key, outcome: outcome) }
@@ -853,7 +899,11 @@ actor TrustedApprovalsCoordinator {
             subscription.invalidate(); recoverySubscriptions[serviceID] = nil; recoveryHandles[serviceID] = nil
             await target?.removeHostRecoveryObserver(subscription)
         }
-        for key in retiredKeys { targets[key] = nil; inspections[key] = nil; targetPins[key] = nil; recoveryTargets.remove(key) }
+        for key in retiredKeys {
+            targets[key] = nil; inspections[key] = nil; targetPins[key] = nil; recoveryTargets.remove(key)
+            recoveryEpochs[key] = nil; preparingRecovery[key] = nil
+        }
+        applicationEpochs = applicationEpochs.filter { !retiredKeys.contains($0.key.target) }
         failedApplications = failedApplications.filter { !retiredKeys.contains($0.key.target) }
         if service?.runtimeID == serviceID { service = nil }
         if departures[serviceID]?.id == departure.id { departures[serviceID] = nil }
@@ -1155,6 +1205,10 @@ actor TrustedApprovalsCoordinator {
         guard needed.allSatisfy({ proofs[$0] != nil }) else { return false }
         for key in needed where finalizedRemovals[intent.operationID]?.contains(key) != true {
             guard let target = targets[key]?.service, let proof = proofs[key] else { return false }
+            if removals[intent.operationID] == nil {
+                let attempt = Attempt(intent: intent.operationID, target: key)
+                guard let epoch = applicationEpochs[attempt], applicationIsCurrent(attempt, epoch: epoch) else { return false }
+            }
             try await target.validateTrustedRevocation(proof)
         }
         let removal = try TrustedRevocationRemoval.checked(authority: id, intent: intent,
@@ -1174,6 +1228,7 @@ actor TrustedApprovalsCoordinator {
         }
         finalizedRemovals[intent.operationID] = nil
         required[intent.operationID] = nil; applications[intent.operationID] = nil; removals[intent.operationID] = nil; failures[intent.operationID] = nil
+        applicationEpochs = applicationEpochs.filter { $0.key.intent != intent.operationID }
         failedApplications = failedApplications.filter { $0.key.intent != intent.operationID }
         completeSettledDepartures()
         let retained = Set(required.values.flatMap { $0 })
@@ -1188,13 +1243,13 @@ actor TrustedApprovalsCoordinator {
         var attempted: Set<Attempt> = [], failed: [UUID: Failure] = [:], removalAttempted: Set<UUID> = []
         drain: while true {
             let token = await acquireProgress()
-            var work: (RequestRevocationIntent, TargetKey, ShaderRequestService)?
+            var work: (RequestRevocationIntent, TargetKey, ShaderRequestService, UUID)?
             let remainingIntents = outstandingIntents
             for intent in remainingIntents {
                 for key in required[intent.operationID] ?? [] {
                     let attempt = Attempt(intent: intent.operationID, target: key)
-                    if !retired(key), applications[intent.operationID]?[key] == nil, !attempted.contains(attempt), failedApplications[attempt] == nil, let target = targets[key]?.service {
-                        work = (intent, key, target); attempted.insert(attempt); break
+                    if !retired(key), applications[intent.operationID]?[key] == nil, !attempted.contains(attempt), failedApplications[attempt] == nil, preparingRecovery[key] == nil, let epoch = recoveryEpochs[key], let target = targets[key]?.service {
+                        work = (intent, key, target, epoch); attempted.insert(attempt); break
                     }
                 }
                 if work != nil { break }
@@ -1205,7 +1260,7 @@ actor TrustedApprovalsCoordinator {
                     removalAttempted.insert(intent.operationID)
                 }
             }
-            guard let (intent, key, target) = work else {
+            guard let (intent, key, target, epoch) = work else {
                 let remaining = Set(envelope.revocations.map(\.operationID)).union(removals.keys)
                 failed = failed.filter { remaining.contains($0.key) }
                 // A successful target cannot erase another target's unresolved application.
@@ -1216,8 +1271,18 @@ actor TrustedApprovalsCoordinator {
             release(token)
             do {
                 try await hook?(intent)
+                let admission = await acquireProgress()
+                let attempt = Attempt(intent: intent.operationID, target: key)
+                let eligible = targets[key]?.service === target && applicationIsCurrent(attempt, epoch: epoch)
+                release(admission)
+                guard eligible else { throw Self.unavailable("Target recovery evidence changed before cancellation application; retain its intent for the successor recovery pass.") }
                 let proof = try await target.applyTrustedRevocation(intent, revision: appliedRevision)
                 let commit = await acquireProgress()
+                guard targets[key]?.service === target, applicationIsCurrent(attempt, epoch: epoch) else {
+                    release(commit)
+                    throw Self.unavailable("Target recovery evidence changed during cancellation application; retain its intent for the successor recovery pass.")
+                }
+                applicationEpochs[attempt] = epoch
                 applications[intent.operationID, default: [:]][key] = proof
                 recoveryTargets.remove(key)
                 removalAttempted.remove(intent.operationID)
@@ -1231,7 +1296,9 @@ actor TrustedApprovalsCoordinator {
             } catch {
                 let commit = await acquireProgress()
                 recoveryTargets.insert(key)
-                blockApplication(.init(intent: intent.operationID, target: key), diagnostic: error.localizedDescription)
+                if recoveryEpochs[key] == epoch || failedApplications[.init(intent: intent.operationID, target: key)] == nil {
+                    blockApplication(.init(intent: intent.operationID, target: key), diagnostic: error.localizedDescription)
+                }
                 failed[intent.operationID] = await record(error, intent: intent)
                 release(commit)
             }

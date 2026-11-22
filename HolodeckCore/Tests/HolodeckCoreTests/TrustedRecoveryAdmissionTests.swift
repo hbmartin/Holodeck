@@ -57,10 +57,66 @@ import XCTest
         addTeardownBlock { second.cancel(); await gate.release() }
         try await wait { await authority.observation.successorParticipants == 1 }
         let active = await authority.observation; XCTAssertEqual(active.recoveryPasses, before + 1)
-        await gate.release(); try await first.value; try await second.value
+        await gate.release()
+        do { try await first.value; XCTFail("Old pass accepted a superseded proof") } catch is TrustedPartialRecovery {}
+        try await second.value
         let after = await authority.observation
         XCTAssertEqual(after.recoveryPasses, before + 2); XCTAssertEqual(after.successorParticipants, 0)
         XCTAssertEqual(after.obligations, 0)
+    }
+    func testImmediateLateLocalFailureKeepsIntentUntilSuccessorRepairsIt() async throws {
+        let failure = AdmissionFailureSwitch(), gate = RecoveryGate()
+        let a = try await fixture(), b = try await fixture(reconcile: { _ in if failure.on { throw POSIXError(.EIO) } })
+        let backend = TrustedBackendFixture(nil), authority = backend.coordinator()
+        try await accept(authority.register(TrustedOwnerRecorder().owner(service: a)))
+        try await accept(authority.register(TrustedOwnerRecorder().owner(service: b, beforeReplay: { _ in try await gate.wait() })))
+        let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        try backend.write(TrustedTVApprovals(revocations: [intent]).encoded())
+        let first = Task { try await a.retryReconciliation() }
+        addTeardownBlock { first.cancel(); await gate.release() }
+        try await wait { await gate.hasEntered }
+        failure.on = true
+        let late = Task { try await b.retryReconciliation() }
+        addTeardownBlock { late.cancel(); await gate.release() }
+        try await wait { await authority.observation.successorParticipants == 1 }
+        await gate.release()
+        do { try await first.value; XCTFail("Active pass ignored changed target evidence") } catch is TrustedPartialRecovery {}
+        do { try await late.value; XCTFail("Failed local phase reported recovered") }
+        catch let error as TrustedPartialRecovery { XCTAssertTrue(error.remaining.joined().contains(POSIXError(.EIO).localizedDescription)) }
+        XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations, [intent])
+        failure.on = false; try await b.retryReconciliation()
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
+    }
+    func testLateSuccessfulReceiptClearsOnlyItsPreviousSuppression() async throws {
+        let armed = AdmissionFailureSwitch(), oldPhase = AdmissionCompletionGate(), seal = RecoveryGate(), sealArmed = AdmissionFailureSwitch()
+        let a = try await fixture(reconcile: { _ in if armed.on { await oldPhase.wait() } }), b = try await fixture()
+        let backend = TrustedBackendFixture(nil)
+        let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
+            beforeRecoverySealing: { if sealArmed.on { try await seal.wait() } })
+        try await accept(authority.register(TrustedOwnerRecorder().owner(service: a)))
+        try await accept(authority.register(TrustedOwnerRecorder().owner(service: b, beforeReplay: { _ in throw POSIXError(.EIO) })))
+        let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        try backend.write(TrustedTVApprovals(revocations: [intent]).encoded())
+        try await accept(authority.register(TrustedOwnerRecorder().owner(service: b, beforeReplay: { _ in throw POSIXError(.EIO) })))
+        do { try await authority.replay(); XCTFail("Injected application failure ignored") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        try await accept(authority.register(TrustedOwnerRecorder().owner(service: b)))
+        armed.on = true
+        let cancelled = Task { try await a.retryReconciliation() }
+        addTeardownBlock { cancelled.cancel(); await oldPhase.release(); await seal.release() }
+        try await wait { await oldPhase.entered }; cancelled.cancel()
+        do { try await cancelled.value; XCTFail("Cancelled phase succeeded") } catch is CancellationError {}
+        sealArmed.on = true
+        let first = Task { try await b.retryReconciliation() }
+        addTeardownBlock { first.cancel(); await oldPhase.release(); await seal.release() }
+        try await wait { await seal.hasEntered }
+        armed.on = false; await oldPhase.release()
+        try await wait { await a.canDisableRequests() }
+        let late = Task { try await a.retryReconciliation() }
+        addTeardownBlock { late.cancel(); await seal.release() }
+        try await wait { await authority.observation.recoveryParticipants == 2 }
+        await seal.release(); try await first.value; try await late.value
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
     }
     func testCancelledSuccessorDoesNotCancelActivePass() async throws {
         let a = try await fixture(), b = try await fixture(), gate = RecoveryGate()
@@ -77,8 +133,21 @@ import XCTest
         second.cancel()
         do { try await second.value; XCTFail("Cancelled successor succeeded") } catch is CancellationError {}
         try await wait { await authority.observation.successorParticipants == 0 }
-        await gate.release(); try await first.value
+        await gate.release()
+        do { try await first.value; XCTFail("Old pass accepted invalidated evidence") } catch is TrustedPartialRecovery {}
+        XCTAssertFalse(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
+        try await b.retryReconciliation()
         XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
     }
+}
+private final class AdmissionFailureSwitch: @unchecked Sendable {
+    private let lock = NSLock(); private var value = false
+    var on: Bool { get { lock.withLock { value } } set { lock.withLock { value = newValue } } }
+}
+private actor AdmissionCompletionGate {
+    private(set) var entered = false; private var open = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    func wait() async { entered = true; if open { return }; await withCheckedContinuation { continuation = $0 } }
+    func release() { open = true; continuation?.resume(); continuation = nil }
 }
 #endif

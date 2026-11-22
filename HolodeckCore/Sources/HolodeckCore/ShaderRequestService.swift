@@ -1696,7 +1696,11 @@ public actor ShaderRequestService {
               localRecoveryPhase?.task.isCancelled != true else { throw TrustedRecoveryAdmissionError() }
         let attempt = UUID(); localRecoveryAttempt = attempt
         defer {
-            if localRecoveryAttempt == attempt { localRecoveryAttempt = nil; localRecoveryResult = nil; emitUpdates(); scheduleWakeup() }
+            if localRecoveryAttempt == attempt {
+                localRecoveryAttempt = nil
+                if trustedRecoveryHolds.isEmpty { localRecoveryResult = nil }
+                emitUpdates(); scheduleWakeup()
+            }
         }
         let local = try await recoverLocalPhase()
         try Task.checkCancellation()
@@ -1731,7 +1735,10 @@ public actor ShaderRequestService {
     }
     private func recoverLocalPhase() async throws -> TrustedLocalRecovery {
         if let phase = localRecoveryPhase { return try await phase.task.subscribe().value() }
-        if !trustedRecoveryHolds.isEmpty, let result = localRecoveryResult { return validateTrustedRecovery(result) }
+        if !trustedRecoveryHolds.isEmpty, let result = localRecoveryResult {
+            let validated = validateTrustedRecovery(result)
+            if validated.completed { return validated }
+        }
         let attempt = UUID(); localRecoveryGeneration &+= 1
         let generation = localRecoveryGeneration
         let task = TrustedRecoveryTask { try await self.performLocalRecovery(attempt: attempt, generation: generation) }
@@ -1740,11 +1747,21 @@ public actor ShaderRequestService {
     }
     private func performLocalRecovery(attempt: UUID, generation: UInt64) async throws -> TrustedLocalRecovery {
         defer { if localRecoveryPhase?.id == attempt { localRecoveryPhase = nil } }
+        let authority = trustedAuthority, registration = revocationRegistration
+        var fenced = false
         let phase: TrustedRecoveryPhase
         var initiatingError: (any Error)?
-        do { try await recoverLocalMetadata(); phase = .completed }
-        catch {
+        do {
+            // Internal progress fences this target before metadata changes. Only
+            // an already admitted trusted write may delay the notification.
+            fenced = try await authority?.beginTargetRecovery(self, registration: registration, attempt: attempt) ?? false
             try Task.checkCancellation()
+            try await recoverLocalMetadata(); phase = .completed
+        } catch {
+            if Task.isCancelled {
+                if fenced { await authority?.endTargetRecovery(serviceID: runtimeID, registration: registration, attempt: attempt, outcome: nil) }
+                throw CancellationError()
+            }
             initiatingError = error
             let detail = BoundedDiagnostics.bounded(error.localizedDescription, bytes: 8192)
             if error is TrustedRecoveryAdmissionError { phase = .refused(detail) }
@@ -1757,6 +1774,7 @@ public actor ShaderRequestService {
             registrationID: revocationRegistration, authority: revocationCoordinatorID, attemptID: attempt,
             generation: generation, metadataRevision: persistenceRevision, ownershipGeneration: reconciliationEpoch), initiatingError: initiatingError)
         localRecoveryResult = outcome
+        if fenced { await authority?.endTargetRecovery(serviceID: runtimeID, registration: registration, attempt: attempt, outcome: outcome) }
         return outcome
     }
     func validateTrustedRecovery(_ outcome: TrustedLocalRecovery, pass: UUID? = nil) -> TrustedLocalRecovery {
@@ -1777,7 +1795,7 @@ public actor ShaderRequestService {
         }
         if localRecoveryPhase == nil, let result = localRecoveryResult,
            localRecoveryAttempt != nil || !trustedRecoveryHolds.isEmpty {
-            return validateTrustedRecovery(result)
+            return validateTrustedRecovery(result, pass: pass)
         }
         guard localRecoveryPhase != nil || (activeID == nil && !maintenanceBusy) else {
             return .init(phase: .refused(TrustedRecoveryAdmissionError().localizedDescription))
