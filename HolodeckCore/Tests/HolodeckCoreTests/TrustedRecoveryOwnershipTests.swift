@@ -249,6 +249,45 @@ import XCTest
             try await wait { retained == nil }
         }
     }
+    func testSuccessfulAuthoritySummarySurvivesRequesterLocalFailure() async throws {
+        let fault = RecoveryOwnershipSwitch()
+        let a = try await fixture(reconcile: { _ in if fault.on { throw POSIXError(.EIO) } }), b = try await fixture()
+        let authority = TrustedBackendFixture(nil).coordinator()
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a)))
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: b)))
+        let other = try await b.recoverDepartureLocal(); XCTAssertTrue(other.completed)
+        // A successful typed authority result can include another repaired target
+        // even when the requester has no applicable cancellation obligation.
+        _ = try await a.installRevocationCoordinator(authority: authority, recovery: { _ in
+            let valid = await b.validateTrustedRecovery(other)
+            return .init(completedServices: valid.completed ? [b.runtimeID] : [])
+        })
+        fault.on = true
+        do { try await a.retryReconciliation(); XCTFail("Requester local failure was lost") }
+        catch let error as TrustedPartialRecovery {
+            XCTAssertEqual(error.completedServices, [b.runtimeID])
+            XCTAssertTrue(error.remaining.joined().contains(POSIXError(.EIO).localizedDescription))
+        }
+    }
+    func testCompatibilityHandoffAdapterDoesNotRetainIdleService() async throws {
+        let root = URL(fileURLWithPath: "/private/tmp/pr52-weak-handoff-" + UUID().uuidString)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        weak var retained: ShaderRequestService?
+        do {
+            let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")),
+                directory: root, workerScript: root.appendingPathComponent("unused.py"), reconcileWorker: { _ in })
+            await service.suspend(); try await service.initialize(configuration: .init(repository: root.path, enabled: true))
+            let old = TrustedBackendFixture(nil).coordinator(), next = TrustedBackendFixture(nil).coordinator()
+            _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: service)))
+            let proposed = try await service.prepareTrustedAuthority(id: next.id)
+            let transfer = try XCTUnwrap(proposed)
+            _ = try await service.installTrustedAuthority(transfer, id: next.id, intents: [],
+                revision: .init(coordinator: next.id, sequence: 0), coordinator: { _ in }, authority: next)
+            await service.finishTrustedAuthority(transfer, authority: next)
+            retained = service
+        }
+        try await wait { retained == nil }
+    }
     func testRequesterDoesNotReintroduceExcludedTrustedCompletion() async throws {
         let a = try await fixture()
         _ = await a.registerRevocationCoordinator(id: UUID(), recovery: { _ in
