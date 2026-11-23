@@ -798,6 +798,14 @@ public actor ShaderRequestService {
             return .init(completedServices: valid.completed ? [serviceID] : [])
         }
     }
+    func failedTrustedRegistration(_ error: Error, authority: UUID,
+        recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) {
+        guard revocationCoordinatorID == nil else { return }
+        // Recovery routing is provisional; it grants no registration or request
+        // authorization and local repair remains unbound until activation.
+        revocationCoordinator = recovery
+        revocationReplayFailed(error)
+    }
     private func requireLocalPreparationFinished(changingTo id: UUID) throws {
         if revocationCoordinatorID != id, let preparation = localPreparation {
             throw TrustedLocalPreparationPending(preparation: preparation)
@@ -823,12 +831,20 @@ public actor ShaderRequestService {
     func installRevocationCoordinator(authority: TrustedApprovalsCoordinator,
                                      installation: TrustedTargetInstallation? = nil,
                                      recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion,
-                                     admitActivation: @Sendable () throws -> Void) throws -> UUID {
+                                     admitActivation: @Sendable () throws -> Void,
+                                     intents: [RequestRevocationIntent]? = nil, revision: TrustedRevocationRevision? = nil) throws -> UUID {
         try requireLocalPreparationFinished(changingTo: authority.id)
         if let installation { try validateTargetInstallation(installation, authority: authority.id) }
+        if let intents, let revision {
+            guard revision.coordinator == authority.id,
+                  revocationCoordinatorID != authority.id || (revision.sequence >= revocationRevision && durableRevocations.isSubset(of: Set(intents.map(\.operationID)))) else {
+                throw ShaderRequestError.unavailable("Trusted inspection does not cover retained TV cancellation evidence. Choose Retry Recovery.")
+            }
+        }
         try admitActivation()
         let registration = bindRevocationCoordinator(id: authority.id, registration: installation?.registration, recovery)
         trustedAuthority = authority; installation?.publish()
+        if let intents, let revision { _ = try loadTrustedRevocations(intents, revision: revision) }
         return registration
     }
     private func bindRevocationCoordinator(id: UUID, registration: UUID? = nil, _ coordinator: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) -> UUID {

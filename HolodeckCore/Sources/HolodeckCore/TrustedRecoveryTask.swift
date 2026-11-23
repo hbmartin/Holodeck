@@ -65,6 +65,33 @@ nonisolated final class TrustedRecoveryTask<Value: Sendable>: @unchecked Sendabl
     }
 }
 
+/// A blocking read has one owner and independently cancellable subscriptions.
+/// Removing its last subscriber never pretends the OS read was cancelled.
+nonisolated final class TrustedReadTask: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<Data?, Error>?
+    private var waiters: [UUID: RequestPersistence.CommitTicket<Data?>] = [:]
+    init(_ read: @escaping @Sendable () throws -> Data?) {
+        Task.detached { [self] in
+            let value = Result { try read() }
+            let pending = lock.withLock {
+                result = value
+                let pending = Array(waiters.values); waiters.removeAll(); return pending
+            }
+            pending.forEach { $0.complete(value) }
+        }
+    }
+    func value() async throws -> Data? {
+        let id = UUID(), receipt = RequestPersistence.CommitTicket<Data?>()
+        lock.withLock {
+            if let result { receipt.complete(result) } else { waiters[id] = receipt }
+        }
+        defer { lock.withLock { _ = waiters.removeValue(forKey: id) } }
+        return try await receipt.value()
+    }
+}
+struct TrustedBoundaryInterrupted: Error, Sendable {}
+
 /// Each waiter owns cancellation; completing a boundary never cancels its owner.
 nonisolated final class TrustedCompletionSignal: @unchecked Sendable {
     private let lock = NSLock()
@@ -91,6 +118,15 @@ nonisolated final class TrustedCompletionSignal: @unchecked Sendable {
 }
 /// Wait only for a boundary; cancellation never cancels its shared owner.
 nonisolated enum TrustedBoundaryWait {
+    static func value<Value: Sendable>(changes: [TrustedCompletionSignal], _ work: @escaping @Sendable () async throws -> Value) async throws -> Value {
+        try await withThrowingTaskGroup(of: Value?.self) { group in
+            group.addTask { .some(try await work()) }
+            for signal in changes { group.addTask { try await signal.wait(); return nil } }
+            defer { group.cancelAll() }
+            guard let first = try await group.next(), let result = first else { throw TrustedBoundaryInterrupted() }
+            return result
+        }
+    }
     static func run(changes: [TrustedCompletionSignal], _ work: @escaping @Sendable () async throws -> Void) async throws {
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask { try await work() }
