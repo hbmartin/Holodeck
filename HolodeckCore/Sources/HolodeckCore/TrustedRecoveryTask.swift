@@ -108,6 +108,40 @@ nonisolated final class TrustedLocalPreparation: Sendable {
 }
 struct TrustedLocalPreparationPending: Error, Sendable { let preparation: TrustedLocalPreparation }
 
+/// A retirement batch is verified before it becomes an activation wait.
+nonisolated final class TrustedWorkerRetirement: Sendable {
+    let id = UUID()
+    let executions: [UUID: UUID]
+    let completion = TrustedCompletionSignal()
+    init(_ executions: [UUID: UUID]) { self.executions = executions }
+    func wait(or changed: TrustedCompletionSignal) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await self.completion.wait() }
+            group.addTask { try await changed.wait() }
+            defer { group.cancelAll() }
+            _ = try await group.next()
+        }
+    }
+}
+struct TrustedWorkerRetirementPending: Error, Sendable { let retirement: TrustedWorkerRetirement }
+struct TrustedRegistrationSuperseded: Error, Sendable {}
+/// Supersession and the first binding mutation have one synchronous ordering point.
+nonisolated final class TrustedRegistrationPreparation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var superseded = false, admitted = false
+    let changed = TrustedCompletionSignal()
+    func supersede() {
+        lock.withLock { if !admitted { superseded = true } }
+        changed.finish()
+    }
+    func admit(_ action: () throws -> Void) throws {
+        try lock.withLock {
+            guard !superseded else { throw TrustedRegistrationSuperseded() }
+            try action(); admitted = true
+        }
+    }
+}
+
 /// The authority records this exact target before the service publishes it.
 nonisolated final class TrustedTargetInstallation: @unchecked Sendable {
     let serviceID: UUID

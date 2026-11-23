@@ -287,6 +287,8 @@ public actor ShaderRequestService {
     private var pendingRetirements: [UUID: UUID] = [:] { didSet { if !pendingRetirements.isEmpty { invalidateDepartureRetirement() } } }
     private var verifiedRetirements: Set<UUID> = []
     private var retirementTask: Task<Void, Never>?
+    private var retirementBoundary: TrustedWorkerRetirement?
+    var trustedRetirementWaiters: Int { retirementBoundary?.completion.waiterCount ?? 0 }
 
     private var schedulingWakeupPending = false
     private var schedulingDeferred = false
@@ -426,6 +428,7 @@ public actor ShaderRequestService {
     }
     private func scheduleRetirement() {
         guard !pendingRetirements.isEmpty, persistenceFailure == nil, retirementTask == nil else { return }
+        retirementBoundary = TrustedWorkerRetirement(pendingRetirements)
         retirementTask = Task { [self] in
             do { try await self.retirePendingWorkers() } catch { self.progressPersistenceFailed(error) }
             self.finishRetirementTask()
@@ -576,26 +579,46 @@ public actor ShaderRequestService {
     }
     func settleTrustedAuthorityDeparture() async throws {
         if let activeID, records[activeID]?.revoked == true, let workerTask { await workerTask.value }
-        if let retirementTask { await retirementTask.value }
+        while let retirementTask { await retirementTask.value }
         try requireDepartureOwnership()
     }
-    private func requireDepartureOwnership() throws {
-        guard departureOwnershipVerified else {
-            let detail = persistenceFailure ?? startupFinalizationFailure ?? recoveryBlocker ??
-                "Previous TV cancellation or process settlement requires recovery before changing authority."
-            throw ShaderRequestError.unavailable(detail)
-        }
+    private enum DepartureReadiness {
+        case ready, retiring(TrustedWorkerRetirement), blocked(String)
     }
-    private var departureOwnershipVerified: Bool {
-        let ownedExecution: Bool
+    private var departureReadiness: DepartureReadiness {
+        if let persistenceFailure { return .blocked(persistenceFailure) }
+        if let startupFinalizationFailure { return .blocked(startupFinalizationFailure) }
+        guard acceptedMetadataAvailable else { return .blocked("Request metadata is not accepted; finish setup or choose Retry Recovery before changing authority.") }
+        if detaching { return .blocked("Checkout Detach owns the service; wait for its exact settlement before changing authority.") }
+        if let entry = recovery.entries.values.min(by: { $0.journal < $1.journal }) {
+            return .blocked("Checkout recovery at " + entry.journal + ": " + entry.message)
+        }
+        if !durableRevocations.isEmpty { return .blocked("Durable TV cancellation must finish before changing authority.") }
         if let activeProcess {
             let matches = execution?.processID == ObjectIdentifier(activeProcess) && execution?.interrupted == false
             let request = activeID.map { records[$0]?.revoked == false } == true
             let publication = activeID == nil && activePublication != nil && maintenanceLease == execution?.id
-            ownedExecution = matches && (request || publication)
-        } else { ownedExecution = true }
-        return acceptedMetadataAvailable && persistenceFailure == nil && startupFinalizationFailure == nil && recovery.entries.isEmpty &&
-            pendingRetirements.isEmpty && durableRevocations.isEmpty && ownedExecution
+            guard matches && (request || publication) else { return .blocked("The active checkout execution is interrupted or its process ownership is unverified; retain its journal and choose Retry Recovery.") }
+        }
+        if !pendingRetirements.isEmpty {
+            if let boundary = retirementBoundary, retirementTask != nil,
+               pendingRetirements.allSatisfy({ boundary.executions[$0.key] == $0.value && verifiedRetirements.contains($0.value) }) {
+                return .retiring(boundary)
+            }
+            return .blocked("Worker retirement is not verified for " + pendingRetirements.keys.map(\.uuidString).sorted().joined(separator: ", ") + "; retain its journal and choose Retry Recovery.")
+        }
+        return .ready
+    }
+    private func requireDepartureOwnership() throws {
+        switch departureReadiness {
+        case .ready: return
+        case .retiring(let retirement): throw TrustedWorkerRetirementPending(retirement: retirement)
+        case .blocked(let detail): throw ShaderRequestError.unavailable(detail)
+        }
+    }
+    private var departureOwnershipVerified: Bool {
+        if case .ready = departureReadiness { return true }
+        return false
     }
     private var retirementAssessment: TrustedDepartureRetirement?
     private var departureRetirementEvidence: TrustedDepartureRetirement.Evidence? {
@@ -717,7 +740,8 @@ public actor ShaderRequestService {
     func installTrustedAuthority(_ transfer: AuthorityTransfer, id: UUID, intents: [RequestRevocationIntent], revision: TrustedRevocationRevision,
                                  completion: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion,
                                  authority: TrustedApprovalsCoordinator? = nil,
-                                 installation: TrustedTargetInstallation? = nil) throws -> (UUID, TrustedRevocationInspection) {
+                                 installation: TrustedTargetInstallation? = nil,
+                                 admitActivation: @Sendable () throws -> Void = {}) throws -> (UUID, TrustedRevocationInspection) {
         try requireLocalPreparationFinished(changingTo: id)
         if let installation { try validateTargetInstallation(installation, authority: id) }
         return try transfer.departure.activate {
@@ -729,6 +753,7 @@ public actor ShaderRequestService {
             // No suspension between validating departure, changing registration and
             // loading the already validated replacement authority snapshot.
             try requireDepartureOwnership()
+            try admitActivation()
             let registration = bindRevocationCoordinator(id: id, registration: installation?.registration, completion)
             if let authority { trustedAuthority = authority }
             installation?.publish()
@@ -3124,7 +3149,12 @@ public actor ShaderRequestService {
         if let operation { transitionRecord(id, .finish(operation, interrupted: interrupted, settled: settled)) }
         emitUpdates()
     }
-    private func finishRetirementTask() { retirementTask = nil; emitUpdates(); kick() }
+    private func finishRetirementTask() {
+        let finished = retirementBoundary
+        retirementTask = nil; retirementBoundary = nil
+        finished?.completion.finish()
+        emitUpdates(); kick()
+    }
     private func retirePendingWorkers(recoveryToken: RequestPersistence.RecoveryToken? = nil) async throws {
         try admitMetadataMutation()
         for (id, operation) in pendingRetirements.sorted(by: { $0.key.uuidString < $1.key.uuidString }) {
