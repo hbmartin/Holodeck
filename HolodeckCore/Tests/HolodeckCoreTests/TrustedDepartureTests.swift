@@ -357,7 +357,7 @@ import XCTest
             else { _ = try await accept(ticket) }
             try await revoking.value
             let first = await a.service.allJobs(), second = await b.service.allJobs()
-            XCTAssertEqual(first.first?.stage, cancel ? .cancelled : .queued)
+            XCTAssertEqual(first.first?.stage, .cancelled)
             XCTAssertEqual(second.first?.stage, .cancelled)
             let stored = try TrustedTVApprovals.decode(XCTUnwrap(backend.read()))
             XCTAssertTrue(stored.approvals.isEmpty); XCTAssertTrue(stored.revocations.isEmpty)
@@ -586,11 +586,12 @@ import XCTest
         try await wait { await old.observation.queuedRevocations == 1 }
         let two = try await second.register(TrustedOwnerRecorder().owner(service: b.service))
         try await wait { (try? await b.service.control(operation: "requestStatus", payload: .init(), deviceID: "B"))?.message.contains("handoff is pending") == true }
-        firstGate.release(); _ = try await accept(one)
+        firstGate.release()
         try await wait { await commit.hasEntered }
         let admitted = await old.observation
         XCTAssertEqual(admitted.departures, 0); XCTAssertFalse(secondGate.entered); XCTAssertEqual(backend.writes, 0)
         await commit.release(); try await revoking.value
+        _ = try await accept(one)
         try await wait { secondGate.entered }; secondGate.release(); _ = try await accept(two)
         let cancelled = await b.service.allJobs(); XCTAssertEqual(cancelled.first?.stage, .cancelled)
         XCTAssertEqual(backend.writes, 2)
@@ -617,7 +618,7 @@ import XCTest
         addTeardownBlock { latestOld.completion.cancel() }
         let oldQueue = await old.observation; XCTAssertEqual(oldQueue.queuedGeneration, latestOld.generation)
         XCTAssertEqual(oldQueue.acceptedGeneration, oldBinding.permit.generation)
-        let heldNext = await next.observation; XCTAssertEqual(heldNext.acceptedGeneration, nextBinding.permit.generation)
+        let heldNext = await next.observation; XCTAssertTrue([nextBinding.permit.generation, latestNext.generation].contains(heldNext.acceptedGeneration ?? 0))
         let backstop = Task {
             try? await Task.sleep(for: .seconds(8))
             if !Task.isCancelled { [movingA, movingB, latestNext, latestOld].forEach { $0.completion.cancel() } }

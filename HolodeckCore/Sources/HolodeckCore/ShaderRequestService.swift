@@ -566,20 +566,24 @@ public actor ShaderRequestService {
     private weak var trustedAuthority: TrustedApprovalsCoordinator?
     private var authorityTransfer: UUID?
     func rememberTrustedAuthority(_ authority: TrustedApprovalsCoordinator) { trustedAuthority = authority }
-    func prepareTrustedAuthority(id: UUID) async throws -> AuthorityTransfer? {
+    func prepareTrustedAuthority(id: UUID, preparation: TrustedRegistrationPreparation? = nil) async throws -> AuthorityTransfer? {
         guard let prior = revocationCoordinatorID, prior != id, let predecessor = trustedAuthority, predecessor.id != id else { return nil }
         guard authorityTransfer == nil else { throw ShaderRequestError.unavailable("A trusted authority handoff is pending; retry after it finishes.") }
         guard acceptedMetadataAvailable || loaded else { throw TrustedSetupPending() }
         let ticket = UUID(); authorityTransfer = ticket; emitUpdates()
         do {
-            let departure = try await predecessor.prepareDeparture(self, ticket: ticket)
+            let departure = try await predecessor.prepareDeparture(self, ticket: ticket, preparation: preparation)
             try Task.checkCancellation()
             return AuthorityTransfer(id: ticket, predecessor: predecessor, registration: revocationRegistration, departure: departure)
         } catch { await predecessor.cancelDeparture(serviceID: runtimeID, ticket: ticket); authorityTransfer = nil; emitUpdates(); scheduleWakeup(); throw error }
     }
     func settleTrustedAuthorityDeparture() async throws {
-        if let activeID, records[activeID]?.revoked == true, let workerTask { await workerTask.value }
-        while let retirementTask { await retirementTask.value }
+        if let activeID, records[activeID]?.revoked == true, let workerTask {
+            let receipt = RequestPersistence.CommitTicket<Void>()
+            Task { await workerTask.value; receipt.complete(.success(())) }
+            try await receipt.value()
+        }
+        while let boundary = retirementBoundary { try await boundary.completion.wait() }
         try requireDepartureOwnership()
     }
     private enum DepartureReadiness {

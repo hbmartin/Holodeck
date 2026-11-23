@@ -71,6 +71,7 @@ nonisolated final class TrustedCompletionSignal: @unchecked Sendable {
     private var finished = false
     private var waiters: [UUID: RequestPersistence.CommitTicket<Void>] = [:]
     var waiterCount: Int { lock.withLock { waiters.count } }
+    var isFinished: Bool { lock.withLock { finished } }
     func wait(cancellable: Bool = true) async throws {
         let id = UUID(), receipt = RequestPersistence.CommitTicket<Void>()
         lock.withLock {
@@ -87,6 +88,20 @@ nonisolated final class TrustedCompletionSignal: @unchecked Sendable {
         }
         pending.forEach { $0.complete(.success(())) }
     }
+}
+/// Wait only for a boundary; cancellation never cancels its shared owner.
+nonisolated enum TrustedBoundaryWait {
+    static func run(changes: [TrustedCompletionSignal], _ work: @escaping @Sendable () async throws -> Void) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await work() }
+            for signal in changes { group.addTask { try await signal.wait() } }
+            defer { group.cancelAll() }
+            _ = try await group.next()
+        }
+    }
+}
+struct TrustedDepartureYielded: LocalizedError, Sendable {
+    var errorDescription: String? { "TV revocation has priority; authority handoff will resume after cancellation settles." }
 }
 /// Metadata preparation owns its binding only until the local phase settles.
 nonisolated final class TrustedLocalPreparation: Sendable {
@@ -133,6 +148,12 @@ nonisolated final class TrustedRegistrationPreparation: @unchecked Sendable {
     func supersede() {
         lock.withLock { if !admitted { superseded = true } }
         changed.finish()
+    }
+    func check() throws {
+        try lock.withLock {
+            if superseded { throw TrustedRegistrationSuperseded() }
+            if !admitted && changed.isFinished { throw CancellationError() }
+        }
     }
     func admit(_ action: () throws -> Void) throws {
         try lock.withLock {

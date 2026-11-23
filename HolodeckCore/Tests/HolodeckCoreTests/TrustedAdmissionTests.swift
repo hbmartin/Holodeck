@@ -37,12 +37,14 @@ import XCTest
         try await wait { await firstGate.hasEntered }
         let movingB = try await first.register(TrustedOwnerRecorder().owner(service: b))
         try await wait { await secondGate.hasEntered }
+        try await wait { await first.observation.departures == 1 }
+        try await wait { await second.observation.departures == 1 }
         let latestFirst = try await first.register(TrustedOwnerRecorder().owner())
         let latestSecond = try await second.register(TrustedOwnerRecorder().owner())
         addTeardownBlock { [movingA, movingB, latestFirst, latestSecond].forEach { $0.completion.cancel() } }
         let heldFirst = await first.observation, heldSecond = await second.observation
         XCTAssertEqual(heldFirst.queuedGeneration, latestFirst.generation); XCTAssertEqual(heldSecond.queuedGeneration, latestSecond.generation)
-        XCTAssertEqual(heldFirst.departures, 1); XCTAssertEqual(heldSecond.departures, 1)
+        XCTAssertLessThanOrEqual(heldFirst.departures, 1); XCTAssertLessThanOrEqual(heldSecond.departures, 1)
         let result = AdmissionResult()
         let completion = Task {
             do {

@@ -434,6 +434,7 @@ actor TrustedApprovalsCoordinator {
             if cancellable { try Task.checkCancellation() }
             let granted = try await withCheckedThrowingContinuation { continuation in
                 admissions[admission, default: AdmissionQueue()].append(.init(id: token, continuation: continuation))
+                if admission == .revocation { for departure in departures.values { departure.requestYield() } }
                 advanceAdmission()
             }
             do {
@@ -921,7 +922,7 @@ actor TrustedApprovalsCoordinator {
         if let error = errors.first { throw error }
     }
     // Cross-authority preparation never holds both authorities' mutation lanes.
-    func prepareDeparture(_ target: ShaderRequestService, ticket: UUID) async throws -> TrustedAuthorityDeparture {
+    func prepareDeparture(_ target: ShaderRequestService, ticket: UUID, preparation: TrustedRegistrationPreparation? = nil) async throws -> TrustedAuthorityDeparture {
         let token = try await acquireDeparture()
         guard departures[target.runtimeID] == nil,
               let known = targets.values.first(where: { $0.key.service == target.runtimeID }) else {
@@ -934,8 +935,20 @@ actor TrustedApprovalsCoordinator {
         let needed = required.values.contains { $0.contains { $0.service == target.runtimeID } }
         release(token)
         do {
-            if needed { try await replayDeparture(serviceID: target.runtimeID) }
-            try await target.settleTrustedAuthorityDeparture()
+            let changes = [departure.yieldRequested] + (preparation.map { [$0.changed] } ?? [])
+            if needed {
+                // Replay owns durable obligations. A registration may leave its
+                // wait without abandoning that work or its authority evidence.
+                let receipt = RequestPersistence.CommitTicket<Void>()
+                Task {
+                    do { try await self.replayDeparture(serviceID: target.runtimeID); receipt.complete(.success(())) }
+                    catch { receipt.complete(.failure(error)) }
+                }
+                try await TrustedBoundaryWait.run(changes: changes) { try await receipt.value() }
+            }
+            try preparation?.check(); try departure.checkYield()
+            try await TrustedBoundaryWait.run(changes: changes) { try await target.settleTrustedAuthorityDeparture() }
+            try preparation?.check(); try departure.checkYield()
             let check = try await acquire(.progress)
             let outstanding = required.values.contains { $0.contains { $0.service == target.runtimeID } }
             departure.validate(evidence(for: known.key))
@@ -1145,6 +1158,14 @@ actor TrustedApprovalsCoordinator {
         let recipients = endpointTargets.removeValue(forKey: departure.id) ?? [:]
         for recipient in recipients.values { await recipient.value?.forgetAuthorityRecovery(ticket: departure.id) }
     }
+    private func waitForRegistration(_ request: Request, transfer: ShaderRequestService.AuthorityTransfer?,
+                                     _ work: @escaping @Sendable () async throws -> Void) async throws {
+        let changes = [request.registration.preparation.changed] + (transfer.map { [$0.departure.yieldRequested] } ?? [])
+        try await TrustedBoundaryWait.run(changes: changes, work)
+        try request.registration.completion.check(); try request.registration.preparation.check()
+        guard request.owner.eligibility.isCurrent else { throw CancellationError() }
+        try transfer?.departure.checkYield()
+    }
     private var preparingRegistration: (server: UUID, lifetime: TrustedOwnerLifetime, preparation: TrustedRegistrationPreparation)?
     private enum RegistrationAbandoned: Error { case superseded }
     private func drainRegistrations() async {
@@ -1161,7 +1182,7 @@ actor TrustedApprovalsCoordinator {
                     release(token)
                     do {
                         try await beforeAuthorityPreparation(target.runtimeID)
-                        transfer = try await target.prepareTrustedAuthority(id: id)
+                        transfer = try await target.prepareTrustedAuthority(id: id, preparation: request.registration.preparation)
                     }
                     catch {
                         token = await acquireReplacement()
@@ -1199,7 +1220,7 @@ actor TrustedApprovalsCoordinator {
                         }
                         catch let waiting as TrustedWorkerRetirementPending {
                             release(token)
-                            do { try await waiting.retirement.wait(or: request.registration.preparation.changed) }
+                            do { try await waitForRegistration(request, transfer: transfer) { try await waiting.retirement.completion.wait() } }
                             catch { token = await acquireReplacement(); throw error }
                             token = await acquireReplacement()
                             try request.registration.completion.check()
@@ -1209,7 +1230,7 @@ actor TrustedApprovalsCoordinator {
                         }
                         catch let waiting as TrustedLocalPreparationPending {
                             release(token)
-                            do { try await waiting.preparation.wait() }
+                            do { try await waitForRegistration(request, transfer: transfer) { try await waiting.preparation.wait() } }
                             catch { token = await acquireReplacement(); throw error }
                             token = await acquireReplacement()
                             try request.registration.completion.check()
@@ -1220,7 +1241,7 @@ actor TrustedApprovalsCoordinator {
                         }
                         catch let waiting as TrustedDepartureInspectionPending {
                             release(token)
-                            do { try await waiting.departure.waitForInspection() }
+                            do { try await waitForRegistration(request, transfer: transfer) { try await waiting.departure.waitForInspection() } }
                             catch { token = await acquireReplacement(); throw error }
                             token = await acquireReplacement()
                             // Destination evidence may have failed while this
@@ -1264,7 +1285,14 @@ actor TrustedApprovalsCoordinator {
                     else { await transfer.predecessor.cancelDeparture(serviceID: transfer.departure.serviceID, ticket: transfer.id) }
                     token = await acquireReplacement()
                 }
-                if error is RegistrationAbandoned || error is TrustedRegistrationSuperseded { request.registration.completion.complete(.success(.superseded)) }
+                if error is TrustedDepartureYielded, !request.registration.completion.hasStarted {
+                    do {
+                        try request.registration.completion.check(); try request.registration.preparation.check()
+                        guard request.owner.eligibility.isCurrent else { throw CancellationError() }
+                        if request.registration.generation == generation { pending = request }
+                        else { request.registration.completion.complete(.success(.superseded)) }
+                    } catch { request.registration.completion.complete(.failure(error)) }
+                } else if error is RegistrationAbandoned || error is TrustedRegistrationSuperseded { request.registration.completion.complete(.success(.superseded)) }
                 else {
                     if let recovery = error as? TrustedDepartureRecoveryError, let target = request.owner.service {
                         await attachDepartureRecovery(ticket: recovery.diagnosticID, to: target)
