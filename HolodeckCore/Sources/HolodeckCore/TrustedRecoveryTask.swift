@@ -13,12 +13,13 @@ nonisolated final class TrustedRecoveryTask<Value: Sendable>: @unchecked Sendabl
     private var result: Result<Value, Error>?
     private var admissionClosed = false
     private let beforeCancellation: @Sendable () -> Void
+    private let cancelWhenEmpty: Bool
     var isCancelled: Bool { lock.withLock { admissionClosed } || task.isCancelled }
     var waiterCount: Int { lock.withLock { waiters.count } }
     /// A cancelled owner drains its admitted work without opening subscriptions.
     func settle() async { _ = await task.result }
-    init(beforeCancellation: @escaping @Sendable () -> Void = {}, _ work: @escaping @Sendable () async throws -> Value) {
-        self.beforeCancellation = beforeCancellation
+    init(cancelWhenEmpty: Bool = true, beforeCancellation: @escaping @Sendable () -> Void = {}, _ work: @escaping @Sendable () async throws -> Value) {
+        self.beforeCancellation = beforeCancellation; self.cancelWhenEmpty = cancelWhenEmpty
         task = Task { try await work() }
         // One relay per shared phase, rather than a suspended Task per waiter.
         Task { [weak self, task] in
@@ -57,7 +58,7 @@ nonisolated final class TrustedRecoveryTask<Value: Sendable>: @unchecked Sendabl
     }
     private func remove(_ id: UUID, cancelling: Bool) {
         let cancel = lock.withLock {
-            guard waiters.removeValue(forKey: id) != nil, cancelling, waiters.isEmpty else { return false }
+            guard waiters.removeValue(forKey: id) != nil, cancelling, cancelWhenEmpty, waiters.isEmpty else { return false }
             admissionClosed = true
             return true
         }

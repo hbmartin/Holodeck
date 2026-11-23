@@ -298,7 +298,8 @@ actor TrustedApprovalsCoordinator {
         var automaticAttempted = false
         var intents: Set<UUID>
     }
-    private var automaticValidations: [TargetKey: (id: UUID, task: Task<Void, Error>)] = [:]
+    private var automaticValidations: [TargetKey: (id: UUID, task: TrustedRecoveryTask<Void>)] = [:]
+    private var revocationCompletions: [UUID: (id: UUID, task: TrustedRecoveryTask<Void>)] = [:]
     private var pendingRecoveryOutcomes: [TargetKey: PendingRecoveryOutcome] = [:]
     private var applicationEpochs: [Attempt: UUID] = [:]
     // A trusted removal may have committed even when a target rejected its stale completion.
@@ -1510,55 +1511,97 @@ actor TrustedApprovalsCoordinator {
             }
         } catch { release(token); throw error }
         release(token)
-        try await validateAbandonedOutcomes(for: intent)
-        try await replay(target: intent.operationID)
+        let completion: (id: UUID, task: TrustedRecoveryTask<Void>)
+        if let active = revocationCompletions[intent.operationID] { completion = active }
+        else {
+            let jobID = UUID()
+            let task = TrustedRecoveryTask<Void>(cancelWhenEmpty: false) {
+                do { try await self.completeRevocation(intent) }
+                catch { await self.finishedRevocation(intent.operationID, job: jobID); throw error }
+                await self.finishedRevocation(intent.operationID, job: jobID)
+            }
+            completion = (jobID, task); revocationCompletions[intent.operationID] = completion
+        }
+        // The durable intent, rather than the initiating caller, owns completion.
+        try await completion.task.subscribe().value()
+    }
+    private func finishedRevocation(_ intent: UUID, job: UUID) {
+        if revocationCompletions[intent]?.id == job { revocationCompletions[intent] = nil }
+    }
+    private func completeRevocation(_ intent: RequestRevocationIntent) async throws {
+        // This first pass can cancel healthy targets while a different target's
+        // validation is waiting. Its provisional result is superseded by the final
+        // pass, but genuine target failures remain recorded in authority evidence.
+        let early = Task { try? await self.replay(target: intent.operationID) }
+        var validation: Error?
+        do { try await validateAbandonedOutcomes(for: intent) } catch { validation = error }
+        _ = await early.value
+        do { try await replay(target: intent.operationID) }
+        catch {
+            if let validation { throw Failure(validation, diagnosticID: intent.operationID).appending(error) }
+            throw error
+        }
+        if let validation { throw validation }
     }
     /// Only a later client revocation starts this pass. Ordinary replay cannot
     /// recursively join the automatic pass which is asking it to settle intents.
     private func validateAbandonedOutcomes(for intent: RequestRevocationIntent) async throws {
+        var failure: Failure?
         for key in (required[intent.operationID] ?? []).sorted(by: { $0.service.uuidString < $1.service.uuidString }) {
             guard let target = targets[key]?.service else { continue }
-            let job: (id: UUID, task: Task<Void, Error>)
-            if let active = automaticValidations[key] { job = active }
-            else {
-                guard let pending = pendingRecoveryOutcomes[key] else { continue }
-                if await target.hasTrustedRecoveryConsumer(attempt: pending.attempt) { continue }
-                guard pendingRecoveryOutcomes[key]?.attempt == pending.attempt, targets[key]?.service === target else { continue }
-                job = try automaticValidation(on: key, pending: pending, target: target)
-            }
-            do { try await job.task.value }
-            catch {
-                if automaticValidations[key]?.id == job.id { automaticValidations[key] = nil }
+            var jobID: UUID?
+            do {
+                let job: (id: UUID, task: TrustedRecoveryTask<Void>)
+                if let active = automaticValidations[key] { job = active }
+                else {
+                    guard let pending = pendingRecoveryOutcomes[key] else { continue }
+                    if await target.hasTrustedRecoveryConsumer(attempt: pending.attempt) { continue }
+                    guard pendingRecoveryOutcomes[key]?.attempt == pending.attempt, targets[key]?.service === target else { continue }
+                    job = try automaticValidation(on: key, pending: pending, target: target)
+                }
+                jobID = job.id
+                try await job.task.subscribe().value()
+            } catch {
                 let token = await acquireProgress()
-                _ = await record(error, intent: intent)
+                let recorded = await record(error, intent: intent)
+                failure = failure?.appending(error) ?? recorded
                 release(token)
-                throw error
             }
-            if automaticValidations[key]?.id == job.id { automaticValidations[key] = nil }
+            if let jobID, automaticValidations[key]?.id == jobID { automaticValidations[key] = nil }
         }
+        if let failure { throw failure }
     }
     private func automaticValidation(on key: TargetKey, pending: PendingRecoveryOutcome,
-                                     target: ShaderRequestService) throws -> (id: UUID, task: Task<Void, Error>) {
-        // Recheck after the service hop, before admitting another shared task.
+                                     target: ShaderRequestService) throws -> (id: UUID, task: TrustedRecoveryTask<Void>) {
         if let active = automaticValidations[key] { return active }
         guard pendingRecoveryOutcomes[key]?.automaticAttempted == false else {
             throw Self.unavailable("Automatic trusted validation did not complete for " + key.service.uuidString + ". Choose Retry Recovery; the TV cancellation remains fenced.")
         }
         pendingRecoveryOutcomes[key]?.automaticAttempted = true
-        let job = (UUID(), Task {
-            var local = await target.validateTrustedRecovery(pending.outcome)
-            if !local.completed { local = try await target.trustedRecoveryOutcome(authority: self.id) }
-            do { _ = try await self.retry(requester: key.service, local: local) }
-            catch { await self.retainAutomaticValidationFailure(local, on: key); throw error }
+        let job = (UUID(), TrustedRecoveryTask<Void>(cancelWhenEmpty: false) {
+            var local = pending.outcome
+            do {
+                local = await target.validateTrustedRecovery(local)
+                if !local.completed { local = try await target.trustedRecoveryOutcome(authority: self.id) }
+                await self.markAutomaticAttempt(local, on: key)
+                _ = try await self.retry(requester: key.service, local: local)
+            } catch { await self.retainAutomaticValidationFailure(local, on: key); throw error }
         })
         automaticValidations[key] = job
         return job
+    }
+    private func markAutomaticAttempt(_ local: TrustedLocalRecovery, on key: TargetKey) {
+        guard let receipt = local.receipt, receipt.registrationID == key.registration,
+              recoveryEpochs[key] == receipt.attemptID,
+              pendingRecoveryOutcomes[key]?.attempt == receipt.attemptID else { return }
+        pendingRecoveryOutcomes[key]?.automaticAttempted = true
     }
     private func retainAutomaticValidationFailure(_ local: TrustedLocalRecovery, on key: TargetKey) async {
         let token = await acquireProgress(); defer { release(token) }
         guard let receipt = local.receipt, receipt.registrationID == key.registration,
               recoveryEpochs[key] == receipt.attemptID, preparingRecovery[key] == nil,
-              required.values.contains(where: { $0.contains(key) }), pendingRecoveryOutcomes[key] == nil else { return }
+              required.values.contains(where: { $0.contains(key) }) else { return }
+        if pendingRecoveryOutcomes[key] != nil { markAutomaticAttempt(local, on: key); return }
         pendingRecoveryOutcomes[key] = .init(attempt: receipt.attemptID, outcome: local, automaticAttempted: true,
             intents: Set(required.filter { $0.value.contains(key) }.keys))
     }
