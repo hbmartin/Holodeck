@@ -222,6 +222,44 @@ import XCTest
         let done = await authority.observation
         XCTAssertEqual(done.departureRecoveryParticipants, 0); XCTAssertEqual(done.departureRecoverySuccessors, 0)
     }
+    func testIntentFreeOutcomeFencesLaterRevocationAndAutomaticallyValidatesAfterAbandonment() async throws {
+        let f = try await fixture(), hold = UUID()
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [.init(id: "Later", name: "Later", tokenHash: "old")]).encoded())
+        let authority = backend.coordinator()
+        let binding = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: f.service)))
+        let local = try await f.service.trustedRecoveryOutcome(pass: hold, authority: authority.id)
+        XCTAssertTrue(local.completed)
+        let pending = await authority.observation; XCTAssertEqual(pending.pendingLocalOutcomes, 1)
+        do { try await authority.revoke("Later", permit: binding.permit) { _ in }; XCTFail("Unaccepted local outcome applied") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("awaiting its trusted pass")) }
+        let fenced = await authority.observation; XCTAssertEqual(fenced.obligations, 1); XCTAssertEqual(fenced.recoveryPasses, 0)
+        let phases = await f.service.localRecoveryPhaseCount
+        await f.service.finishTrustedRecovery(pass: hold)
+        try await authority.revoke("Later", permit: binding.permit) { _ in }
+        let done = await authority.observation
+        XCTAssertEqual(done.pendingLocalOutcomes, 0); XCTAssertEqual(done.obligations, 0)
+        XCTAssertEqual(done.recoveryPasses, 1); XCTAssertEqual(backend.writes, 2)
+        let after = await f.service.localRecoveryPhaseCount; XCTAssertEqual(after, phases)
+    }
+    func testFailedAutomaticValidationRetainsFenceAndDoesNotSpin() async throws {
+        let f = try await fixture(), hold = UUID()
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [.init(id: "Later", name: "Later", tokenHash: "old")]).encoded())
+        let authority = backend.coordinator()
+        let binding = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: f.service)))
+        _ = try await f.service.trustedRecoveryOutcome(pass: hold, authority: authority.id)
+        await f.service.finishTrustedRecovery(pass: hold)
+        backend.failReads(true)
+        do { try await authority.revoke("Later", permit: binding.permit) { _ in }; XCTFail("Failed inspection accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EACCES).localizedDescription)) }
+        let failed = await authority.observation
+        XCTAssertEqual(failed.pendingLocalOutcomes, 1); XCTAssertEqual(failed.obligations, 1); XCTAssertEqual(failed.recoveryPasses, 1)
+        backend.failReads(false)
+        do { try await authority.revoke("Later", permit: binding.permit) { _ in }; XCTFail("Automatic validation spun again") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("Choose Retry Recovery")) }
+        let still = await authority.observation; XCTAssertEqual(still.recoveryPasses, 1)
+        try await f.service.retryReconciliation()
+        let done = await authority.observation; XCTAssertEqual(done.obligations, 0); XCTAssertEqual(done.pendingLocalOutcomes, 0)
+    }
     func testLaterRevocationsRemainCoveredByPendingLocalOutcome() async throws {
         let f = try await fixture(), fail = RetirementSwitch(); fail.on = true
         let first = RequestRevocationIntent(operationID: UUID(), deviceID: "A")

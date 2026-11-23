@@ -1982,6 +1982,10 @@ public actor ShaderRequestService {
             return .init(phase: .interrupted(BoundedDiagnostics.bounded(detail, bytes: 8192)), initiatingError: error)
         }
     }
+    func hasTrustedRecoveryConsumer(attempt: UUID) -> Bool {
+        (localRecoveryPhase?.id == attempt) ||
+        (localRecoveryResult?.receipt?.attemptID == attempt && (localRecoveryAttempt != nil || !trustedRecoveryHolds.isEmpty))
+    }
     func finishTrustedRecovery(pass: UUID) async {
         if Task.isCancelled, trustedRecoveryHolds.contains(pass), let phase = localRecoveryPhase, phase.task.isCancelled {
             await phase.task.settle()

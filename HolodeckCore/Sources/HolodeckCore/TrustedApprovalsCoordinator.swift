@@ -293,8 +293,11 @@ actor TrustedApprovalsCoordinator {
     private var preparingRecovery: [TargetKey: UUID] = [:]
     private struct PendingRecoveryOutcome {
         let attempt: UUID
+        let outcome: TrustedLocalRecovery
+        var automaticAttempted = false
         var intents: Set<UUID>
     }
+    private var automaticValidations: [TargetKey: (id: UUID, task: Task<Void, Error>)] = [:]
     private var pendingRecoveryOutcomes: [TargetKey: PendingRecoveryOutcome] = [:]
     private var applicationEpochs: [Attempt: UUID] = [:]
     // A trusted removal may have committed even when a target rejected its stale completion.
@@ -621,8 +624,8 @@ actor TrustedApprovalsCoordinator {
         preparingRecovery[key] = nil
         if let outcome {
             if outcome.completed {
-                if requiresTrustedPass, required.values.contains(where: { $0.contains(key) }) {
-                    pendingRecoveryOutcomes[key] = .init(attempt: attempt, intents: Set(required.filter { $0.value.contains(key) }.keys))
+                if requiresTrustedPass {
+                    pendingRecoveryOutcomes[key] = .init(attempt: attempt, outcome: outcome, intents: Set(required.filter { $0.value.contains(key) }.keys))
                 }
                 clearApplicationBlockers(on: key) { _, blocker in blocker.localAttempt == attempt }
             } else { suppressApplications(to: key, outcome: outcome) }
@@ -1442,7 +1445,49 @@ actor TrustedApprovalsCoordinator {
             }
         } catch { release(token); throw error }
         release(token)
+        try await validateAbandonedOutcomes(for: intent)
         try await replay(target: intent.operationID)
+    }
+    /// Only a later client revocation starts this pass. Ordinary replay cannot
+    /// recursively join the automatic pass which is asking it to settle intents.
+    private func validateAbandonedOutcomes(for intent: RequestRevocationIntent) async throws {
+        for key in (required[intent.operationID] ?? []).sorted(by: { $0.service.uuidString < $1.service.uuidString }) {
+            guard let pending = pendingRecoveryOutcomes[key], let target = targets[key]?.service else { continue }
+            if await target.hasTrustedRecoveryConsumer(attempt: pending.attempt) { continue }
+            guard pendingRecoveryOutcomes[key]?.attempt == pending.attempt, targets[key]?.service === target else { continue }
+            let job: (id: UUID, task: Task<Void, Error>)
+            if let active = automaticValidations[key] { job = active }
+            else {
+                guard !pending.automaticAttempted else {
+                    throw Self.unavailable("Automatic trusted validation did not complete for " + key.service.uuidString + ". Choose Retry Recovery; the TV cancellation remains fenced.")
+                }
+                pendingRecoveryOutcomes[key]?.automaticAttempted = true
+                job = (UUID(), Task {
+                    var local = await target.validateTrustedRecovery(pending.outcome)
+                    if !local.completed { local = try await target.trustedRecoveryOutcome(authority: self.id) }
+                    do { _ = try await self.retry(requester: key.service, local: local) }
+                    catch { await self.retainAutomaticValidationFailure(local, on: key); throw error }
+                })
+                automaticValidations[key] = job
+            }
+            do { try await job.task.value }
+            catch {
+                if automaticValidations[key]?.id == job.id { automaticValidations[key] = nil }
+                let token = await acquireProgress()
+                _ = await record(error, intent: intent)
+                release(token)
+                throw error
+            }
+            if automaticValidations[key]?.id == job.id { automaticValidations[key] = nil }
+        }
+    }
+    private func retainAutomaticValidationFailure(_ local: TrustedLocalRecovery, on key: TargetKey) async {
+        let token = await acquireProgress(); defer { release(token) }
+        guard let receipt = local.receipt, receipt.registrationID == key.registration,
+              recoveryEpochs[key] == receipt.attemptID, preparingRecovery[key] == nil,
+              required.values.contains(where: { $0.contains(key) }), pendingRecoveryOutcomes[key] == nil else { return }
+        pendingRecoveryOutcomes[key] = .init(attempt: receipt.attemptID, outcome: local, automaticAttempted: true,
+            intents: Set(required.filter { $0.value.contains(key) }.keys))
     }
     func replay(target: UUID? = nil) async throws {
         guard targets.values.contains(where: { $0.service != nil }) else {
