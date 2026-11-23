@@ -5527,8 +5527,10 @@ extension ShaderRequestTests {
         let first = Task { try await server.revoke("A") }; try await waitFor { await gate.hasEntered }
         let second = Task { try await server.revoke("B") }
         try await waitFor { (trusted.read().flatMap { try? TrustedTVApprovals.decode($0) }?.revocations.count) == 2 }
-        first.cancel(); await gate.release()
-        try await first.value; try await second.value
+        first.cancel()
+        do { try await first.value; XCTFail("Cancelled caller kept waiting") } catch is CancellationError {}
+        await gate.release(); try await second.value
+        try await waitFor { trusted.read().flatMap { try? TrustedTVApprovals.decode($0) }?.revocations.isEmpty == true }
         let envelope = try TrustedTVApprovals.decode(XCTUnwrap(trusted.read())); XCTAssertTrue(envelope.approvals.isEmpty); XCTAssertTrue(envelope.revocations.isEmpty)
         let statuses = await service.recoveryStatuses(); XCTAssertTrue(statuses.isEmpty)
     }

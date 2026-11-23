@@ -34,7 +34,7 @@ import XCTest
         let service = try await fixture(reconcile: { _ in if armed.on { try await repairing.wait() } })
         let backend = TrustedBackendFixture(nil)
         let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
-            afterTargetInstallation: { _ in try await configured.wait() })
+            afterTargetActivation: { _ in try? await configured.wait() })
         let registration = try await authority.register(TrustedOwnerRecorder().owner(service: service))
         addTeardownBlock { registration.completion.cancel(); await configured.release(); await repairing.release() }
         try await wait { await configured.hasEntered }
@@ -54,16 +54,16 @@ import XCTest
         await configured.release(); _ = try await accepted(registration)
         XCTAssertEqual(backend.writes, 0)
     }
-    func testPublishedTargetSurvivesLaterConfigurationFailure() async throws {
+    func testUnpublishedTargetIsRemovedAfterPreparationFailure() async throws {
         let fault = ActivationSwitch(); fault.on = true
         let service = try await fixture(), backend = TrustedBackendFixture(nil)
         let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
-            afterTargetInstallation: { _ in if fault.on { throw POSIXError(.EIO) } })
+            beforeTargetActivation: { _ in if fault.on { throw POSIXError(.EIO) } })
         do { _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: service))); XCTFail("Injected installation failure ignored") }
         catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
         let local = try await service.recoverDepartureLocal()
-        XCTAssertTrue(local.completed); XCTAssertEqual(local.receipt?.authority, authority.id)
-        let retained = await authority.observation; XCTAssertEqual(retained.targets, 1)
+        XCTAssertTrue(local.completed); XCTAssertNil(local.receipt?.authority)
+        let retained = await authority.observation; XCTAssertEqual(retained.targets, 0)
         fault.on = false
         _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: service)))
         XCTAssertEqual(backend.writes, 0)

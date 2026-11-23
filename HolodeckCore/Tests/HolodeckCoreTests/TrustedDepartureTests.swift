@@ -44,6 +44,19 @@ import XCTest
         try await wait { result.value != nil }
         return try XCTUnwrap(result.value).get()
     }
+    private func heldWrite(_ services: [ShaderRequestService], backend: TrustedBackendFixture) async throws ->
+        (TrustedApprovalsCoordinator, TrustedApprovalsCoordinator.Binding, RecoveryGate, Task<TrustedApprovalsCoordinator.Approval?, Error>) {
+        let gate = RecoveryGate()
+        addTeardownBlock { await gate.release() }
+        let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) }, beforeTrustedWrite: { try await gate.wait() })
+        var binding: TrustedApprovalsCoordinator.Binding?
+        for service in services { binding = try await accept(authority.register(TrustedOwnerRecorder().owner(service: service))) }
+        let current = try XCTUnwrap(binding)
+        let blocker = Task { try await authority.approve(current.permit) { .init(record: .init(id: "B", name: "B", tokenHash: "old"), token: "old", eligibility: .init()) } }
+        addTeardownBlock { blocker.cancel(); await gate.release() }
+        try await wait { await gate.hasEntered }
+        return (authority, current, gate, blocker)
+    }
     func testKnownApprovalWritePreservesPreparedDeparture() async throws {
         let a = try await fixture(), b = try await fixture(), backend = TrustedBackendFixture(nil), old = backend.coordinator()
         _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
@@ -340,7 +353,7 @@ import XCTest
             try await wait { gate.entered }
             let revoking = Task { try await old.revoke("B", permit: binding.permit) { _ in } }
             addTeardownBlock { revoking.cancel(); gate.release(); _ = try? await revoking.value }
-            try await wait { await old.observation.queuedRevocations == 1 }
+            try await wait { (try? backend.read().map(TrustedTVApprovals.decode)?.approvals.isEmpty) == true }
             let reads = backend.reads, started = ProcessInfo.processInfo.systemUptime
             let queries = ProcessInfo.processInfo.environment["HOLODECK_TRUSTED_PROFILE"] == "1" ? 128 : 4
             for _ in 0..<queries {
@@ -348,8 +361,8 @@ import XCTest
                 XCTAssertTrue(reply.enabled)
             }
             XCTAssertEqual(backend.reads, reads)
-            XCTAssertEqual(backend.read(), bytes); XCTAssertEqual(backend.writes, 0)
-            let waiting = await old.observation; XCTAssertEqual(waiting.encodings, 0)
+            let waiting = await old.observation
+            XCTAssertFalse(ticket.completion.hasStarted)
             if queries == 128 { print("HANDOFF_PROFILE queries=\(queries) elapsed=\(ProcessInfo.processInfo.systemUptime - started) trustedWrites=\(backend.writes) encodings=\(waiting.encodings)") }
             if cancel { ticket.completion.cancel() }
             gate.release()
@@ -362,30 +375,26 @@ import XCTest
             let stored = try TrustedTVApprovals.decode(XCTUnwrap(backend.read()))
             XCTAssertTrue(stored.approvals.isEmpty); XCTAssertTrue(stored.revocations.isEmpty)
             XCTAssertEqual(backend.writes, 2)
+            try await wait { await old.observation.departures == 0 }
             let final = await old.observation; XCTAssertEqual(final.queuedRevocations, 0); XCTAssertEqual(final.departures, 0)
         }
     }
     func testDuplicateQueuedRevocationsHaveIndependentCancellationAndOneWritePair() async throws {
         let a = try await fixture(), b = try await fixture()
-        let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [ApprovedTV(id: "B", name: "B", tokenHash: "old")]).encoded()), old = backend.coordinator()
-        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a.service)))
-        let binding = try await accept(old.register(TrustedOwnerRecorder().owner(service: b.service)))
-        let nextBackend = TrustedBackendFixture(nil), gate = TrustedReadGate(); nextBackend.gateReads(gate)
-        addTeardownBlock { gate.release() }
-        let next = nextBackend.coordinator(), ticket = try await next.register(TrustedOwnerRecorder().owner(service: a.service))
-        try await wait { gate.entered }
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [.init(id: "B", name: "B", tokenHash: "old")]).encoded())
+        let (old, binding, gate, blocker) = try await heldWrite([a.service, b.service], backend: backend)
         let first = Task { try await old.revoke("B", permit: binding.permit) { _ in } }
         let cancelled = Task { try await old.revoke("B", permit: binding.permit) { _ in } }
         let second = Task { try await old.revoke("B", permit: binding.permit) { _ in } }
-        addTeardownBlock { first.cancel(); second.cancel(); cancelled.cancel(); gate.release(); _ = try? await first.value; _ = try? await second.value }
+        addTeardownBlock { first.cancel(); second.cancel(); cancelled.cancel(); await gate.release() }
         try await wait { await old.observation.queuedRevocations == 3 }
         cancelled.cancel()
         do { try await cancelled.value; XCTFail("Cancelled waiter executed") } catch is CancellationError {}
         try await wait { await old.observation.queuedRevocations == 2 }
         XCTAssertEqual(backend.writes, 0)
-        gate.release(); _ = try await accept(ticket); try await first.value; try await second.value
-        XCTAssertEqual(backend.writes, 2)
-        let final = await old.observation; XCTAssertEqual(final.encodings, 2); XCTAssertEqual(final.queuedRevocations, 0)
+        await gate.release(); _ = try await blocker.value; try await first.value; try await second.value
+        XCTAssertEqual(backend.writes, 3) // One fixture approval and one exact revocation/removal pair.
+        let final = await old.observation; XCTAssertEqual(final.encodings, 3); XCTAssertEqual(final.queuedRevocations, 0)
     }
     func testCancelledDepartureCannotClearFailedInspectionUsingCachedEnvelope() async throws {
         let a = try await fixture(), b = try await fixture(), backend = TrustedBackendFixture(nil), old = backend.coordinator()
@@ -495,7 +504,9 @@ import XCTest
         let next = backend.coordinator(), first = try await next.register(TrustedOwnerRecorder().owner(service: fixture.service))
         try await wait { gate.entered }
         let latest = try await Task(priority: .background) { try await next.register(TrustedOwnerRecorder().owner()) }.value
-        let admitted = await next.observation; XCTAssertEqual(admitted.queuedGeneration, latest.generation)
+        let admitted = await next.observation
+        XCTAssertEqual(admitted.requestedGeneration, latest.generation)
+        XCTAssertTrue([admitted.queuedGeneration, admitted.preparingGeneration, admitted.acceptedGeneration].contains(latest.generation))
         gate.release()
         guard case .superseded = try await first.value() else { return XCTFail("Older preparation activated") }
         _ = try await accept(latest)
@@ -533,41 +544,38 @@ import XCTest
         let retired = await authority.observation
         XCTAssertEqual(retired.departures, 0); XCTAssertEqual(retired.recoveryPins, 0); XCTAssertEqual(retired.recoverySubscriptions, 0)
     }
-    func testAllCancelledQueuedRevocationsLeaveApprovalsAndBytesUnchanged() async throws {
-        let fixture = try await fixture(), bytes = try TrustedTVApprovals(approvals: [ApprovedTV(id: "B", name: "B", tokenHash: "old")]).encoded()
-        let backend = TrustedBackendFixture(bytes), old = backend.coordinator()
-        let binding = try await accept(old.register(TrustedOwnerRecorder().owner(service: fixture.service)))
-        let nextBackend = TrustedBackendFixture(nil), gate = TrustedReadGate(); nextBackend.gateReads(gate)
-        addTeardownBlock { gate.release() }
-        let next = nextBackend.coordinator(), ticket = try await next.register(TrustedOwnerRecorder().owner(service: fixture.service))
-        try await wait { gate.entered }
+    func testAllCancelledQueuedRevocationsPreserveApprovalsAndAddNoWrites() async throws {
+        let fixture = try await fixture(), backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [.init(id: "B", name: "B", tokenHash: "old")]).encoded())
+        let (old, binding, gate, blocker) = try await heldWrite([fixture.service], backend: backend)
+        let retained = backend.read()
         let calls = (0..<2).map { _ in Task { try await old.revoke("B", permit: binding.permit) { _ in } } }
-        addTeardownBlock { calls.forEach { $0.cancel() }; gate.release(); for call in calls { _ = try? await call.value } }
+        addTeardownBlock { calls.forEach { $0.cancel() }; await gate.release() }
         try await wait { await old.observation.queuedRevocations == 2 }
         for call in calls { call.cancel(); do { try await call.value; XCTFail("Cancelled revocation ran") } catch is CancellationError {} }
         try await wait { await old.observation.queuedRevocations == 0 }
-        gate.release(); _ = try await accept(ticket)
-        XCTAssertEqual(backend.read(), bytes); XCTAssertEqual(backend.writes, 0)
-        let final = await old.observation; XCTAssertEqual(final.encodings, 0)
+        XCTAssertEqual(backend.read(), retained); XCTAssertEqual(backend.writes, 0)
+        await gate.release(); _ = try await blocker.value
+        XCTAssertEqual(backend.writes, 1)
+        let envelope = try TrustedTVApprovals.decode(XCTUnwrap(backend.read()))
+        XCTAssertEqual(envelope.approvals.map(\.id), ["B"]); XCTAssertTrue(envelope.revocations.isEmpty)
+        let final = await old.observation; XCTAssertEqual(final.encodings, 1)
     }
-    func testRetiredQueuedCallerEncodesNothingAfterHandoffSettles() async throws {
-        let fixture = try await fixture(), bytes = try TrustedTVApprovals(approvals: [ApprovedTV(id: "B", name: "B", tokenHash: "old")]).encoded()
-        let backend = TrustedBackendFixture(bytes), old = backend.coordinator()
-        let binding = try await accept(old.register(TrustedOwnerRecorder().owner(service: fixture.service)))
-        let nextBackend = TrustedBackendFixture(nil), gate = TrustedReadGate(); nextBackend.gateReads(gate)
-        addTeardownBlock { gate.release() }
-        let next = nextBackend.coordinator(), ticket = try await next.register(TrustedOwnerRecorder().owner(service: fixture.service))
-        try await wait { gate.entered }
+    func testRetiredQueuedCallerEncodesNothingAfterAdmissionSettles() async throws {
+        let fixture = try await fixture(), backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [.init(id: "B", name: "B", tokenHash: "old")]).encoded())
+        let (old, binding, gate, blocker) = try await heldWrite([fixture.service], backend: backend)
         let revoking = Task { try await old.revoke("B", permit: binding.permit) { _ in } }
-        addTeardownBlock { revoking.cancel(); gate.release(); _ = try? await revoking.value }
+        addTeardownBlock { revoking.cancel(); await gate.release() }
         try await wait { await old.observation.queuedRevocations == 1 }
-        _ = try await accept(old.register(TrustedOwnerRecorder().owner()))
-        gate.release()
-        _ = try await accept(ticket)
+        // Transport shutdown invalidates this permit synchronously, even while
+        // an already-admitted trusted write finishes its actual outcome.
+        binding.permit.invalidate(); binding.permit.lifetime.invalidate()
+        await gate.release(); _ = try await blocker.value
         do { try await revoking.value; XCTFail("Retired queued caller wrote approvals") }
         catch { XCTAssertTrue(error.localizedDescription.contains("replaced")) }
-        XCTAssertEqual(backend.read(), bytes); XCTAssertEqual(backend.writes, 0)
-        let final = await old.observation; XCTAssertEqual(final.encodings, 0)
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: fixture.service)))
+        XCTAssertEqual(backend.writes, 1)
+        let final = await old.observation; XCTAssertEqual(final.encodings, 1)
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
     }
     func testWaitingRevocationIsAdmittedBeforeALaterDeparture() async throws {
         let a = try await fixture(), b = try await fixture(), c = try await fixture(); try await submit(b.service)
@@ -583,7 +591,7 @@ import XCTest
         let one = try await first.register(TrustedOwnerRecorder().owner(service: a.service)); try await wait { firstGate.entered }
         let revoking = Task { try await old.revoke("B", permit: binding.permit) { _ in try await commit.wait() } }
         addTeardownBlock { revoking.cancel(); firstGate.release(); secondGate.release(); await commit.release(); _ = try? await revoking.value }
-        try await wait { await old.observation.queuedRevocations == 1 }
+        try await wait { await commit.hasEntered }
         let two = try await second.register(TrustedOwnerRecorder().owner(service: b.service))
         try await wait { (try? await b.service.control(operation: "requestStatus", payload: .init(), deviceID: "B"))?.message.contains("handoff is pending") == true }
         firstGate.release()

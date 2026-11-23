@@ -274,7 +274,9 @@ import XCTest
         try await wait { await sealing.hasEntered }
         let second = Task { try await authority.revoke("C", permit: binding.permit) { _ in } }
         addTeardownBlock { second.cancel(); await sealing.release() }
-        try await wait { backend.writes == 2 }
+        // Independent replay may already have finalized the first intent. Both
+        // credential removals must be admitted before releasing shared validation.
+        try await wait { (try? backend.read().map(TrustedTVApprovals.decode)?.approvals.isEmpty) == true }
         await sealing.release()
         try await completed { try await first.value }; try await completed { try await second.value }
         let done = await authority.observation

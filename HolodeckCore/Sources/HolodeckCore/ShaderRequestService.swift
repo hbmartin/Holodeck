@@ -432,6 +432,10 @@ public actor ShaderRequestService {
               metadataRecoveryAttempt == nil, retirementTask == nil else { return }
         startRetirementDrain(recoveryToken: nil)
     }
+    private struct ReportedRetirementFailure: LocalizedError {
+        let underlying: Error
+        var errorDescription: String? { underlying.localizedDescription }
+    }
     private func startRetirementDrain(recoveryToken: RequestPersistence.RecoveryToken?) {
         precondition(retirementTask == nil)
         retirementDrainCount += 1
@@ -442,7 +446,7 @@ public actor ShaderRequestService {
             do { try await self.drainPendingWorkers(recoveryToken: recoveryToken); result = .success(()) }
             catch { result = .failure(error) }
             self.finishRetirementTask(boundary, result: result)
-            try result.get()
+            if case .failure(let error) = result { throw ReportedRetirementFailure(underlying: error) }
         }
     }
     private var storageCommit: UUID?
@@ -575,9 +579,19 @@ public actor ShaderRequestService {
         let departure: TrustedAuthorityDeparture
     }
     private weak var trustedAuthority: TrustedApprovalsCoordinator?
+    private var pendingTrustedAuthority: UUID?
     private var authorityTransfer: UUID?
     func rememberTrustedAuthority(_ authority: TrustedApprovalsCoordinator) { trustedAuthority = authority }
     func prepareTrustedAuthority(id: UUID, preparation: TrustedRegistrationPreparation? = nil) async throws -> AuthorityTransfer? {
+        if let pendingTrustedAuthority, pendingTrustedAuthority != id {
+            throw ShaderRequestError.unavailable("An earlier TV authority inspection is unresolved. Recover that authority and explicitly register before switching approval accounts.")
+        }
+        if revocationCoordinatorID == nil {
+            // Inspection readiness is provisional; it does not install an
+            // authority or authorize restored TV jobs before the first read.
+            revocationInspectionPending = true; emitUpdates()
+            return nil
+        }
         guard let prior = revocationCoordinatorID, prior != id, let predecessor = trustedAuthority, predecessor.id != id else { return nil }
         guard authorityTransfer == nil else { throw ShaderRequestError.unavailable("A trusted authority handoff is pending; retry after it finishes.") }
         guard acceptedMetadataAvailable || loaded else { throw TrustedSetupPending() }
@@ -798,6 +812,15 @@ public actor ShaderRequestService {
             return .init(completedServices: valid.completed ? [serviceID] : [])
         }
     }
+    func failedTrustedRegistration(_ error: Error, authority: UUID,
+        recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) {
+        guard revocationCoordinatorID == nil || (trustedAuthority?.id == authority && revocationCoordinatorID != authority) else { return }
+        // Recovery routing is provisional; it grants no registration or request
+        // authorization and local repair remains unbound until activation.
+        pendingTrustedAuthority = authority
+        revocationCoordinator = recovery
+        revocationReplayFailed(ShaderRequestError.unavailable("Trusted TV approval inspection requires recovery: " + error.localizedDescription))
+    }
     private func requireLocalPreparationFinished(changingTo id: UUID) throws {
         if revocationCoordinatorID != id, let preparation = localPreparation {
             throw TrustedLocalPreparationPending(preparation: preparation)
@@ -823,15 +846,24 @@ public actor ShaderRequestService {
     func installRevocationCoordinator(authority: TrustedApprovalsCoordinator,
                                      installation: TrustedTargetInstallation? = nil,
                                      recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion,
-                                     admitActivation: @Sendable () throws -> Void) throws -> UUID {
+                                     admitActivation: @Sendable () throws -> Void,
+                                     intents: [RequestRevocationIntent]? = nil, revision: TrustedRevocationRevision? = nil) throws -> UUID {
         try requireLocalPreparationFinished(changingTo: authority.id)
         if let installation { try validateTargetInstallation(installation, authority: authority.id) }
+        if let intents, let revision {
+            guard revision.coordinator == authority.id,
+                  revocationCoordinatorID != authority.id || (revision.sequence >= revocationRevision && durableRevocations.isSubset(of: Set(intents.map(\.operationID)))) else {
+                throw ShaderRequestError.unavailable("Trusted inspection does not cover retained TV cancellation evidence. Choose Retry Recovery.")
+            }
+        }
         try admitActivation()
         let registration = bindRevocationCoordinator(id: authority.id, registration: installation?.registration, recovery)
         trustedAuthority = authority; installation?.publish()
+        if let intents, let revision { _ = try loadTrustedRevocations(intents, revision: revision) }
         return registration
     }
     private func bindRevocationCoordinator(id: UUID, registration: UUID? = nil, _ coordinator: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) -> UUID {
+        if pendingTrustedAuthority == id { pendingTrustedAuthority = nil }
         if revocationCoordinatorID == id { revocationCoordinator = coordinator; return revocationRegistration }
         revocationRegistration = registration ?? UUID(); revocationApplications.removeAll()
         controlScopes.removeAll()
@@ -1227,6 +1259,7 @@ public actor ShaderRequestService {
         } catch {
             // Retirement owns its journal-specific recovery. An operational failure
             // after decoding must never be reported as unreadable shared metadata.
+            if error is ReportedRetirementFailure { return }
             progressPersistenceFailed(error)
             if !Self.isMetadataBlocker(error), reconciliationFailure == nil {
                 startupFinalizationFailure = "Request startup finalization failed: " + RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 8192) + ". Choose Retry Recovery."
@@ -1774,7 +1807,8 @@ public actor ShaderRequestService {
             } catch {
                 await persistence.abortRecovery(token)
                 if error is MetadataIssue { publishMetadataIssue(error, file: directory.path, preferencesOnly: metadataIssue?.preferencesOnly == true) }
-                publishStorageFault(error); throw error
+                if !(error is ReportedRetirementFailure) { publishStorageFault(error) }
+                throw error
             }
         }
     }
@@ -1858,7 +1892,7 @@ public actor ShaderRequestService {
                 emitUpdates(); scheduleWakeup()
             }
         }
-        let local = try await recoverLocalPhase(consumingAuthority: replayTrusted ? revocationCoordinatorID : nil)
+        var local = try await recoverLocalPhase(consumingAuthority: replayTrusted ? revocationCoordinatorID : nil)
         try Task.checkCancellation()
         let hasTrustedPhase = replayTrusted && revocationCoordinator != nil
         var failures: [String] = [], completed: Set<UUID> = !hasTrustedPhase && local.completed ? [runtimeID] : []
@@ -1876,6 +1910,10 @@ public actor ShaderRequestService {
                     failures.append(error.localizedDescription)
                 }
             }
+        }
+        if completed.contains(runtimeID), let refreshed = localRecoveryResult,
+           refreshed.receipt?.attemptID != local.receipt?.attemptID, validateTrustedRecovery(refreshed).completed {
+            local = refreshed
         }
         // These exact old-authority routes survive replacement of the ordinary
         // coordinator callback. Each owns only its retained departure evidence.
@@ -1985,6 +2023,11 @@ public actor ShaderRequestService {
         }
         if let pass { trustedRecoveryHolds.insert(pass) }
         return outcome
+    }
+    func recoverAfterTrustedBinding(pass: UUID, authority: UUID) async throws -> TrustedLocalRecovery {
+        guard revocationCoordinatorID == authority, localRecoveryPhase == nil else { throw TrustedRecoveryInterrupted() }
+        if localRecoveryResult?.receipt?.registrationID != revocationRegistration { localRecoveryResult = nil }
+        return try await trustedRecoveryOutcome(pass: pass, authority: authority)
     }
     /// Join only the local phase, never the authority pass which is asking us.
     func trustedRecoveryOutcome(pass: UUID? = nil, authority: UUID? = nil) async throws -> TrustedLocalRecovery {
@@ -3143,10 +3186,12 @@ public actor ShaderRequestService {
     }
 
     private static func isMetadataBlocker(_ error: Error) -> Bool {
-        error is MetadataUnavailable || error is RequestPersistence.MetadataAdmission.Unavailable || error is RequestPersistence.Fault || error is RequestPersistence.ValidationError
+        if let reported = error as? ReportedRetirementFailure { return isMetadataBlocker(reported.underlying) }
+        return error is MetadataUnavailable || error is RequestPersistence.MetadataAdmission.Unavailable || error is RequestPersistence.Fault || error is RequestPersistence.ValidationError
     }
     private static func requiresCheckoutRecovery(_ error: Error) -> Bool {
-        error is RequestWorkerEvidenceError || error is RequestWorkerOwnershipError || error is RequestWorkerTeardownError || error is RequestWorkerSupervisionError
+        if let reported = error as? ReportedRetirementFailure { return requiresCheckoutRecovery(reported.underlying) }
+        return error is RequestWorkerEvidenceError || error is RequestWorkerOwnershipError || error is RequestWorkerTeardownError || error is RequestWorkerSupervisionError
     }
     private func cleanup(_ id: UUID, operation: UUID) async {
         guard let record = records[id] else { finishWorker(id); return }
@@ -3202,17 +3247,27 @@ public actor ShaderRequestService {
     }
     private func drainPendingWorkers(recoveryToken: RequestPersistence.RecoveryToken?) async throws {
         try admitMetadataMutation()
-        while !pendingRetirements.isEmpty {
-            for (id, operation) in pendingRetirements.sorted(by: { $0.key.uuidString < $1.key.uuidString }) {
+        var parked: [UUID: UUID] = [:], diagnostics: [UUID: String] = [:]
+        while true {
+            let candidates = pendingRetirements.filter { parked[$0.key] != $0.value }.sorted { $0.key.uuidString < $1.key.uuidString }
+            guard !candidates.isEmpty else { break }
+            for (id, operation) in candidates {
                 guard pendingRetirements[id] == operation else { continue }
                 guard records[id]?.dispatch?.executionID == operation || records[id]?.dispatch == nil,
                       records[id]?.executionID == nil || records[id]?.executionID == operation else {
-                    throw RequestWorkerEvidenceError(cause: "Pending retirement " + operation.uuidString + " conflicts with a newer execution for " + id.uuidString + ". Its active marker was retained.")
+                    parked[id] = operation
+                    diagnostics[id] = "Pending retirement " + operation.uuidString + " conflicts with a newer execution for " + id.uuidString + ". Its active marker was retained."
+                    continue
                 }
                 let job = folder(id)
                 if !verifiedRetirements.contains(operation) {
                     do { try await reconcileWorker(job); verifiedRetirements.insert(operation) }
-                    catch { await holdForRecovery(journal: job, configuration: records[id]?.configuration, error: error); throw error }
+                    catch {
+                        if Self.isMetadataBlocker(error) { throw error }
+                        await holdForRecovery(journal: job, configuration: records[id]?.configuration, error: error)
+                        parked[id] = operation; diagnostics[id] = error.localizedDescription
+                        continue
+                    }
                 }
                 let marker = directory.appendingPathComponent("active.json")
                 do {
@@ -3223,17 +3278,22 @@ public actor ShaderRequestService {
                         }
                     }
                 } catch {
-                    if !Self.isMetadataBlocker(error) {
-                        await holdForRecovery(journal: job, configuration: records[id]?.configuration,
-                            error: RequestWorkerEvidenceError(cause: "Cannot retire active marker at " + marker.path + ": " + error.localizedDescription))
-                    }
-                    throw error
+                    if Self.isMetadataBlocker(error) { throw error }
+                    let detail = "Cannot retire active marker at " + marker.path + ": " + error.localizedDescription
+                    await holdForRecovery(journal: job, configuration: records[id]?.configuration, error: RequestWorkerEvidenceError(cause: detail))
+                    parked[id] = operation; diagnostics[id] = detail
+                    continue
                 }
                 _ = try await appliedRecord(id, .retired(operation))
                 try await persist(recoveryToken: recoveryToken)
                 if pendingRetirements[id] == operation { pendingRetirements[id] = nil }
                 verifiedRetirements.remove(operation)
             }
+        }
+        let unresolved = diagnostics.keys.filter { pendingRetirements[$0] == parked[$0] }.sorted { $0.uuidString < $1.uuidString }
+        if !unresolved.isEmpty {
+            let details = unresolved.prefix(8).compactMap { diagnostics[$0] }.map { BoundedDiagnostics.bounded($0, bytes: 2048) }.joined(separator: "\n")
+            throw RequestWorkerEvidenceError(cause: "Unresolved worker retirement evidence:\n" + details)
         }
     }
     private func execute(_ id: UUID, operation: UUID) async {

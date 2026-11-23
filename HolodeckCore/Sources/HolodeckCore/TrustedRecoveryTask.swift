@@ -4,8 +4,8 @@ import Foundation
 struct TrustedRecoveryTaskClosed: LocalizedError, Sendable {
     var errorDescription: String? { "The cancelled recovery phase is still settling; join its successor after settlement." }
 }
-/// Independent waiters share preparation; the last cancelled waiter stops only
-/// work which has not crossed its existing noncancellable acceptance boundary.
+/// Independent waiters share preparation. The last cancellation stops unadmitted
+/// work by default; durable intent owners explicitly keep their task running.
 nonisolated final class TrustedRecoveryTask<Value: Sendable>: @unchecked Sendable {
     private let task: Task<Value, Error>
     private let lock = NSLock()
@@ -13,12 +13,13 @@ nonisolated final class TrustedRecoveryTask<Value: Sendable>: @unchecked Sendabl
     private var result: Result<Value, Error>?
     private var admissionClosed = false
     private let beforeCancellation: @Sendable () -> Void
+    private let cancelWhenEmpty: Bool
     var isCancelled: Bool { lock.withLock { admissionClosed } || task.isCancelled }
     var waiterCount: Int { lock.withLock { waiters.count } }
     /// A cancelled owner drains its admitted work without opening subscriptions.
     func settle() async { _ = await task.result }
-    init(beforeCancellation: @escaping @Sendable () -> Void = {}, _ work: @escaping @Sendable () async throws -> Value) {
-        self.beforeCancellation = beforeCancellation
+    init(cancelWhenEmpty: Bool = true, beforeCancellation: @escaping @Sendable () -> Void = {}, _ work: @escaping @Sendable () async throws -> Value) {
+        self.beforeCancellation = beforeCancellation; self.cancelWhenEmpty = cancelWhenEmpty
         task = Task { try await work() }
         // One relay per shared phase, rather than a suspended Task per waiter.
         Task { [weak self, task] in
@@ -57,13 +58,42 @@ nonisolated final class TrustedRecoveryTask<Value: Sendable>: @unchecked Sendabl
     }
     private func remove(_ id: UUID, cancelling: Bool) {
         let cancel = lock.withLock {
-            guard waiters.removeValue(forKey: id) != nil, cancelling, waiters.isEmpty else { return false }
+            guard waiters.removeValue(forKey: id) != nil, cancelling, cancelWhenEmpty, waiters.isEmpty else { return false }
             admissionClosed = true
             return true
         }
         if cancel { beforeCancellation(); task.cancel() }
     }
 }
+
+/// A blocking read has one owner and independently cancellable subscriptions.
+/// Removing its last subscriber never pretends the OS read was cancelled.
+nonisolated final class TrustedReadTask: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<Data?, Error>?
+    private var waiters: [UUID: RequestPersistence.CommitTicket<Data?>] = [:]
+    var waiterCount: Int { lock.withLock { waiters.count } }
+    init(_ read: @escaping @Sendable () throws -> Data?, completed: @escaping @Sendable () -> Void) {
+        DispatchQueue.global(qos: .utility).async { [self] in
+            let value = Result { try read() }
+            let pending = lock.withLock {
+                result = value
+                let pending = Array(waiters.values); waiters.removeAll(); return pending
+            }
+            pending.forEach { $0.complete(value) }
+            completed()
+        }
+    }
+    func value() async throws -> Data? {
+        let id = UUID(), receipt = RequestPersistence.CommitTicket<Data?>()
+        lock.withLock {
+            if let result { receipt.complete(result) } else { waiters[id] = receipt }
+        }
+        defer { lock.withLock { _ = waiters.removeValue(forKey: id) } }
+        return try await receipt.value()
+    }
+}
+struct TrustedBoundaryInterrupted: Error, Sendable {}
 
 /// Each waiter owns cancellation; completing a boundary never cancels its owner.
 nonisolated final class TrustedCompletionSignal: @unchecked Sendable {
@@ -91,6 +121,15 @@ nonisolated final class TrustedCompletionSignal: @unchecked Sendable {
 }
 /// Wait only for a boundary; cancellation never cancels its shared owner.
 nonisolated enum TrustedBoundaryWait {
+    static func value<Value: Sendable>(changes: [TrustedCompletionSignal], _ work: @escaping @Sendable () async throws -> Value) async throws -> Value {
+        try await withThrowingTaskGroup(of: Value?.self) { group in
+            group.addTask { .some(try await work()) }
+            for signal in changes { group.addTask { try await signal.wait(); return nil } }
+            defer { group.cancelAll() }
+            guard let first = try await group.next(), let result = first else { throw TrustedBoundaryInterrupted() }
+            return result
+        }
+    }
     static func run(changes: [TrustedCompletionSignal], _ work: @escaping @Sendable () async throws -> Void) async throws {
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask { try await work() }
@@ -132,14 +171,7 @@ nonisolated final class TrustedWorkerRetirement: Sendable {
     let executions: [UUID: UUID]
     let completion = TrustedCompletionSignal()
     init(_ executions: [UUID: UUID]) { self.executions = executions }
-    func wait(or changed: TrustedCompletionSignal) async throws {
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask { try await self.completion.wait() }
-            group.addTask { try await changed.wait() }
-            defer { group.cancelAll() }
-            _ = try await group.next()
-        }
-    }
+
 }
 struct TrustedWorkerRetirementPending: LocalizedError, Sendable {
     let retirement: TrustedWorkerRetirement
