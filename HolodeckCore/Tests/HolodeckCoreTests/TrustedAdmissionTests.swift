@@ -43,7 +43,10 @@ import XCTest
         let latestSecond = try await second.register(TrustedOwnerRecorder().owner())
         addTeardownBlock { [movingA, movingB, latestFirst, latestSecond].forEach { $0.completion.cancel() } }
         let heldFirst = await first.observation, heldSecond = await second.observation
-        XCTAssertEqual(heldFirst.queuedGeneration, latestFirst.generation); XCTAssertEqual(heldSecond.queuedGeneration, latestSecond.generation)
+        XCTAssertEqual(heldFirst.requestedGeneration, latestFirst.generation)
+        XCTAssertEqual(heldSecond.requestedGeneration, latestSecond.generation)
+        XCTAssertTrue([heldFirst.queuedGeneration, heldFirst.preparingGeneration, heldFirst.acceptedGeneration].contains(latestFirst.generation))
+        XCTAssertTrue([heldSecond.queuedGeneration, heldSecond.preparingGeneration, heldSecond.acceptedGeneration].contains(latestSecond.generation))
         XCTAssertLessThanOrEqual(heldFirst.departures, 1); XCTAssertLessThanOrEqual(heldSecond.departures, 1)
         let result = AdmissionResult()
         let completion = Task {
@@ -92,7 +95,10 @@ import XCTest
         try await wait { await firstReservation.hasEntered }
         try await wait { await secondReservation.hasEntered }
         let heldFirst = await first.observation, heldSecond = await second.observation
-        XCTAssertEqual(heldFirst.queuedGeneration, latestFirst.generation); XCTAssertEqual(heldSecond.queuedGeneration, latestSecond.generation)
+        XCTAssertEqual(heldFirst.requestedGeneration, latestFirst.generation)
+        XCTAssertEqual(heldSecond.requestedGeneration, latestSecond.generation)
+        XCTAssertTrue([heldFirst.queuedGeneration, heldFirst.preparingGeneration, heldFirst.acceptedGeneration].contains(latestFirst.generation))
+        XCTAssertTrue([heldSecond.queuedGeneration, heldSecond.preparingGeneration, heldSecond.acceptedGeneration].contains(latestSecond.generation))
         XCTAssertEqual(firstBackend.writes, 0); XCTAssertEqual(secondBackend.writes, 0)
         let result = AdmissionResult()
         let completion = Task {

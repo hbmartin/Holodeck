@@ -269,14 +269,15 @@ private final class LifecycleClientSecrets: @unchecked Sendable {
     }
     func testAdmittedApprovalRetainsBytesWhenDeliveryBecomesImpossible() async throws {
         for ending in ["close", "expire", "decline", "retire"] {
-            let fixture = try await fixture(), backend = TrustedBackendFixture(nil), gate = TrustedWriteGate(), clock = TestClock()
-            let authority = TrustedApprovalsCoordinator(read: { backend.read() }, write: { _ = gate.wait(); try backend.write($0) })
+            let fixture = try await fixture(), backend = TrustedBackendFixture(nil), gate = RecoveryGate(), clock = TestClock()
+            let authority = TrustedApprovalsCoordinator(read: { backend.read() }, write: { try backend.write($0) },
+                beforeTrustedWrite: { try await gate.wait() })
             let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "pair-outcome-" + UUID().uuidString, clock: clock, trustedApprovals: authority)
-            addTeardownBlock { gate.release(); try await server.clearTestSecrets() }
+            addTeardownBlock { await gate.release(); try await server.clearTestSecrets() }
             try await server.start(); let client = try await tls(server), device = UUID().uuidString
             let proposal = try await pair(server, client: client, device: device)
-            gate.arm(); let approval = Task { try await server.approve(proposal.id) }
-            try await wait { gate.entered }
+            let approval = Task { try await server.approve(proposal.id) }
+            try await wait { await gate.hasEntered }
             switch ending {
             case "close": client.cancel(); try await wait { await server.sessionCount == 0 }
             case "expire": await clock.advance(by: .seconds(301)); try await wait { await server.sessionCount == 0 }
@@ -286,9 +287,9 @@ private final class LifecycleClientSecrets: @unchecked Sendable {
                 // Registration waits for the admitted write. Final teardown invalidates delivery immediately.
                 let shutdown = Task { await server.shutdown() }
                 try await wait { await server.sessionCount == 0 }
-                gate.release(); await shutdown.value; try await accept(replacement)
+                await gate.release(); await shutdown.value; try await accept(replacement)
             }
-            gate.release()
+            await gate.release()
             do { try await approval.value; XCTFail("Committed undeliverable approval reported success: \(ending)") }
             catch is CommittedApprovalDeliveryError {} catch { XCTFail("Incorrect approval outcome: \(error)") }
             let stored = try TrustedTVApprovals.decode(XCTUnwrap(backend.read()))

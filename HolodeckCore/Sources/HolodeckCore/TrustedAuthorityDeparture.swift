@@ -1,8 +1,9 @@
 #if os(macOS)
 import Foundation
 
-struct TrustedDepartureInspectionPending: Error, Sendable {
+struct TrustedDepartureInspectionPending: LocalizedError, Sendable {
     let departure: TrustedAuthorityDeparture
+    var errorDescription: String? { "Trusted approval inspection is still running; authority registration waits for its result." }
 }
 /// Bridges authority actors without holding either lane while inspection waits.
 nonisolated final class TrustedAuthorityDeparture: @unchecked Sendable {

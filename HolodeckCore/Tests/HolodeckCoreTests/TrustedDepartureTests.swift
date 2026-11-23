@@ -609,14 +609,18 @@ import XCTest
         try await wait { await replay.hasEntered }
         let latestNext = try await next.register(TrustedOwnerRecorder().owner())
         addTeardownBlock { latestNext.completion.cancel() }
-        let nextQueue = await next.observation; XCTAssertEqual(nextQueue.queuedGeneration, latestNext.generation)
+        let nextQueue = await next.observation
+        XCTAssertEqual(nextQueue.requestedGeneration, latestNext.generation)
+        XCTAssertTrue([nextQueue.queuedGeneration, nextQueue.preparingGeneration, nextQueue.acceptedGeneration].contains(latestNext.generation))
         oldBackend.gateReads(read)
         let movingB = try await old.register(TrustedOwnerRecorder().owner(service: b.service))
         addTeardownBlock { movingB.completion.cancel(); read.release(); await replay.release() }
         try await wait { read.entered } // B's preparation passed the pending replacement on its source authority.
         let latestOld = try await old.register(TrustedOwnerRecorder().owner())
         addTeardownBlock { latestOld.completion.cancel() }
-        let oldQueue = await old.observation; XCTAssertEqual(oldQueue.queuedGeneration, latestOld.generation)
+        let oldQueue = await old.observation
+        XCTAssertEqual(oldQueue.requestedGeneration, latestOld.generation)
+        XCTAssertTrue([oldQueue.queuedGeneration, oldQueue.preparingGeneration, oldQueue.acceptedGeneration].contains(latestOld.generation))
         XCTAssertEqual(oldQueue.acceptedGeneration, oldBinding.permit.generation)
         let heldNext = await next.observation; XCTAssertTrue([nextBinding.permit.generation, latestNext.generation].contains(heldNext.acceptedGeneration ?? 0))
         let backstop = Task {

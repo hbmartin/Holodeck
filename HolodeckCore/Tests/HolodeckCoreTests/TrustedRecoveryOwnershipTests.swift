@@ -117,6 +117,22 @@ import XCTest
         armed.on = false; await gate.release(); try await completed { try await recovery.value }
         try await wait { await old.observation.departures == 0 }
     }
+    func testWithdrawalPreventsInitialAndSameAuthorityAdmission() async throws {
+        for initial in [true, false] {
+            let a = try await fixture(), gate = RecoveryGate(), armed = RecoveryOwnershipSwitch(), backend = TrustedBackendFixture(nil)
+            addTeardownBlock { await gate.release() }
+            let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
+                beforeAuthorityPreparation: { _ in if armed.on { try await gate.wait() } })
+            if !initial { _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a))) }
+            armed.on = true
+            let owner = TrustedOwnerRecorder().owner(service: a), registration = try await authority.register(owner)
+            addTeardownBlock { registration.completion.cancel(); await gate.release() }
+            try await wait { await gate.hasEntered }
+            await authority.withdraw(serverID: owner.serverID, eligibility: owner.eligibility)
+            armed.on = false; await gate.release()
+            guard case .superseded = try await completed({ try await registration.value() }) else { return XCTFail("Withdrawn candidate accepted") }
+        }
+    }
     func testInitialBindingAlsoWaitsForUnboundLocalPreparation() async throws {
         let armed = RecoveryOwnershipSwitch(), repairing = RecoveryGate()
         addTeardownBlock { await repairing.release() }

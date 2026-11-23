@@ -752,13 +752,13 @@ public actor ShaderRequestService {
                                  coordinator: @escaping @Sendable (TrustedLocalRecovery) async throws -> Void,
                                  authority: TrustedApprovalsCoordinator? = nil) throws -> (UUID, TrustedRevocationInspection) {
         try installTrustedAuthority(transfer, id: id, intents: intents, revision: revision,
-            completion: validatedRecoveryCompletion(coordinator), authority: authority)
+            completion: validatedRecoveryCompletion(coordinator), authority: authority, admitActivation: {})
     }
     func installTrustedAuthority(_ transfer: AuthorityTransfer, id: UUID, intents: [RequestRevocationIntent], revision: TrustedRevocationRevision,
                                  completion: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion,
                                  authority: TrustedApprovalsCoordinator? = nil,
                                  installation: TrustedTargetInstallation? = nil,
-                                 admitActivation: @Sendable () throws -> Void = {}) throws -> (UUID, TrustedRevocationInspection) {
+                                 admitActivation: @Sendable () throws -> Void) throws -> (UUID, TrustedRevocationInspection) {
         try requireLocalPreparationFinished(changingTo: id)
         if let installation { try validateTargetInstallation(installation, authority: id) }
         return try transfer.departure.activate {
@@ -814,11 +814,19 @@ public actor ShaderRequestService {
             throw ShaderRequestError.unavailable("The request-service registration changed before binding installation; explicitly retry registration.")
         }
     }
+    // Compatibility callers do not own a transport registration ticket.
     func installRevocationCoordinator(authority: TrustedApprovalsCoordinator,
                                      installation: TrustedTargetInstallation? = nil,
                                      recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) throws -> UUID {
+        try installRevocationCoordinator(authority: authority, installation: installation, recovery: recovery, admitActivation: {})
+    }
+    func installRevocationCoordinator(authority: TrustedApprovalsCoordinator,
+                                     installation: TrustedTargetInstallation? = nil,
+                                     recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion,
+                                     admitActivation: @Sendable () throws -> Void) throws -> UUID {
         try requireLocalPreparationFinished(changingTo: authority.id)
         if let installation { try validateTargetInstallation(installation, authority: authority.id) }
+        try admitActivation()
         let registration = bindRevocationCoordinator(id: authority.id, registration: installation?.registration, recovery)
         trustedAuthority = authority; installation?.publish()
         return registration

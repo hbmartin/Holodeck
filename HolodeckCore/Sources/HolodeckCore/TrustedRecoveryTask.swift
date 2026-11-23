@@ -121,7 +121,10 @@ nonisolated final class TrustedLocalPreparation: Sendable {
     func wait(cancellable: Bool = true) async throws { try await completion.wait(cancellable: cancellable) }
     func finish() { completion.finish() }
 }
-struct TrustedLocalPreparationPending: Error, Sendable { let preparation: TrustedLocalPreparation }
+struct TrustedLocalPreparationPending: LocalizedError, Sendable {
+    let preparation: TrustedLocalPreparation
+    var errorDescription: String? { "Local metadata repair is still running; authority registration waits for that preparation to finish." }
+}
 
 /// A retirement batch is verified before it becomes an activation wait.
 nonisolated final class TrustedWorkerRetirement: Sendable {
@@ -138,8 +141,13 @@ nonisolated final class TrustedWorkerRetirement: Sendable {
         }
     }
 }
-struct TrustedWorkerRetirementPending: Error, Sendable { let retirement: TrustedWorkerRetirement }
-struct TrustedRegistrationSuperseded: Error, Sendable {}
+struct TrustedWorkerRetirementPending: LocalizedError, Sendable {
+    let retirement: TrustedWorkerRetirement
+    var errorDescription: String? { "Verified worker settlement is awaiting metadata retirement; authority registration waits for that save to finish." }
+}
+struct TrustedRegistrationSuperseded: LocalizedError, Sendable {
+    var errorDescription: String? { "This authority registration was superseded or withdrawn before activation." }
+}
 /// Supersession and the first binding mutation have one synchronous ordering point.
 nonisolated final class TrustedRegistrationPreparation: @unchecked Sendable {
     private let lock = NSLock()

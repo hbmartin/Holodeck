@@ -260,6 +260,27 @@ import XCTest
         try await f.service.retryReconciliation()
         let done = await authority.observation; XCTAssertEqual(done.obligations, 0); XCTAssertEqual(done.pendingLocalOutcomes, 0)
     }
+    func testLaterRevocationsJoinTheSameAutomaticValidation() async throws {
+        let f = try await fixture(), hold = UUID(), sealing = RecoveryGate()
+        addTeardownBlock { await sealing.release() }
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: ["B", "C"].map { .init(id: $0, name: $0, tokenHash: "old") }).encoded())
+        let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
+            beforeRecoverySealing: { try await sealing.wait() })
+        let binding = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: f.service)))
+        _ = try await f.service.trustedRecoveryOutcome(pass: hold, authority: authority.id)
+        await f.service.finishTrustedRecovery(pass: hold)
+        let first = Task { try await authority.revoke("B", permit: binding.permit) { _ in } }
+        addTeardownBlock { first.cancel(); await sealing.release() }
+        try await wait { await sealing.hasEntered }
+        let second = Task { try await authority.revoke("C", permit: binding.permit) { _ in } }
+        addTeardownBlock { second.cancel(); await sealing.release() }
+        try await wait { backend.writes == 2 }
+        await sealing.release()
+        try await completed { try await first.value }; try await completed { try await second.value }
+        let done = await authority.observation
+        XCTAssertEqual(done.recoveryPasses, 1); XCTAssertEqual(done.obligations, 0)
+        XCTAssertEqual(backend.writes, 4)
+    }
     func testLaterRevocationsRemainCoveredByPendingLocalOutcome() async throws {
         let f = try await fixture(), fail = RetirementSwitch(); fail.on = true
         let first = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
