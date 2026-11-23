@@ -432,6 +432,10 @@ public actor ShaderRequestService {
               metadataRecoveryAttempt == nil, retirementTask == nil else { return }
         startRetirementDrain(recoveryToken: nil)
     }
+    private struct ReportedRetirementFailure: LocalizedError {
+        let underlying: Error
+        var errorDescription: String? { underlying.localizedDescription }
+    }
     private func startRetirementDrain(recoveryToken: RequestPersistence.RecoveryToken?) {
         precondition(retirementTask == nil)
         retirementDrainCount += 1
@@ -442,7 +446,7 @@ public actor ShaderRequestService {
             do { try await self.drainPendingWorkers(recoveryToken: recoveryToken); result = .success(()) }
             catch { result = .failure(error) }
             self.finishRetirementTask(boundary, result: result)
-            try result.get()
+            if case .failure(let error) = result { throw ReportedRetirementFailure(underlying: error) }
         }
     }
     private var storageCommit: UUID?
@@ -1243,6 +1247,7 @@ public actor ShaderRequestService {
         } catch {
             // Retirement owns its journal-specific recovery. An operational failure
             // after decoding must never be reported as unreadable shared metadata.
+            if error is ReportedRetirementFailure { return }
             progressPersistenceFailed(error)
             if !Self.isMetadataBlocker(error), reconciliationFailure == nil {
                 startupFinalizationFailure = "Request startup finalization failed: " + RequestRecoveryStore.Entry.bounded(error.localizedDescription, bytes: 8192) + ". Choose Retry Recovery."
@@ -1790,7 +1795,8 @@ public actor ShaderRequestService {
             } catch {
                 await persistence.abortRecovery(token)
                 if error is MetadataIssue { publishMetadataIssue(error, file: directory.path, preferencesOnly: metadataIssue?.preferencesOnly == true) }
-                publishStorageFault(error); throw error
+                if !(error is ReportedRetirementFailure) { publishStorageFault(error) }
+                throw error
             }
         }
     }
@@ -3159,10 +3165,12 @@ public actor ShaderRequestService {
     }
 
     private static func isMetadataBlocker(_ error: Error) -> Bool {
-        error is MetadataUnavailable || error is RequestPersistence.MetadataAdmission.Unavailable || error is RequestPersistence.Fault || error is RequestPersistence.ValidationError
+        if let reported = error as? ReportedRetirementFailure { return isMetadataBlocker(reported.underlying) }
+        return error is MetadataUnavailable || error is RequestPersistence.MetadataAdmission.Unavailable || error is RequestPersistence.Fault || error is RequestPersistence.ValidationError
     }
     private static func requiresCheckoutRecovery(_ error: Error) -> Bool {
-        error is RequestWorkerEvidenceError || error is RequestWorkerOwnershipError || error is RequestWorkerTeardownError || error is RequestWorkerSupervisionError
+        if let reported = error as? ReportedRetirementFailure { return requiresCheckoutRecovery(reported.underlying) }
+        return error is RequestWorkerEvidenceError || error is RequestWorkerOwnershipError || error is RequestWorkerTeardownError || error is RequestWorkerSupervisionError
     }
     private func cleanup(_ id: UUID, operation: UUID) async {
         guard let record = records[id] else { finishWorker(id); return }
@@ -3218,17 +3226,27 @@ public actor ShaderRequestService {
     }
     private func drainPendingWorkers(recoveryToken: RequestPersistence.RecoveryToken?) async throws {
         try admitMetadataMutation()
-        while !pendingRetirements.isEmpty {
-            for (id, operation) in pendingRetirements.sorted(by: { $0.key.uuidString < $1.key.uuidString }) {
+        var parked: [UUID: UUID] = [:], diagnostics: [UUID: String] = [:]
+        while true {
+            let candidates = pendingRetirements.filter { parked[$0.key] != $0.value }.sorted { $0.key.uuidString < $1.key.uuidString }
+            guard !candidates.isEmpty else { break }
+            for (id, operation) in candidates {
                 guard pendingRetirements[id] == operation else { continue }
                 guard records[id]?.dispatch?.executionID == operation || records[id]?.dispatch == nil,
                       records[id]?.executionID == nil || records[id]?.executionID == operation else {
-                    throw RequestWorkerEvidenceError(cause: "Pending retirement " + operation.uuidString + " conflicts with a newer execution for " + id.uuidString + ". Its active marker was retained.")
+                    parked[id] = operation
+                    diagnostics[id] = "Pending retirement " + operation.uuidString + " conflicts with a newer execution for " + id.uuidString + ". Its active marker was retained."
+                    continue
                 }
                 let job = folder(id)
                 if !verifiedRetirements.contains(operation) {
                     do { try await reconcileWorker(job); verifiedRetirements.insert(operation) }
-                    catch { await holdForRecovery(journal: job, configuration: records[id]?.configuration, error: error); throw error }
+                    catch {
+                        if Self.isMetadataBlocker(error) { throw error }
+                        await holdForRecovery(journal: job, configuration: records[id]?.configuration, error: error)
+                        parked[id] = operation; diagnostics[id] = error.localizedDescription
+                        continue
+                    }
                 }
                 let marker = directory.appendingPathComponent("active.json")
                 do {
@@ -3239,17 +3257,22 @@ public actor ShaderRequestService {
                         }
                     }
                 } catch {
-                    if !Self.isMetadataBlocker(error) {
-                        await holdForRecovery(journal: job, configuration: records[id]?.configuration,
-                            error: RequestWorkerEvidenceError(cause: "Cannot retire active marker at " + marker.path + ": " + error.localizedDescription))
-                    }
-                    throw error
+                    if Self.isMetadataBlocker(error) { throw error }
+                    let detail = "Cannot retire active marker at " + marker.path + ": " + error.localizedDescription
+                    await holdForRecovery(journal: job, configuration: records[id]?.configuration, error: RequestWorkerEvidenceError(cause: detail))
+                    parked[id] = operation; diagnostics[id] = detail
+                    continue
                 }
                 _ = try await appliedRecord(id, .retired(operation))
                 try await persist(recoveryToken: recoveryToken)
                 if pendingRetirements[id] == operation { pendingRetirements[id] = nil }
                 verifiedRetirements.remove(operation)
             }
+        }
+        let unresolved = diagnostics.keys.filter { pendingRetirements[$0] == parked[$0] }.sorted { $0.uuidString < $1.uuidString }
+        if !unresolved.isEmpty {
+            let details = unresolved.prefix(8).compactMap { diagnostics[$0] }.map { BoundedDiagnostics.bounded($0, bytes: 2048) }.joined(separator: "\n")
+            throw RequestWorkerEvidenceError(cause: "Unresolved worker retirement evidence:\n" + details)
         }
     }
     private func execute(_ id: UUID, operation: UUID) async {

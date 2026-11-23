@@ -4,10 +4,10 @@ import XCTest
 @testable import HolodeckCore
 
 @MainActor final class TrustedInspectionAdmissionTests: XCTestCase {
-    private func fixture() async throws -> ShaderRequestService {
+    private func fixture(reconcile: @escaping @Sendable (URL) async throws -> Void = { _ in }) async throws -> ShaderRequestService {
         let root = URL(fileURLWithPath: "/private/tmp/pr55-inspection-" + UUID().uuidString)
         let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")),
-            directory: root, workerScript: root.appendingPathComponent("unused.py"), reconcileWorker: { _ in })
+            directory: root, workerScript: root.appendingPathComponent("unused.py"), reconcileWorker: reconcile)
         await service.suspend(); try await service.initialize(configuration: .init(repository: root.path, enabled: true))
         addTeardownBlock { await service.suspend(); try? FileManager.default.removeItem(at: root) }
         return service
@@ -88,6 +88,45 @@ import XCTest
         _ = try await accepted(proposal)
         XCTAssertEqual(source.writes, 2)
     }
+    func testSupersessionDuringYieldCleanupRemainsTypedSupersession() async throws {
+        let local = RecoveryGate(), inspection = RecoveryGate(), latestPreparation = RecoveryGate()
+        let repairing = InspectionSwitch(), inspecting = InspectionSwitch(), latestWaiting = InspectionSwitch()
+        addTeardownBlock { await local.release(); await inspection.release(); await latestPreparation.release() }
+        let service = try await fixture(reconcile: { _ in if repairing.on { try await local.wait() } })
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [.init(id: "TV", name: "TV", tokenHash: "old")]).encoded())
+        let old = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) }, beforeTargetInspection: { _ in
+            if inspecting.on { try await inspection.wait() }
+        })
+        let destination = TrustedBackendFixture(nil)
+        let next = TrustedApprovalsCoordinator(read: { try destination.checkedRead() }, write: { try destination.write($0) }, beforeAuthorityPreparation: { _ in
+            if latestWaiting.on { try await latestPreparation.wait() }
+        })
+        let binding = try await accepted(old.register(TrustedOwnerRecorder().owner(service: service)))
+        repairing.on = true
+        let repair = Task { try await service.trustedRecoveryOutcome() }
+        addTeardownBlock { repair.cancel(); await local.release() }
+        try await wait { await local.hasEntered }
+        let ticket = try await next.register(TrustedOwnerRecorder().owner(service: service))
+        addTeardownBlock { ticket.completion.cancel() }
+        try await wait { await service.localPreparationWaiters > 0 }
+        inspecting.on = true
+        let revoke = Task { try await old.revoke("TV", permit: binding.permit) { _ in } }
+        addTeardownBlock { revoke.cancel(); await inspection.release() }
+        try await wait { await inspection.hasEntered }
+        latestWaiting.on = true
+        let newest = try await next.register(TrustedOwnerRecorder().owner(service: service))
+        addTeardownBlock { newest.completion.cancel() }
+        inspecting.on = false; await inspection.release(); repairing.on = false; await local.release()
+        _ = try await repair.value
+        guard case .superseded = try await ticket.value() else { return XCTFail("Yielded candidate did not resolve as superseded") }
+        do { try await revoke.value }
+        catch { XCTAssertTrue(error.localizedDescription.contains("Target local recovery is still preparing")) }
+        // The separately gated local phase can outlive the revocation caller.
+        // Finish its remaining replay before admitting the newest preparation.
+        try await old.replay()
+        latestWaiting.on = false; await latestPreparation.release()
+        _ = try await accepted(newest)
+    }
     func testCancelledReadDoesNotPublishAndNewestRegistrationSharesRawFlight() async throws {
         let service = try await fixture(), backend = TrustedBackendFixture(nil), authority = backend.coordinator(), gate = TrustedReadGate()
         addTeardownBlock { gate.release() }
@@ -110,4 +149,8 @@ import XCTest
     }
 }
 @MainActor private final class InspectionResult<Value: Sendable> { var value: Result<Value, Error>? }
+private final class InspectionSwitch: @unchecked Sendable {
+    private let lock = NSLock(); private var value = false
+    var on: Bool { get { lock.withLock { value } } set { lock.withLock { value = newValue } } }
+}
 #endif

@@ -1346,8 +1346,8 @@ actor TrustedApprovalsCoordinator {
                         guard request.owner.eligibility.isCurrent else { throw CancellationError() }
                         if request.registration.generation == generation { pending = request }
                         else { request.registration.completion.complete(.success(.superseded)) }
-                    } catch { request.registration.completion.complete(.failure(error)) }
-                } else if error is RegistrationAbandoned || error is TrustedRegistrationSuperseded { request.registration.completion.complete(.success(.superseded)) }
+                    } catch { completeRegistration(request, error: error) }
+                } else if error is RegistrationAbandoned || error is TrustedRegistrationSuperseded { completeRegistration(request, error: error) }
                 else {
                     if let recovery = error as? TrustedDepartureRecoveryError, let target = request.owner.service {
                         await attachDepartureRecovery(ticket: recovery.diagnosticID, to: target)
@@ -1368,6 +1368,11 @@ actor TrustedApprovalsCoordinator {
             preparing = nil; preparingRegistration = nil; release(token)
         }
         registrationTask = nil
+    }
+    private func completeRegistration(_ request: Request, error: Error) {
+        if error is RegistrationAbandoned || error is TrustedRegistrationSuperseded {
+            request.registration.completion.complete(.success(.superseded))
+        } else { request.registration.completion.complete(.failure(error)) }
     }
     func withdraw(serverID: UUID, eligibility: TrustedOwnerLifetime) async {
         if preparingRegistration?.server == serverID, preparingRegistration?.lifetime === eligibility { preparingRegistration?.preparation.supersede() }
