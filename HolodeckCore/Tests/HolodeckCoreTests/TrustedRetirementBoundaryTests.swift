@@ -126,6 +126,72 @@ import XCTest
         let refreshed = await f.service.departureRetirementAssessment(); let second = try XCTUnwrap(refreshed)
         XCTAssertFalse(receipt === second); XCTAssertTrue(second.isCurrent)
     }
+    func testIndependentTicketReceiptsShareOnlyOwnershipInvalidation() async throws {
+        let armed = RetirementSwitch()
+        let f = try await fixture(beforeWrite: { if armed.on && $0.lastPathComponent == "preferences.json" { throw POSIXError(.EIO) } })
+        try await f.service.retryReconciliation()
+        let authority = UUID(), firstTicket = UUID(), secondTicket = UUID()
+        let captureda = await f.service.departureRetirementAssessment(authority: authority, ticket: firstTicket)
+        let a = try XCTUnwrap(captureda)
+        let capturedb = await f.service.departureRetirementAssessment(authority: authority, ticket: secondTicket)
+        let b = try XCTUnwrap(capturedb)
+        XCTAssertTrue(a.ownership === b.ownership)
+        XCTAssertTrue(a.admit()); XCTAssertTrue(b.admit()); XCTAssertFalse(a.admit())
+        let wrong = await f.service.validateDepartureRetirement(b, authority: authority, ticket: firstTicket)
+        XCTAssertFalse(wrong)
+        let capturedc = await f.service.departureRetirementAssessment(authority: authority, ticket: UUID())
+        let c = try XCTUnwrap(capturedc)
+        let capturedd = await f.service.departureRetirementAssessment(authority: UUID(), ticket: UUID())
+        let d = try XCTUnwrap(capturedd)
+        armed.on = true
+        do { try await f.service.disable(); XCTFail("Fault ignored") } catch is RequestPersistence.Fault {}
+        XCTAssertFalse(c.admit()); XCTAssertFalse(d.admit())
+    }
+    func testTwoExceptionalAuthoritiesRetireIndependentTickets() async throws {
+        let f = try await fixture(), admission = RetirementSettlementGate()
+        addTeardownBlock { await admission.release() }
+        let one = TrustedBackendFixture(nil), two = TrustedBackendFixture(nil)
+        let a = TrustedApprovalsCoordinator(read: { try one.checkedRead() }, write: { try one.write($0) },
+            beforeDepartureRetirementAdmission: { _ in await admission.wait() })
+        let b = TrustedApprovalsCoordinator(read: { try two.checkedRead() }, write: { try two.write($0) },
+            beforeDepartureRetirementAdmission: { _ in await admission.wait() })
+        _ = try await accepted(a.register(TrustedOwnerRecorder().owner(service: f.service)))
+        let da = try await exceptional(f, authority: a)
+        // Explicit invariant injection retains two old authorities. This does
+        // not establish a normal producer of either exceptional departure.
+        _ = await f.service.registerRevocationCoordinator(id: b.id, recovery: { _ in })
+        _ = try await accepted(b.register(TrustedOwnerRecorder().owner(service: f.service)))
+        let db = try await exceptional(f, authority: b)
+        let first = Task { try await a.recoverDeparture(serviceID: f.service.runtimeID, ticket: da.id) }
+        let second = Task { try await b.recoverDeparture(serviceID: f.service.runtimeID, ticket: db.id) }
+        addTeardownBlock { first.cancel(); second.cancel(); await admission.release() }
+        try await wait { await admission.entries == 2 }
+        await admission.release()
+        try await completed { try await first.value }; try await completed { try await second.value }
+        let oldA = await a.observation, oldB = await b.observation
+        XCTAssertEqual(oldA.targets, 0); XCTAssertEqual(oldB.targets, 0)
+        XCTAssertEqual(oldA.recoverySubscriptions, 0); XCTAssertEqual(oldB.recoverySubscriptions, 0)
+    }
+    func testSameDepartureCallersShareOneAdmission() async throws {
+        let f = try await fixture(), admission = RetirementSettlementGate()
+        addTeardownBlock { await admission.release() }
+        let backend = TrustedBackendFixture(nil)
+        let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
+            beforeDepartureRetirementAdmission: { _ in await admission.wait() })
+        _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: f.service)))
+        let departure = try await exceptional(f, authority: authority)
+        let first = Task { try await authority.recoverDeparture(serviceID: f.service.runtimeID, ticket: departure.id) }
+        addTeardownBlock { first.cancel(); await admission.release() }
+        try await wait { await admission.entered }
+        let second = Task { try await authority.recoverDeparture(serviceID: f.service.runtimeID, ticket: departure.id) }
+        addTeardownBlock { second.cancel(); await admission.release() }
+        try await wait { await authority.observation.departureRecoveryParticipants == 2 }
+        await admission.release()
+        try await completed { try await first.value }; try await completed { try await second.value }
+        let count = await admission.entries; XCTAssertEqual(count, 1)
+        try await authority.recoverDeparture(serviceID: f.service.runtimeID, ticket: departure.id)
+        let after = await admission.entries; XCTAssertEqual(after, 1)
+    }
     func testUnrelatedTrustedRecoveryWaitsForRetainedSettlement() async throws {
         let fault = RetirementSwitch(), armed = RetirementSwitch(), settling = RetirementSettlementGate()
         addTeardownBlock { await settling.release() }
@@ -155,6 +221,38 @@ import XCTest
         try await wait { result.value != nil }; try XCTUnwrap(result.value).get()
         let done = await authority.observation
         XCTAssertEqual(done.departureRecoveryParticipants, 0); XCTAssertEqual(done.departureRecoverySuccessors, 0)
+    }
+    func testLaterRevocationsRemainCoveredByPendingLocalOutcome() async throws {
+        let f = try await fixture(), fail = RetirementSwitch(); fail.on = true
+        let first = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [
+            .init(id: "B", name: "B", tokenHash: "B"), .init(id: "C", name: "C", tokenHash: "C")], revocations: [first]).encoded())
+        let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
+            beforeRemovalFinalization: { intent, _ in if intent == first.operationID && fail.on { throw POSIXError(.EIO) } })
+        let binding = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: f.service)))
+        // Construct retained committed-removal evidence explicitly; this test
+        // does not claim a normal producer of exceptional finalization failure.
+        do { try await authority.replay(); XCTFail("Injected finalization failure ignored") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        let hold = UUID()
+        addTeardownBlock { await f.service.finishTrustedRecovery(pass: hold) }
+        let local = try await f.service.trustedRecoveryOutcome(pass: hold, authority: authority.id)
+        XCTAssertTrue(local.completed)
+        fail.on = false
+        for (index, device) in ["B", "C"].enumerated() {
+            do { try await authority.revoke(device, permit: binding.permit, beforeCommit: { _ in }); XCTFail("Unaccepted local outcome lost its fence") }
+            catch { XCTAssertTrue(error.localizedDescription.contains("awaiting its trusted pass admission")) }
+            let current = await authority.observation
+            XCTAssertEqual(current.pendingLocalOutcomes, 1); XCTAssertEqual(current.obligations, index + 1)
+            XCTAssertEqual(current.recoveryPasses, 0)
+            let bytes = try XCTUnwrap(backend.read())
+            XCTAssertEqual(Set(try TrustedTVApprovals.decode(bytes).revocations.map(\.deviceID)), Set(["B", "C"].prefix(index + 1)))
+        }
+        try await f.service.retryReconciliation()
+        let done = await authority.observation
+        XCTAssertEqual(done.pendingLocalOutcomes, 0); XCTAssertEqual(done.obligations, 0)
+        XCTAssertEqual(done.applicationRecoveryTargets, 0)
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
     }
     func testCommittedRemovalPrunesOnlyItsPendingOutcomeObligation() async throws {
         for anotherIntent in [false, true] {
@@ -211,9 +309,10 @@ private final class RetirementSwitch: @unchecked Sendable {
 }
 private actor RetirementSettlementGate {
     private(set) var entered = false
+    private(set) var entries = 0
     private var open = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
-    func wait() async { entered = true; if !open { await withCheckedContinuation { waiters.append($0) } } }
+    func wait() async { entries += 1; entered = true; if !open { await withCheckedContinuation { waiters.append($0) } } }
     func release() { open = true; let pending = waiters; waiters.removeAll(); pending.forEach { $0.resume() } }
 }
 #endif

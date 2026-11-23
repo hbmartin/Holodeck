@@ -59,6 +59,8 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
         private var continuation: CheckedContinuation<Value, Error>?
         private var cancelled = false, committing = false, finished = false
         private var result: Result<Value, Error>?
+        private let onCancellation: (@Sendable () -> Void)?
+        init(onCancellation: (@Sendable () -> Void)? = nil) { self.onCancellation = onCancellation }
         func value(cancellable: Bool = true) async throws -> Value {
             if !cancellable { return try await withCheckedThrowingContinuation { attach($0) } }
             return try await withTaskCancellationHandler {
@@ -74,11 +76,12 @@ nonisolated final class RequestPersistence: @unchecked Sendable {
             if let ready { c.resume(with: ready) }
         }
         func cancel() {
-            let c = lock.withLock { () -> CheckedContinuation<Value, Error>? in
-                guard !committing, !finished else { return nil }
-                cancelled = true; let value = continuation; continuation = nil; return value
+            let (cancelledNow, c) = lock.withLock { () -> (Bool, CheckedContinuation<Value, Error>?) in
+                guard !committing, !finished, !cancelled else { return (false, nil) }
+                cancelled = true; let value = continuation; continuation = nil; return (true, value)
             }
             c?.resume(throwing: CancellationError())
+            if cancelledNow { onCancellation?() }
         }
         var hasStarted: Bool { lock.withLock { committing } }
         func check() throws { if lock.withLock({ cancelled }) { throw CancellationError() } }

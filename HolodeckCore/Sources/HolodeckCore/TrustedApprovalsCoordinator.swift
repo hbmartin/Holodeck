@@ -127,6 +127,7 @@ actor TrustedApprovalsCoordinator {
     struct Registration: Sendable {
         let generation: UInt64
         let completion: RequestPersistence.CommitTicket<BindingOutcome>
+        let preparation: TrustedRegistrationPreparation
         func value() async throws -> BindingOutcome {
             try await completion.value()
         }
@@ -462,6 +463,11 @@ actor TrustedApprovalsCoordinator {
         if required[intent.operationID, default: []].insert(key).inserted {
             departures[key.service]?.invalidatePreparation()
         }
+        // Eligibility is target-wide: obligations admitted after local completion
+        // remain covered until that exact outcome enters a trusted pass.
+        if var pending = pendingRecoveryOutcomes[key] {
+            pending.intents.insert(intent.operationID); pendingRecoveryOutcomes[key] = pending
+        }
         targetPins[key] = target
     }
     private func retired(_ key: TargetKey) -> Bool {
@@ -510,13 +516,16 @@ actor TrustedApprovalsCoordinator {
         }
         failedRegistration = nil
         generation &+= 1
-        let receipt = Registration(generation: generation, completion: .init())
+        let preparation = TrustedRegistrationPreparation()
+        let receipt = Registration(generation: generation, completion: .init(onCancellation: { preparation.changed.finish() }), preparation: preparation)
+        preparingRegistration?.preparation.supersede()
         pending?.registration.completion.complete(.success(.superseded))
         pending = Request(owner: owner, registration: receipt)
         if registrationTask == nil { registrationTask = Task { await self.drainRegistrations() } }
         return receipt
     }
-    private func configure(_ target: ShaderRequestService, transfer: ShaderRequestService.AuthorityTransfer? = nil) async throws {
+    private func configure(_ target: ShaderRequestService, transfer: ShaderRequestService.AuthorityTransfer? = nil,
+                           admitActivation: @Sendable () throws -> Void = {}) async throws {
         let serviceID = target.runtimeID
         guard departures[serviceID] == nil else {
             throw Self.unavailable("This request service has a trusted authority handoff pending; retry registration after it finishes.")
@@ -549,7 +558,7 @@ actor TrustedApprovalsCoordinator {
         var inspection: TrustedRevocationInspection?
         if let transfer {
             (_, inspection) = try await target.installTrustedAuthority(transfer, id: id,
-                intents: outstandingIntents, revision: revision, completion: callback, authority: self, installation: installation)
+                intents: outstandingIntents, revision: revision, completion: callback, authority: self, installation: installation, admitActivation: admitActivation)
         } else { _ = try await target.installRevocationCoordinator(authority: self, installation: installation, recovery: callback) }
         let previous = targets.keys.filter { $0.service == serviceID && $0 != key }
         for old in previous {
@@ -828,6 +837,14 @@ actor TrustedApprovalsCoordinator {
             }
         } else { suppressApplications(to: key, outcome: outcome) }
     }
+    private func finishPendingObligation(_ intent: UUID, on key: TargetKey) {
+        guard var pending = pendingRecoveryOutcomes[key] else { return }
+        pending.intents.remove(intent)
+        // Include every still-required obligation, including any added while an
+        // already-committed removal was completing on another actor.
+        pending.intents.formUnion(required.filter { $0.value.contains(key) }.keys)
+        pendingRecoveryOutcomes[key] = pending.intents.isEmpty ? nil : pending
+    }
     private func clearApplicationBlockers(on key: TargetKey, matching: (Attempt, ApplicationBlocker) -> Bool) {
         failedApplications = failedApplications.filter { $0.key.target != key || !matching($0.key, $0.value) }
         if !failedApplications.keys.contains(where: { $0.target == key }),
@@ -1069,7 +1086,7 @@ actor TrustedApprovalsCoordinator {
         }
         // Clean, generation-bound ownership can retire while healthy admitted
         // work continues. A real metadata fault still requires original repair.
-        if await target.departureRetirementAssessment() == nil {
+        if await target.departureRetirementAssessment(authority: id, ticket: ticket) == nil {
             let local = try await target.recoverDepartureLocal()
             guard local.completed else {
                 throw TrustedPartialRecovery(completedServices: [], remaining: ["Original departure target " + serviceID.uuidString + ": " + (local.failure ?? "Local recovery is unverified.")])
@@ -1077,7 +1094,7 @@ actor TrustedApprovalsCoordinator {
         }
         try Task.checkCancellation()
         try await target.settleTrustedAuthorityDeparture()
-        guard let assessment = await target.departureRetirementAssessment() else {
+        guard let assessment = await target.departureRetirementAssessment(authority: id, ticket: ticket) else {
             throw Self.unavailable("Original departure target evidence changed before retirement. Retain its exact journal and choose Retry Recovery.")
         }
         let commit = try await acquire(.progress); defer { release(commit) }
@@ -1085,7 +1102,7 @@ actor TrustedApprovalsCoordinator {
         guard !departureObligations(keys) else { throw unverifiableDeparture(ticket) }
         if !loaded || keys.contains(where: { inspections[$0] != baseline }) { try await readFresh(target: nil) }
         guard !departureObligations(keys) else { throw unverifiableDeparture(ticket) }
-        guard await target.validateDepartureRetirement(assessment) else {
+        guard await target.validateDepartureRetirement(assessment, authority: id, ticket: ticket) else {
             throw Self.unavailable("Original departure target evidence changed during retirement inspection. Retain its journal and choose Retry Recovery.")
         }
         if let beforeDepartureRetirementAdmission { try await beforeDepartureRetirementAdmission(serviceID) }
@@ -1128,12 +1145,14 @@ actor TrustedApprovalsCoordinator {
         let recipients = endpointTargets.removeValue(forKey: departure.id) ?? [:]
         for recipient in recipients.values { await recipient.value?.forgetAuthorityRecovery(ticket: departure.id) }
     }
+    private var preparingRegistration: (server: UUID, lifetime: TrustedOwnerLifetime, preparation: TrustedRegistrationPreparation)?
     private enum RegistrationAbandoned: Error { case superseded }
     private func drainRegistrations() async {
         while pending != nil {
             var token = await acquireReplacement()
             guard let request = pending else { release(token); continue }
             pending = nil; preparing = request.registration.generation
+            preparingRegistration = (request.owner.serverID, request.owner.eligibility, request.registration.preparation)
             var transfer: ShaderRequestService.AuthorityTransfer?
             var admittedService: ShaderRequestService?
             do {
@@ -1167,11 +1186,27 @@ actor TrustedApprovalsCoordinator {
                     guard request.registration.generation == generation else { throw RegistrationAbandoned.superseded }
                     admittedService = request.owner.service
                     guard !request.owner.requiresService || admittedService != nil else { throw Self.unavailable("The proposed request service was released before activation.") }
-                    try request.owner.eligibility.admitWrite { try request.registration.completion.beginMutation() }
                 }
                 if let target = admittedService ?? request.owner.service {
                     while true {
-                        do { try await configure(target, transfer: transfer); break }
+                        do {
+                            try await configure(target, transfer: transfer, admitActivation: {
+                                try request.owner.eligibility.admitWrite {
+                                    try request.registration.preparation.admit { try request.registration.completion.beginMutation() }
+                                }
+                            })
+                            break
+                        }
+                        catch let waiting as TrustedWorkerRetirementPending {
+                            release(token)
+                            do { try await waiting.retirement.wait(or: request.registration.preparation.changed) }
+                            catch { token = await acquireReplacement(); throw error }
+                            token = await acquireReplacement()
+                            try request.registration.completion.check()
+                            guard request.owner.eligibility.isCurrent else { throw CancellationError() }
+                            guard request.registration.completion.hasStarted || request.registration.generation == generation else { throw RegistrationAbandoned.superseded }
+                            if currentInspection() == nil { try await readFresh(target: target) }
+                        }
                         catch let waiting as TrustedLocalPreparationPending {
                             release(token)
                             do { try await waiting.preparation.wait() }
@@ -1202,7 +1237,7 @@ actor TrustedApprovalsCoordinator {
                 }
                 try request.registration.completion.check()
                 guard request.registration.completion.hasStarted || request.registration.generation == generation else {
-                    request.registration.completion.complete(.success(.superseded)); preparing = nil; release(token); continue
+                    request.registration.completion.complete(.success(.superseded)); preparing = nil; preparingRegistration = nil; release(token); continue
                 }
                 if !request.registration.completion.hasStarted {
                     admittedService = request.owner.service
@@ -1229,7 +1264,7 @@ actor TrustedApprovalsCoordinator {
                     else { await transfer.predecessor.cancelDeparture(serviceID: transfer.departure.serviceID, ticket: transfer.id) }
                     token = await acquireReplacement()
                 }
-                if error is RegistrationAbandoned { request.registration.completion.complete(.success(.superseded)) }
+                if error is RegistrationAbandoned || error is TrustedRegistrationSuperseded { request.registration.completion.complete(.success(.superseded)) }
                 else {
                     if let recovery = error as? TrustedDepartureRecoveryError, let target = request.owner.service {
                         await attachDepartureRecovery(ticket: recovery.diagnosticID, to: target)
@@ -1238,11 +1273,12 @@ actor TrustedApprovalsCoordinator {
                     request.registration.completion.complete(.failure(error))
                 }
             }
-            preparing = nil; release(token)
+            preparing = nil; preparingRegistration = nil; release(token)
         }
         registrationTask = nil
     }
     func withdraw(serverID: UUID, eligibility: TrustedOwnerLifetime) async {
+        if preparingRegistration?.server == serverID, preparingRegistration?.lifetime === eligibility { preparingRegistration?.preparation.supersede() }
         let token = await acquireProgress()
         defer { release(token) }
         if failedRegistration?.serverID == serverID, failedRegistration?.eligibility === eligibility { failedRegistration = nil }
@@ -1475,9 +1511,7 @@ actor TrustedApprovalsCoordinator {
         applicationEpochs = applicationEpochs.filter { $0.key.intent != intent.operationID }
         failedApplications = failedApplications.filter { $0.key.intent != intent.operationID }
         for key in needed {
-            if var pending = pendingRecoveryOutcomes[key], pending.intents.remove(intent.operationID) != nil {
-                pendingRecoveryOutcomes[key] = pending.intents.isEmpty ? nil : pending
-            }
+            finishPendingObligation(intent.operationID, on: key)
             clearApplicationBlockers(on: key) { _, _ in false }
         }
         completeSettledDepartures()

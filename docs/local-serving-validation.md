@@ -1288,3 +1288,55 @@ Evidence: `/tmp/pr52-final-validation.json`, `/tmp/pr52-final-focused.log`, `/tm
 Desktop UI runtime checks remain **blocked by instruction**. Live Bonjour/LAN, real Codex publication, physical Apple TV and tvOS simulator execution were not run. Six skips cover three unrelated catalog profiles, live Bonjour, real Codex publication and the separate worker-supervision idle profile. Isolated TLS, headless Mac-model checks, local native/GPU fixtures and the unsigned tvOS build did run.
 
 Worker, checker and shader code, artifacts, locks and Linux CI are unchanged. Separate full Python worker/checker suites, the compile-all external library run and standalone GPU profiles were not rerun. Public/network contracts and persisted formats are unchanged. No live installation replacement, request enabling, merge or deployment was performed.
+
+
+## PR #52 follow-up — retirement waits and recovery fences (2026-11-22)
+
+Based on merged PR #52 at `66a4062` (reviewed tree `c197188`). Four reviewable changesets preserve the existing worker/checker/shader implementation and persisted/network formats.
+
+### Activation and recovery invariants
+
+- Verified worker retirement still being saved is a temporary activation wait. Its batch captures exact request/execution identities. Registration releases the authority lane, awaits completion or cancellation/supersession, then revalidates ownership and inspection before changing the binding. Activation admission now shares a synchronous boundary with that final check; an admitted binding transition still finishes its actual outcome.
+- Deterministic tests pause real worker retirement persistence after source preparation. Healthy completion accepts the original registration without another user action. A never-launched dispatch remains queued through the wait, cancellation and newer replacement remain effective, Detach retains its own diagnostic, and EIO preserves the accepted authority.
+- Pending local outcomes fence the entire target. New required intents extend their covered set. Finalizing an older committed removal removes only that obligation and cannot unblock later revocations before the matching trusted pass accepts the outcome. The regression holds two later durable intents through that boundary.
+- Each authority/departure ticket has independent one-shot retirement admission, sharing only the service's invalidatable ownership evidence. Two exceptional old-authority jobs both retire; same-ticket callers share one job; actual storage/ownership changes invalidate stale receipts. The tests explicitly inject exceptional departure and committed-removal states; **no normal producer or legitimate retired-proof finalization path is claimed**.
+- Departure diagnostics identify the failed readiness predicate instead of selecting an unrelated global recovery message. Generic trusted failures continue reporting verified local completion while throwing partial recovery; structured authority results remain authoritative.
+
+### Final validation
+
+- Frozen source: **112 Swift files**, unchanged through tests, app builds and profiling.
+- Full core, packaged resources and local native fixtures: **628 tests, six skips, zero failures**, 165.009 seconds including build. Verified **25 local scenes** at revision `8348af807717ea0e436208e957c333ec271e935380a9ea68b1db5aca56df13a5`; opted-in Metal GPU regression tests passed.
+- Final focused boundary selection: **30 tests, zero failures**. Full Release selection: **186 tests, zero failures**, 182.053 seconds including build, including isolated TLS and packaged resources.
+- Optimized races: **20 × 139 = 2,780 executions, zero failures**, using `SWIFT_CONCURRENCY_THREADPOOL_STRICT=1` and a 90-second failure backstop per run. Opposing transfers, token retention, publication holds, shared recovery and the new retirement cases remain included.
+- Headless checks of the actual Mac request model passed with system **Python 3.9.6** and current **Python 3.15.0** against isolated temporary state.
+- Both unsigned Release apps built in `/tmp/HolodeckPR53Validation`: `HolodeckMac` for macOS (202.159 seconds) and `Holodeck` for generic tvOS (30.408 seconds). Neither was installed or launched.
+- Built native artifact-info matches PR #52: checker **1.1.1**, interface **1**, source `58ed409e023b9b1ccbc08dcedd5b38c1090e14fc`, SHA-256 `8a8229c76e6e42d91d84fe9744bf53bbcda0c9dc8064ba82a41e2b15bb66ef19`.
+
+### Release comparison
+
+The baseline is a physical APFS copy of the unchanged PR #52 optimized products, retained before rebuilding. Both versions use Apple Swift 6.4.2 on the same filesystem. Seven alternating samples per version use injected trusted backends and real temporary metadata, without production Keychain changes. Values below are descriptive medians in milliseconds, not CI timing thresholds or a general throughput claim.
+
+| Workload | PR #52 ms | Follow-up ms |
+| --- | ---: | ---: |
+| 200 sequential revocations | 73.993 | 74.756 |
+| 50 queued revocations | 14.295 | 14.220 |
+| 100 queued revocations | 41.973 | 40.991 |
+| 200 queued revocations | 135.688 | 135.468 |
+| 100 no-intent recoveries | 39.971 | 41.091 |
+| 100 late-caller pairs | 267.391 | 267.326 |
+| 200 same-authority registrations | 10.913 | 11.369 |
+
+Structural results preserve normal trusted I/O: sequential revocation uses one read and 400 encodings/writes; queued 50/100/200 workloads use two reads and 100/200/400 encodings/writes. No-intent recovery adds no trusted writes or unrelated local phases; late callers retain 200 passes/local phases/reads and 100 writes/encodings per 100 pairs. Same-authority registration uses 200 reads and zero encodings/writes. Final obligations, pins and recovery participants are zero in completed workloads. Queued resumes/advances remain linear and within structural bounds. Late-caller resume/advance medians are 1903/3806 → 2050/4100; that additional admission work is recorded without claiming an optimization, while pass, phase, trusted I/O and final-retention counts remain unchanged.
+
+A separate seven-sample comparison runs ten gated healthy worker retirements per sample. PR #52 automatically accepts **0/10**, requiring **10** scripted registration retries and **20** destination trusted reads; the follow-up accepts **10/10**, with **0** retries and **10** reads. Median per-sample mean release-to-acceptance latency is 5.001 → 10.372 ms; baseline latency includes the immediate scripted retry, not human response time. Successful automatic waiting retains one verified batch wait and performs no trusted write.
+
+Reproduction:
+
+```sh
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer HOLODECK_AUTHORING_FIXTURE=/Volumes/Pro2T/HolodeckShaders HOLODECK_GPU_TESTS=1 swift test --package-path HolodeckCore --skip-update
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --package-path HolodeckCore -c release --skip-update --filter 'Trusted|ShaderLibraryToolTests|CatalogNetworkTests|LocalClientRecoveryTests'
+/usr/bin/python3 tools/check_mac_requests_recovery.py
+/opt/homebrew/bin/python3 tools/check_mac_requests_recovery.py
+```
+
+Local evidence: `/tmp/pr53-final-validation.json`, `/tmp/pr53-app-builds.json`, `/tmp/pr53-final-source.json`, `/tmp/pr53-races.json`, `/tmp/pr53-profile-summary.json`, `/tmp/pr53-retirement-summary.json` and corresponding logs. Six skips are two catalog profiles, directory-reload profiling, live Bonjour/LAN, real Codex publication and the separate worker idle-CPU profile. Desktop UI runtime checks remain **blocked by instruction**. Physical Apple TV/tvOS simulator execution, separate external Python worker/checker suites, compile-all external library checks and standalone GPU-profile runs were not repeated. Existing Swift process regressions and local native/GPU fixtures did run. Linux CI, checker artifacts/locks and worker/shader code remain unchanged; no live installation replacement, request enabling, merge or deployment occurred.
