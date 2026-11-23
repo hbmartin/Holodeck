@@ -215,7 +215,10 @@ public actor ShaderRequestService {
     private let catalog: DirectoryCatalog
     private let workerScript: URL?
     private var recoveryRevision: UInt64 = 0
-    private var recovery = RequestRecoveryStore() { didSet { recoveryRevision &+= 1 } }
+    private var recovery = RequestRecoveryStore() { didSet {
+        recoveryRevision &+= 1
+        if !recovery.entries.isEmpty { invalidateDepartureRetirement() }
+    } }
     private struct ProposalInput: Equatable, Sendable {
         let id: UUID; let journal: String; let generation: UInt64; let configuration: ShaderRequestConfiguration
     }
@@ -232,8 +235,8 @@ public actor ShaderRequestService {
     private var persistenceRevision: UInt64 = 0
     private var resolvedPersistenceGeneration: UInt64 = 0
     private var pendingCommits = 0
-    private var persistenceFault: RequestPersistence.Fault?
-    private var validationBlocker: RequestPersistence.ValidationBlocker?
+    private var persistenceFault: RequestPersistence.Fault? { didSet { if persistenceFault != nil { invalidateDepartureRetirement() } } }
+    private var validationBlocker: RequestPersistence.ValidationBlocker? { didSet { if validationBlocker != nil { invalidateDepartureRetirement() } } }
     private var resolvedValidationRevision: UInt64 = 0
     private struct MetadataIssue: LocalizedError, Sendable {
         let id = UUID()
@@ -245,8 +248,8 @@ public actor ShaderRequestService {
             " Retain this file and restore or repair it, then choose Retry Recovery. Checkout work stays disabled; the cached library remains available."
         }
     }
-    private var metadataIssue: MetadataIssue?
-    private var startupFinalizationFailure: String?
+    private var metadataIssue: MetadataIssue? { didSet { if metadataIssue != nil { invalidateDepartureRetirement() } } }
+    private var startupFinalizationFailure: String? { didSet { if startupFinalizationFailure != nil { invalidateDepartureRetirement() } } }
     private let beforeStartupFinalization: @Sendable () async throws -> Void
     // Inspection completion releases shared load waiters; only a fully decoded
     // baseline and an inspected fault marker authorize metadata mutation.
@@ -281,7 +284,7 @@ public actor ShaderRequestService {
     }
     private struct MetadataUnavailable: LocalizedError { let message: String; var errorDescription: String? { message } }
     private var settledExecutions: Set<UUID> = []
-    private var pendingRetirements: [UUID: UUID] = [:]
+    private var pendingRetirements: [UUID: UUID] = [:] { didSet { if !pendingRetirements.isEmpty { invalidateDepartureRetirement() } } }
     private var verifiedRetirements: Set<UUID> = []
     private var retirementTask: Task<Void, Never>?
 
@@ -438,7 +441,7 @@ public actor ShaderRequestService {
     private var localObservers: [UUID: AsyncStream<ShaderRequestLocalState>.Continuation] = [:]
     private var localSnapshots = 0, setupQueries = 0
     private var activeID: UUID?
-    private var activeProcess: RequestWorkerProcess?
+    private var activeProcess: RequestWorkerProcess? { didSet { invalidateDepartureRetirement() } }
     private var workerTask: Task<Void, Never>?
     private var preparedID: UUID? { didSet { if preparedID == nil { preparedAttemptID = nil } } }
     private var preparedAttemptID: UUID?
@@ -449,11 +452,11 @@ public actor ShaderRequestService {
         var checkoutLaunched = false
         var processID: ObjectIdentifier?
     }
-    private var execution: Execution?
+    private var execution: Execution? { didSet { invalidateDepartureRetirement() } }
     private var selectingRepository = false
     private var acceptingRepository = false
     private var maintenanceLease: UUID?
-    private var detaching = false
+    private var detaching = false { didSet { if detaching { invalidateDepartureRetirement() } } }
     private var maintenanceWaiters: [CheckedContinuation<Void, Never>] = []
     private var maintenanceBusy: Bool { maintenanceLease != nil || detaching }
     private struct ReconciliationResult: Sendable { var owner: UUID?; var acknowledgements: [DetachedCheckoutAcknowledgement] }
@@ -465,12 +468,14 @@ public actor ShaderRequestService {
     private var reconciled: Bool {
         get { !fullReconciliationRequired && dirtyJournals.isEmpty }
         set {
+            invalidateDepartureRetirement()
             reconciliationEpoch &+= 1
             fullReconciliationRequired = !newValue
             if newValue { dirtyJournals.removeAll() }
         }
     }
     private func invalidateJournal(_ key: String) {
+        invalidateDepartureRetirement()
         dirtyJournals.insert(key); reconciliationEpoch &+= 1
         invalidateMaintenanceProposal(key)
     }
@@ -561,6 +566,7 @@ public actor ShaderRequestService {
     func prepareTrustedAuthority(id: UUID) async throws -> AuthorityTransfer? {
         guard let prior = revocationCoordinatorID, prior != id, let predecessor = trustedAuthority, predecessor.id != id else { return nil }
         guard authorityTransfer == nil else { throw ShaderRequestError.unavailable("A trusted authority handoff is pending; retry after it finishes.") }
+        guard acceptedMetadataAvailable || loaded else { throw TrustedSetupPending() }
         let ticket = UUID(); authorityTransfer = ticket; emitUpdates()
         do {
             let departure = try await predecessor.prepareDeparture(self, ticket: ticket)
@@ -571,8 +577,13 @@ public actor ShaderRequestService {
     func settleTrustedAuthorityDeparture() async throws {
         if let activeID, records[activeID]?.revoked == true, let workerTask { await workerTask.value }
         if let retirementTask { await retirementTask.value }
+        try requireDepartureOwnership()
+    }
+    private func requireDepartureOwnership() throws {
         guard departureOwnershipVerified else {
-            throw ShaderRequestError.unavailable("Previous TV cancellation or process settlement requires recovery before changing authority.")
+            let detail = persistenceFailure ?? startupFinalizationFailure ?? recoveryBlocker ??
+                "Previous TV cancellation or process settlement requires recovery before changing authority."
+            throw ShaderRequestError.unavailable(detail)
         }
     }
     private var departureOwnershipVerified: Bool {
@@ -586,15 +597,32 @@ public actor ShaderRequestService {
         return acceptedMetadataAvailable && persistenceFailure == nil && startupFinalizationFailure == nil && recovery.entries.isEmpty &&
             pendingRetirements.isEmpty && durableRevocations.isEmpty && ownedExecution
     }
-    func departureRetirementAssessment() -> TrustedDepartureRetirement? {
-        guard localPreparation == nil, localRecoveryPhase == nil, storageCommit == nil, pendingCommits == 0, reconciled,
+    private var retirementAssessment: TrustedDepartureRetirement?
+    private var departureRetirementEvidence: TrustedDepartureRetirement.Evidence? {
+        guard localPreparation == nil, localRecoveryPhase == nil, !detaching, reconciled,
               departureOwnershipVerified else { return nil }
         return .init(serviceID: runtimeID, registration: revocationRegistration, authority: revocationCoordinatorID,
-            metadataRevision: persistenceRevision, ownershipGeneration: reconciliationEpoch,
-            recoveryGeneration: localRecoveryGeneration, executionID: execution?.id)
+            ownershipGeneration: reconciliationEpoch, recoveryGeneration: localRecoveryGeneration,
+            executionID: execution?.id, processID: execution?.processID)
+    }
+    private func invalidateDepartureRetirement() {
+        retirementAssessment?.invalidate(); retirementAssessment = nil
+    }
+    private func refreshDepartureRetirement() {
+        if let receipt = retirementAssessment, !receipt.isCurrent || receipt.evidence != departureRetirementEvidence {
+            invalidateDepartureRetirement()
+        }
+    }
+    func departureRetirementAssessment() -> TrustedDepartureRetirement? {
+        refreshDepartureRetirement()
+        guard let evidence = departureRetirementEvidence else { return nil }
+        if let retirementAssessment { return retirementAssessment }
+        let receipt = TrustedDepartureRetirement(evidence); retirementAssessment = receipt
+        return receipt
     }
     func validateDepartureRetirement(_ receipt: TrustedDepartureRetirement) -> Bool {
-        departureRetirementAssessment() == receipt
+        refreshDepartureRetirement()
+        return retirementAssessment === receipt && receipt.isCurrent && receipt.evidence == departureRetirementEvidence
     }
     func settleCancelledLocalRecovery() async {
         if let phase = localRecoveryPhase, phase.task.isCancelled { await phase.task.settle() }
@@ -615,7 +643,7 @@ public actor ShaderRequestService {
     private var revocationRegistration = UUID()
     private var revocationApplications: [UUID: TrustedRevocationApplication] = [:]
     private var pendingRevocations: [UUID: RequestRevocationIntent] = [:]
-    private var durableRevocations: Set<UUID> = []
+    private var durableRevocations: Set<UUID> = [] { didSet { if !durableRevocations.isEmpty { invalidateDepartureRetirement() } } }
     private var revocationCoordinatorID: UUID?
     private var revocationRevision: UInt64 = 0
     private struct ControlScope: Sendable {
@@ -636,6 +664,10 @@ public actor ShaderRequestService {
     func trustedRecoveryJournal() -> URL { directory }
     func rememberAuthorityRecovery(_ endpoint: TrustedAuthorityRecoveryEndpoint) {
         authorityRecoveryEndpoints[endpoint.ticketID] = endpoint; emitUpdates(); scheduleWakeup()
+    }
+    func authorityRecoveryChanged(_ endpoint: TrustedAuthorityRecoveryEndpoint) {
+        guard authorityRecoveryEndpoints[endpoint.ticketID] === endpoint else { return }
+        emitUpdates()
     }
     func forgetAuthorityRecovery(ticket: UUID) {
         authorityRecoveryEndpoints[ticket] = nil; emitUpdates(); scheduleWakeup()
@@ -680,12 +712,14 @@ public actor ShaderRequestService {
                                  coordinator: @escaping @Sendable (TrustedLocalRecovery) async throws -> Void,
                                  authority: TrustedApprovalsCoordinator? = nil) throws -> (UUID, TrustedRevocationInspection) {
         try installTrustedAuthority(transfer, id: id, intents: intents, revision: revision,
-            completion: { local in try await coordinator(local); return .init(completedServices: []) }, authority: authority)
+            completion: validatedRecoveryCompletion(coordinator), authority: authority)
     }
     func installTrustedAuthority(_ transfer: AuthorityTransfer, id: UUID, intents: [RequestRevocationIntent], revision: TrustedRevocationRevision,
                                  completion: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion,
-                                 authority: TrustedApprovalsCoordinator? = nil) throws -> (UUID, TrustedRevocationInspection) {
+                                 authority: TrustedApprovalsCoordinator? = nil,
+                                 installation: TrustedTargetInstallation? = nil) throws -> (UUID, TrustedRevocationInspection) {
         try requireLocalPreparationFinished(changingTo: id)
+        if let installation { try validateTargetInstallation(installation, authority: id) }
         return try transfer.departure.activate {
             guard authorityTransfer == transfer.id, revocationRegistration == transfer.registration,
                   transfer.departure.registrationID == revocationRegistration, durableRevocations.isEmpty,
@@ -694,8 +728,10 @@ public actor ShaderRequestService {
             }
             // No suspension between validating departure, changing registration and
             // loading the already validated replacement authority snapshot.
-            let registration = bindRevocationCoordinator(id: id, completion)
+            try requireDepartureOwnership()
+            let registration = bindRevocationCoordinator(id: id, registration: installation?.registration, completion)
             if let authority { trustedAuthority = authority }
+            installation?.publish()
             return (registration, try loadTrustedRevocations(intents, revision: revision))
         }
     }
@@ -706,10 +742,18 @@ public actor ShaderRequestService {
         // Compatibility callers do not own an authority lane. Production uses
         // the throwing admission below and releases its lane before waiting.
         while revocationCoordinatorID != id, let preparation = localPreparation { try? await preparation.wait(cancellable: false) }
-        return bindRevocationCoordinator(id: id) { local in
+        return bindRevocationCoordinator(id: id, validatedRecoveryCompletion(recovery))
+    }
+    private func validatedRecoveryCompletion(_ recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> Void)
+        -> @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion {
+        let serviceID = runtimeID
+        return { [weak self] local in
             try await recovery(local)
+            guard let self else {
+                throw ShaderRequestError.unavailable("The local recovery service ended before completion could be verified.")
+            }
             let valid = await self.validateTrustedRecovery(local)
-            return .init(completedServices: valid.completed ? [self.runtimeID] : [])
+            return .init(completedServices: valid.completed ? [serviceID] : [])
         }
     }
     private func requireLocalPreparationFinished(changingTo id: UUID) throws {
@@ -717,16 +761,29 @@ public actor ShaderRequestService {
             throw TrustedLocalPreparationPending(preparation: preparation)
         }
     }
+    func prepareTargetInstallation(authority: UUID) -> TrustedTargetInstallation {
+        .init(serviceID: runtimeID, authority: authority, predecessorAuthority: revocationCoordinatorID,
+              predecessorRegistration: revocationRegistration)
+    }
+    private func validateTargetInstallation(_ installation: TrustedTargetInstallation, authority: UUID) throws {
+        guard installation.serviceID == runtimeID, installation.authority == authority,
+              installation.predecessorAuthority == revocationCoordinatorID,
+              installation.predecessorRegistration == revocationRegistration else {
+            throw ShaderRequestError.unavailable("The request-service registration changed before binding installation; explicitly retry registration.")
+        }
+    }
     func installRevocationCoordinator(authority: TrustedApprovalsCoordinator,
+                                     installation: TrustedTargetInstallation? = nil,
                                      recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) throws -> UUID {
         try requireLocalPreparationFinished(changingTo: authority.id)
-        let registration = bindRevocationCoordinator(id: authority.id, recovery)
-        trustedAuthority = authority
+        if let installation { try validateTargetInstallation(installation, authority: authority.id) }
+        let registration = bindRevocationCoordinator(id: authority.id, registration: installation?.registration, recovery)
+        trustedAuthority = authority; installation?.publish()
         return registration
     }
-    private func bindRevocationCoordinator(id: UUID, _ coordinator: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) -> UUID {
+    private func bindRevocationCoordinator(id: UUID, registration: UUID? = nil, _ coordinator: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) -> UUID {
         if revocationCoordinatorID == id { revocationCoordinator = coordinator; return revocationRegistration }
-        revocationRegistration = UUID(); revocationApplications.removeAll()
+        revocationRegistration = registration ?? UUID(); revocationApplications.removeAll()
         controlScopes.removeAll()
         revocationCoordinatorID = id; revocationRevision = 0
         revocationCoordinator = coordinator; revocationInspectionPending = true; emitUpdates()
@@ -1740,6 +1797,9 @@ public actor ShaderRequestService {
         try Task.checkCancellation()
         guard activeID == nil, !maintenanceBusy, localRecoveryAttempt == nil,
               localRecoveryPhase?.task.isCancelled != true else { throw TrustedRecoveryAdmissionError() }
+        // New requester ownership cannot adopt an outcome which had no owner
+        // before admission. Existing trusted-pass holds still permit sharing.
+        if localRecoveryPhase == nil, trustedRecoveryHolds.isEmpty { localRecoveryResult = nil }
         let attempt = UUID(); localRecoveryAttempt = attempt
         defer {
             if localRecoveryAttempt == attempt {
@@ -1759,7 +1819,10 @@ public actor ShaderRequestService {
                 try Task.checkCancellation()
                 if let partial = error as? TrustedPartialRecovery {
                     completed.formUnion(partial.completedServices); failures += partial.remaining
-                } else { failures.append(error.localizedDescription) }
+                } else {
+                    if validateTrustedRecovery(local).completed { completed.insert(runtimeID) }
+                    failures.append(error.localizedDescription)
+                }
             }
         }
         // These exact old-authority routes survive replacement of the ordinary
@@ -1776,7 +1839,9 @@ public actor ShaderRequestService {
             throw TrustedPartialRecovery(completedServices: completed.sorted { $0.uuidString < $1.uuidString },
                 remaining: Array(failures.prefix(9)).map { BoundedDiagnostics.bounded($0, bytes: 8192) })
         }
-        if hasIndependentPhase, let failure = local.failure { throw TrustedPartialRecovery(completedServices: [], remaining: [failure]) }
+        if hasIndependentPhase, let failure = local.failure {
+            throw TrustedPartialRecovery(completedServices: completed.sorted { $0.uuidString < $1.uuidString }, remaining: [failure])
+        }
         if let original = local.initiatingError { throw original }
         if let failure = local.failure { throw TrustedPartialRecovery(completedServices: [], remaining: [failure]) }
     }
@@ -1792,6 +1857,7 @@ public actor ShaderRequestService {
         }
         if let cached = cachedRecoveryOutcome(pass: pass) { return cached }
         if let pass { trustedRecoveryHolds.insert(pass) }
+        invalidateDepartureRetirement()
         let attempt = UUID(); localRecoveryGeneration &+= 1
         let generation = localRecoveryGeneration
         let task = TrustedRecoveryTask { try await self.performLocalRecovery(attempt: attempt, generation: generation, consumerAuthority: consumingAuthority) }
@@ -2635,6 +2701,7 @@ public actor ShaderRequestService {
                      canDisableRequests: canDisableRequests(), setup: acceptedSetupSnapshot())
     }
     private func emitUpdates() {
+        refreshDepartureRetirement()
         publishHostRecoveryRequirement()
         scheduleMaintenanceProposals()
         guard !observers.isEmpty || !localObservers.isEmpty else { return }

@@ -7,6 +7,9 @@ nonisolated final class TrustedInvalidationToken: @unchecked Sendable {
     private var current = true
     var isCurrent: Bool { lock.withLock { current } }
     func invalidate() { lock.withLock { current = false } }
+    func consume() -> Bool {
+        lock.withLock { guard current else { return false }; current = false; return true }
+    }
     func withCurrent<T>(_ body: () throws -> T) rethrows -> T? {
         try lock.withLock { guard current else { return nil }; return try body() }
     }

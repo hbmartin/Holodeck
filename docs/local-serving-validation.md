@@ -1231,3 +1231,60 @@ Evidence: `/tmp/pr51-final-validation.json`, `/tmp/pr51-cancelled-outcome-after.
 Desktop UI runtime checks remain **blocked by the user's instruction**. Live Bonjour/LAN, real Codex publication, physical Apple TV and tvOS simulator execution were not run. The six core skips cover three unrelated catalog profiles, live Bonjour, real Codex publication and the separate worker-supervision idle profile. Isolated TLS, headless Mac-model recovery, local native/GPU fixtures and the unsigned tvOS build did run.
 
 Worker, checker and shader sources, artifacts, locks and Linux CI are unchanged. Their separate full Python worker/checker suites, compile-all external shader-library run and standalone GPU profiles were not rerun. Public/network interfaces and persisted envelope/journal formats are unchanged. No live installation replacement, request enabling, merge or deployment was performed.
+
+
+## PR #51 follow-up — recovery reuse and activation boundaries (2026-11-22)
+
+Baseline: merged PR #51, `5db3d5cb9d56b7e950c99784ba4ad6b3f4791234`, whose tree `508d4adec260138d1a7ac588a0e428bc3459b3f0` matches reviewed head `354c4f6`. The frozen inventory `/tmp/pr52-final-source.json` covers 111 Swift files. Validation and profiles use Apple Swift 6.4.2 on the same filesystem. Production installation, approvals and request enabling were untouched.
+
+### Recovery and ownership boundaries
+
+- Fresh Retry admission discards an unowned cached local result before establishing new requester ownership. Existing logical retries and trusted-pass holds still share validated success or failure. A comparison against the unchanged optimized baseline reproduces a failed first Retry with zero new local phases; the follow-up succeeds on that first Retry with one new local phase.
+- Coordinator target installation is staged before the service publishes the exact registration. Recovery fences the published target even while `configure` has not returned. Unpublished candidate membership is unwound; a published target remains fenceable after a later configuration error. Local repair still runs without acquiring the general trusted-mutation lane.
+- Activation rechecks source ownership on the service actor immediately before changing its binding, after any local-preparation wait. Failed original-target repair retains the old authority and initiating diagnostic. Early handoff returns typed setup-pending guidance without creating a departure or accepting default preferences; initialization alone does not activate that rejected replacement, and an explicit registration retry succeeds.
+- Retirement evidence tracks registration, execution/process identity and ownership/recovery generations rather than ordinary metadata revisions or pending progress commits. One consumable permit orders final admission against relevant state changes. Tests retire clean ownership during real worker progress and an already-admitted unrelated submission, and reject a storage fault arriving after service validation but before authority admission.
+- The selected policy intentionally waits for **all retained departure settlement** during trusted recovery. Local work proceeds outside authority lanes, each participant cancels independently, and closed exact jobs drain before their shared successor starts. The exact endpoint reports retained work as settling while that physical work remains active.
+- Pending local outcomes retain their exact intent set. Committed-removal finalization prunes only its finished obligation, preserving another intent's pending outcome and independent blockers. Subsequent normal revocation completes with its usual two trusted writes. The retained-removal and exceptional-departure cases use explicit invariant injection; **no normal producer of those exceptional states or legitimate retired-proof finalization path is claimed**.
+- Recovery reports preserve validated successful service IDs on generic errors and requester-local failure while respecting an authority's excluded/superseded result. Both compatibility callback adapters validate completion and capture their service weakly; idle-release tests cover registration and handoff adapters.
+
+### Final validation
+
+- Full core, packaged resources and existing native fixtures: **618 tests, six opt-in skips, zero failures**; 160.638 seconds including incremental build. Local rendering verified **25 scenes** at revision `8348af807717ea0e436208e957c333ec271e935380a9ea68b1db5aca56df13a5`, and opted-in Metal GPU regressions passed.
+- Final focused boundary/lifecycle selection: **24 tests, zero failures**. Final Release selection: **176 tests, zero failures**; 141.593 seconds including build, covering isolated TLS, trusted coordination and packaged resources.
+- Optimized races: **20 × 129 = 2,580 executions, zero failures**, with `SWIFT_CONCURRENCY_THREADPOOL_STRICT=1` and a 90-second failure backstop per run. The selection includes opposing transfers, publication holds, late successor admission, paused recovery, token retention and the new registration/retirement cases.
+- Maintained headless checks of the actual `MacRequestsModel` passed with system **Python 3.9.6** and current **Python 3.15.0**, using isolated temporary request state and no production preferences, approvals or listeners.
+- Both unsigned Release apps built successfully in `/tmp/HolodeckPR52Validation`: `HolodeckMac` for macOS (183.725 seconds) and `Holodeck` for generic tvOS (34.782 seconds). Neither was installed or launched.
+- The built app's native `library artifact-info --json` reports unchanged checker **1.1.1**, interface **1**, source `58ed409e023b9b1ccbc08dcedd5b38c1090e14fc`, SHA-256 `8a8229c76e6e42d91d84fe9744bf53bbcda0c9dc8064ba82a41e2b15bb66ef19`.
+
+Reproduction commands:
+
+```sh
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer HOLODECK_AUTHORING_FIXTURE=/Volumes/Pro2T/HolodeckShaders HOLODECK_GPU_TESTS=1 swift test --package-path HolodeckCore --skip-update
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --package-path HolodeckCore -c release --skip-update --filter 'Trusted|ShaderLibraryToolTests|CatalogNetworkTests|LocalClientRecoveryTests'
+/usr/bin/python3 tools/check_mac_requests_recovery.py
+/opt/homebrew/bin/python3 tools/check_mac_requests_recovery.py
+```
+
+### Release profiles against merged PR #51
+
+Seven alternating samples per version use injected in-memory trusted storage and real temporary metadata. The unchanged baseline Release products were copied to `/private/tmp/pr52-baseline-products` before rebuilding the follow-up; the cached-failure comparison verifies the expected old/new behavior. Both versions use the same compiler/filesystem. These are **not live Keychain measurements**. Medians are descriptive, and acceptance uses structural counts and bounded state rather than CI timing thresholds.
+
+| Workload | PR #51 median ms | Follow-up median ms | Structural result |
+| --- | ---: | ---: | --- |
+| 200 sequential revocations | 68.163 | 68.478 | Both: one read, 400 encodings/writes |
+| 50 queued revocations | 23.623 | 23.384 | Both: two reads, 100 encodings/writes |
+| 100 queued revocations | 63.951 | 64.549 | Both: two reads, 200 encodings/writes |
+| 200 queued revocations | 143.038 | 159.675 | Both: two reads, 400 encodings/writes |
+| 100 no-intent recoveries | 36.278 | 36.215 | Both: 100 reads, zero trusted encodings/writes, 200 requester reconciliation calls, zero unrelated calls |
+| 100 late-caller pairs | 265.265 | 268.007 | Both: 200 local phases/passes/reads, 100 encodings/writes, zero final obligations/pins |
+| 200 same-authority registrations | 11.449 | 12.044 | Both: 200 reads, zero encodings/writes, two retained targets, zero obligations/pins/participants |
+
+The 200-item queued median increased in this sample set while the smaller queued medians were similar; no general throughput improvement or timing-equivalence claim is made. Same-authority registration admission resumes/advances remain 600/1200 → 600/1200. Staging adds an exact service-registration preparation hop without an extra trusted read, encoding or write. Queued cancellation and targeted FIFO admission remain covered. No ineligible candidate is encoded; ordinary revoke/removal retains exactly two successful trusted writes. The late-caller workload intentionally returns a superseded first-pass partial result and succeeds through its successor in both versions.
+
+Evidence: `/tmp/pr52-final-validation.json`, `/tmp/pr52-final-focused.log`, `/tmp/pr52-core.log`, `/tmp/pr52-release.log`, `/tmp/pr52-races.json`, `/tmp/pr52-race-*.log`, `/tmp/pr52-model39.log`, `/tmp/pr52-model-current.log`, `/tmp/pr52-app-builds.json`, `/tmp/pr52-{mac,tv}-build.log`, `/tmp/pr52-artifact-info.json`, `/tmp/pr52-profile-{raw,summary}.json` and `/tmp/pr52-cache-profile.json`. Drivers/common workloads are `/tmp/pr52-final-validation.py`, `/tmp/pr52-build-apps.py`, `/tmp/pr52-profiling.py`, `/tmp/pr52-registration-profile.swift`, `/tmp/pr52-cache-profile.swift`, `/tmp/pr49-recovery-profile.swift` and `/tmp/pr51-successor-profile.swift`. Development runs are excluded from final totals; they corrected an asynchronous test assertion and gated the unrelated submission before injecting exceptional recovery.
+
+### Explicit limits
+
+Desktop UI runtime checks remain **blocked by instruction**. Live Bonjour/LAN, real Codex publication, physical Apple TV and tvOS simulator execution were not run. Six skips cover three unrelated catalog profiles, live Bonjour, real Codex publication and the separate worker-supervision idle profile. Isolated TLS, headless Mac-model checks, local native/GPU fixtures and the unsigned tvOS build did run.
+
+Worker, checker and shader code, artifacts, locks and Linux CI are unchanged. Separate full Python worker/checker suites, the compile-all external library run and standalone GPU profiles were not rerun. Public/network contracts and persisted formats are unchanged. No live installation replacement, request enabling, merge or deployment was performed.

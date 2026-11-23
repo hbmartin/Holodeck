@@ -108,14 +108,43 @@ nonisolated final class TrustedLocalPreparation: Sendable {
 }
 struct TrustedLocalPreparationPending: Error, Sendable { let preparation: TrustedLocalPreparation }
 
-struct TrustedDepartureRetirement: Sendable, Equatable {
+/// The authority records this exact target before the service publishes it.
+nonisolated final class TrustedTargetInstallation: @unchecked Sendable {
     let serviceID: UUID
+    let authority: UUID
+    let predecessorAuthority: UUID?
+    let predecessorRegistration: UUID
     let registration: UUID
-    let authority: UUID?
-    let metadataRevision: UInt64
-    let ownershipGeneration: UInt64
-    let recoveryGeneration: UInt64
-    let executionID: UUID?
+    private let lock = NSLock()
+    private var published: Bool
+    init(serviceID: UUID, authority: UUID, predecessorAuthority: UUID?, predecessorRegistration: UUID) {
+        self.serviceID = serviceID; self.authority = authority
+        self.predecessorAuthority = predecessorAuthority; self.predecessorRegistration = predecessorRegistration
+        registration = predecessorAuthority == authority ? predecessorRegistration : UUID()
+        published = predecessorAuthority == authority
+    }
+    var isPublished: Bool { lock.withLock { published } }
+    func publish() { lock.withLock { published = true } }
+}
+
+/// Ordinary progress does not change ownership. Relevant service transitions
+/// invalidate this permit before the authority can admit exact retirement.
+nonisolated final class TrustedDepartureRetirement: Sendable {
+    struct Evidence: Sendable, Equatable {
+        let serviceID: UUID
+        let registration: UUID
+        let authority: UUID?
+        let ownershipGeneration: UInt64
+        let recoveryGeneration: UInt64
+        let executionID: UUID?
+        let processID: ObjectIdentifier?
+    }
+    let evidence: Evidence
+    private let validity = TrustedInvalidationToken()
+    init(_ evidence: Evidence) { self.evidence = evidence }
+    var isCurrent: Bool { validity.isCurrent }
+    func invalidate() { validity.invalidate() }
+    func admit() -> Bool { validity.consume() }
 }
 
 struct TrustedLocalRecoveryReceipt: Sendable {
@@ -136,11 +165,21 @@ nonisolated final class TrustedAuthorityRecoveryEndpoint: @unchecked Sendable {
     let journal: URL?
     private weak var authority: TrustedApprovalsCoordinator?
     private let token = TrustedInvalidationToken()
+    private let lock = NSLock()
+    private var settling = false
     init(authority: TrustedApprovalsCoordinator, ticketID: UUID, serviceID: UUID, journal: URL?) {
         self.authority = authority; authorityID = authority.id; self.ticketID = ticketID; self.serviceID = serviceID; self.journal = journal
     }
     var isCurrent: Bool { token.isCurrent }
-    var message: String { "Authority departure " + ticketID.uuidString + " needs receipt recovery. Choose Retry Recovery; unverifiable receipts require manual repair." }
+    var message: String {
+        if lock.withLock({ settling }) {
+            return "Authority departure " + ticketID.uuidString + " is settling retained recovery work. Retry Recovery waits for settlement; cancelling releases only this caller."
+        }
+        return "Authority departure " + ticketID.uuidString + " needs receipt recovery. Choose Retry Recovery; unverifiable receipts require manual repair."
+    }
+    func setSettling(_ value: Bool) -> Bool {
+        lock.withLock { guard settling != value else { return false }; settling = value; return true }
+    }
     func invalidate() { token.invalidate() }
     func retry() async throws {
         guard isCurrent else { return }
