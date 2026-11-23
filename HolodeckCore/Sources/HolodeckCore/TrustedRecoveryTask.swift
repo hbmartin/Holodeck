@@ -4,8 +4,8 @@ import Foundation
 struct TrustedRecoveryTaskClosed: LocalizedError, Sendable {
     var errorDescription: String? { "The cancelled recovery phase is still settling; join its successor after settlement." }
 }
-/// Independent waiters share preparation; the last cancelled waiter stops only
-/// work which has not crossed its existing noncancellable acceptance boundary.
+/// Independent waiters share preparation. The last cancellation stops unadmitted
+/// work by default; durable intent owners explicitly keep their task running.
 nonisolated final class TrustedRecoveryTask<Value: Sendable>: @unchecked Sendable {
     private let task: Task<Value, Error>
     private let lock = NSLock()
@@ -72,14 +72,16 @@ nonisolated final class TrustedReadTask: @unchecked Sendable {
     private let lock = NSLock()
     private var result: Result<Data?, Error>?
     private var waiters: [UUID: RequestPersistence.CommitTicket<Data?>] = [:]
-    init(_ read: @escaping @Sendable () throws -> Data?) {
-        Task.detached { [self] in
+    var waiterCount: Int { lock.withLock { waiters.count } }
+    init(_ read: @escaping @Sendable () throws -> Data?, completed: @escaping @Sendable () -> Void) {
+        DispatchQueue.global(qos: .utility).async { [self] in
             let value = Result { try read() }
             let pending = lock.withLock {
                 result = value
                 let pending = Array(waiters.values); waiters.removeAll(); return pending
             }
             pending.forEach { $0.complete(value) }
+            completed()
         }
     }
     func value() async throws -> Data? {
@@ -169,14 +171,7 @@ nonisolated final class TrustedWorkerRetirement: Sendable {
     let executions: [UUID: UUID]
     let completion = TrustedCompletionSignal()
     init(_ executions: [UUID: UUID]) { self.executions = executions }
-    func wait(or changed: TrustedCompletionSignal) async throws {
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask { try await self.completion.wait() }
-            group.addTask { try await changed.wait() }
-            defer { group.cancelAll() }
-            _ = try await group.next()
-        }
-    }
+
 }
 struct TrustedWorkerRetirementPending: LocalizedError, Sendable {
     let retirement: TrustedWorkerRetirement

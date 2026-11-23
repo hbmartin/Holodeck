@@ -310,7 +310,12 @@ import XCTest
         try await wait { result.finished }; try result.check(); _ = try await accept(latest)
         XCTAssertGreaterThan(backend.reads, reads)
         let status = try await a.control(operation: "requestStatus", payload: .init(), deviceID: "A")
-        XCTAssertTrue(status.enabled); XCTAssertFalse(status.message.contains("inspection requires recovery"))
+        // A superseded, unaccepted proposal cannot acquire a binding merely
+        // because another service completed a fresh backend inspection.
+        XCTAssertFalse(status.enabled); XCTAssertTrue(status.message.contains("inspection"))
+        _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a)))
+        let accepted = try await a.control(operation: "requestStatus", payload: .init(), deviceID: "A")
+        XCTAssertTrue(accepted.enabled)
     }
     func testRequesterActiveWorkRefusesBothRecoveryPhases() async throws {
         let (service, root) = try await fixture(), backend = TrustedBackendFixture(nil), authority = backend.coordinator()

@@ -59,6 +59,10 @@ import XCTest
             let owner = TrustedOwnerRecorder().owner(service: service), ticket = try await authority.register(owner)
             addTeardownBlock { ticket.completion.cancel() }
             try await wait { gate.entered }; XCTAssertFalse(ticket.completion.hasStarted)
+            if initial {
+                let status = try await service.control(operation: "requestStatus", payload: .init(), deviceID: "TV")
+                XCTAssertFalse(status.enabled); XCTAssertTrue(status.message.contains("not been inspected"))
+            }
             let withdrawal = Task { await authority.withdraw(serverID: owner.serverID, eligibility: owner.eligibility) }
             addTeardownBlock { withdrawal.cancel() }
             let result = InspectionResult<TrustedApprovalsCoordinator.BindingOutcome>()
@@ -126,6 +130,82 @@ import XCTest
         try await old.replay()
         latestWaiting.on = false; await latestPreparation.release()
         _ = try await accepted(newest)
+    }
+    func testCancelledReadCannotReplaceANewerAcceptedTrustedWrite() async throws {
+        let service = try await fixture()
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [.init(id: "TV", name: "TV", tokenHash: "old")]).encoded())
+        let authority = backend.coordinator(), gate = TrustedReadGate()
+        addTeardownBlock { gate.release() }
+        let first = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: service))), reads = backend.reads
+        backend.gateReads(gate)
+        let cancelled = try await authority.register(TrustedOwnerRecorder().owner(service: service))
+        addTeardownBlock { cancelled.completion.cancel() }
+        try await wait { gate.entered }; cancelled.completion.cancel()
+        do { _ = try await cancelled.value(); XCTFail("Cancelled inspection accepted") } catch is CancellationError {}
+        try await wait { await authority.observation.preparingGeneration == nil }
+        try await authority.revoke("TV", permit: first.permit) { _ in }
+        XCTAssertEqual(backend.writes, 2)
+        let latest = try await authority.register(TrustedOwnerRecorder().owner(service: service))
+        addTeardownBlock { latest.completion.cancel() }
+        try await wait { await authority.observation.rawReadSubscribers == 1 }
+        backend.gateReads(nil); gate.release(); _ = try await accepted(latest)
+        XCTAssertEqual(backend.reads, reads + 2) // Discard the obsolete read, then inspect current bytes.
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).approvals.isEmpty)
+        let state = await authority.observation
+        XCTAssertEqual(state.rawReadFlights, 0); XCTAssertEqual(state.rawReadSubscribers, 0)
+        XCTAssertEqual(state.revocationCompletionTasks, 0); XCTAssertEqual(state.automaticValidationTasks, 0)
+    }
+    func testObsoleteReadFailureCannotInvalidateANewerTrustedWrite() async throws {
+        let service = try await fixture(), gate = TrustedReadGate(), failOne = InspectionSwitch()
+        addTeardownBlock { gate.release() }
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [.init(id: "TV", name: "TV", tokenHash: "old")]).encoded())
+        let authority = TrustedApprovalsCoordinator(read: {
+            if failOne.on { failOne.on = false; gate.wait(); throw POSIXError(.EIO) }
+            return try backend.checkedRead()
+        }, write: { try backend.write($0) })
+        let first = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: service)))
+        failOne.on = true
+        let cancelled = try await authority.register(TrustedOwnerRecorder().owner(service: service))
+        addTeardownBlock { cancelled.completion.cancel() }
+        try await wait { gate.entered }; cancelled.completion.cancel()
+        do { _ = try await cancelled.value(); XCTFail("Cancelled inspection accepted") } catch is CancellationError {}
+        try await wait { await authority.observation.preparingGeneration == nil }
+        try await authority.revoke("TV", permit: first.permit) { _ in }
+        let owner = TrustedOwnerRecorder(), latest = try await authority.register(owner.owner(service: service))
+        addTeardownBlock { latest.completion.cancel() }
+        try await wait { await authority.observation.rawReadSubscribers == 1 }
+        gate.release(); _ = try await accepted(latest)
+        let diagnostic = await owner.snapshot?.diagnostic; XCTAssertNil(diagnostic)
+        XCTAssertEqual(backend.writes, 2)
+    }
+    func testRawReadAndSubscriptionsStayBoundedAcrossCancelledRegistrations() async throws {
+        let service = try await fixture(), backend = TrustedBackendFixture(nil), authority = backend.coordinator(), gate = TrustedReadGate()
+        addTeardownBlock { gate.release() }
+        _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: service)))
+        let reads = backend.reads, start = ContinuousClock.now
+        backend.gateReads(gate)
+        for _ in 0..<40 {
+            let ticket = try await authority.register(TrustedOwnerRecorder().owner(service: service))
+            addTeardownBlock { ticket.completion.cancel() }
+            try await wait { await authority.observation.rawReadSubscribers == 1 }
+            ticket.completion.cancel()
+            do { _ = try await ticket.value(); XCTFail("Cancelled registration accepted") } catch is CancellationError {}
+            try await wait { let state = await authority.observation; return state.preparingGeneration == nil && state.rawReadSubscribers == 0 }
+            let state = await authority.observation
+            XCTAssertEqual(state.rawReadFlights, 1); XCTAssertEqual(state.encodings, 0); XCTAssertEqual(state.writes, 0)
+        }
+        let latest = try await authority.register(TrustedOwnerRecorder().owner(service: service))
+        addTeardownBlock { latest.completion.cancel() }
+        try await wait { await authority.observation.rawReadSubscribers == 1 }
+        backend.gateReads(nil); gate.release(); _ = try await accepted(latest)
+        XCTAssertEqual(backend.reads, reads + 1)
+        let final = await authority.observation
+        XCTAssertEqual(final.rawReadFlights, 0); XCTAssertEqual(final.rawReadSubscribers, 0)
+        if ProcessInfo.processInfo.environment["HOLODECK_TRUSTED_PROFILE"] == "1" {
+            let elapsed = start.duration(to: .now).components
+            let seconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+            print("READ_CONTENTION_PROFILE commands=40 seconds=\(seconds) reads=\(backend.reads - reads) encodings=\(final.encodings) writes=\(final.writes) flights=\(final.rawReadFlights) subscribers=\(final.rawReadSubscribers) resumes=\(final.admissionResumes)")
+        }
     }
     func testCancelledReadDoesNotPublishAndNewestRegistrationSharesRawFlight() async throws {
         let service = try await fixture(), backend = TrustedBackendFixture(nil), authority = backend.coordinator(), gate = TrustedReadGate()

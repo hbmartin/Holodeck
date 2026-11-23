@@ -579,9 +579,19 @@ public actor ShaderRequestService {
         let departure: TrustedAuthorityDeparture
     }
     private weak var trustedAuthority: TrustedApprovalsCoordinator?
+    private var pendingTrustedAuthority: UUID?
     private var authorityTransfer: UUID?
     func rememberTrustedAuthority(_ authority: TrustedApprovalsCoordinator) { trustedAuthority = authority }
     func prepareTrustedAuthority(id: UUID, preparation: TrustedRegistrationPreparation? = nil) async throws -> AuthorityTransfer? {
+        if let pendingTrustedAuthority, pendingTrustedAuthority != id {
+            throw ShaderRequestError.unavailable("An earlier TV authority inspection is unresolved. Recover that authority and explicitly register before switching approval accounts.")
+        }
+        if revocationCoordinatorID == nil {
+            // Inspection readiness is provisional; it does not install an
+            // authority or authorize restored TV jobs before the first read.
+            revocationInspectionPending = true; emitUpdates()
+            return nil
+        }
         guard let prior = revocationCoordinatorID, prior != id, let predecessor = trustedAuthority, predecessor.id != id else { return nil }
         guard authorityTransfer == nil else { throw ShaderRequestError.unavailable("A trusted authority handoff is pending; retry after it finishes.") }
         guard acceptedMetadataAvailable || loaded else { throw TrustedSetupPending() }
@@ -804,11 +814,12 @@ public actor ShaderRequestService {
     }
     func failedTrustedRegistration(_ error: Error, authority: UUID,
         recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) {
-        guard revocationCoordinatorID == nil else { return }
+        guard revocationCoordinatorID == nil || (trustedAuthority?.id == authority && revocationCoordinatorID != authority) else { return }
         // Recovery routing is provisional; it grants no registration or request
         // authorization and local repair remains unbound until activation.
+        pendingTrustedAuthority = authority
         revocationCoordinator = recovery
-        revocationReplayFailed(error)
+        revocationReplayFailed(ShaderRequestError.unavailable("Trusted TV approval inspection requires recovery: " + error.localizedDescription))
     }
     private func requireLocalPreparationFinished(changingTo id: UUID) throws {
         if revocationCoordinatorID != id, let preparation = localPreparation {
@@ -852,6 +863,7 @@ public actor ShaderRequestService {
         return registration
     }
     private func bindRevocationCoordinator(id: UUID, registration: UUID? = nil, _ coordinator: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) -> UUID {
+        if pendingTrustedAuthority == id { pendingTrustedAuthority = nil }
         if revocationCoordinatorID == id { revocationCoordinator = coordinator; return revocationRegistration }
         revocationRegistration = registration ?? UUID(); revocationApplications.removeAll()
         controlScopes.removeAll()
@@ -1880,7 +1892,7 @@ public actor ShaderRequestService {
                 emitUpdates(); scheduleWakeup()
             }
         }
-        let local = try await recoverLocalPhase(consumingAuthority: replayTrusted ? revocationCoordinatorID : nil)
+        var local = try await recoverLocalPhase(consumingAuthority: replayTrusted ? revocationCoordinatorID : nil)
         try Task.checkCancellation()
         let hasTrustedPhase = replayTrusted && revocationCoordinator != nil
         var failures: [String] = [], completed: Set<UUID> = !hasTrustedPhase && local.completed ? [runtimeID] : []
@@ -1898,6 +1910,10 @@ public actor ShaderRequestService {
                     failures.append(error.localizedDescription)
                 }
             }
+        }
+        if completed.contains(runtimeID), let refreshed = localRecoveryResult,
+           refreshed.receipt?.attemptID != local.receipt?.attemptID, validateTrustedRecovery(refreshed).completed {
+            local = refreshed
         }
         // These exact old-authority routes survive replacement of the ordinary
         // coordinator callback. Each owns only its retained departure evidence.
@@ -2007,6 +2023,11 @@ public actor ShaderRequestService {
         }
         if let pass { trustedRecoveryHolds.insert(pass) }
         return outcome
+    }
+    func recoverAfterTrustedBinding(pass: UUID, authority: UUID) async throws -> TrustedLocalRecovery {
+        guard revocationCoordinatorID == authority, localRecoveryPhase == nil else { throw TrustedRecoveryInterrupted() }
+        if localRecoveryResult?.receipt?.registrationID != revocationRegistration { localRecoveryResult = nil }
+        return try await trustedRecoveryOutcome(pass: pass, authority: authority)
     }
     /// Join only the local phase, never the authority pass which is asking us.
     func trustedRecoveryOutcome(pass: UUID? = nil, authority: UUID? = nil) async throws -> TrustedLocalRecovery {
