@@ -1340,3 +1340,58 @@ env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --packag
 ```
 
 Local evidence: `/tmp/pr53-final-validation.json`, `/tmp/pr53-app-builds.json`, `/tmp/pr53-final-source.json`, `/tmp/pr53-races.json`, `/tmp/pr53-profile-summary.json`, `/tmp/pr53-retirement-summary.json` and corresponding logs. Six skips are two catalog profiles, directory-reload profiling, live Bonjour/LAN, real Codex publication and the separate worker idle-CPU profile. Desktop UI runtime checks remain **blocked by instruction**. Physical Apple TV/tvOS simulator execution, separate external Python worker/checker suites, compile-all external library checks and standalone GPU-profile runs were not repeated. Existing Swift process regressions and local native/GPU fixtures did run. Linux CI, checker artifacts/locks and worker/shader code remain unchanged; no live installation replacement, request enabling, merge or deployment occurred.
+
+
+## PR #53 follow-up — handoff waits and recovery fences (2026-11-23)
+
+Based on merged PR #53 at `2e5a00d` (reviewed head `04711c2`). Four commits cover revocation admission/cancellable waits, intent-free recovery fences, shared retirement draining, and binding admission/diagnostics.
+
+### Acceptance and recovery boundaries
+
+- A queued revocation makes an unadmitted departure yield. Activation and yielding share the departure lock; an already-admitted activation still finishes. The accepted source binding remains available, trusted credential removal can proceed while a worker retirement save is stalled, and the registration automatically prepares again after required cancellation settles. No timeout declares persistence or process settlement complete.
+- Retirement, local-preparation and source-inspection waits observe cancellation, supersession and departure yielding. Leaving a wait does not cancel its shared recovery or admitted I/O. Internal progress never waits behind dependent client work, including opposing transfers.
+- Successful local preparation records a matching pending outcome even before its first obligation. Later intents extend that fence. A later revocation encountering an abandoned outcome joins one automatic trusted validation; failure retains the exact fence and Retry Recovery guidance without spinning. Two gated revocations share one validation pass, and normal revocation still performs two trusted writes.
+- Ordinary completion, startup and recovery join one retirement drain. It processes eligible entries to quiescence, preserves newer markers, parks conflicts/errors visibly, and distinguishes verified settlement awaiting metadata from unverified processes. Recovery cannot start an independent retirement loop beside that owner.
+- Initial, same-authority and cross-authority production bindings all require atomic lifetime/preparation/ticket admission. Compatibility adapters remain explicit. Direct withdrawal is covered separately from production shutdown, whose existing cancellation/lifetime safeguards remain intact. Internal boundary errors have readable fallback diagnostics. The admitted-pairing expiry test uses an optional asynchronous write-admission hook, avoiding cooperative-pool blocking and timed gate auto-release. The hook is nil for ordinary writes and adds no ordinary suspension or trusted I/O.
+- The reported ordinary retirement-overlap producer and production shutdown acceptance were not established by triage. Stale/conflicting retirement handling remains defensive; no normal producer of exceptional departed-registration evidence is claimed.
+
+### Final validation
+
+- Final source inventory: **112 Swift files**. Production sources stayed fixed through core, Release, app builds and profiling. The large-queue structural bound was subsequently expressed per captured target and verified in Release and all seven comparison samples. The admission fixture also passed 30 Debug repetitions; asynchronous admitted-pairing gating passed the strict-executor selection before the final run.
+- Full core, packaging and local native/GPU fixtures: **Executed 636 tests, with 6 tests skipped and 0 failures (0 unexpected) in 176.171 (176.283) seconds**, 208.775 seconds including build.
+- Focused Release selection, including isolated TLS and packaged resources: **Executed 194 tests, with 0 failures (0 unexpected) in 13.251 (13.275) seconds**, 66.200 seconds including build.
+- Optimized races: **20 × 147 = 2,940 executions, zero failures**, with strict cooperative-pool scheduling and a 90-second failure backstop per run.
+- Headless checks of the actual Mac request model passed on system Python 3.9 and the current supported interpreter. Verified **25 local scenes** at revision `8348af807717ea0e436208e957c333ec271e935380a9ea68b1db5aca56df13a5`; opted-in Metal/GPU regressions passed with the fixture and GPU environment flags shown below.
+- Both unsigned Release apps built in `/tmp/HolodeckPR54Validation`: `HolodeckMac` (116.555 seconds), `Holodeck` (14.096 seconds). Neither was installed or launched.
+- The built native artifact-info exactly matches PR #53, including checker repository/version/interface/source commit/SHA-256; checker bytes and locks are unchanged.
+
+### Release comparisons
+
+A physical copy of PR #53's optimized products was retained before rebuilding. Seven samples alternate baseline/follow-up on the same filesystem and compiler, using injected trusted backends and real temporary request metadata. These are descriptive median milliseconds, not CI thresholds or a general throughput claim.
+
+| Workload | PR #53 ms | Follow-up ms |
+| --- | ---: | ---: |
+| 200 sequential revocations | 71.659 | 72.548 |
+| 50 queued revocations | 166.015 | 171.153 |
+| 100 queued revocations | 345.926 | 354.364 |
+| 200 queued revocations | 739.088 | 767.558 |
+| 100 no-intent recoveries | 40.784 | 41.431 |
+| 100 late-caller pairs | 266.155 | 265.398 |
+| 200 same-authority registrations | 11.381 | 10.013 |
+
+Normal trusted I/O is unchanged: 200 sequential revocations use one read and 400 encodings/writes; queued 50/100/200 workloads use two reads and 100/200/400 encodings/writes. No-intent recovery and registration add no trusted writes. Late-caller passes preserve their measured phase and I/O counts. Completed workloads retain no obligations, recovery pins or participants. Queued follow-up revocations apply to both registered targets before handoff resumes; the baseline applies after the departing target leaves. That additional target work is intentional. Resume/advance bounds scale with the captured target count, and measurements remain in the raw comparison; no elapsed-time improvement is assumed.
+
+Ten separately gated worker retirements per sample verify the behavior change: PR #53 removes credentials before releasing retirement in **0/10** cases and needs **10** scripted handoff cancellations/retries; the follow-up removes them in **10/10** cases with **0** retries. Both retain safe settlement and complete the registration after the writer is released. The baseline intervention is scripted, not human response time.
+
+Reproduction:
+
+```sh
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer HOLODECK_AUTHORING_FIXTURE=/Volumes/Pro2T/HolodeckShaders HOLODECK_GPU_TESTS=1 swift test --package-path HolodeckCore --skip-update
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --package-path HolodeckCore -c release --skip-update --filter 'Trusted|ShaderLibraryToolTests|CatalogNetworkTests|LocalClientRecoveryTests'
+/usr/bin/python3 tools/check_mac_requests_recovery.py
+/opt/homebrew/bin/python3 tools/check_mac_requests_recovery.py
+```
+
+Local evidence: `/tmp/pr54-final-source.json`, `/tmp/pr54-final-validation.json`, `/tmp/pr54-app-builds.json`, `/tmp/pr54-races.json`, `/tmp/pr54-profile-summary.json`, `/tmp/pr54-retirement-summary.json` and corresponding logs. Desktop UI runtime checks remain **blocked by instruction**. Live Bonjour/LAN, real Codex publication, physical Apple TV and tvOS simulator execution were not run. Separate unchanged Python worker/checker suites, compile-all external library checks and standalone GPU profiles were not repeated. Existing Swift process regressions, isolated TLS and the local native/GPU fixtures did run.
+
+Public/network contracts, persisted formats, Linux CI, checker artifacts/locks and worker/shader implementation remain unchanged. No live installation replacement, request enabling, merge or deployment was performed.

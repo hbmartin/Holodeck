@@ -76,6 +76,63 @@ import XCTest
         let accepted = await next.observation; XCTAssertEqual(accepted.targets, 1)
         await a.finishTrustedRecovery(pass: pass)
     }
+    func testCancelledRegistrationLeavesLocalPreparationWaitPromptly() async throws {
+        let armed = RecoveryOwnershipSwitch(), repairing = RecoveryGate()
+        addTeardownBlock { await repairing.release() }
+        let a = try await fixture(reconcile: { _ in if armed.on { try await repairing.wait() } })
+        let old = TrustedBackendFixture(nil).coordinator(), next = TrustedBackendFixture(nil).coordinator()
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a)))
+        armed.on = true
+        let local = Task { try await a.trustedRecoveryOutcome() }
+        addTeardownBlock { local.cancel(); await repairing.release() }
+        try await wait { await repairing.hasEntered }
+        let registration = try await next.register(TrustedOwnerRecorder().owner(service: a))
+        addTeardownBlock { registration.completion.cancel() }
+        try await wait { await a.localPreparationWaiters == 1 }
+        registration.completion.cancel()
+        try await wait { await a.localPreparationWaiters == 0 }
+        try await wait { await old.observation.departures == 0 }
+        do { _ = try await registration.value(); XCTFail("Cancelled registration accepted") } catch is CancellationError {}
+        armed.on = false; await repairing.release(); _ = try await completed { try await local.value }
+    }
+    func testCancelledRegistrationLeavesInspectionWaitWithoutCancellingInspection() async throws {
+        let a = try await fixture(), b = try await fixture(), armed = RecoveryOwnershipSwitch()
+        let gate = RecoveryGate(), reading = TrustedReadGate(), backend = TrustedBackendFixture(nil)
+        addTeardownBlock { reading.release(); await gate.release() }
+        let old = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
+            beforeTargetInspection: { id in if id == a.runtimeID && armed.on { try await gate.wait() } })
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: a)))
+        _ = try await accept(old.register(TrustedOwnerRecorder().owner(service: b)))
+        let destination = TrustedBackendFixture(nil), next = destination.coordinator(); destination.gateReads(reading)
+        let registration = try await next.register(TrustedOwnerRecorder().owner(service: a))
+        addTeardownBlock { registration.completion.cancel() }
+        try await wait { reading.entered }; armed.on = true
+        let recovery = Task { try await b.retryReconciliation() }
+        addTeardownBlock { recovery.cancel(); await gate.release() }
+        try await wait { await gate.hasEntered }; destination.gateReads(nil); reading.release()
+        try await wait { await old.observation.departureInspectionWaiters == 1 }
+        registration.completion.cancel()
+        try await wait { await old.observation.departureInspectionWaiters == 0 }
+        do { _ = try await registration.value(); XCTFail("Cancelled inspection wait accepted") } catch is CancellationError {}
+        armed.on = false; await gate.release(); try await completed { try await recovery.value }
+        try await wait { await old.observation.departures == 0 }
+    }
+    func testWithdrawalPreventsInitialAndSameAuthorityAdmission() async throws {
+        for initial in [true, false] {
+            let a = try await fixture(), gate = RecoveryGate(), armed = RecoveryOwnershipSwitch(), backend = TrustedBackendFixture(nil)
+            addTeardownBlock { await gate.release() }
+            let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
+                beforeAuthorityPreparation: { _ in if armed.on { try await gate.wait() } })
+            if !initial { _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a))) }
+            armed.on = true
+            let owner = TrustedOwnerRecorder().owner(service: a), registration = try await authority.register(owner)
+            addTeardownBlock { registration.completion.cancel(); await gate.release() }
+            try await wait { await gate.hasEntered }
+            await authority.withdraw(serverID: owner.serverID, eligibility: owner.eligibility)
+            armed.on = false; await gate.release()
+            guard case .superseded = try await completed({ try await registration.value() }) else { return XCTFail("Withdrawn candidate accepted") }
+        }
+    }
     func testInitialBindingAlsoWaitsForUnboundLocalPreparation() async throws {
         let armed = RecoveryOwnershipSwitch(), repairing = RecoveryGate()
         addTeardownBlock { await repairing.release() }

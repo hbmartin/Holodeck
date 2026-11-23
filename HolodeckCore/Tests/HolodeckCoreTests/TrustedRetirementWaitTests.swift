@@ -7,6 +7,7 @@ import XCTest
     private struct Pending {
         let service: ShaderRequestService
         let root: URL
+        let oldBackend: TrustedBackendFixture
         let old: TrustedApprovalsCoordinator
         let next: TrustedApprovalsCoordinator
         let backend: TrustedBackendFixture
@@ -33,7 +34,7 @@ import XCTest
         guard case .accepted(let binding) = try await result(registration) else { throw ShaderRequestError.invalidRequest }
         return binding
     }
-    private func pending(launched: Bool = true, reconcile: @escaping @Sendable () async throws -> Void = {}) async throws -> Pending {
+    private func pending(launched: Bool = true, approvals: [ApprovedTV] = [], reconcile: @escaping @Sendable () async throws -> Void = {}) async throws -> Pending {
         let root = URL(fileURLWithPath: "/private/tmp/pr53-retirement-wait-" + UUID().uuidString)
         let writing = TrustedReadGate(), reading = TrustedReadGate(), dispatch = TrustedReadGate()
         let armed = RetirementWaitSwitch(), fail = RetirementWaitSwitch(), dispatching = RetirementWaitSwitch()
@@ -71,7 +72,7 @@ import XCTest
         print(json.dumps(dict(event='clarification',question='Choose',options=['A','B'])),flush=True)
         """.write(to: root.appendingPathComponent("worker.py"), atomically: true, encoding: .utf8)
         try await service.retryReconciliation()
-        let old = TrustedBackendFixture(nil).coordinator(), backend = TrustedBackendFixture(nil), next = backend.coordinator()
+        let oldBackend = TrustedBackendFixture(try TrustedTVApprovals(approvals: approvals).encoded()), old = oldBackend.coordinator(), backend = TrustedBackendFixture(nil), next = backend.coordinator()
         let binding = try await accepted(old.register(TrustedOwnerRecorder().owner(service: service)))
         dispatching.on = !launched
         await service.activateScheduling(); await service.resume()
@@ -91,8 +92,45 @@ import XCTest
         let before = await next.observation
         XCTAssertNil(before.acceptedGeneration); XCTAssertFalse(before.transitionActive)
         XCTAssertTrue(binding.permit.isCurrent)
-        return .init(service: service, root: root, old: old, next: next, backend: backend,
+        return .init(service: service, root: root, oldBackend: oldBackend, old: old, next: next, backend: backend,
                      binding: binding, registration: registration, writing: writing, fail: fail)
+    }
+    func testRevocationYieldsRetirementWaitAndHandoffResumes() async throws {
+        let p = try await pending(approvals: [.init(id: "TV", name: "TV", tokenHash: "old")])
+        let revoked = RetirementDetachResult()
+        let task = Task {
+            do { try await p.old.revoke("TV", permit: p.binding.permit) { _ in }; revoked.value = .success(()) }
+            catch { revoked.value = .failure(error) }
+        }
+        addTeardownBlock { task.cancel(); p.writing.release() }
+        try await wait { (try? TrustedTVApprovals.decode(p.oldBackend.read()!).approvals.isEmpty) == true }
+        XCTAssertTrue(p.writing.entered)
+        XCTAssertFalse(p.registration.completion.hasStarted)
+        let stored = try TrustedTVApprovals.decode(XCTUnwrap(p.oldBackend.read()))
+        XCTAssertEqual(stored.revocations.map(\.deviceID), ["TV"])
+        p.writing.release()
+        try await wait { revoked.value != nil }; try XCTUnwrap(revoked.value).get()
+        _ = try await accepted(p.registration)
+        XCTAssertEqual(p.oldBackend.writes, 2)
+        let done = await p.old.observation
+        XCTAssertEqual(done.departures, 0); XCTAssertEqual(done.queuedRevocations, 0)
+    }
+    func testStorageRecoveryJoinsTheRetirementDrain() async throws {
+        let p = try await pending()
+        let count = await p.service.retirementDrainCount
+        let outcome = RetirementDetachResult()
+        let recovering = Task {
+            do { try await p.service.retryReconciliation(); outcome.value = .success(()) }
+            catch { outcome.value = .failure(error) }
+        }
+        addTeardownBlock { recovering.cancel(); p.writing.release() }
+        try await wait { await p.service.localRecoveryPhaseCount > 1 }
+        XCTAssertNil(outcome.value)
+        p.writing.release()
+        try await wait { outcome.value != nil }; try XCTUnwrap(outcome.value).get()
+        _ = try await accepted(p.registration)
+        let after = await p.service.retirementDrainCount; XCTAssertEqual(after, count)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(p.root.appendingPathComponent("active.json")))
     }
     func testHealthyRetirementAutomaticallyCompletesHandoff() async throws {
         let p = try await pending()

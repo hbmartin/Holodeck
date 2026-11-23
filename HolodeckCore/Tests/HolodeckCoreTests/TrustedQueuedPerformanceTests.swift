@@ -83,8 +83,10 @@ import XCTest
         XCTAssertEqual(final.targets, 1); XCTAssertEqual(final.recoverySubscriptions, 1)
         let resumes = final.admissionResumes - initial.admissionResumes
         let advances = final.admissionAdvances - initial.admissionAdvances
-        XCTAssertLessThanOrEqual(resumes, count * 8 + 20)
-        XCTAssertLessThanOrEqual(advances, count * 12 + 40)
+        // Each target contributes application/verification/finalization progress.
+        // A yielded handoff retains its departing target until cancellation settles.
+        XCTAssertLessThanOrEqual(resumes, count * (initial.targets * 3 + 2) + 20)
+        XCTAssertLessThanOrEqual(advances, count * (initial.targets * 6 + 2) + 40)
         let stored = try TrustedTVApprovals.decode(XCTUnwrap(backend.read()))
         XCTAssertEqual(Set(stored.approvals.map(\.id)), Set(cancelled.map { "TV-\($0)" })); XCTAssertTrue(stored.revocations.isEmpty)
         print("QUEUED_PROFILE commands=\(count) cancelled=\(cancelled.count) reads=\(backend.reads) writes=\(backend.writes) encodings=\(final.encodings) resumes=\(resumes) advances=\(advances) queries=32 response=\(responsiveness) drain=\(ProcessInfo.processInfo.systemUptime - draining) elapsed=\(ProcessInfo.processInfo.systemUptime - started)")

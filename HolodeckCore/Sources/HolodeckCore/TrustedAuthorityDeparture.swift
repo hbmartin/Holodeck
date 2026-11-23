@@ -1,8 +1,9 @@
 #if os(macOS)
 import Foundation
 
-struct TrustedDepartureInspectionPending: Error, Sendable {
+struct TrustedDepartureInspectionPending: LocalizedError, Sendable {
     let departure: TrustedAuthorityDeparture
+    var errorDescription: String? { "Trusted approval inspection is still running; authority registration waits for its result." }
 }
 /// Bridges authority actors without holding either lane while inspection waits.
 nonisolated final class TrustedAuthorityDeparture: @unchecked Sendable {
@@ -17,12 +18,22 @@ nonisolated final class TrustedAuthorityDeparture: @unchecked Sendable {
     private enum Phase { case preparing, ready(Evidence), activated, closed }
     private let lock = NSLock()
     private var phase = Phase.preparing
+    let yieldRequested = TrustedCompletionSignal()
+    private var yielded = false
     private var inspections: Set<UUID> = []
     private var inspectionWaiters: [UUID: RequestPersistence.CommitTicket<Void>] = [:]
     init(id: UUID, serviceID: UUID, registrationID: UUID) {
         self.id = id; self.serviceID = serviceID; self.registrationID = registrationID
     }
     var inspectionWaiterCount: Int { lock.withLock { inspectionWaiters.count } }
+    func requestYield() {
+        let changed = lock.withLock {
+            switch phase { case .activated, .closed: return false; default: break }
+            yielded = true; return true
+        }
+        if changed { yieldRequested.finish() }
+    }
+    func checkYield() throws { if lock.withLock({ yielded }) { throw TrustedDepartureYielded() } }
     var activated: Bool { lock.withLock { if case .activated = phase { return true }; return false } }
     func invalidatePreparation() { lock.withLock { if case .ready = phase { phase = .preparing } } }
     func advanceBaseline(from previous: UInt64, to current: UInt64) {
@@ -66,6 +77,7 @@ nonisolated final class TrustedAuthorityDeparture: @unchecked Sendable {
     }
     func activate<T>(_ change: () throws -> T) throws -> T {
         try lock.withLock {
+            if yielded { throw TrustedDepartureYielded() }
             guard inspections.isEmpty else { throw TrustedDepartureInspectionPending(departure: self) }
             guard case .ready(let evidence) = phase, evidence.registration == registrationID, evidence.obligations.isEmpty else {
                 throw ShaderRequestError.unavailable("Previous TV approval inspection changed during handoff. Retain the accepted authority and retry.")
