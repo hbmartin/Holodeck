@@ -33,12 +33,12 @@ import XCTest
         guard case .accepted(let binding) = try await result(registration) else { throw ShaderRequestError.invalidRequest }
         return binding
     }
-    private func pending(launched: Bool = true) async throws -> Pending {
+    private func pending(launched: Bool = true, reconcile: @escaping @Sendable () async throws -> Void = {}) async throws -> Pending {
         let root = URL(fileURLWithPath: "/private/tmp/pr53-retirement-wait-" + UUID().uuidString)
         let writing = TrustedReadGate(), reading = TrustedReadGate(), dispatch = TrustedReadGate()
         let armed = RetirementWaitSwitch(), fail = RetirementWaitSwitch(), dispatching = RetirementWaitSwitch()
         let service = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")),
-            directory: root, workerScript: root.appendingPathComponent("worker.py"), reconcileWorker: { _ in },
+            directory: root, workerScript: root.appendingPathComponent("worker.py"), reconcileWorker: { _ in try await reconcile() },
             beforePersistenceReplacement: { url in
                 if dispatching.on && url.lastPathComponent == "active.json" { dispatch.wait() }
                 if armed.on && url.lastPathComponent == "journal.json" && !FileManager.default.fileExists(atPath: root.appendingPathComponent("active.json").path) {
@@ -125,6 +125,26 @@ import XCTest
         p.writing.release(); _ = try await accepted(newest)
         let next = await p.next.observation; XCTAssertEqual(next.acceptedGeneration, newest.generation)
     }
+    func testDetachInterruptsWaitingActivationWithItsOwnDiagnostic() async throws {
+        let armed = RetirementWaitSwitch(), settling = RecoveryGate()
+        addTeardownBlock { await settling.release() }
+        let p = try await pending(reconcile: { if armed.on { try await settling.wait() } })
+        armed.on = true
+        let outcome = RetirementDetachResult()
+        let detach = Task {
+            do { try await p.service.detachCheckout(.selectedCheckout); outcome.value = .success(()) }
+            catch { outcome.value = .failure(error) }
+        }
+        addTeardownBlock { detach.cancel(); p.writing.release(); await settling.release() }
+        try await wait { await p.service.recoveryStatuses().contains { $0.disposition == .detach } }
+        p.writing.release()
+        try await wait { await settling.hasEntered }
+        do { _ = try await result(p.registration); XCTFail("Detach allowed binding activation") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("Detach")); XCTAssertFalse(error.localizedDescription.contains("needs receipt recovery")) }
+        let next = await p.next.observation; XCTAssertNil(next.acceptedGeneration)
+        armed.on = false; await settling.release()
+        try await wait { outcome.value != nil }; try XCTUnwrap(outcome.value).get()
+    }
     func testRetirementWriteFailureKeepsOldBindingAndExactDiagnostic() async throws {
         let p = try await pending()
         p.fail.on = true; p.writing.release()
@@ -134,6 +154,7 @@ import XCTest
         let next = await p.next.observation; XCTAssertNil(next.acceptedGeneration)
     }
 }
+@MainActor private final class RetirementDetachResult { var value: Result<Void, Error>? }
 @MainActor private final class RetirementWaitResult { var value: Result<TrustedApprovalsCoordinator.BindingOutcome, Error>? }
 private final class RetirementWaitSwitch: @unchecked Sendable {
     private let lock = NSLock(); private var value = false

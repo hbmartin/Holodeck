@@ -747,7 +747,7 @@ public actor ShaderRequestService {
         if let installation { try validateTargetInstallation(installation, authority: id) }
         return try transfer.departure.activate {
             guard authorityTransfer == transfer.id, revocationRegistration == transfer.registration,
-                  transfer.departure.registrationID == revocationRegistration, durableRevocations.isEmpty,
+                  transfer.departure.registrationID == revocationRegistration,
                   revision.coordinator == id else {
                 throw ShaderRequestError.unavailable("The previous authority changed during handoff; retain its registration and retry recovery.")
             }
@@ -1846,6 +1846,8 @@ public actor ShaderRequestService {
                 if let partial = error as? TrustedPartialRecovery {
                     completed.formUnion(partial.completedServices); failures += partial.remaining
                 } else {
+                    // This set records verified local phases, not whole-pass
+                    // success. The trusted failure still makes the result partial.
                     if validateTrustedRecovery(local).completed { completed.insert(runtimeID) }
                     failures.append(error.localizedDescription)
                 }

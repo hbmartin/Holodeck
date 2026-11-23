@@ -1237,7 +1237,7 @@ actor TrustedApprovalsCoordinator {
                 }
                 try request.registration.completion.check()
                 guard request.registration.completion.hasStarted || request.registration.generation == generation else {
-                    request.registration.completion.complete(.success(.superseded)); preparing = nil; release(token); continue
+                    request.registration.completion.complete(.success(.superseded)); preparing = nil; preparingRegistration = nil; release(token); continue
                 }
                 if !request.registration.completion.hasStarted {
                     admittedService = request.owner.service
