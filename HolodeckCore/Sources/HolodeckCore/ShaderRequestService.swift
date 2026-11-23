@@ -620,7 +620,7 @@ public actor ShaderRequestService {
         if case .ready = departureReadiness { return true }
         return false
     }
-    private var retirementAssessment: TrustedDepartureRetirement?
+    private var retirementAssessment: TrustedDepartureOwnership?
     private var departureRetirementEvidence: TrustedDepartureRetirement.Evidence? {
         guard localPreparation == nil, localRecoveryPhase == nil, !detaching, reconciled,
               departureOwnershipVerified else { return nil }
@@ -636,16 +636,17 @@ public actor ShaderRequestService {
             invalidateDepartureRetirement()
         }
     }
-    func departureRetirementAssessment() -> TrustedDepartureRetirement? {
+    func departureRetirementAssessment(authority: UUID? = nil, ticket: UUID = UUID()) -> TrustedDepartureRetirement? {
         refreshDepartureRetirement()
         guard let evidence = departureRetirementEvidence else { return nil }
-        if let retirementAssessment { return retirementAssessment }
-        let receipt = TrustedDepartureRetirement(evidence); retirementAssessment = receipt
-        return receipt
+        let ownership = retirementAssessment ?? TrustedDepartureOwnership(evidence)
+        retirementAssessment = ownership
+        return .init(ownership, authority: authority, ticket: ticket)
     }
-    func validateDepartureRetirement(_ receipt: TrustedDepartureRetirement) -> Bool {
+    func validateDepartureRetirement(_ receipt: TrustedDepartureRetirement, authority: UUID? = nil, ticket: UUID? = nil) -> Bool {
         refreshDepartureRetirement()
-        return retirementAssessment === receipt && receipt.isCurrent && receipt.evidence == departureRetirementEvidence
+        return retirementAssessment === receipt.ownership && receipt.isCurrent && receipt.evidence == departureRetirementEvidence &&
+            (authority == nil || receipt.authority == authority) && (ticket == nil || receipt.ticket == ticket)
     }
     func settleCancelledLocalRecovery() async {
         if let phase = localRecoveryPhase, phase.task.isCancelled { await phase.task.settle() }

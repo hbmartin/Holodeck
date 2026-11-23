@@ -1086,7 +1086,7 @@ actor TrustedApprovalsCoordinator {
         }
         // Clean, generation-bound ownership can retire while healthy admitted
         // work continues. A real metadata fault still requires original repair.
-        if await target.departureRetirementAssessment() == nil {
+        if await target.departureRetirementAssessment(authority: id, ticket: ticket) == nil {
             let local = try await target.recoverDepartureLocal()
             guard local.completed else {
                 throw TrustedPartialRecovery(completedServices: [], remaining: ["Original departure target " + serviceID.uuidString + ": " + (local.failure ?? "Local recovery is unverified.")])
@@ -1094,7 +1094,7 @@ actor TrustedApprovalsCoordinator {
         }
         try Task.checkCancellation()
         try await target.settleTrustedAuthorityDeparture()
-        guard let assessment = await target.departureRetirementAssessment() else {
+        guard let assessment = await target.departureRetirementAssessment(authority: id, ticket: ticket) else {
             throw Self.unavailable("Original departure target evidence changed before retirement. Retain its exact journal and choose Retry Recovery.")
         }
         let commit = try await acquire(.progress); defer { release(commit) }
@@ -1102,7 +1102,7 @@ actor TrustedApprovalsCoordinator {
         guard !departureObligations(keys) else { throw unverifiableDeparture(ticket) }
         if !loaded || keys.contains(where: { inspections[$0] != baseline }) { try await readFresh(target: nil) }
         guard !departureObligations(keys) else { throw unverifiableDeparture(ticket) }
-        guard await target.validateDepartureRetirement(assessment) else {
+        guard await target.validateDepartureRetirement(assessment, authority: id, ticket: ticket) else {
             throw Self.unavailable("Original departure target evidence changed during retirement inspection. Retain its journal and choose Retry Recovery.")
         }
         if let beforeDepartureRetirementAdmission { try await beforeDepartureRetirementAdmission(serviceID) }

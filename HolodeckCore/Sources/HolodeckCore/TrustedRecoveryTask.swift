@@ -161,8 +161,18 @@ nonisolated final class TrustedTargetInstallation: @unchecked Sendable {
     func publish() { lock.withLock { published = true } }
 }
 
-/// Ordinary progress does not change ownership. Relevant service transitions
-/// invalidate this permit before the authority can admit exact retirement.
+/// All ticket receipts observe one ownership generation. Consuming a ticket
+/// cannot invalidate another authority's independently verified retirement.
+nonisolated final class TrustedDepartureOwnership: Sendable {
+    let evidence: TrustedDepartureRetirement.Evidence
+    private let validity = TrustedInvalidationToken()
+    init(_ evidence: TrustedDepartureRetirement.Evidence) { self.evidence = evidence }
+    var isCurrent: Bool { validity.isCurrent }
+    func invalidate() { validity.invalidate() }
+    func admit(_ receipt: TrustedInvalidationToken) -> Bool {
+        validity.withCurrent { receipt.consume() } ?? false
+    }
+}
 nonisolated final class TrustedDepartureRetirement: Sendable {
     struct Evidence: Sendable, Equatable {
         let serviceID: UUID
@@ -173,12 +183,16 @@ nonisolated final class TrustedDepartureRetirement: Sendable {
         let executionID: UUID?
         let processID: ObjectIdentifier?
     }
-    let evidence: Evidence
-    private let validity = TrustedInvalidationToken()
-    init(_ evidence: Evidence) { self.evidence = evidence }
-    var isCurrent: Bool { validity.isCurrent }
-    func invalidate() { validity.invalidate() }
-    func admit() -> Bool { validity.consume() }
+    let authority: UUID?
+    let ticket: UUID
+    let ownership: TrustedDepartureOwnership
+    var evidence: Evidence { ownership.evidence }
+    private let admission = TrustedInvalidationToken()
+    init(_ ownership: TrustedDepartureOwnership, authority: UUID?, ticket: UUID) {
+        self.ownership = ownership; self.authority = authority; self.ticket = ticket
+    }
+    var isCurrent: Bool { ownership.isCurrent && admission.isCurrent }
+    func admit() -> Bool { ownership.admit(admission) }
 }
 
 struct TrustedLocalRecoveryReceipt: Sendable {
