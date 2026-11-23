@@ -115,6 +115,23 @@ import XCTest
         let done = await p.old.observation
         XCTAssertEqual(done.departures, 0); XCTAssertEqual(done.queuedRevocations, 0)
     }
+    func testStorageRecoveryJoinsTheRetirementDrain() async throws {
+        let p = try await pending()
+        let count = await p.service.retirementDrainCount
+        let outcome = RetirementDetachResult()
+        let recovering = Task {
+            do { try await p.service.retryReconciliation(); outcome.value = .success(()) }
+            catch { outcome.value = .failure(error) }
+        }
+        addTeardownBlock { recovering.cancel(); p.writing.release() }
+        try await wait { await p.service.localRecoveryPhaseCount > 1 }
+        XCTAssertNil(outcome.value)
+        p.writing.release()
+        try await wait { outcome.value != nil }; try XCTUnwrap(outcome.value).get()
+        _ = try await accepted(p.registration)
+        let after = await p.service.retirementDrainCount; XCTAssertEqual(after, count)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(p.root.appendingPathComponent("active.json")))
+    }
     func testHealthyRetirementAutomaticallyCompletesHandoff() async throws {
         let p = try await pending()
         p.writing.release()
