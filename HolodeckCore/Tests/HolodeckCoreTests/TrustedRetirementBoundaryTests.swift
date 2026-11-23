@@ -156,6 +156,38 @@ import XCTest
         let done = await authority.observation
         XCTAssertEqual(done.departureRecoveryParticipants, 0); XCTAssertEqual(done.departureRecoverySuccessors, 0)
     }
+    func testLaterRevocationsRemainCoveredByPendingLocalOutcome() async throws {
+        let f = try await fixture(), fail = RetirementSwitch(); fail.on = true
+        let first = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [
+            .init(id: "B", name: "B", tokenHash: "B"), .init(id: "C", name: "C", tokenHash: "C")], revocations: [first]).encoded())
+        let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
+            beforeRemovalFinalization: { intent, _ in if intent == first.operationID && fail.on { throw POSIXError(.EIO) } })
+        let binding = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: f.service)))
+        // Construct retained committed-removal evidence explicitly; this test
+        // does not claim a normal producer of exceptional finalization failure.
+        do { try await authority.replay(); XCTFail("Injected finalization failure ignored") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        let hold = UUID()
+        addTeardownBlock { await f.service.finishTrustedRecovery(pass: hold) }
+        let local = try await f.service.trustedRecoveryOutcome(pass: hold, authority: authority.id)
+        XCTAssertTrue(local.completed)
+        fail.on = false
+        for (index, device) in ["B", "C"].enumerated() {
+            do { try await authority.revoke(device, permit: binding.permit, beforeCommit: { _ in }); XCTFail("Unaccepted local outcome lost its fence") }
+            catch { XCTAssertTrue(error.localizedDescription.contains("awaiting its trusted pass admission")) }
+            let current = await authority.observation
+            XCTAssertEqual(current.pendingLocalOutcomes, 1); XCTAssertEqual(current.obligations, index + 1)
+            XCTAssertEqual(current.recoveryPasses, 0)
+            let bytes = try XCTUnwrap(backend.read())
+            XCTAssertEqual(Set(try TrustedTVApprovals.decode(bytes).revocations.map(\.deviceID)), Set(["B", "C"].prefix(index + 1)))
+        }
+        try await f.service.retryReconciliation()
+        let done = await authority.observation
+        XCTAssertEqual(done.pendingLocalOutcomes, 0); XCTAssertEqual(done.obligations, 0)
+        XCTAssertEqual(done.applicationRecoveryTargets, 0)
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
+    }
     func testCommittedRemovalPrunesOnlyItsPendingOutcomeObligation() async throws {
         for anotherIntent in [false, true] {
             let f = try await fixture(), fail = RetirementSwitch(); fail.on = true

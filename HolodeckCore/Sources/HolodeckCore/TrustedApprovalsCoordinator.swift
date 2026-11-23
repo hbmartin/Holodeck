@@ -463,6 +463,11 @@ actor TrustedApprovalsCoordinator {
         if required[intent.operationID, default: []].insert(key).inserted {
             departures[key.service]?.invalidatePreparation()
         }
+        // Eligibility is target-wide: obligations admitted after local completion
+        // remain covered until that exact outcome enters a trusted pass.
+        if var pending = pendingRecoveryOutcomes[key] {
+            pending.intents.insert(intent.operationID); pendingRecoveryOutcomes[key] = pending
+        }
         targetPins[key] = target
     }
     private func retired(_ key: TargetKey) -> Bool {
@@ -831,6 +836,14 @@ actor TrustedApprovalsCoordinator {
                     (outcome.receipt?.attemptID != nil && blocker.localAttempt == outcome.receipt?.attemptID)
             }
         } else { suppressApplications(to: key, outcome: outcome) }
+    }
+    private func finishPendingObligation(_ intent: UUID, on key: TargetKey) {
+        guard var pending = pendingRecoveryOutcomes[key] else { return }
+        pending.intents.remove(intent)
+        // Include every still-required obligation, including any added while an
+        // already-committed removal was completing on another actor.
+        pending.intents.formUnion(required.filter { $0.value.contains(key) }.keys)
+        pendingRecoveryOutcomes[key] = pending.intents.isEmpty ? nil : pending
     }
     private func clearApplicationBlockers(on key: TargetKey, matching: (Attempt, ApplicationBlocker) -> Bool) {
         failedApplications = failedApplications.filter { $0.key.target != key || !matching($0.key, $0.value) }
@@ -1498,9 +1511,7 @@ actor TrustedApprovalsCoordinator {
         applicationEpochs = applicationEpochs.filter { $0.key.intent != intent.operationID }
         failedApplications = failedApplications.filter { $0.key.intent != intent.operationID }
         for key in needed {
-            if var pending = pendingRecoveryOutcomes[key], pending.intents.remove(intent.operationID) != nil {
-                pendingRecoveryOutcomes[key] = pending.intents.isEmpty ? nil : pending
-            }
+            finishPendingObligation(intent.operationID, on: key)
             clearApplicationBlockers(on: key) { _, _ in false }
         }
         completeSettledDepartures()
