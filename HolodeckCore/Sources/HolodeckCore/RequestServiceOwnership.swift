@@ -70,13 +70,14 @@ nonisolated final class TrustedWithdrawalReceipt: Sendable {
 
 nonisolated final class TrustedApprovalEligibility: @unchecked Sendable {
     let id = UUID()
-    private enum State { case eligible, admitted, closed }
+    private enum State { case eligible, admitted, recoveredWithoutToken, closed }
     private let lock = NSLock()
     private var state: State = .eligible
     private let withinDeadline: @Sendable () -> Bool
     init(withinDeadline: @escaping @Sendable () -> Bool = { true }) { self.withinDeadline = withinDeadline }
     func check() throws {
         try lock.withLock {
+            if state == .recoveredWithoutToken { throw CommittedApprovalDeliveryError(recoveredAfterFailure: true) }
             guard state == .eligible, withinDeadline() else { throw LocalCatalogError.disconnected }
         }
     }
@@ -89,11 +90,18 @@ nonisolated final class TrustedApprovalEligibility: @unchecked Sendable {
     func restoreAfterFailedWrite() {
         lock.withLock { if state == .admitted, withinDeadline() { state = .eligible } }
     }
+    func recoveredWithoutDelivery() {
+        lock.withLock { if state == .admitted { state = .recoveredWithoutToken } }
+    }
     var canIssue: Bool { lock.withLock { state == .admitted && withinDeadline() } }
     func close() { lock.withLock { state = .closed } }
 }
 nonisolated struct CommittedApprovalDeliveryError: LocalizedError, Sendable {
-    var errorDescription: String? { "The TV approval was saved, but its pairing connection closed before the token could be issued. Pair this TV again; the saved approval has not been rolled back." }
+    var recoveredAfterFailure = false
+    var errorDescription: String? {
+        recoveredAfterFailure ? "The TV approval was saved during recovery, but its token was not delivered. Pair this TV again; the saved approval has not been rolled back." :
+            "The TV approval was saved, but its pairing connection closed before the token could be issued. Pair this TV again; the saved approval has not been rolled back."
+    }
 }
 /// Live servers share an authority by the actual Keychain service/account pair.
 /// Weak entries do not own idle hosts. Only unresolved evidence receives a strong pin.
