@@ -828,10 +828,12 @@ actor TrustedApprovalsCoordinator {
         var preparedOutcomes: [UUID: TrustedLocalRecovery] = [:]
         var heldTargets: [UUID: ShaderRequestService] = [:]
         do {
-            let resolving = await acquireProgress()
-            do { try await resolveUncertainWrite() }
-            catch { release(resolving); throw error }
-            release(resolving)
+            if uncertainWrite != nil {
+                let resolving = await acquireProgress()
+                do { try await resolveUncertainWrite() }
+                catch { release(resolving); throw error }
+                release(resolving)
+            }
             var registrationInspection: InspectionPass?
             try Task.checkCancellation()
             for entry in uninspectedTargets.values.filter(\.withdrawn).sorted(by: { $0.service.runtimeID.uuidString < $1.service.runtimeID.uuidString }) {

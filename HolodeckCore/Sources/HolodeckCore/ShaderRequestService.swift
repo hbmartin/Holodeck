@@ -802,8 +802,7 @@ public actor ShaderRequestService {
     @discardableResult func registerRevocationCoordinator(id: UUID, recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> Void) async -> UUID {
         // Compatibility callers do not own an authority lane. Production uses
         // the throwing admission below and releases its lane before waiting.
-        while let preparation = unacceptedRetirement { try? await preparation.wait(cancellable: false) }
-        while revocationCoordinatorID != id, let preparation = localPreparation { try? await preparation.wait(cancellable: false) }
+        while let preparation = bindingPreparation(changingTo: id) { try? await preparation.wait(cancellable: false) }
         return bindRevocationCoordinator(id: id, validatedRecoveryCompletion(recovery))
     }
     private func validatedRecoveryCompletion(_ recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> Void)
@@ -870,11 +869,11 @@ public actor ShaderRequestService {
         guard unacceptedRetirement === preparation else { return }
         unacceptedRetirement = nil; preparation.finish()
     }
+    private func bindingPreparation(changingTo id: UUID) -> TrustedLocalPreparation? {
+        unacceptedRetirement ?? (revocationCoordinatorID != id ? localPreparation : nil)
+    }
     private func requireLocalPreparationFinished(changingTo id: UUID) throws {
-        if let preparation = unacceptedRetirement { throw TrustedLocalPreparationPending(preparation: preparation) }
-        if revocationCoordinatorID != id, let preparation = localPreparation {
-            throw TrustedLocalPreparationPending(preparation: preparation)
-        }
+        if let preparation = bindingPreparation(changingTo: id) { throw TrustedLocalPreparationPending(preparation: preparation) }
     }
     func prepareTargetInstallation(authority: UUID) -> TrustedTargetInstallation {
         .init(serviceID: runtimeID, authority: authority, predecessorAuthority: revocationCoordinatorID,

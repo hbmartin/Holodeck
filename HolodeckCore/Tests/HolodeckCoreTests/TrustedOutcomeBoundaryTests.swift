@@ -47,15 +47,21 @@ private final class OutcomeBackend: @unchecked Sendable {
         addTeardownBlock { await service.suspend(); try? FileManager.default.removeItem(at: root) }
         return .init(root: root, service: service)
     }
-    func wait(_ condition: () async -> Bool) async throws {
-        let end = ContinuousClock.now.advanced(by: .seconds(8))
+    func wait(timeout: Duration = .seconds(8), _ condition: () async -> Bool) async throws {
+        let end = ContinuousClock.now.advanced(by: timeout)
         while !(await condition()) {
             guard ContinuousClock.now < end else { throw ShaderRequestError.unavailable("Outcome boundary backstop") }
             try await Task.sleep(for: .milliseconds(3))
         }
     }
-    func accepted(_ ticket: TrustedApprovalsCoordinator.Registration) async throws -> TrustedApprovalsCoordinator.Binding {
-        guard case .accepted(let binding) = try await ticket.value() else { throw ShaderRequestError.invalidRequest }
+    func accepted(_ ticket: TrustedApprovalsCoordinator.Registration, timeout: Duration = .seconds(8)) async throws -> TrustedApprovalsCoordinator.Binding {
+        let result = OutcomeResult<TrustedApprovalsCoordinator.BindingOutcome>()
+        let probe = Task { do { result.value = .success(try await ticket.value()) } catch { result.value = .failure(error) } }
+        addTeardownBlock { ticket.completion.cancel(); probe.cancel() }
+        defer { probe.cancel() }
+        // An independent probe can time out without joining an admitted owner.
+        try await wait(timeout: timeout) { result.value != nil }
+        guard case .accepted(let binding) = try XCTUnwrap(result.value).get() else { throw ShaderRequestError.invalidRequest }
         return binding
     }
     func submit(_ service: ShaderRequestService, device: String = "TV") async throws -> UUID {
@@ -466,6 +472,58 @@ private final class OutcomeBackend: @unchecked Sendable {
         let jobs = await a.service.allJobs(), bytes = try TrustedTVApprovals.decode(XCTUnwrap(backend.bytes))
         XCTAssertEqual(jobs.first { $0.id == job }?.stage, .cancelled)
         XCTAssertTrue(bytes.approvals.isEmpty); XCTAssertTrue(bytes.revocations.isEmpty)
+    }
+
+    func testCompatibilityBindingRechecksRetirementAfterLocalPreparationWait() async throws {
+        let armed = OutcomeSwitch(), gate = RecoveryGate()
+        addTeardownBlock { await gate.release() }
+        let f = try await fixture(reconcile: { _ in if armed.on { try await gate.wait() } })
+        let backend = OutcomeBackend(), authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) })
+        await f.service.failedTrustedRegistration(POSIXError(.EIO), authority: authority.id) { _ in .init(completedServices: []) }
+        armed.on = true
+        let local = Task { try await f.service.recoverDepartureLocal() }
+        addTeardownBlock { local.cancel(); await gate.release() }
+        try await wait { await gate.hasEntered }
+        let result = OutcomeResult<UUID>(), binding = Task { result.value = .success(await f.service.registerRevocationCoordinator(id: authority.id) {}) }
+        addTeardownBlock { binding.cancel(); await gate.release() }
+        try await wait { await f.service.localPreparationWaiters == 1 }
+        let retirement = try await f.service.prepareUnacceptedTargetRetirement(authority: authority.id, proposal: UUID())
+        addTeardownBlock { await f.service.endUnacceptedTargetRetirement(retirement) }
+        do { _ = try await f.service.installRevocationCoordinator(authority: authority, recovery: { _ in .init(completedServices: []) }); XCTFail("Production guard ignored retirement") }
+        catch is TrustedLocalPreparationPending { }
+        armed.on = false; await gate.release()
+        let outcome = try await local.value; XCTAssertTrue(outcome.completed)
+        try await wait { retirement.waiterCount == 1 }
+        XCTAssertNil(result.value)
+        try await f.service.completeUnacceptedTargetRetirement(retirement)
+        try await wait { result.value != nil }
+        let registration = try XCTUnwrap(result.value).get()
+        let repeated = await f.service.registerRevocationCoordinator(id: authority.id) {}
+        XCTAssertEqual(registration, repeated)
+    }
+    func testRegistrationCompletionBackstopDoesNotAbandonAdmittedActivation() async throws {
+        let f = try await fixture(), gate = RecoveryGate(), armed = OutcomeSwitch(), backend = OutcomeBackend()
+        addTeardownBlock { await gate.release() }
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) }, afterTargetActivation: { _ in
+            if armed.on { try? await gate.wait() }
+        })
+        let prior = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: f.service)))
+        armed.on = true
+        let ticket = try await authority.register(TrustedOwnerRecorder().owner(service: f.service))
+        addTeardownBlock { ticket.completion.cancel(); await gate.release() }
+        try await wait { await gate.hasEntered }
+        XCTAssertTrue(ticket.completion.hasStarted)
+        let result = OutcomeResult<TrustedApprovalsCoordinator.Binding>()
+        let timed = Task { do { result.value = .success(try await self.accepted(ticket, timeout: .milliseconds(30))) } catch { result.value = .failure(error) } }
+        addTeardownBlock { timed.cancel(); await gate.release() }
+        // This outer bound also makes a regression in accepted's own timeout fail.
+        try await wait { result.value != nil }
+        guard case .failure(let error) = try XCTUnwrap(result.value) else { return XCTFail("Held registration finished") }
+        XCTAssertTrue(error.localizedDescription.contains("Outcome boundary backstop"))
+        XCTAssertTrue(prior.permit.isCurrent)
+        armed.on = false; await gate.release()
+        try await wait { await authority.observation.acceptedGeneration == ticket.generation }
+        XCTAssertFalse(prior.permit.isCurrent)
     }
 
 }
