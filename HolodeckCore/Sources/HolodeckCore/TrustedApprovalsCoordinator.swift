@@ -162,6 +162,7 @@ actor TrustedApprovalsCoordinator {
         let rawReadFlights: Int
         let rawReadSubscribers: Int
         let revocationCompletionTasks: Int
+        let revocationCompletionSubscribers: Int
         let automaticValidationTasks: Int
         let uninspectedTargets: Int
         let uninspectedCleanupTasks: Int
@@ -431,7 +432,9 @@ actor TrustedApprovalsCoordinator {
               departureRecoverySuccessors: departureRecoverySuccessors.values.reduce(0) { $0 + $1.participants.count },
               pendingLocalOutcomes: pendingRecoveryOutcomes.count, applicationRecoveryTargets: recoveryTargets.count,
               rawReadFlights: readFlight == nil ? 0 : 1, rawReadSubscribers: readFlight?.task.waiterCount ?? 0,
-              revocationCompletionTasks: revocationCompletions.count, automaticValidationTasks: automaticValidations.count,
+              revocationCompletionTasks: revocationCompletions.count,
+              revocationCompletionSubscribers: revocationCompletions.values.reduce(0) { $0 + $1.task.waiterCount },
+              automaticValidationTasks: automaticValidations.count,
               uninspectedTargets: uninspectedTargets.count, uninspectedCleanupTasks: uninspectedCleanup.count)
     }
     private var outstandingIntents: [RequestRevocationIntent] {
@@ -1482,8 +1485,9 @@ actor TrustedApprovalsCoordinator {
         for serviceID in uninspectedTargets.keys {
             guard var entry = uninspectedTargets[serviceID], entry.owner.serverID == serverID,
                   entry.owner.eligibility === eligibility else { continue }
+            let firstWithdrawal = !entry.withdrawn
             entry.withdrawn = true; uninspectedTargets[serviceID] = entry
-            _ = cleanupUninspectedTask(entry)
+            if firstWithdrawal { _ = cleanupUninspectedTask(entry) }
         }
         if accepted?.owner.serverID == serverID, accepted?.owner.eligibility === eligibility {
             accepted?.binding.permit.invalidate(); accepted?.binding.permit.lifetime.invalidate()
@@ -1530,7 +1534,18 @@ actor TrustedApprovalsCoordinator {
                 let token = await acquireProgress()
                 do {
                     guard uninspectedTargets[serviceID]?.id == entry.id else { release(token); await target.endUnacceptedTargetRetirement(preparation); return }
-                    if !fresh || !loaded { try await readFresh(target: nil, inspectTargets: false); fresh = true }
+                    if !fresh || !loaded {
+                        do { try await readFresh(target: nil) }
+                        catch {
+                            guard loaded else { throw error }
+                            // The read succeeded but another target could not
+                            // inspect it. Preserve that failure while this exact
+                            // withdrawn target still completes its own cleanup.
+                            registrationInspectionFailure = entry.id
+                            await recordMutationFailure(error, operation: entry.id, context: "Retained target inspection")
+                        }
+                        fresh = true
+                    }
                     let intents = envelope.revocations
                     release(token)
                     try await target.retireUnacceptedRequests(intents, preparation: preparation)

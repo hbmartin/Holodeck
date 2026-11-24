@@ -215,6 +215,10 @@ private final class OutcomeBackend: @unchecked Sendable {
         let failures = await a.service.recoveryStatuses()
         XCTAssertTrue(failures.contains { $0.message.contains(POSIXError(.EIO).localizedDescription) })
         XCTAssertFalse(try TrustedTVApprovals.decode(XCTUnwrap(backend.bytes)).revocations.isEmpty)
+        let reads = backend.reads
+        await authority.withdraw(serverID: proposal.serverID, eligibility: proposal.eligibility)
+        let repeated = await authority.observation
+        XCTAssertEqual(repeated.uninspectedCleanupTasks, 0); XCTAssertEqual(backend.reads, reads)
         fail.on = false
         _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: b.service)))
         try await b.service.retryReconciliation()
@@ -234,13 +238,16 @@ private final class OutcomeBackend: @unchecked Sendable {
         backend.failReads(false); backend.arm(read); proposal.eligibility.invalidate()
         await authority.withdraw(serverID: proposal.serverID, eligibility: proposal.eligibility)
         try await wait { read.entered }
-        await authority.withdraw(serverID: proposal.serverID, eligibility: proposal.eligibility)
+        let repeated = Task { await authority.withdraw(serverID: proposal.serverID, eligibility: proposal.eligibility) }
+        addTeardownBlock { repeated.cancel(); read.release() }
+        try await wait { await authority.observation.progressWaiters > 0 }
         let held = await authority.observation
         XCTAssertNil(held.acceptedGeneration); XCTAssertEqual(held.uninspectedCleanupTasks, 1)
         let replacement = try await authority.register(TrustedOwnerRecorder().owner(service: f.service))
         addTeardownBlock { replacement.completion.cancel() }
         XCTAssertFalse(replacement.completion.hasStarted)
         backend.arm(nil); read.release()
+        await repeated.value
         _ = try await accepted(replacement)
         try await wait { await authority.observation.uninspectedCleanupTasks == 0 }
         let after = await authority.observation, old = await owner.binding
@@ -307,6 +314,45 @@ private final class OutcomeBackend: @unchecked Sendable {
             let row = try XCTUnwrap(saved.first { ($0["status"] as? [String: Any])?["id"] as? String == id.uuidString })
             XCTAssertNil(row["dispatch"])
         }
+    }
+
+    func testWithdrawnCleanupFreshReadAlsoFencesAndCancelsAcceptedTargets() async throws {
+        let a = try await fixture(), b = try await fixture(), aJob = try await submit(a.service), bJob = try await submit(b.service)
+        let backend = OutcomeBackend(try TrustedTVApprovals(approvals: [.init(id: "TV", name: "TV", tokenHash: "old")]).encoded())
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) })
+        _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: b.service)))
+        let proposal = TrustedOwnerRecorder().owner(service: a.service)
+        backend.failReads(true)
+        do { _ = try await accepted(authority.register(proposal)); XCTFail("Failed inspection accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EACCES).localizedDescription)) }
+        backend.failReads(false)
+        try backend.write(TrustedTVApprovals(revocations: [.init(operationID: UUID(), deviceID: "TV")]).encoded())
+        proposal.eligibility.invalidate()
+        await authority.withdraw(serverID: proposal.serverID, eligibility: proposal.eligibility)
+        try await wait { let state = await authority.observation; return state.uninspectedTargets == 0 && state.uninspectedCleanupTasks == 0 }
+        let aJobs = await a.service.allJobs(), bJobs = await b.service.allJobs()
+        XCTAssertEqual(aJobs.first { $0.id == aJob }?.stage, .cancelled)
+        XCTAssertEqual(bJobs.first { $0.id == bJob }?.stage, .cancelled)
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.bytes)).revocations.isEmpty)
+    }
+
+    func testUnacceptedRetirementCannotFinalizeDuringConcurrentLocalInspection() async throws {
+        let armed = OutcomeSwitch(), gate = RecoveryGate()
+        addTeardownBlock { await gate.release() }
+        let f = try await fixture(reconcile: { _ in if armed.on { try await gate.wait() } }), authority = UUID()
+        await f.service.failedTrustedRegistration(POSIXError(.EIO), authority: authority) { _ in .init(completedServices: []) }
+        let preparation = try await f.service.prepareUnacceptedTargetRetirement(authority: authority, proposal: UUID())
+        addTeardownBlock { await f.service.endUnacceptedTargetRetirement(preparation); await gate.release() }
+        armed.on = true
+        let repair = Task { try await f.service.recoverDepartureLocal() }
+        addTeardownBlock { repair.cancel(); await gate.release() }
+        try await wait { await gate.hasEntered }
+        do { try await f.service.completeUnacceptedTargetRetirement(preparation); XCTFail("Unfinished local inspection certified retirement") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("verified metadata")) }
+        armed.on = false; await gate.release()
+        let repaired = try await repair.value; XCTAssertTrue(repaired.completed)
+        try await f.service.completeUnacceptedTargetRetirement(preparation)
+        _ = try await f.service.prepareTrustedAuthority(id: UUID())
     }
 
 }

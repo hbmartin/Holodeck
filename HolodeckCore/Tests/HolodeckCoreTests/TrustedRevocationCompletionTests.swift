@@ -76,6 +76,7 @@ import XCTest
         try await wait { await gate.hasEntered }
         let other = Task { do { try await authority.revoke("TV", permit: binding.permit) { _ in }; result.done = true } catch { result.error = error; result.done = true } }
         addTeardownBlock { other.cancel() }
+        try await wait { await authority.observation.revocationCompletionSubscribers == 2 }
         first.cancel()
         let cancelled = CompletionResult()
         let waiter = Task { do { try await first.value; cancelled.error = ShaderRequestError.invalidRequest } catch { cancelled.error = error }; cancelled.done = true }
@@ -86,6 +87,28 @@ import XCTest
         XCTAssertNil(result.error); XCTAssertTrue(result.done)
         XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
         let observation = await authority.observation; XCTAssertEqual(observation.recoveryPasses, 1)
+    }
+    func testLoneCancelledSubscriberDoesNotAbandonDurableCompletion() async throws {
+        let service = try await fixture(), gate = RecoveryGate()
+        addTeardownBlock { await gate.release() }
+        let backend = TrustedBackendFixture(try TrustedTVApprovals(approvals: [.init(id: "TV", name: "TV", tokenHash: "old")]).encoded())
+        let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) }, beforeRecoverySealing: { try await gate.wait() })
+        let binding = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: service))), hold = UUID()
+        _ = try await service.trustedRecoveryOutcome(pass: hold, authority: authority.id); await service.finishTrustedRecovery(pass: hold)
+        let task = Task { try await authority.revoke("TV", permit: binding.permit) { _ in } }
+        addTeardownBlock { task.cancel(); await gate.release() }
+        try await wait { await gate.hasEntered }
+        try await wait { await authority.observation.revocationCompletionSubscribers == 1 }
+        task.cancel()
+        let cancelled = CompletionResult()
+        let probe = Task { do { try await task.value } catch { cancelled.error = error }; cancelled.done = true }
+        addTeardownBlock { probe.cancel(); await gate.release() }
+        try await wait { cancelled.done }
+        XCTAssertTrue(cancelled.error is CancellationError)
+        await gate.release()
+        try await wait { let state = await authority.observation; return state.revocationCompletionTasks == 0 && state.automaticValidationTasks == 0 }
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.read())).revocations.isEmpty)
+        XCTAssertEqual(backend.writes, 2)
     }
     func testRefreshedObsoleteOutcomeDoesNotResetAutomaticAttempt() async throws {
         let service = try await fixture(), armed = ReplaySwitch(), fault = ReplaySwitch(), gate = RecoveryGate()

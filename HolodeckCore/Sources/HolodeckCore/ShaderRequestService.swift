@@ -857,6 +857,9 @@ public actor ShaderRequestService {
     func completeUnacceptedTargetRetirement(_ preparation: TrustedLocalPreparation) throws {
         try validateUnacceptedTargetRetirement(preparation)
         try requireDepartureOwnership()
+        guard departureRetirementEvidence != nil else {
+            throw ShaderRequestError.unavailable("Retained proposal retirement is awaiting verified metadata and checkout settlement; finish local recovery and choose Retry Recovery.")
+        }
         pendingTrustedAuthority = nil; revocationCoordinator = nil; revocationFailure = nil
         // No binding was installed: a future host must still inspect approvals.
         revocationInspectionPending = true
