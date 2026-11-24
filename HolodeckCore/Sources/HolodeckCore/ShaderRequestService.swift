@@ -580,6 +580,7 @@ public actor ShaderRequestService {
     }
     private weak var trustedAuthority: TrustedApprovalsCoordinator?
     private var pendingTrustedAuthority: UUID?
+    private var unacceptedRetirement: TrustedLocalPreparation?
     private var authorityTransfer: UUID?
     func rememberTrustedAuthority(_ authority: TrustedApprovalsCoordinator) { trustedAuthority = authority }
     private func requirePendingTrustedAuthority(_ id: UUID) throws {
@@ -801,6 +802,7 @@ public actor ShaderRequestService {
     @discardableResult func registerRevocationCoordinator(id: UUID, recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> Void) async -> UUID {
         // Compatibility callers do not own an authority lane. Production uses
         // the throwing admission below and releases its lane before waiting.
+        while let preparation = unacceptedRetirement { try? await preparation.wait(cancellable: false) }
         while revocationCoordinatorID != id, let preparation = localPreparation { try? await preparation.wait(cancellable: false) }
         return bindRevocationCoordinator(id: id, validatedRecoveryCompletion(recovery))
     }
@@ -816,17 +818,57 @@ public actor ShaderRequestService {
             return .init(completedServices: valid.completed ? [serviceID] : [])
         }
     }
-    func failedTrustedRegistration(_ error: Error, authority: UUID,
-        recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) {
+    @discardableResult func failedTrustedRegistration(_ error: Error, authority: UUID,
+        recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) -> Bool {
         guard pendingTrustedAuthority == nil || pendingTrustedAuthority == authority,
-              revocationCoordinatorID == nil || (trustedAuthority?.id == authority && revocationCoordinatorID != authority) else { return }
+              revocationCoordinatorID == nil || (trustedAuthority?.id == authority && revocationCoordinatorID != authority) else { return false }
         // Recovery routing is provisional; it grants no registration or request
         // authorization and local repair remains unbound until activation.
         pendingTrustedAuthority = authority
         revocationCoordinator = recovery
         revocationReplayFailed(ShaderRequestError.unavailable("Trusted TV approval inspection requires recovery: " + error.localizedDescription))
+        return true
+    }
+    func prepareUnacceptedTargetRetirement(authority: UUID, proposal: UUID) throws -> TrustedLocalPreparation {
+        guard revocationCoordinatorID == nil, pendingTrustedAuthority == authority else { throw TrustedRecoveryInterrupted() }
+        if let preparation = unacceptedRetirement {
+            guard preparation.attempt == proposal, preparation.authority == authority else { throw TrustedRecoveryInterrupted() }
+            return preparation
+        }
+        let preparation = TrustedLocalPreparation(serviceID: runtimeID, authority: authority, registration: revocationRegistration,
+            attempt: proposal, generation: localRecoveryGeneration, consumerAuthority: nil)
+        unacceptedRetirement = preparation
+        return preparation
+    }
+    private func validateUnacceptedTargetRetirement(_ preparation: TrustedLocalPreparation) throws {
+        guard unacceptedRetirement === preparation, preparation.serviceID == runtimeID,
+              preparation.registration == revocationRegistration, revocationCoordinatorID == nil,
+              pendingTrustedAuthority == preparation.authority else { throw TrustedRecoveryInterrupted() }
+    }
+    func retireUnacceptedRequests(_ intents: [RequestRevocationIntent], preparation: TrustedLocalPreparation) async throws {
+        try validateUnacceptedTargetRetirement(preparation)
+        for intent in intents {
+            try await revoke(intent.deviceID)
+            try validateUnacceptedTargetRetirement(preparation)
+        }
+        try await settleTrustedAuthorityDeparture()
+        try validateUnacceptedTargetRetirement(preparation)
+    }
+    func completeUnacceptedTargetRetirement(_ preparation: TrustedLocalPreparation) throws {
+        try validateUnacceptedTargetRetirement(preparation)
+        try requireDepartureOwnership()
+        pendingTrustedAuthority = nil; revocationCoordinator = nil; revocationFailure = nil
+        // No binding was installed: a future host must still inspect approvals.
+        revocationInspectionPending = true
+        endUnacceptedTargetRetirement(preparation)
+        emitUpdates(); scheduleWakeup()
+    }
+    func endUnacceptedTargetRetirement(_ preparation: TrustedLocalPreparation) {
+        guard unacceptedRetirement === preparation else { return }
+        unacceptedRetirement = nil; preparation.finish()
     }
     private func requireLocalPreparationFinished(changingTo id: UUID) throws {
+        if let preparation = unacceptedRetirement { throw TrustedLocalPreparationPending(preparation: preparation) }
         if revocationCoordinatorID != id, let preparation = localPreparation {
             throw TrustedLocalPreparationPending(preparation: preparation)
         }

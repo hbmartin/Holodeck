@@ -163,6 +163,8 @@ actor TrustedApprovalsCoordinator {
         let rawReadSubscribers: Int
         let revocationCompletionTasks: Int
         let automaticValidationTasks: Int
+        let uninspectedTargets: Int
+        let uninspectedCleanupTasks: Int
     }
     struct Approval: Sendable {
         let record: ApprovedTV
@@ -262,7 +264,15 @@ actor TrustedApprovalsCoordinator {
     private var targetPins: [TargetKey: ShaderRequestService] = [:]
     // Failed initial inspection cannot make restored jobs an invisible target or
     // let another target remove the durable intent before explicit registration.
-    private var uninspectedTargets: [UUID: ShaderRequestService] = [:]
+    private struct UninspectedTarget {
+        let id = UUID()
+        let service: ShaderRequestService
+        let owner: Owner
+        let generation: UInt64
+        var withdrawn = false
+    }
+    private var uninspectedTargets: [UUID: UninspectedTarget] = [:]
+    private var uninspectedCleanup: [UUID: (id: UUID, task: TrustedRecoveryTask<Void>)] = [:]
     private struct RecoveryHandle {
         let reference: WeakRequestService
         let revision: UInt64
@@ -334,6 +344,7 @@ actor TrustedApprovalsCoordinator {
     private var preparing: UInt64?
     private var registrationTask: Task<Void, Never>?
     private var failedRegistration: Owner?
+    private var registrationInspectionFailure: UUID?
     private var lane: UUID?
     private var admissions: [Admission: AdmissionQueue] = [:]
     private var admissionResumes = 0
@@ -420,7 +431,8 @@ actor TrustedApprovalsCoordinator {
               departureRecoverySuccessors: departureRecoverySuccessors.values.reduce(0) { $0 + $1.participants.count },
               pendingLocalOutcomes: pendingRecoveryOutcomes.count, applicationRecoveryTargets: recoveryTargets.count,
               rawReadFlights: readFlight == nil ? 0 : 1, rawReadSubscribers: readFlight?.task.waiterCount ?? 0,
-              revocationCompletionTasks: revocationCompletions.count, automaticValidationTasks: automaticValidations.count)
+              revocationCompletionTasks: revocationCompletions.count, automaticValidationTasks: automaticValidations.count,
+              uninspectedTargets: uninspectedTargets.count, uninspectedCleanupTasks: uninspectedCleanup.count)
     }
     private var outstandingIntents: [RequestRevocationIntent] {
         envelope.revocations + removals.values.map(\.intent).sorted { $0.operationID.uuidString < $1.operationID.uuidString }
@@ -775,6 +787,11 @@ actor TrustedApprovalsCoordinator {
         do {
             var registrationInspection: InspectionPass?
             try Task.checkCancellation()
+            for entry in uninspectedTargets.values.filter(\.withdrawn).sorted(by: { $0.service.runtimeID.uuidString < $1.service.runtimeID.uuidString }) {
+                try Task.checkCancellation()
+                do { try await cleanupUninspectedTask(entry).subscribe().value() }
+                catch { try Task.checkCancellation(); errors.append("Withdrawn proposal " + entry.id.uuidString + ": " + error.localizedDescription) }
+            }
             if let candidate = failedRegistration {
                 if candidate.eligibility.isCurrent {
                     do {
@@ -1008,6 +1025,10 @@ actor TrustedApprovalsCoordinator {
             do { try await inspect(known, intents: intents) } catch { errors.append(error) }
         }
         if let error = errors.first { throw error }
+        if let origin = registrationInspectionFailure {
+            registrationInspectionFailure = nil
+            if mutationFailure?.operation == origin { mutationFailure = nil; await notify() }
+        }
     }
     // Cross-authority preparation never holds both authorities' mutation lanes.
     func prepareDeparture(_ target: ShaderRequestService, ticket: UUID, preparation: TrustedRegistrationPreparation? = nil) async throws -> TrustedAuthorityDeparture {
@@ -1394,10 +1415,14 @@ actor TrustedApprovalsCoordinator {
                 await request.owner.changed(snapshot, binding)
                 if let transfer, let target = admittedService { await target.finishTrustedAuthority(transfer, authority: self) }
                 if let prior, prior.owner.serverID != request.owner.serverID { await prior.owner.retired() }
+                // Acceptance is irrevocable after admission. A failed target
+                // notification remains a diagnostic, not a failed binding ticket.
                 if let activationFailure {
-                    failedRegistration = request.owner
-                    request.registration.completion.complete(.failure(activationFailure))
-                } else { request.registration.completion.complete(.success(.accepted(binding))) }
+                    let origin = UUID(); registrationInspectionFailure = origin
+                    await recordMutationFailure(activationFailure, operation: origin, context: "Accepted registration inspection")
+                }
+                if request.registration.generation == generation { failedRegistration = nil }
+                request.registration.completion.complete(.success(.accepted(binding)))
             } catch {
                 if let transfer {
                     release(token)
@@ -1421,11 +1446,16 @@ actor TrustedApprovalsCoordinator {
                         failedRegistration = request.owner
                         if !(error is TrustedDepartureRecoveryError), let target = request.owner.service {
                             let serviceID = target.runtimeID
-                            if !targets.keys.contains(where: { $0.service == serviceID }) { uninspectedTargets[serviceID] = target }
-                            await target.failedTrustedRegistration(error, authority: id) { [weak self] local in
+                            let claimed = await target.failedTrustedRegistration(error, authority: id) { [weak self] local in
                                 guard let self else { throw Self.unavailable("The trusted approval authority is unavailable.") }
                                 return try await self.retry(requester: serviceID, local: local)
                             }
+                            if claimed, !targets.keys.contains(where: { $0.service == serviceID }) {
+                                var entry = UninspectedTarget(service: target, owner: request.owner, generation: request.registration.generation)
+                                entry.withdrawn = !request.owner.eligibility.isCurrent
+                                uninspectedTargets[serviceID] = entry
+                                if entry.withdrawn { _ = cleanupUninspectedTask(entry) }
+                            } else if !claimed, !targets.keys.contains(where: { $0.service == serviceID }) { failedRegistration = nil }
                         }
                     }
                     request.registration.completion.complete(.failure(error))
@@ -1449,9 +1479,82 @@ actor TrustedApprovalsCoordinator {
             request.registration.completion.complete(.success(.superseded)); pending = nil
         }
         if failedRegistration?.serverID == serverID, failedRegistration?.eligibility === eligibility { failedRegistration = nil }
+        for serviceID in uninspectedTargets.keys {
+            guard var entry = uninspectedTargets[serviceID], entry.owner.serverID == serverID,
+                  entry.owner.eligibility === eligibility else { continue }
+            entry.withdrawn = true; uninspectedTargets[serviceID] = entry
+            _ = cleanupUninspectedTask(entry)
+        }
         if accepted?.owner.serverID == serverID, accepted?.owner.eligibility === eligibility {
             accepted?.binding.permit.invalidate(); accepted?.binding.permit.lifetime.invalidate()
             accepted = nil; service = nil
+        }
+    }
+    /// The withdrawn lifetime never receives a binding. Its retained service is
+    /// inspected and cancelled only through an exact, non-dispatching capability.
+    private func cleanupUninspectedTask(_ entry: UninspectedTarget) -> TrustedRecoveryTask<Void> {
+        let serviceID = entry.service.runtimeID
+        if let job = uninspectedCleanup[serviceID], job.id == entry.id { return job.task }
+        let task = TrustedRecoveryTask<Void>(cancelWhenEmpty: false) {
+            do {
+                try await self.cleanupUninspected(entry)
+                await self.finishedUninspectedCleanup(entry, error: nil)
+            } catch {
+                await self.finishedUninspectedCleanup(entry, error: error)
+                throw error
+            }
+        }
+        uninspectedCleanup[serviceID] = (entry.id, task)
+        return task
+    }
+    private func finishedUninspectedCleanup(_ entry: UninspectedTarget, error: Error?) async {
+        let token = await acquireProgress(); defer { release(token) }
+        let serviceID = entry.service.runtimeID
+        if uninspectedCleanup[serviceID]?.id == entry.id { uninspectedCleanup[serviceID] = nil }
+        guard uninspectedTargets[serviceID]?.id == entry.id, let error else { return }
+        _ = await entry.service.failedTrustedRegistration(error, authority: id) { [weak self] local in
+            guard let self else { throw Self.unavailable("The retained TV authority is unavailable; preserve its journal for manual repair.") }
+            return try await self.retry(requester: serviceID, local: local)
+        }
+        await recordMutationFailure(error, operation: entry.id, context: "Withdrawn TV proposal cleanup")
+    }
+    private func cleanupUninspected(_ entry: UninspectedTarget) async throws {
+        let target = entry.service, serviceID = target.runtimeID
+        guard uninspectedTargets[serviceID]?.id == entry.id, entry.withdrawn else { return }
+        let preparation = try await target.prepareUnacceptedTargetRetirement(authority: id, proposal: entry.id)
+        do {
+            let local = try await target.recoverDepartureLocal()
+            guard local.completed else { throw local.initiatingError ?? Self.unavailable(local.failure ?? "Retained target metadata requires manual repair.") }
+            var fresh = false
+            while true {
+                let token = await acquireProgress()
+                do {
+                    guard uninspectedTargets[serviceID]?.id == entry.id else { release(token); await target.endUnacceptedTargetRetirement(preparation); return }
+                    if !fresh || !loaded { try await readFresh(target: nil, inspectTargets: false); fresh = true }
+                    let intents = envelope.revocations
+                    release(token)
+                    try await target.retireUnacceptedRequests(intents, preparation: preparation)
+                    let commit = await acquireProgress()
+                    guard uninspectedTargets[serviceID]?.id == entry.id else { release(commit); await target.endUnacceptedTargetRetirement(preparation); return }
+                    if !loaded || envelope.revocations != intents { release(commit); continue }
+                    do { try await target.completeUnacceptedTargetRetirement(preparation) }
+                    catch { release(commit); throw error }
+                    uninspectedTargets[serviceID] = nil
+                    release(commit)
+                    // Other targets may already have applied the retained intent.
+                    // Their replay owns any remaining failure independently.
+                    try? await replay()
+                    return
+                } catch {
+                    // Only the read path still owns this token. Later paths
+                    // release it before invoking target-local work.
+                    if lane == token { release(token) }
+                    throw error
+                }
+            }
+        } catch {
+            await target.endUnacceptedTargetRetirement(preparation)
+            throw error
         }
     }
     func releaseBinding(_ permit: TrustedOwnerPermit) async {
@@ -1494,7 +1597,7 @@ actor TrustedApprovalsCoordinator {
             inspections = inspections.mapValues { $0 == predecessor ? baseline : $0 }
         }
         envelope = value; bytes = candidate; sequence &+= 1; writes += 1
-        mutationFailure = nil
+        mutationFailure = nil; registrationInspectionFailure = nil
     }
     private func recordMutationFailure(_ error: Error, operation: UUID, context: String) async {
         mutationFailure = (operation, RequestRecoveryStore.Entry.bounded(context + ": " + error.localizedDescription, bytes: 8192))
