@@ -579,6 +579,14 @@ public actor ShaderRequestService {
         let departure: TrustedAuthorityDeparture
     }
     private weak var trustedAuthority: TrustedApprovalsCoordinator?
+    private var trustedRegistrationPreparation: (authority: UUID, ticket: UUID)?
+    func beginTrustedRegistration(authority: UUID, ticket: UUID) {
+        trustedRegistrationPreparation = (authority, ticket); emitUpdates()
+    }
+    func endTrustedRegistration(ticket: UUID) {
+        guard trustedRegistrationPreparation?.ticket == ticket else { return }
+        trustedRegistrationPreparation = nil; emitUpdates()
+    }
     private var pendingTrustedAuthority: UUID?
     private var unacceptedRetirement: TrustedLocalPreparation?
     private var authorityTransfer: UUID?
@@ -772,6 +780,7 @@ public actor ShaderRequestService {
     private var approvalInspectionBlocker: String? {
         if let revocationFailure { return "TV approval inspection requires recovery: " + revocationFailure }
         guard revocationInspectionPending else { return nil }
+        if trustedRegistrationPreparation != nil { return "Local catalog server registration is inspecting TV approvals. TV requests remain paused until acceptance." }
         return revocationCoordinator == nil
             ? "TV approvals have not been inspected. Register a local catalog server for this service before TV requests resume."
             : "TV approvals have not been inspected. TV requests are paused; choose Retry Recovery."

@@ -299,6 +299,9 @@ final class MacLibraryModel {
     }
     #endif
     func approve(_ id: UUID) { Task { do { try await server.approve(id); clearError(from: .approval) } catch { self.setError(error.localizedDescription, from: .approval) } } }
+    func dismissRecoveryNotice(_ notice: TrustedRecoveryNotice) {
+        Task { do { try await server.dismissRecoveryNotice(notice.id, revision: notice.revision) } catch { setError(error.localizedDescription, from: .server) } }
+    }
     func decline(_ id: UUID) { Task { await server.decline(id) } }
     func revoke(_ id: String) { Task { do { try await server.revoke(id); clearError(from: .revocation) } catch { self.setError(error.localizedDescription, from: .revocation) } } }
 }
@@ -327,6 +330,14 @@ struct ShaderLibrarySettings: View {
                 }
                 HStack { Text(library.serverState.message); Spacer() }
                     .accessibilityElement(children: .combine).accessibilityIdentifier("shader-serving-status")
+                ForEach(library.serverState.recoveryNotices) { notice in
+                    HStack(alignment: .top) {
+                        Text(notice.message).textSelection(.enabled)
+                        Spacer()
+                        Button("Dismiss") { library.dismissRecoveryNotice(notice) }
+                            .accessibilityIdentifier("dismiss-trusted-outcome-" + notice.id.uuidString)
+                    }.accessibilityIdentifier("trusted-recovery-outcome-" + notice.id.uuidString)
+                }
                 if let error = library.error {
                     // Recreate the selectable native text when the diagnostic changes.
                     HStack { Text(error).foregroundStyle(.red).textSelection(.enabled).id(error); Spacer() }

@@ -116,6 +116,7 @@ actor TrustedApprovalsCoordinator {
         let approvals: [String: ApprovedTV]
         let diagnostic: String?
         let diagnosticID: UUID?
+        var notices: [TrustedRecoveryNotice] = []
     }
     struct Binding: Sendable {
         let permit: TrustedOwnerPermit
@@ -423,6 +424,48 @@ actor TrustedApprovalsCoordinator {
         let failure: Failure
         let requiresRecovery: Bool
     }
+    private enum NoticeKind: Int, CaseIterable { case approvalSaved, approvalRejected, revocationRejected }
+    private struct Notice { let value: TrustedRecoveryNotice; let kind: NoticeKind }
+    private var notices: [Notice] = []
+    private var noticeRevision: UInt64 = 0
+    private let summaryNoticeID = UUID()
+    private var earlierNotices: [NoticeKind: Int] = [:]
+    private var summaryNoticeRevision: UInt64 = 0
+    private var recoveryNotices: [TrustedRecoveryNotice] {
+        var values = notices.reversed().map(\.value)
+        if !earlierNotices.isEmpty {
+            let descriptions: [NoticeKind: String] = [.approvalSaved: "saved approvals without token delivery", .approvalRejected: "approvals that did not commit", .revocationRejected: "revocations that did not commit"]
+            let detail = NoticeKind.allCases.compactMap { kind in earlierNotices[kind].map { String($0) + " " + descriptions[kind]! } }.joined(separator: "; ")
+            values.append(.init(id: summaryNoticeID, revision: summaryNoticeRevision, deviceID: nil,
+                message: "Earlier recovery outcomes: " + detail + ". Review Approved TVs before repeating an action."))
+        }
+        return values
+    }
+    private func recordRecoveryNotice(operation: UUID, device: String, kind: NoticeKind, message: String) {
+        noticeRevision &+= 1
+        notices.removeAll { $0.value.id == operation }
+        notices.append(.init(value: .init(id: operation, revision: noticeRevision,
+            deviceID: BoundedDiagnostics.bounded(device, bytes: 512), message: BoundedDiagnostics.bounded(message, bytes: 2048)), kind: kind))
+        if notices.count > 7 {
+            let prior = notices.removeFirst()
+            let previous = earlierNotices[prior.kind] ?? 0
+            earlierNotices[prior.kind] = previous == Int.max ? previous : previous + 1
+            summaryNoticeRevision = noticeRevision
+        }
+        updateRetention()
+    }
+    func dismissRecoveryNotice(_ notice: UUID, revision: UInt64, permit: TrustedOwnerPermit) async throws {
+        let token = await acquireProgress(); defer { release(token) }
+        try validate(permit)
+        if notice == summaryNoticeID {
+            guard revision == summaryNoticeRevision, !earlierNotices.isEmpty else { return }
+            earlierNotices.removeAll()
+        } else {
+            guard let index = notices.firstIndex(where: { $0.value.id == notice && $0.value.revision == revision }) else { return }
+            notices.remove(at: index)
+        }
+        await notify()
+    }
     private var diagnostics: [DiagnosticOrigin: DiagnosticRecord] = [:]
     private var diagnosticGenerations: [DiagnosticOrigin: UInt64] = [:]
     private var diagnosticSequence: UInt64 = 0
@@ -543,7 +586,7 @@ actor TrustedApprovalsCoordinator {
         for (serviceID, subscription) in recoverySubscriptions where !targets.keys.contains(where: { $0.service == serviceID && $0.registration == subscription.registrationID }) {
             subscription.invalidate(); recoverySubscriptions[serviceID] = nil
         }
-        retainEvidence(self, recoveryHandles.values.contains(where: { $0.pin != nil }) || !envelope.revocations.isEmpty || !failures.isEmpty || diagnostics.values.contains(where: \.requiresRecovery) || uncertainWrite != nil || !targetPins.isEmpty || !uninspectedTargets.isEmpty || !departureRecovery.isEmpty)
+        retainEvidence(self, recoveryHandles.values.contains(where: { $0.pin != nil }) || !envelope.revocations.isEmpty || !failures.isEmpty || diagnostics.values.contains(where: \.requiresRecovery) || uncertainWrite != nil || !targetPins.isEmpty || !uninspectedTargets.isEmpty || !departureRecovery.isEmpty || !notices.isEmpty || !earlierNotices.isEmpty)
     }
     var observation: Observation {
         .init(requestedGeneration: generation, acceptedGeneration: accepted?.binding.permit.generation,
@@ -615,7 +658,7 @@ actor TrustedApprovalsCoordinator {
         var secondary: [String] = []
         if let primary { for (_, detail) in messages.dropFirst() { secondary = BoundedDiagnostics.appending(detail, primary: primary, secondary: secondary) } }
         return .init(approvals: Dictionary(envelope.approvals.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last }),
-            diagnostic: primary.map { ([$0] + secondary.map { "Additional trusted failure: " + $0 }).joined(separator: "\n") }, diagnosticID: messages.first?.0)
+            diagnostic: primary.map { ([$0] + secondary.map { "Additional trusted failure: " + $0 }).joined(separator: "\n") }, diagnosticID: messages.first?.0, notices: recoveryNotices)
     }
     static func unavailable(_ message: String) -> ShaderRequestError { .unavailable(message) }
     private func validate(_ permit: TrustedOwnerPermit) throws {
@@ -1486,6 +1529,9 @@ actor TrustedApprovalsCoordinator {
             guard let request = pending else { release(token); continue }
             pending = nil; preparing = request.registration.generation
             preparingRegistration = (request.owner.serverID, request.owner.eligibility, request.registration.preparation)
+            let preparingTarget = request.owner.service, preparationNotice = UUID()
+            await preparingTarget?.beginTrustedRegistration(authority: id, ticket: preparationNotice)
+            defer { if let preparingTarget { Task { await preparingTarget.endTrustedRegistration(ticket: preparationNotice) } } }
             var transfer: ShaderRequestService.AuthorityTransfer?
             var admittedService: ShaderRequestService?
             do {
@@ -1836,6 +1882,7 @@ actor TrustedApprovalsCoordinator {
     func discardTestingCacheIfIdle() {
         guard accepted == nil, pending == nil, preparing == nil, lane == nil, replayTask == nil,
               uncertainWrite == nil, uninspectedTargets.isEmpty, uninspectedCleanup.isEmpty,
+              notices.isEmpty, earlierNotices.isEmpty,
               !diagnostics.values.contains(where: \.requiresRecovery) else { return }
         envelope = .init(); bytes = nil; loaded = false
         required.removeAll(); applications.removeAll(); removals.removeAll(); finalizedRemovals.removeAll(); failures.removeAll(); recoveryTargets.removeAll(); failedApplications.removeAll(); failedRemovalWrites.removeAll(); targetPins.removeAll()
@@ -1910,20 +1957,23 @@ actor TrustedApprovalsCoordinator {
             switch pending.effect {
             case .approval(let device, let eligibility, _):
                 await eligibility.recoveredWithoutDelivery()
-                await recordDiagnostic(.writeDevice(device), error: CommittedApprovalDeliveryError(recoveredAfterFailure: true), operation: pending.error.diagnosticID, context: "TV approval for " + device, requiresRecovery: false)
+                recordRecoveryNotice(operation: pending.error.diagnosticID, device: device, kind: .approvalSaved,
+                    message: "TV approval for " + device + ": " + CommittedApprovalDeliveryError(recoveredAfterFailure: true).localizedDescription)
             case .revocation(let admission): await acceptRevocation(admission)
             case .removal(let proof): removals[proof.intent.operationID] = proof; failedRemovalWrites.remove(proof.intent.operationID)
             }
         } else if actual == pending.predecessor {
             uncertainWrite = nil; loaded = true; confirmedWriteAttempt = writeAttempt
             clearDiagnostic(pending.diagnostic)
-            let rejected = beginDiagnostic(pending.effect.origin, operation: pending.error.diagnosticID)
-            setDiagnostic(rejected, error: pending.error.failure, context: pending.effect.context + " did not commit", requiresRecovery: false)
             switch pending.effect {
-            case .approval(_, let eligibility, let lifetime):
+            case .approval(let device, let eligibility, let lifetime):
                 if lifetime.isCurrent { eligibility.restoreAfterFailedWrite() }
+                recordRecoveryNotice(operation: pending.error.diagnosticID, device: device, kind: .approvalRejected,
+                    message: "TV approval for " + device + " did not commit. Its previous approval is unchanged; approve again if intended.")
             case .revocation(let admission):
                 for (target, receipt) in admission.reservations { await target.cancelRevocationReservation(receipt) }
+                recordRecoveryNotice(operation: pending.error.diagnosticID, device: admission.intent.deviceID, kind: .revocationRejected,
+                    message: "Revocation for " + admission.intent.deviceID + " did not commit. This TV remains approved; choose Revoke again if intended.")
             case .removal(let proof):
                 applications[proof.intent.operationID] = nil
                 applicationEpochs = applicationEpochs.filter { $0.key.intent != proof.intent.operationID }
@@ -2178,10 +2228,18 @@ actor TrustedApprovalsCoordinator {
         failedApplications[attempt] = .init(generation: applicationBlockerGeneration, localAttempt: localAttempt,
             diagnostic: BoundedDiagnostics.bounded(diagnostic, bytes: 8192))
     }
+    private var uninspectedEvidenceMessage: String {
+        let live = uninspectedTargets.values.filter { !$0.withdrawn }.map { $0.service.runtimeID.uuidString }.sorted()
+        let withdrawn = uninspectedTargets.values.filter(\.withdrawn).map { $0.service.runtimeID.uuidString }.sorted()
+        var parts: [String] = []
+        if !live.isEmpty { parts.append("A proposed request service still needs trusted approval inspection: " + live.prefix(8).joined(separator: ", ") + ". Explicitly register that service before retiring retained TV cancellation evidence.") }
+        if !withdrawn.isEmpty { parts.append("Withdrawn TV proposal cleanup is pending for " + withdrawn.prefix(8).joined(separator: ", ") + ". Retain its cancellation evidence and choose Retry Recovery if cleanup does not finish.") }
+        return parts.joined(separator: "\n")
+    }
     private func acknowledgeIfReady(_ intent: RequestRevocationIntent) async throws -> Bool {
         try requireCertainWrite()
         guard removals[intent.operationID] != nil || uninspectedTargets.isEmpty else {
-            throw Self.unavailable("A proposed request service still needs trusted approval inspection: " + uninspectedTargets.keys.map(\.uuidString).sorted().prefix(8).joined(separator: ", ") + ". Explicitly register that service before removing retained TV cancellation evidence.")
+            throw Self.unavailable(uninspectedEvidenceMessage)
         }
         guard !failedRemovalWrites.contains(intent.operationID) else { return false }
         let needed = required[intent.operationID] ?? []
@@ -2239,7 +2297,7 @@ actor TrustedApprovalsCoordinator {
         // still cancellation evidence for proposals not yet inspected. Preserve
         // their inventory and the finalized receipts until each is accounted for.
         guard uninspectedTargets.isEmpty else {
-            throw Self.unavailable("A proposed request service still needs trusted approval inspection before retained TV cancellation evidence can retire.")
+            throw Self.unavailable(uninspectedEvidenceMessage)
         }
         finalizedRemovals[intent.operationID] = nil
         required[intent.operationID] = nil; applications[intent.operationID] = nil; removals[intent.operationID] = nil; failures[intent.operationID] = nil
