@@ -64,11 +64,14 @@ private final class OutcomeBackend: @unchecked Sendable {
         guard case .accepted(let binding) = try XCTUnwrap(result.value).get() else { throw ShaderRequestError.invalidRequest }
         return binding
     }
-    func submit(_ service: ShaderRequestService, device: String = "TV") async throws -> UUID {
+    func makeRequest() throws -> ShaderRequest {
         let file = Bundle.module.url(forResource: "CatalogFixture", withExtension: "json", subdirectory: "TestSupport")!
         let shader = try JSONDecoder().decode(CatalogSnapshot.self, from: Data(contentsOf: file)).validated().initialShader
         let context = ShaderRequestContext(shader: shader, screenshot: try RequestScreenshot.encode(pixels: Data([128,64,32,255]), width: 1, height: 1, bytesPerRow: 4), animationTime: 1, width: 1, height: 1)
-        let request = ShaderRequest(prompt: "Outcome boundary", context: context)
+        return ShaderRequest(prompt: "Outcome boundary", context: context)
+    }
+    func submit(_ service: ShaderRequestService, device: String = "TV") async throws -> UUID {
+        let request = try makeRequest()
         _ = try await service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: device)
         return request.id
     }
@@ -522,7 +525,11 @@ private final class OutcomeBackend: @unchecked Sendable {
         XCTAssertTrue(error.localizedDescription.contains("Outcome boundary backstop"))
         XCTAssertTrue(prior.permit.isCurrent)
         armed.on = false; await gate.release()
-        try await wait { await authority.observation.acceptedGeneration == ticket.generation }
+        let completed = try await accepted(ticket)
+        XCTAssertEqual(completed.permit.generation, ticket.generation)
+        XCTAssertTrue(completed.permit.isCurrent)
+        let final = await authority.observation
+        XCTAssertEqual(final.acceptedGeneration, completed.permit.generation)
         XCTAssertFalse(prior.permit.isCurrent)
     }
 
@@ -586,6 +593,49 @@ private final class OutcomeBackend: @unchecked Sendable {
         let clean = await authority.observation
         XCTAssertEqual(clean.obligations, 0); XCTAssertEqual(clean.uncertainWrites, 0)
         XCTAssertEqual(backend.writes, 2) // Confirmed B approval and one removal of A.
+    }
+
+    func testUncertainRevocationKeepsCredentialButFencesEveryRequestMutation() async throws {
+        for mode in [OutcomeBackend.WriteFailure.unreadableAfter, .unreadableBefore] {
+            let f = try await fixture(), request = try makeRequest(), job = request.id
+            _ = try await f.service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV")
+            let original = try TrustedTVApprovals(approvals: [.init(id: "TV", name: "TV", tokenHash: "old")]).encoded()
+            let backend = OutcomeBackend(original), authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) })
+            let server = LocalCatalogServer(catalog: DirectoryCatalog(directory: f.root.appendingPathComponent("catalog")),
+                testingNamespace: "pr58-authorization-" + UUID().uuidString, trustedApprovals: authority)
+            addTeardownBlock { let receipt = await server.shutdownReceipt(); try? await receipt.value() }
+            await server.setRequestService(f.service)
+            let authorization = try await server.requestAuthorization(for: "TV")
+            backend.failWrites(mode)
+            do { try await server.revoke("TV"); XCTFail("Unknown revocation accepted") }
+            catch { XCTAssertTrue(error.localizedDescription.contains("unverified")) }
+            let continued = try await server.requestAuthorization(for: "TV"), state = await server.currentState
+            XCTAssertTrue(continued === authorization); XCTAssertTrue(authorization.isCurrent)
+            XCTAssertEqual(state.approved.map(\.id), ["TV"])
+            for operation in ["requestSubmit", "requestAnswer", "requestActivated", "requestDelivery"] {
+                do {
+                    _ = try await f.service.control(operation: operation,
+                        payload: .init(request: request, requestID: job, answer: UUID().uuidString, sourceHash: request.context.sourceHash),
+                        deviceID: "TV", authorization: authorization)
+                    XCTFail("Uncertain revocation admitted " + operation)
+                } catch { XCTAssertTrue(error.localizedDescription.contains("TV approval inspection requires recovery"), operation + ": " + error.localizedDescription) }
+            }
+            let status = try await f.service.control(operation: "requestStatus", payload: .init(), deviceID: "TV", authorization: authorization)
+            XCTAssertFalse(status.enabled); XCTAssertEqual(status.jobs.map(\.id), [job])
+            let blocked = await f.service.allJobs(); XCTAssertEqual(blocked.map(\.id), [job])
+            backend.failReads(false); backend.failWrites(.none)
+            try await f.service.retryReconciliation()
+            if mode == .unreadableAfter {
+                XCTAssertFalse(authorization.isCurrent)
+                do { _ = try await server.requestAuthorization(for: "TV"); XCTFail("Confirmed revocation retained access") }
+                catch { XCTAssertTrue(error.localizedDescription.contains("revoked")) }
+            } else {
+                let restored = try await server.requestAuthorization(for: "TV")
+                XCTAssertTrue(restored === authorization); XCTAssertTrue(restored.isCurrent)
+                XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(backend.bytes)).approvals.first?.tokenHash, "old")
+                _ = try await f.service.control(operation: "requestSubmit", payload: .init(request: request), deviceID: "TV", authorization: restored)
+            }
+        }
     }
 
     func testReplacingFailedProposalRetiresOnlySupersededCleanupDiagnostic() async throws {
