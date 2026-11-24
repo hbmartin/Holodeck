@@ -425,8 +425,11 @@ actor TrustedApprovalsCoordinator {
         return .init(origin: origin, operation: operation, generation: diagnosticSequence)
     }
     private func discardUnrecordedAttempt(_ attempt: DiagnosticAttempt) {
-        if diagnosticGenerations[attempt.origin] == attempt.generation, diagnostics[attempt.origin] == nil {
-            diagnosticGenerations[attempt.origin] = nil
+        if diagnosticGenerations[attempt.origin] == attempt.generation,
+           diagnostics[attempt.origin]?.attempt.generation != attempt.generation {
+            // A cancelled unrecorded successor cannot make its older history
+            // permanently immune to generation-checked eviction.
+            diagnosticGenerations[attempt.origin] = diagnostics[attempt.origin]?.attempt.generation
         }
     }
     private func setDiagnostic(_ attempt: DiagnosticAttempt, error: Error, context: String, requiresRecovery: Bool) {
@@ -451,6 +454,11 @@ actor TrustedApprovalsCoordinator {
         diagnosticGenerations[origin] = nil
         return diagnostics.removeValue(forKey: origin) != nil
     }
+    @discardableResult private func clearSettledWriteDiagnostics() -> Bool {
+        let origins = diagnostics.values.filter { !$0.requiresRecovery && $0.attempt.origin.isWrite }.map { $0.attempt.origin }
+        for origin in origins { clearDiagnostic(origin) }
+        return !origins.isEmpty
+    }
     private func recordDiagnostic(_ origin: DiagnosticOrigin, error: Error, operation: UUID,
                                   context: String, requiresRecovery: Bool) async {
         let attempt = beginDiagnostic(origin, operation: operation)
@@ -458,6 +466,7 @@ actor TrustedApprovalsCoordinator {
         await notify()
     }
     private var replayTask: Task<Void, Never>?
+    private var replayNeedsRescan = false
     private enum RecoveryPassState { case collecting, sealed, replaying, finishing, finished }
     private struct RecoveryParticipant {
         let requester: UUID
@@ -582,15 +591,19 @@ actor TrustedApprovalsCoordinator {
     private var revision: TrustedRevocationRevision { .init(coordinator: id, sequence: sequence) }
     private var snapshot: Snapshot {
         let ordered = diagnostics.values.sorted {
+            if $0.requiresRecovery != $1.requiresRecovery { return $0.requiresRecovery }
             if $0.attempt.origin.isWrite != $1.attempt.origin.isWrite { return $0.attempt.origin.isWrite }
             return $0.attempt.origin.isWrite ? $0.attempt.generation > $1.attempt.generation : $0.attempt.generation < $1.attempt.generation
         }
         var messages: [(UUID, String)] = []
         if let uncertainWrite { messages.append((uncertainWrite.error.diagnosticID, uncertainWrite.error.localizedDescription)) }
-        for record in ordered where record.attempt.origin != uncertainWrite?.diagnostic.origin {
+        for record in ordered where record.requiresRecovery && record.attempt.origin != uncertainWrite?.diagnostic.origin {
             messages.append((record.failure.diagnosticID, "Trusted TV operation " + record.failure.diagnosticID.uuidString + ": " + record.failure.message))
         }
         messages += failures.sorted { $0.key.uuidString < $1.key.uuidString }.map { ($0.key, "Trusted TV intent " + $0.key.uuidString + ": " + $0.value.message) }
+        for record in ordered where !record.requiresRecovery && record.attempt.origin != uncertainWrite?.diagnostic.origin {
+            messages.append((record.failure.diagnosticID, "Trusted TV operation " + record.failure.diagnosticID.uuidString + ": " + record.failure.message))
+        }
         let primary = messages.first.map { BoundedDiagnostics.bounded($0.1, bytes: 8192) }
         var secondary: [String] = []
         if let primary { for (_, detail) in messages.dropFirst() { secondary = BoundedDiagnostics.appending(detail, primary: primary, secondary: secondary) } }
@@ -747,7 +760,10 @@ actor TrustedApprovalsCoordinator {
                 admitActivation: admitActivation, intents: outstandingIntents.filter { finalizedRemovals[$0.operationID]?.contains(key) != true }, revision: revision)
             inspection = .init(registrationID: registration)
         }
-        if let retired = uninspectedTargets.removeValue(forKey: serviceID) { clearDiagnostic(.cleanup(retired.id)) }
+        if let retired = uninspectedTargets.removeValue(forKey: serviceID) {
+            clearDiagnostic(.cleanup(retired.id))
+            if replayTask != nil { replayNeedsRescan = true }
+        }
         if let afterTargetActivation { await afterTargetActivation(serviceID) }
         let previous = targets.keys.filter { $0.service == serviceID && $0 != key }
         for old in previous {
@@ -919,8 +935,13 @@ actor TrustedApprovalsCoordinator {
             try Task.checkCancellation()
             for entry in uninspectedTargets.values.filter(\.withdrawn).sorted(by: { $0.service.runtimeID.uuidString < $1.service.runtimeID.uuidString }) {
                 try Task.checkCancellation()
-                do { try await cleanupUninspectedTask(entry).subscribe().value() }
-                catch { try Task.checkCancellation(); errors.append("Withdrawn proposal " + entry.id.uuidString + ": " + error.localizedDescription) }
+                let cleanup = cleanupUninspectedTask(entry)
+                // A durable cleanup owns itself. Unrelated participants must not
+                // wait for another service's local disk or process recovery.
+                if !outstandingIntents.isEmpty || recoveryPass?.participants.values.contains(where: { $0.requester == entry.service.runtimeID }) == true {
+                    do { try await cleanup.subscribe().value() }
+                    catch { try Task.checkCancellation(); errors.append("Withdrawn proposal " + entry.id.uuidString + ": " + error.localizedDescription) }
+                }
             }
             if let candidate = failedRegistration {
                 if candidate.eligibility.isCurrent {
@@ -1034,12 +1055,13 @@ actor TrustedApprovalsCoordinator {
             // the lane or recursively join the trusted pass calling it.
             errors += await finishRecoveredDepartures()
             if let pass = recoveryPass, pass.id == passID {
-                for serviceID in Set(pass.participants.values.map(\.requester)) where uninspectedTargets[serviceID] != nil {
+                for serviceID in Set(pass.participants.values.map(\.requester)) where uninspectedTargets[serviceID]?.withdrawn == false {
                     errors.append("Service " + serviceID.uuidString + " remains unaccepted after its failed trusted inspection. Explicitly register its intended server; superseded proposals cannot reactivate themselves.")
                 }
             }
             let readiness = try await acquire(.progress)
             do { try requireAuthorityReady() } catch { errors.append(error.localizedDescription) }
+            if errors.isEmpty, clearSettledWriteDiagnostics() { await notify() }
             release(readiness)
         } catch {
             for target in heldTargets.values { await target.finishTrustedRecovery(pass: passID) }
@@ -1453,6 +1475,7 @@ actor TrustedApprovalsCoordinator {
                     }
                     catch {
                         token = await acquireReplacement()
+                        try checkRegistrationPreparation(request, transfer: transfer)
                         throw error
                     }
                     token = await acquireReplacement()
@@ -1596,7 +1619,10 @@ actor TrustedApprovalsCoordinator {
                                 uninspectedTargets[serviceID] = entry
                                 if cleared { await notify() }
                                 if entry.withdrawn { _ = cleanupUninspectedTask(entry) }
-                            } else if !claimed, !targets.keys.contains(where: { $0.service == serviceID }) { failedRegistration = nil }
+                            } else if !claimed, !targets.keys.contains(where: { $0.service == serviceID }),
+                                      await target.hasConflictingTrustedPreparation(authority: id) {
+                                failedRegistration = nil
+                            }
                         }
                     }
                     request.registration.completion.complete(.failure(error))
@@ -1691,20 +1717,22 @@ actor TrustedApprovalsCoordinator {
                             // Successful proposal cleanup must not clear it.
                         }
                         fresh = true
+                        scheduleReplay()
                     }
-                    let intents = envelope.revocations, observedAttempt = writeAttempt
+                    let intents = outstandingIntents, observedAttempt = writeAttempt
                     release(token)
                     try await target.retireUnacceptedRequests(intents, preparation: preparation)
                     let commit = await acquireProgress()
                     guard uninspectedTargets[serviceID]?.id == entry.id else { release(commit); await target.endUnacceptedTargetRetirement(preparation); return }
                     do { try requireCertainWrite() } catch { release(commit); throw error }
-                    if !loaded || envelope.revocations != intents || observedAttempt != writeAttempt {
+                    if !loaded || outstandingIntents != intents || observedAttempt != writeAttempt {
                         fresh = loaded && confirmedWriteAttempt == writeAttempt
                         release(commit); continue
                     }
                     do { try await target.completeUnacceptedTargetRetirement(preparation) }
                     catch { release(commit); throw error }
                     uninspectedTargets[serviceID] = nil
+                    if replayTask != nil { replayNeedsRescan = true }
                     release(commit)
                     // Other targets may already have applied the retained intent.
                     // Their replay owns any remaining failure independently.
@@ -1799,13 +1827,15 @@ actor TrustedApprovalsCoordinator {
         guard let pending = uncertainWrite else { return }
         let actual: Data?
         do { actual = try await readTrustedBytes() }
+        catch is CancellationError { throw CancellationError() }
+        catch is TrustedBoundaryInterrupted { throw TrustedBoundaryInterrupted() }
         catch { let failure = await retainWriteUncertainty(pending, error: error); throw failure }
         if actual == pending.candidate {
             acceptPersisted(pending.value, bytes: pending.candidate)
             uncertainWrite = nil; loaded = true; clearDiagnostic(pending.diagnostic)
             switch pending.effect {
             case .approval(let device, let eligibility, _):
-                eligibility.recoveredWithoutDelivery()
+                await eligibility.recoveredWithoutDelivery()
                 await recordDiagnostic(.writeDevice(device), error: CommittedApprovalDeliveryError(recoveredAfterFailure: true), operation: pending.error.diagnosticID, context: "TV approval for " + device, requiresRecovery: false)
             case .revocation(let admission): await acceptRevocation(admission)
             case .removal(let proof): removals[proof.intent.operationID] = proof; failedRemovalWrites.remove(proof.intent.operationID)
@@ -1861,6 +1891,7 @@ actor TrustedApprovalsCoordinator {
             inspections = inspections.mapValues { $0 == predecessor ? baseline : $0 }
         }
         envelope = value; bytes = candidate; sequence &+= 1; writes += 1; loaded = true; confirmedWriteAttempt = writeAttempt
+        clearSettledWriteDiagnostics()
     }
     private func notify() async {
         if let accepted { await accepted.owner.changed(snapshot, accepted.binding) }
@@ -2033,6 +2064,10 @@ actor TrustedApprovalsCoordinator {
             if replayTask == nil { replayTask = Task { await self.drainReplay() } }
         }
     }
+    private func scheduleReplay() {
+        guard loaded, uncertainWrite == nil, !outstandingIntents.isEmpty, replayTask == nil else { return }
+        replayTask = Task { await self.drainReplay() }
+    }
     private func replayDeparture(serviceID: UUID) async throws {
         guard required.values.contains(where: { $0.contains(where: { $0.service == serviceID }) }) else { return }
         try await withCheckedThrowingContinuation { c in
@@ -2114,6 +2149,12 @@ actor TrustedApprovalsCoordinator {
             try await target.finalizeTrustedRevocation(proof, removal: removal)
             finalizedRemovals[intent.operationID, default: []].insert(key)
         }
+        // Known targets may finish independently, but the committed removal is
+        // still cancellation evidence for proposals not yet inspected. Preserve
+        // their inventory and the finalized receipts until each is accounted for.
+        guard uninspectedTargets.isEmpty else {
+            throw Self.unavailable("A proposed request service still needs trusted approval inspection before retained TV cancellation evidence can retire.")
+        }
         finalizedRemovals[intent.operationID] = nil
         required[intent.operationID] = nil; applications[intent.operationID] = nil; removals[intent.operationID] = nil; failures[intent.operationID] = nil
         applicationEpochs = applicationEpochs.filter { $0.key.intent != intent.operationID }
@@ -2149,11 +2190,19 @@ actor TrustedApprovalsCoordinator {
                 if !removalAttempted.contains(intent.operationID) {
                     do {
                         if try await acknowledgeIfReady(intent) { failed[intent.operationID] = nil; release(token); continue drain }
-                    } catch { failed[intent.operationID] = await record(error, intent: intent) }
+                    } catch {
+                        if finishReplayIfUncertain() { release(token); return }
+                        failed[intent.operationID] = await record(error, intent: intent)
+                    }
                     removalAttempted.insert(intent.operationID)
                 }
             }
             guard let (intent, key, target, epoch) = work else {
+                if replayNeedsRescan {
+                    replayNeedsRescan = false
+                    removalAttempted.removeAll()
+                    release(token); continue
+                }
                 let remaining = Set(envelope.revocations.map(\.operationID)).union(removals.keys)
                 failed = failed.filter { remaining.contains($0.key) }
                 // A successful target cannot erase another target's unresolved application.
@@ -2186,12 +2235,14 @@ actor TrustedApprovalsCoordinator {
                 do {
                     if try await acknowledgeIfReady(intent) { failed[intent.operationID] = nil }
                 } catch {
+                    if finishReplayIfUncertain() { release(commit); return }
                     removalAttempted.insert(intent.operationID)
                     failed[intent.operationID] = await record(error, intent: intent)
                 }
                 release(commit)
             } catch {
                 let commit = await acquireProgress()
+                if finishReplayIfUncertain() { release(commit); return }
                 recoveryTargets.insert(key)
                 if recoveryEpochs[key] == epoch || failedApplications[.init(intent: intent.operationID, target: key)] == nil {
                     blockApplication(.init(intent: intent.operationID, target: key), diagnostic: error.localizedDescription)
@@ -2224,12 +2275,13 @@ actor TrustedApprovalsCoordinator {
     private func finishReplayIfUncertain() -> Bool {
         guard let uncertainWrite else { return false }
         let ids = Set(replayWaiters.keys).union(required.keys).union([uncertainWrite.error.diagnosticID])
-        let errors = Dictionary(uniqueKeysWithValues: ids.map { ($0, Failure(uncertainWrite.error, diagnosticID: $0)) })
+        let failure = Failure(uncertainWrite.error, diagnosticID: uncertainWrite.error.diagnosticID)
+        let errors = Dictionary(uniqueKeysWithValues: ids.map { ($0, failure) })
         finishReplay(errors)
         return true
     }
     private func finishReplay(_ failed: [UUID: Failure]) {
-        replayTask = nil
+        replayTask = nil; replayNeedsRescan = false
         let departures = departureReplay; departureReplay.removeAll()
         for (serviceID, waiting) in departures {
             let error = departureFailure(serviceID: serviceID)

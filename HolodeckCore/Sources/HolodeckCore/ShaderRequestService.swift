@@ -589,6 +589,17 @@ public actor ShaderRequestService {
         }
     }
     func prepareTrustedAuthority(id: UUID, preparation: TrustedRegistrationPreparation? = nil) async throws -> AuthorityTransfer? {
+        while let retirement = unacceptedRetirement {
+            do {
+                try await TrustedBoundaryWait.value(changes: preparation.map { [$0.changed] } ?? []) {
+                    try await retirement.wait()
+                }
+            } catch {
+                try preparation?.check(); try Task.checkCancellation()
+                throw error
+            }
+            try preparation?.check(); try Task.checkCancellation()
+        }
         try requirePendingTrustedAuthority(id)
         if revocationCoordinatorID == nil {
             // Inspection readiness is provisional; it does not install an
@@ -742,7 +753,10 @@ public actor ShaderRequestService {
     }
     private var approvalInspectionBlocker: String? {
         if let revocationFailure { return "TV approval inspection requires recovery: " + revocationFailure }
-        return revocationInspectionPending ? "TV approvals have not been inspected. TV requests are paused; choose Retry Recovery." : nil
+        guard revocationInspectionPending else { return nil }
+        return revocationCoordinator == nil
+            ? "TV approvals have not been inspected. Register a local catalog server for this service before TV requests resume."
+            : "TV approvals have not been inspected. TV requests are paused; choose Retry Recovery."
     }
     private func revocationBlocker(for deviceID: String) -> String? {
         if let unknownRevocationBlocker { return unknownRevocationBlocker }
@@ -816,6 +830,9 @@ public actor ShaderRequestService {
             let valid = await self.validateTrustedRecovery(local)
             return .init(completedServices: valid.completed ? [serviceID] : [])
         }
+    }
+    func hasConflictingTrustedPreparation(authority: UUID) -> Bool {
+        pendingTrustedAuthority.map { $0 != authority } ?? false
     }
     @discardableResult func failedTrustedRegistration(_ error: Error, authority: UUID,
         recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) -> Bool {

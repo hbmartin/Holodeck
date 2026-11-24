@@ -639,5 +639,34 @@ private final class LifecycleClientSecrets: @unchecked Sendable {
         XCTAssertTrue(recovered.enabled); XCTAssertEqual(backend.read(), original)
     }
 
+    func testRecoveredCommittedApprovalClosesOnlyItsPendingTLSSession() async throws {
+        let fixture = try await fixture(), backend = TrustedBackendFixture(try TrustedTVApprovals().encoded())
+        let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { value in
+            try backend.write(value)
+            if backend.writes == 1 { backend.failReads(true); throw POSIXError(.EIO) }
+        })
+        let server = LocalCatalogServer(catalog: fixture.catalog, testingNamespace: "recovered-pairing-" + UUID().uuidString, trustedApprovals: authority)
+        addTeardownBlock { backend.failReads(false); try await server.clearTestSecrets() }
+        await server.setRequestService(fixture.service); try await server.start()
+        let client = try await tls(server), device = UUID().uuidString, pending = try await pair(server, client: client, device: device)
+        do { try await server.approve(pending.id); XCTFail("Uncertain approval accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("unverified")) }
+        let saved = backend.read()
+        backend.failReads(false); try await fixture.service.retryReconciliation()
+        try await wait { await server.sessionCount == 0 }
+        let recovered = await server.currentState
+        XCTAssertTrue(recovered.pending.isEmpty); XCTAssertEqual(recovered.approved.map(\.id), [device])
+        XCTAssertTrue(recovered.message.contains("Pair this TV again")); XCTAssertEqual(backend.read(), saved)
+        let next = try await tls(server), repeated = try await pair(server, client: next, device: device)
+        try await fixture.service.retryReconciliation() // Old completion cannot close the new pairing.
+        let stillPending = await server.currentState
+        XCTAssertEqual(stillPending.pending.map(\.id), [repeated.id])
+        try await server.approve(repeated.id)
+        let issued = try await next.exchange(LocalPacket(message: .init(operation: "pairStatus")))
+        XCTAssertNotNil(issued.message.token); XCTAssertEqual(backend.writes, 2)
+        let final = await server.currentState
+        XCTAssertFalse(final.message.contains("Pair this TV again"))
+    }
+
 }
 #endif
