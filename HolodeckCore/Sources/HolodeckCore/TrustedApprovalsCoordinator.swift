@@ -425,8 +425,11 @@ actor TrustedApprovalsCoordinator {
         return .init(origin: origin, operation: operation, generation: diagnosticSequence)
     }
     private func discardUnrecordedAttempt(_ attempt: DiagnosticAttempt) {
-        if diagnosticGenerations[attempt.origin] == attempt.generation, diagnostics[attempt.origin] == nil {
-            diagnosticGenerations[attempt.origin] = nil
+        if diagnosticGenerations[attempt.origin] == attempt.generation,
+           diagnostics[attempt.origin]?.attempt.generation != attempt.generation {
+            // A cancelled unrecorded successor cannot make its older history
+            // permanently immune to generation-checked eviction.
+            diagnosticGenerations[attempt.origin] = diagnostics[attempt.origin]?.attempt.generation
         }
     }
     private func setDiagnostic(_ attempt: DiagnosticAttempt, error: Error, context: String, requiresRecovery: Bool) {
@@ -450,6 +453,11 @@ actor TrustedApprovalsCoordinator {
     @discardableResult private func clearDiagnostic(_ origin: DiagnosticOrigin) -> Bool {
         diagnosticGenerations[origin] = nil
         return diagnostics.removeValue(forKey: origin) != nil
+    }
+    @discardableResult private func clearSettledWriteDiagnostics() -> Bool {
+        let origins = diagnostics.values.filter { !$0.requiresRecovery && $0.attempt.origin.isWrite }.map { $0.attempt.origin }
+        for origin in origins { clearDiagnostic(origin) }
+        return !origins.isEmpty
     }
     private func recordDiagnostic(_ origin: DiagnosticOrigin, error: Error, operation: UUID,
                                   context: String, requiresRecovery: Bool) async {
@@ -582,15 +590,19 @@ actor TrustedApprovalsCoordinator {
     private var revision: TrustedRevocationRevision { .init(coordinator: id, sequence: sequence) }
     private var snapshot: Snapshot {
         let ordered = diagnostics.values.sorted {
+            if $0.requiresRecovery != $1.requiresRecovery { return $0.requiresRecovery }
             if $0.attempt.origin.isWrite != $1.attempt.origin.isWrite { return $0.attempt.origin.isWrite }
             return $0.attempt.origin.isWrite ? $0.attempt.generation > $1.attempt.generation : $0.attempt.generation < $1.attempt.generation
         }
         var messages: [(UUID, String)] = []
         if let uncertainWrite { messages.append((uncertainWrite.error.diagnosticID, uncertainWrite.error.localizedDescription)) }
-        for record in ordered where record.attempt.origin != uncertainWrite?.diagnostic.origin {
+        for record in ordered where record.requiresRecovery && record.attempt.origin != uncertainWrite?.diagnostic.origin {
             messages.append((record.failure.diagnosticID, "Trusted TV operation " + record.failure.diagnosticID.uuidString + ": " + record.failure.message))
         }
         messages += failures.sorted { $0.key.uuidString < $1.key.uuidString }.map { ($0.key, "Trusted TV intent " + $0.key.uuidString + ": " + $0.value.message) }
+        for record in ordered where !record.requiresRecovery && record.attempt.origin != uncertainWrite?.diagnostic.origin {
+            messages.append((record.failure.diagnosticID, "Trusted TV operation " + record.failure.diagnosticID.uuidString + ": " + record.failure.message))
+        }
         let primary = messages.first.map { BoundedDiagnostics.bounded($0.1, bytes: 8192) }
         var secondary: [String] = []
         if let primary { for (_, detail) in messages.dropFirst() { secondary = BoundedDiagnostics.appending(detail, primary: primary, secondary: secondary) } }
@@ -1045,6 +1057,7 @@ actor TrustedApprovalsCoordinator {
             }
             let readiness = try await acquire(.progress)
             do { try requireAuthorityReady() } catch { errors.append(error.localizedDescription) }
+            if errors.isEmpty, clearSettledWriteDiagnostics() { await notify() }
             release(readiness)
         } catch {
             for target in heldTargets.values { await target.finishTrustedRecovery(pass: passID) }
@@ -1809,13 +1822,15 @@ actor TrustedApprovalsCoordinator {
         guard let pending = uncertainWrite else { return }
         let actual: Data?
         do { actual = try await readTrustedBytes() }
+        catch is CancellationError { throw CancellationError() }
+        catch is TrustedBoundaryInterrupted { throw TrustedBoundaryInterrupted() }
         catch { let failure = await retainWriteUncertainty(pending, error: error); throw failure }
         if actual == pending.candidate {
             acceptPersisted(pending.value, bytes: pending.candidate)
             uncertainWrite = nil; loaded = true; clearDiagnostic(pending.diagnostic)
             switch pending.effect {
             case .approval(let device, let eligibility, _):
-                eligibility.recoveredWithoutDelivery()
+                await eligibility.recoveredWithoutDelivery()
                 await recordDiagnostic(.writeDevice(device), error: CommittedApprovalDeliveryError(recoveredAfterFailure: true), operation: pending.error.diagnosticID, context: "TV approval for " + device, requiresRecovery: false)
             case .revocation(let admission): await acceptRevocation(admission)
             case .removal(let proof): removals[proof.intent.operationID] = proof; failedRemovalWrites.remove(proof.intent.operationID)
@@ -1871,6 +1886,7 @@ actor TrustedApprovalsCoordinator {
             inspections = inspections.mapValues { $0 == predecessor ? baseline : $0 }
         }
         envelope = value; bytes = candidate; sequence &+= 1; writes += 1; loaded = true; confirmedWriteAttempt = writeAttempt
+        clearSettledWriteDiagnostics()
     }
     private func notify() async {
         if let accepted { await accepted.owner.changed(snapshot, accepted.binding) }
@@ -2169,7 +2185,10 @@ actor TrustedApprovalsCoordinator {
                 if !removalAttempted.contains(intent.operationID) {
                     do {
                         if try await acknowledgeIfReady(intent) { failed[intent.operationID] = nil; release(token); continue drain }
-                    } catch { failed[intent.operationID] = await record(error, intent: intent) }
+                    } catch {
+                        if finishReplayIfUncertain() { release(token); return }
+                        failed[intent.operationID] = await record(error, intent: intent)
+                    }
                     removalAttempted.insert(intent.operationID)
                 }
             }
@@ -2206,12 +2225,14 @@ actor TrustedApprovalsCoordinator {
                 do {
                     if try await acknowledgeIfReady(intent) { failed[intent.operationID] = nil }
                 } catch {
+                    if finishReplayIfUncertain() { release(commit); return }
                     removalAttempted.insert(intent.operationID)
                     failed[intent.operationID] = await record(error, intent: intent)
                 }
                 release(commit)
             } catch {
                 let commit = await acquireProgress()
+                if finishReplayIfUncertain() { release(commit); return }
                 recoveryTargets.insert(key)
                 if recoveryEpochs[key] == epoch || failedApplications[.init(intent: intent.operationID, target: key)] == nil {
                     blockApplication(.init(intent: intent.operationID, target: key), diagnostic: error.localizedDescription)
@@ -2244,7 +2265,8 @@ actor TrustedApprovalsCoordinator {
     private func finishReplayIfUncertain() -> Bool {
         guard let uncertainWrite else { return false }
         let ids = Set(replayWaiters.keys).union(required.keys).union([uncertainWrite.error.diagnosticID])
-        let errors = Dictionary(uniqueKeysWithValues: ids.map { ($0, Failure(uncertainWrite.error, diagnosticID: $0)) })
+        let failure = Failure(uncertainWrite.error, diagnosticID: uncertainWrite.error.diagnosticID)
+        let errors = Dictionary(uniqueKeysWithValues: ids.map { ($0, failure) })
         finishReplay(errors)
         return true
     }

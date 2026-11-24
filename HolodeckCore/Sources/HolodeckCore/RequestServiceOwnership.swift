@@ -74,7 +74,10 @@ nonisolated final class TrustedApprovalEligibility: @unchecked Sendable {
     private let lock = NSLock()
     private var state: State = .eligible
     private let withinDeadline: @Sendable () -> Bool
-    init(withinDeadline: @escaping @Sendable () -> Bool = { true }) { self.withinDeadline = withinDeadline }
+    private let recovered: @Sendable (UUID) async -> Void
+    init(withinDeadline: @escaping @Sendable () -> Bool = { true }, recovered: @escaping @Sendable (UUID) async -> Void = { _ in }) {
+        self.withinDeadline = withinDeadline; self.recovered = recovered
+    }
     func check() throws {
         try lock.withLock {
             if state == .recoveredWithoutToken { throw CommittedApprovalDeliveryError(recoveredAfterFailure: true) }
@@ -90,8 +93,12 @@ nonisolated final class TrustedApprovalEligibility: @unchecked Sendable {
     func restoreAfterFailedWrite() {
         lock.withLock { if state == .admitted, withinDeadline() { state = .eligible } }
     }
-    func recoveredWithoutDelivery() {
-        lock.withLock { if state == .admitted { state = .recoveredWithoutToken } }
+    func recoveredWithoutDelivery() async {
+        let changed = lock.withLock {
+            guard state == .admitted else { return false }
+            state = .recoveredWithoutToken; return true
+        }
+        if changed { await recovered(id) }
     }
     var canIssue: Bool { lock.withLock { state == .admitted && withinDeadline() } }
     func close() { lock.withLock { state = .closed } }
