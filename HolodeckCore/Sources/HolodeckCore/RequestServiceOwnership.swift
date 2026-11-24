@@ -69,6 +69,7 @@ nonisolated final class TrustedWithdrawalReceipt: Sendable {
 }
 
 nonisolated final class TrustedApprovalEligibility: @unchecked Sendable {
+    let id = UUID()
     private enum State { case eligible, admitted, closed }
     private let lock = NSLock()
     private var state: State = .eligible

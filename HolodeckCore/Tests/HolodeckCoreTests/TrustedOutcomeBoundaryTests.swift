@@ -4,7 +4,7 @@ import XCTest
 @testable import HolodeckCore
 
 private final class OutcomeBackend: @unchecked Sendable {
-    enum WriteFailure { case none, before, after, conflict }
+    enum WriteFailure { case none, before, after, conflict, unreadableBefore, unreadableAfter }
     private let lock = NSLock()
     private var data: Data?
     private var gate: TrustedReadGate?
@@ -23,9 +23,11 @@ private final class OutcomeBackend: @unchecked Sendable {
     }
     func write(_ value: Data) throws {
         try lock.withLock {
+            if failure == .unreadableBefore { readFailure = true; throw POSIXError(.EIO) }
             if failure == .before { throw POSIXError(.EIO) }
             data = failure == .conflict ? Data("conflicting bytes".utf8) : value
             writeCount += 1
+            if failure == .unreadableAfter { readFailure = true }
             if failure != .none { throw POSIXError(.EIO) }
         }
     }
@@ -100,7 +102,7 @@ private final class OutcomeBackend: @unchecked Sendable {
             case .conflict:
                 guard case .failure = outcome else { return XCTFail("Conflicting outcome accepted") }
                 XCTAssertThrowsError(try eligibility.check())
-            case .none: XCTFail("Unexpected fixture mode")
+            case .none, .unreadableBefore, .unreadableAfter: XCTFail("Unexpected fixture mode")
             }
             let state = await authority.observation
             XCTAssertEqual(state.rawReadFlights, 0); XCTAssertEqual(state.rawReadSubscribers, 0)
@@ -353,6 +355,117 @@ private final class OutcomeBackend: @unchecked Sendable {
         let repaired = try await repair.value; XCTAssertTrue(repaired.completed)
         try await f.service.completeUnacceptedTargetRetirement(preparation)
         _ = try await f.service.prepareTrustedAuthority(id: UUID())
+    }
+
+    func testCommittedRevocationAndRemovalWriteErrorsContinueTheirActualOutcome() async throws {
+        let f = try await fixture(), job = try await submit(f.service)
+        let backend = OutcomeBackend(try TrustedTVApprovals(approvals: [.init(id: "TV", name: "TV", tokenHash: "old")]).encoded())
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) })
+        let binding = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: f.service)))
+        backend.failWrites(.after)
+        try await authority.revoke("TV", permit: binding.permit) { _ in }
+        let bytes = try TrustedTVApprovals.decode(XCTUnwrap(backend.bytes)), state = await authority.observation, jobs = await f.service.allJobs()
+        XCTAssertTrue(bytes.approvals.isEmpty); XCTAssertTrue(bytes.revocations.isEmpty)
+        XCTAssertEqual(jobs.first { $0.id == job }?.stage, .cancelled)
+        XCTAssertEqual(backend.writes, 2); XCTAssertEqual(state.encodings, 2)
+        XCTAssertEqual(state.writeReadbacks, 2); XCTAssertEqual(state.uncertainWrites, 0)
+    }
+    func testAmbiguousRevocationKeepsFencesAndResolvesOnlyThroughRecovery() async throws {
+        for mode in [OutcomeBackend.WriteFailure.unreadableAfter, .unreadableBefore] {
+            let f = try await fixture(), job = try await submit(f.service)
+            let original = try TrustedTVApprovals(approvals: [.init(id: "TV", name: "TV", tokenHash: "old")]).encoded()
+            let backend = OutcomeBackend(original), authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) })
+            let binding = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: f.service)))
+            backend.failWrites(mode)
+            do { try await authority.revoke("TV", permit: binding.permit) { _ in }; XCTFail("Ambiguous write accepted") }
+            catch {
+                XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription))
+                XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EACCES).localizedDescription))
+            }
+            let before = await authority.observation
+            XCTAssertEqual(before.uncertainWrites, 1); XCTAssertEqual(before.writeReadbacks, 1)
+            do { _ = try await submit(f.service); XCTFail("Uncertain device fence lifted") }
+            catch { XCTAssertTrue(error.localizedDescription.contains("recovery")) }
+            do {
+                _ = try await authority.approve(binding.permit) { XCTFail("Blocked proposal prepared"); return nil }
+                XCTFail("Uncertain write admitted another mutation")
+            } catch { XCTAssertTrue(error.localizedDescription.contains("unverified")) }
+            let blocked = await authority.observation; XCTAssertEqual(blocked.encodings, before.encodings)
+            backend.failReads(false); backend.failWrites(.none)
+            try await f.service.retryReconciliation()
+            let done = await authority.observation, jobs = await f.service.allJobs()
+            XCTAssertEqual(done.uncertainWrites, 0); XCTAssertEqual(done.obligations, 0)
+            if mode == .unreadableAfter {
+                XCTAssertEqual(jobs.first { $0.id == job }?.stage, .cancelled)
+                XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.bytes)).approvals.isEmpty)
+            } else {
+                XCTAssertEqual(jobs.first { $0.id == job }?.stage, .queued)
+                XCTAssertEqual(backend.bytes, original)
+            }
+        }
+    }
+    func testUnknownRemovalKeepsExactApplicationsAcrossLocalRepair() async throws {
+        for mode in [OutcomeBackend.WriteFailure.unreadableAfter, .unreadableBefore] {
+            let f = try await fixture(), job = try await submit(f.service)
+            let backend = OutcomeBackend(try TrustedTVApprovals(revocations: [.init(operationID: UUID(), deviceID: "TV")]).encoded())
+            let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) })
+            _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: f.service)))
+            backend.failWrites(mode)
+            do { try await authority.replay(); XCTFail("Uncertain removal accepted") }
+            catch { XCTAssertTrue(error.localizedDescription.contains("unverified")) }
+            let before = await authority.observation; XCTAssertEqual(before.uncertainWrites, 1); XCTAssertEqual(before.obligations, 1)
+            backend.failReads(false); backend.failWrites(.none)
+            try await f.service.retryReconciliation()
+            let after = await authority.observation, jobs = await f.service.allJobs()
+            XCTAssertEqual(after.uncertainWrites, 0); XCTAssertEqual(after.obligations, 0)
+            XCTAssertEqual(after.pendingLocalOutcomes, 0); XCTAssertEqual(after.writeReadbacks, 1)
+            XCTAssertEqual(backend.writes, 1) // A proven committed removal is never rewritten.
+            XCTAssertEqual(jobs.first { $0.id == job }?.stage, .cancelled)
+            XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.bytes)).revocations.isEmpty)
+        }
+    }
+    func testUnknownApprovalNoncommitRestoresOnlyTheSameLivePairing() async throws {
+        for closed in [false, true] {
+            let f = try await fixture(), backend = OutcomeBackend(try TrustedTVApprovals().encoded())
+            let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) })
+            let binding = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: f.service))), eligibility = TrustedApprovalEligibility()
+            backend.failWrites(.unreadableBefore)
+            do { _ = try await authority.approve(binding.permit) { .init(record: .init(id: "TV", name: "TV", tokenHash: "new"), token: "new", eligibility: eligibility) }; XCTFail("Unknown approval accepted") }
+            catch { XCTAssertTrue(error.localizedDescription.contains("unverified")) }
+            XCTAssertThrowsError(try eligibility.check())
+            if closed { eligibility.close() }
+            backend.failReads(false); backend.failWrites(.none)
+            try await f.service.retryReconciliation()
+            if closed { XCTAssertThrowsError(try eligibility.check()) } else { XCTAssertNoThrow(try eligibility.check()) }
+        }
+    }
+    func testCleanupReprocessesRevocationCommittedDespiteWriteError() async throws {
+        let arm = OutcomeSwitch(), inspecting = OutcomeSwitch(), gate = TrustedReadGate()
+        addTeardownBlock { gate.release() }
+        let a = try await fixture(beforeWrite: { url in if url.lastPathComponent == "journal.json" && arm.take() { gate.wait() } }), b = try await fixture()
+        _ = try await submit(a.service, device: "OLD"); let job = try await submit(a.service)
+        let backend = OutcomeBackend(try TrustedTVApprovals(approvals: [.init(id: "TV", name: "TV", tokenHash: "old")], revocations: [.init(operationID: UUID(), deviceID: "OLD")]).encoded())
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) }, beforeInspectionRead: { if inspecting.on { arm.on = true } })
+        let binding = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: b.service))), proposal = TrustedOwnerRecorder().owner(service: a.service)
+        backend.failReads(true)
+        do { _ = try await accepted(authority.register(proposal)); XCTFail("Failed initial read accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EACCES).localizedDescription)) }
+        backend.failReads(false); inspecting.on = true; proposal.eligibility.invalidate()
+        await authority.withdraw(serverID: proposal.serverID, eligibility: proposal.eligibility)
+        try await wait { gate.entered }
+        backend.failWrites(.after)
+        let result = OutcomeResult<Void>(), revoke = Task {
+            do { try await authority.revoke("TV", permit: binding.permit) { _ in }; result.value = .success(()) }
+            catch { result.value = .failure(error) }
+        }
+        addTeardownBlock { revoke.cancel(); gate.release() }
+        try await wait { backend.writes > 0 }
+        inspecting.on = false; gate.release()
+        try await wait { let value = await authority.observation; return value.uninspectedTargets == 0 && value.uninspectedCleanupTasks == 0 && result.value != nil }
+        if case .failure(let error) = result.value { XCTAssertTrue(error.localizedDescription.contains("proposed request service")) }
+        let jobs = await a.service.allJobs(), bytes = try TrustedTVApprovals.decode(XCTUnwrap(backend.bytes))
+        XCTAssertEqual(jobs.first { $0.id == job }?.stage, .cancelled)
+        XCTAssertTrue(bytes.approvals.isEmpty); XCTAssertTrue(bytes.revocations.isEmpty)
     }
 
 }

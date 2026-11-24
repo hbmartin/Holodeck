@@ -395,12 +395,12 @@ private final class LifecycleClientSecrets: @unchecked Sendable {
         let failed = await server.currentState; XCTAssertTrue(failed.message.contains(POSIXError(.EIO).localizedDescription))
         backend.failWrites(false); try await server.revoke("A")
         let recovered = await server.currentState; XCTAssertEqual(recovered.message, "Serving shaders on the local network.")
-        XCTAssertEqual(reads.value, 1); XCTAssertEqual(backend.writes, 2)
+        XCTAssertEqual(reads.value, 2); XCTAssertEqual(backend.writes, 2)
         let before = await authority.observation
         try await server.revoke("unapproved")
         let after = await authority.observation
         XCTAssertEqual(before.encodings, after.encodings); XCTAssertEqual(before.writes, after.writes)
-        XCTAssertEqual(reads.value, 1)
+        XCTAssertEqual(reads.value, 2) // One failed-write readback; successful writes add none.
     }
     func testAcceptedControlReplyInterruptedByRebindingRemainsDurable() async throws {
         let gate = TrustedWriteGate(), fixture = try await fixture(gate: gate), device = UUID().uuidString, token = "valid-token"
@@ -626,7 +626,11 @@ private final class LifecycleClientSecrets: @unchecked Sendable {
         await server.setRequestService(fixture.service); try await server.start()
         let client = try await tls(server), pending = try await pair(server, client: client)
         do { try await server.approve(pending.id); XCTFail("Uncertain write accepted") }
-        catch let error as POSIXError { XCTAssertEqual(error.code, .EIO) }
+        catch {
+            XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription))
+            XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EACCES).localizedDescription))
+            XCTAssertTrue(error.localizedDescription.contains("Retry Recovery"))
+        }
         XCTAssertEqual(backend.read(), original); XCTAssertEqual(backend.writes, 0)
         let reply = try await fixture.service.control(operation: "requestStatus", payload: .init(), deviceID: "other")
         XCTAssertFalse(reply.enabled); XCTAssertTrue(reply.message.contains("inspection requires recovery"))

@@ -166,6 +166,8 @@ actor TrustedApprovalsCoordinator {
         let automaticValidationTasks: Int
         let uninspectedTargets: Int
         let uninspectedCleanupTasks: Int
+        let uncertainWrites: Int
+        let writeReadbacks: Int
     }
     struct Approval: Sendable {
         let record: ApprovedTV
@@ -252,6 +254,7 @@ actor TrustedApprovalsCoordinator {
     private var loaded = false
     private var sequence: UInt64 = 0
     private var writeAttempt: UInt64 = 0
+    private var confirmedWriteAttempt: UInt64 = 0
     private var accepted: Accepted?
     private weak var service: ShaderRequestService?
     private struct TargetKey: Hashable { let service: UUID; let registration: UUID }
@@ -339,6 +342,41 @@ actor TrustedApprovalsCoordinator {
     }
     private var applicationBlockerGeneration: UInt64 = 0
     private var failedApplications: [Attempt: ApplicationBlocker] = [:]
+    private struct RevocationWrite {
+        let intent: RequestRevocationIntent
+        let targets: [Target]
+        let reservations: [(ShaderRequestService, TrustedRevocationReservation)]
+    }
+    private enum WriteEffect {
+        case approval(String, TrustedApprovalEligibility, TrustedOwnerLifetime)
+        case revocation(RevocationWrite)
+        case removal(TrustedRevocationRemoval)
+        var operation: UUID {
+            switch self { case .approval(_, let eligibility, _): eligibility.id; case .revocation(let value): value.intent.operationID; case .removal(let value): value.intent.operationID }
+        }
+    }
+    private struct WriteUncertainty: LocalizedError, TrustedReportedDiagnostic {
+        let diagnosticID: UUID
+        let failure: Failure
+        var errorDescription: String? {
+            "Trusted write outcome is unverified: " + failure.message + ". Retain its evidence and choose Retry Recovery before changing TV access."
+        }
+    }
+    private struct PendingWrite {
+        let predecessor: Data?
+        let candidate: Data
+        let value: TrustedTVApprovals
+        let effect: WriteEffect
+        var error: WriteUncertainty
+    }
+    private var uncertainWrite: PendingWrite?
+    private var writeReadbacks = 0
+    private func requireCertainWrite() throws { if let uncertainWrite { throw uncertainWrite.error } }
+    private func hasRemovalEvidence(_ intent: UUID) -> Bool {
+        if removals[intent] != nil { return true }
+        if case .removal(let proof) = uncertainWrite?.effect { return proof.intent.operationID == intent }
+        return false
+    }
     private var failedRemovalWrites: Set<UUID> = []
     private var generation: UInt64 = 0
     private var pending: Request?
@@ -421,7 +459,7 @@ actor TrustedApprovalsCoordinator {
         for (serviceID, subscription) in recoverySubscriptions where !targets.keys.contains(where: { $0.service == serviceID && $0.registration == subscription.registrationID }) {
             subscription.invalidate(); recoverySubscriptions[serviceID] = nil
         }
-        retainEvidence(self, recoveryHandles.values.contains(where: { $0.pin != nil }) || !envelope.revocations.isEmpty || !failures.isEmpty || mutationFailure != nil || !targetPins.isEmpty || !uninspectedTargets.isEmpty || !departureRecovery.isEmpty)
+        retainEvidence(self, recoveryHandles.values.contains(where: { $0.pin != nil }) || !envelope.revocations.isEmpty || !failures.isEmpty || mutationFailure != nil || uncertainWrite != nil || !targetPins.isEmpty || !uninspectedTargets.isEmpty || !departureRecovery.isEmpty)
     }
     var observation: Observation {
         .init(requestedGeneration: generation, acceptedGeneration: accepted?.binding.permit.generation,
@@ -435,7 +473,8 @@ actor TrustedApprovalsCoordinator {
               revocationCompletionTasks: revocationCompletions.count,
               revocationCompletionSubscribers: revocationCompletions.values.reduce(0) { $0 + $1.task.waiterCount },
               automaticValidationTasks: automaticValidations.count,
-              uninspectedTargets: uninspectedTargets.count, uninspectedCleanupTasks: uninspectedCleanup.count)
+              uninspectedTargets: uninspectedTargets.count, uninspectedCleanupTasks: uninspectedCleanup.count,
+              uncertainWrites: uncertainWrite == nil ? 0 : 1, writeReadbacks: writeReadbacks)
     }
     private var outstandingIntents: [RequestRevocationIntent] {
         envelope.revocations + removals.values.map(\.intent).sorted { $0.operationID.uuidString < $1.operationID.uuidString }
@@ -474,9 +513,9 @@ actor TrustedApprovalsCoordinator {
     private var snapshot: Snapshot {
         let first = failures.min { $0.key.uuidString < $1.key.uuidString }
         return .init(approvals: Dictionary(envelope.approvals.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last }),
-            diagnostic: mutationFailure.map { "Trusted TV operation \($0.operation): " + $0.message }
+            diagnostic: uncertainWrite?.error.localizedDescription ?? mutationFailure.map { "Trusted TV operation \($0.operation): " + $0.message }
                 ?? first.map { "Trusted TV intent \($0.key): " + $0.value.message },
-            diagnosticID: mutationFailure?.operation ?? first?.key)
+            diagnosticID: uncertainWrite?.error.diagnosticID ?? mutationFailure?.operation ?? first?.key)
     }
     static func unavailable(_ message: String) -> ShaderRequestError { .unavailable(message) }
     private func validate(_ permit: TrustedOwnerPermit) throws {
@@ -509,6 +548,7 @@ actor TrustedApprovalsCoordinator {
         }
     }
     private func requireAuthorityReady() throws {
+        try requireCertainWrite()
         if let ticket = departureRecovery.values.min(by: { $0.id.uuidString < $1.id.uuidString }) {
             throw TrustedDepartureRecoveryError(diagnosticID: ticket.id, serviceID: ticket.serviceID)
         }
@@ -673,7 +713,7 @@ actor TrustedApprovalsCoordinator {
             required.values.contains(where: { $0.contains(key) }) { return false }
         recoveryEpochs[key] = attempt; preparingRecovery[key] = attempt
         pendingRecoveryOutcomes[key] = nil
-        for intent in required.keys where required[intent]?.contains(key) == true && removals[intent] == nil {
+        for intent in required.keys where required[intent]?.contains(key) == true && !hasRemovalEvidence(intent) {
             applications[intent]?[key] = nil
             applicationEpochs[.init(intent: intent, target: key)] = nil
             // Preparation is provisional, not an application failure. Keep an
@@ -788,6 +828,10 @@ actor TrustedApprovalsCoordinator {
         var preparedOutcomes: [UUID: TrustedLocalRecovery] = [:]
         var heldTargets: [UUID: ShaderRequestService] = [:]
         do {
+            let resolving = await acquireProgress()
+            do { try await resolveUncertainWrite() }
+            catch { release(resolving); throw error }
+            release(resolving)
             var registrationInspection: InspectionPass?
             try Task.checkCancellation()
             for entry in uninspectedTargets.values.filter(\.withdrawn).sorted(by: { $0.service.runtimeID.uuidString < $1.service.runtimeID.uuidString }) {
@@ -988,6 +1032,7 @@ actor TrustedApprovalsCoordinator {
         } catch { await target.revocationReplayFailed(error, revision: revision); throw error }
     }
     private func readFresh(target: ShaderRequestService?, inspectTargets: Bool = true, changes: [TrustedCompletionSignal] = [], check: @Sendable () throws -> Void = {}) async throws {
+        try requireCertainWrite()
         // Protect the complete inspection, including its backend read. Acquiring
         // only at target notification leaves activation racing unread evidence.
         let permits = departures.values.compactMap { departure in
@@ -1013,7 +1058,7 @@ actor TrustedApprovalsCoordinator {
         readSucceeded = true
         let changed = current != bytes
         if changed { invalidateBaseline() }
-        envelope = candidate; bytes = current; if changed { sequence &+= 1 }; loaded = true
+        envelope = candidate; bytes = current; if changed { sequence &+= 1 }; loaded = true; confirmedWriteAttempt = writeAttempt
         var inspectionError: Error?
         if inspectTargets { do { try await inspectCurrentTargets() } catch { inspectionError = error } }
         if changed { await notify() }
@@ -1534,6 +1579,7 @@ actor TrustedApprovalsCoordinator {
                 let token = await acquireProgress()
                 do {
                     guard uninspectedTargets[serviceID]?.id == entry.id else { release(token); await target.endUnacceptedTargetRetirement(preparation); return }
+                    try requireCertainWrite()
                     if !fresh || !loaded {
                         do { try await readFresh(target: nil) }
                         catch {
@@ -1546,12 +1592,16 @@ actor TrustedApprovalsCoordinator {
                         }
                         fresh = true
                     }
-                    let intents = envelope.revocations
+                    let intents = envelope.revocations, observedAttempt = writeAttempt
                     release(token)
                     try await target.retireUnacceptedRequests(intents, preparation: preparation)
                     let commit = await acquireProgress()
                     guard uninspectedTargets[serviceID]?.id == entry.id else { release(commit); await target.endUnacceptedTargetRetirement(preparation); return }
-                    if !loaded || envelope.revocations != intents { release(commit); continue }
+                    do { try requireCertainWrite() } catch { release(commit); throw error }
+                    if !loaded || envelope.revocations != intents || observedAttempt != writeAttempt {
+                        fresh = loaded && confirmedWriteAttempt == writeAttempt
+                        release(commit); continue
+                    }
                     do { try await target.completeUnacceptedTargetRetirement(preparation) }
                     catch { release(commit); throw error }
                     uninspectedTargets[serviceID] = nil
@@ -1594,14 +1644,87 @@ actor TrustedApprovalsCoordinator {
     private func prepare(_ value: TrustedTVApprovals) throws -> Data {
         let encoded = try value.encoded(); encodings += 1; return encoded
     }
-    private func persist(_ value: TrustedTVApprovals, bytes candidate: Data) async throws {
-        // A thrown write may already have replaced storage. Accepted revisions
-        // cannot certify a read begun before this uncertain attempt.
-        writeAttempt &+= 1
+    private func persist(_ value: TrustedTVApprovals, bytes candidate: Data, effect: WriteEffect) async throws {
+        try requireCertainWrite()
+        // Hook/validation errors prove that the backend never started.
         if let beforeTrustedWrite { try await beforeTrustedWrite() }
+        let predecessor = bytes, operation = effect.operation
+        let permits = departures.values.compactMap { departure in departure.beginInspection().map { (departure, $0) } }
+        var certain = false
+        defer { for (departure, permit) in permits { departure.finishInspection(permit, succeeded: certain) } }
+        writeAttempt &+= 1
         let write = write
-        try await Task.detached { try write(candidate) }.value
-        acceptPersisted(value, bytes: candidate)
+        do { try await Task.detached { try write(candidate) }.value }
+        catch {
+            let original = error
+            writeReadbacks += 1
+            // The admitted write owns this readback even if its caller leaves.
+            let readback = Task { try await self.readTrustedBytes() }
+            do {
+                let actual = try await readback.value
+                if actual == candidate {
+                    acceptPersisted(value, bytes: candidate); certain = true; return
+                }
+                if actual == predecessor {
+                    confirmedWriteAttempt = writeAttempt; certain = true
+                } else { throw Self.unavailable("Trusted storage matches neither the recorded predecessor nor the candidate; preserve it for manual repair before Retry Recovery.") }
+            } catch {
+                let uncertainty = WriteUncertainty(diagnosticID: operation, failure: Failure(original, diagnosticID: operation).appending(error))
+                uncertainWrite = PendingWrite(predecessor: predecessor, candidate: candidate, value: value, effect: effect, error: uncertainty)
+                loaded = false; invalidateBaseline()
+                for target in targets.values { await target.service?.revocationReplayFailed(uncertainty, revision: revision) }
+                await notify()
+                throw uncertainty
+            }
+            throw original
+        }
+        acceptPersisted(value, bytes: candidate); certain = true
+    }
+    /// Explicit recovery alone resolves an ambiguous write. Physical write waits
+    /// have ended, while candidate bytes and exact target receipts stay pinned.
+    private func resolveUncertainWrite() async throws {
+        guard var pending = uncertainWrite else { return }
+        let actual: Data?
+        do { actual = try await readTrustedBytes() }
+        catch {
+            pending.error = .init(diagnosticID: pending.error.diagnosticID, failure: pending.error.failure.appending(error))
+            uncertainWrite = pending; throw pending.error
+        }
+        if actual == pending.candidate {
+            acceptPersisted(pending.value, bytes: pending.candidate)
+            uncertainWrite = nil; loaded = true
+            switch pending.effect {
+            case .approval: break
+            case .revocation(let admission): await acceptRevocation(admission)
+            case .removal(let proof): removals[proof.intent.operationID] = proof; failedRemovalWrites.remove(proof.intent.operationID)
+            }
+        } else if actual == pending.predecessor {
+            uncertainWrite = nil; loaded = true; confirmedWriteAttempt = writeAttempt
+            switch pending.effect {
+            case .approval(_, let eligibility, let lifetime):
+                if lifetime.isCurrent { eligibility.restoreAfterFailedWrite() }
+            case .revocation(let admission):
+                for (target, receipt) in admission.reservations { await target.cancelRevocationReservation(receipt) }
+            case .removal(let proof):
+                applications[proof.intent.operationID] = nil
+                applicationEpochs = applicationEpochs.filter { $0.key.intent != proof.intent.operationID }
+            }
+        } else { throw pending.error }
+        await notify()
+    }
+    private func acceptRevocation(_ admission: RevocationWrite) async {
+        for target in admission.targets {
+            if let service = target.service { require(admission.intent, on: target.key, target: service) }
+        }
+        await notify()
+        for target in admission.targets {
+            guard let service = target.service else { continue }
+            do { try await service.commitTrustedRevocation(admission.intent, revision: revision) }
+            catch {
+                inspections[target.key] = nil; recoveryTargets.insert(target.key)
+                _ = await record(error, intent: admission.intent)
+            }
+        }
     }
     private func acceptPersisted(_ value: TrustedTVApprovals, bytes candidate: Data) {
         if candidate != bytes {
@@ -1611,7 +1734,7 @@ actor TrustedApprovalsCoordinator {
             for departure in departures.values { departure.advanceBaseline(from: predecessor, to: baseline) }
             inspections = inspections.mapValues { $0 == predecessor ? baseline : $0 }
         }
-        envelope = value; bytes = candidate; sequence &+= 1; writes += 1
+        envelope = value; bytes = candidate; sequence &+= 1; writes += 1; loaded = true; confirmedWriteAttempt = writeAttempt
         mutationFailure = nil; registrationInspectionFailure = nil
     }
     private func recordMutationFailure(_ error: Error, operation: UUID, context: String) async {
@@ -1630,26 +1753,13 @@ actor TrustedApprovalsCoordinator {
         try Task.checkCancellation(); try validate(permit); try proposal.eligibility.check()
         var value = envelope
         value.approvals.removeAll { $0.id == proposal.record.id }; value.approvals.append(proposal.record)
-        let candidate = try prepare(value), predecessor = bytes
+        let candidate = try prepare(value)
         try Task.checkCancellation(); try permit.lifetime.admitWrite { try proposal.eligibility.beginWrite() }
-        do { try await persist(value, bytes: candidate) }
+        do { try await persist(value, bytes: candidate, effect: .approval(proposal.record.id, proposal.eligibility, permit.lifetime)) }
         catch {
-            let initiating = error
-            do {
-                let actual = try await readTrustedBytes()
-                if actual == candidate {
-                    acceptPersisted(value, bytes: candidate)
-                    await notify(); return proposal
-                }
-                if actual == predecessor {
-                    if permit.lifetime.isCurrent { proposal.eligibility.restoreAfterFailedWrite() }
-                } else { throw Self.unavailable("Approval persistence has an uncertain outcome; retain trusted storage and choose Retry Recovery.") }
-            } catch {
-                loaded = false; invalidateBaseline()
-                await service?.revocationReplayFailed(error, revision: revision)
-            }
-            await recordMutationFailure(initiating, operation: UUID(), context: "TV approval for " + proposal.record.id)
-            throw initiating
+            if !(error is WriteUncertainty), permit.lifetime.isCurrent { proposal.eligibility.restoreAfterFailedWrite() }
+            await recordMutationFailure(error, operation: UUID(), context: "TV approval for " + proposal.record.id)
+            throw error
         }
         await notify()
         return proposal
@@ -1680,26 +1790,17 @@ actor TrustedApprovalsCoordinator {
                     }
                     try await beforeCommit(intent); try Task.checkCancellation(); try validate(permit)
                     try permit.lifetime.admitWrite { writeAdmitted = true }
-                    try await persist(value, bytes: candidate)
+                    try await persist(value, bytes: candidate, effect: .revocation(.init(intent: intent, targets: admittedTargets, reservations: reservations)))
                 } catch {
                     if !(error is CancellationError), writeAdmitted || permit.lifetime.isCurrent {
                         await recordMutationFailure(error, operation: intent.operationID, context: "TV revocation for " + intent.deviceID)
                     }
-                    for (service, receipt) in reservations { await service.cancelRevocationReservation(receipt) }
+                    if !(error is WriteUncertainty) {
+                        for (service, receipt) in reservations { await service.cancelRevocationReservation(receipt) }
+                    }
                     throw error
                 }
-                for target in admittedTargets {
-                    if let service = target.service { require(intent, on: target.key, target: service) }
-                }
-                await notify()
-                for target in admittedTargets {
-                    guard let service = target.service else { continue }
-                    do { try await service.commitTrustedRevocation(intent, revision: revision) }
-                    catch {
-                        inspections[target.key] = nil; recoveryTargets.insert(target.key)
-                        _ = await record(error, intent: intent)
-                    }
-                }
+                await acceptRevocation(.init(intent: intent, targets: admittedTargets, reservations: reservations))
             }
         } catch { release(token); throw error }
         release(token)
@@ -1798,6 +1899,7 @@ actor TrustedApprovalsCoordinator {
             intents: Set(required.filter { $0.value.contains(key) }.keys))
     }
     func replay(target: UUID? = nil) async throws {
+        try requireCertainWrite()
         guard targets.values.contains(where: { $0.service != nil }) else {
             if let failure = required.keys.sorted(by: { $0.uuidString < $1.uuidString }).compactMap({ outstandingFailure($0) }).first { throw failure }
             return
@@ -1847,6 +1949,7 @@ actor TrustedApprovalsCoordinator {
             diagnostic: BoundedDiagnostics.bounded(diagnostic, bytes: 8192))
     }
     private func acknowledgeIfReady(_ intent: RequestRevocationIntent) async throws -> Bool {
+        try requireCertainWrite()
         guard removals[intent.operationID] != nil || uninspectedTargets.isEmpty else {
             throw Self.unavailable("A proposed request service still needs trusted approval inspection: " + uninspectedTargets.keys.map(\.uuidString).sorted().prefix(8).joined(separator: ", ") + ". Explicitly register that service before removing retained TV cancellation evidence.")
         }
@@ -1878,7 +1981,7 @@ actor TrustedApprovalsCoordinator {
         }
         if removals[intent.operationID] == nil {
             var value = envelope; value.revocations.removeAll { $0.operationID == intent.operationID }
-            do { try await persist(value, bytes: prepare(value)) }
+            do { try await persist(value, bytes: prepare(value), effect: .removal(removal)) }
             catch { failedRemovalWrites.insert(intent.operationID); throw error }
         }
         removals[intent.operationID] = removal
@@ -1911,6 +2014,11 @@ actor TrustedApprovalsCoordinator {
         var attempted: Set<Attempt> = [], failed: [UUID: Failure] = [:], removalAttempted: Set<UUID> = []
         drain: while true {
             let token = await acquireProgress()
+            if let uncertainWrite {
+                let ids = Set(replayWaiters.keys).union(required.keys).union([uncertainWrite.error.diagnosticID])
+                let errors = Dictionary(uniqueKeysWithValues: ids.map { ($0, Failure(uncertainWrite.error, diagnosticID: $0)) })
+                finishReplay(errors); release(token); return
+            }
             var work: (RequestRevocationIntent, TargetKey, ShaderRequestService, UUID)?
             let remainingIntents = outstandingIntents
             for intent in remainingIntents {
