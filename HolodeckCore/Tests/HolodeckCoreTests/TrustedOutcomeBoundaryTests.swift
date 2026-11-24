@@ -310,7 +310,7 @@ private final class OutcomeBackend: @unchecked Sendable {
         do { try await authority.replay(); XCTFail("Uninspected evidence retired") }
         catch { XCTAssertTrue(error.localizedDescription.contains("proposed request service")) }
         let state = await authority.observation, jobs = await a.service.allJobs()
-        XCTAssertEqual(state.obligations, 1); XCTAssertEqual(state.uninspectedTargets, 1)
+        XCTAssertEqual(state.obligations, 0); XCTAssertEqual(state.uninspectedTargets, 1)
         XCTAssertEqual(jobs.first { $0.id == job }?.stage, .cancelled)
         XCTAssertEqual(backend.writes, 1) // Known target finalizes without rewriting removal.
         _ = try await submit(a.service)
@@ -934,7 +934,7 @@ private final class OutcomeBackend: @unchecked Sendable {
                 catch { XCTAssertTrue(error.localizedDescription.contains("proposed request service")) }
             }
             let pending = await authority.observation
-            XCTAssertEqual(pending.obligations, 1)
+            XCTAssertEqual(pending.obligations, 0)
             XCTAssertEqual(finalized.count, 1, "Known target finalized more than once")
             _ = try await accepted(authority.register(recorder.owner(service: b.service)))
             try await authority.replay()
@@ -1030,8 +1030,13 @@ private final class OutcomeBackend: @unchecked Sendable {
         let before = await destination.observation
         XCTAssertTrue(old.permit.isCurrent)
         destinationStore.failReads(false); try await b.service.retryReconciliation()
+        let unrelated = await destination.observation
+        XCTAssertEqual(unrelated.requestedGeneration, before.requestedGeneration)
+        let unmoved = await recorder.binding; XCTAssertNil(unmoved)
+        try await a.service.retryReconciliation()
         let after = await destination.observation
         XCTAssertGreaterThan(after.requestedGeneration, before.requestedGeneration)
+        try await wait { await source.observation.targets == 0 }
         let moved = await recorder.binding, retired = await source.observation
         XCTAssertEqual(moved?.permit.authority, destination.id)
         XCTAssertTrue(moved?.permit.isCurrent == true); XCTAssertEqual(retired.targets, 0)
@@ -1048,11 +1053,15 @@ private final class OutcomeBackend: @unchecked Sendable {
         backend.failReads(false); blocked.on = true; proposal.eligibility.invalidate()
         await old.withdraw(serverID: proposal.serverID, eligibility: proposal.eligibility)
         try await wait { await gate.hasEntered }
-        let new = TrustedApprovalsCoordinator(read: { nil }, write: { _ in })
+        let destinationStore = OutcomeBackend(), new = TrustedApprovalsCoordinator(read: { try destinationStore.read() }, write: { try destinationStore.write($0) })
+        let current = try await accepted(new.register(TrustedOwnerRecorder().owner()))
         let registration = try await new.register(TrustedOwnerRecorder().owner(service: a.service))
         addTeardownBlock { registration.completion.cancel(); await gate.release() }
         try await wait { await new.observation.preparingGeneration == registration.generation }
         XCTAssertFalse(registration.completion.hasStarted)
+        _ = try await new.approve(current.permit) { .init(record: .init(id: "DESTINATION", name: "Destination TV", tokenHash: "new"), token: "new", eligibility: .init()) }
+        XCTAssertEqual(destinationStore.writes, 1)
+        XCTAssertTrue(current.permit.isCurrent)
         blocked.on = false; await gate.release()
         let binding = try await accepted(registration)
         XCTAssertTrue(binding.permit.isCurrent)
@@ -1279,6 +1288,27 @@ private final class OutcomeBackend: @unchecked Sendable {
             guard case .failure(let error) = result else { XCTFail("Participant cleanup failure was reported as success"); continue }
             XCTAssertTrue(error.localizedDescription.contains("Withdrawn proposal"))
         }
+    }
+
+    func testFinalizedTargetCanDepartWhileUninspectedEvidenceRemains() async throws {
+        let a = try await fixture(), b = try await fixture(), job = try await submit(b.service), fail = OutcomeSwitch()
+        let backend = OutcomeBackend(try TrustedTVApprovals(revocations: [.init(operationID: UUID(), deviceID: "TV")]).encoded())
+        fail.on = true
+        let source = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) }, beforeRemovalFinalization: { _, _ in if fail.on { throw POSIXError(.EIO) } })
+        _ = try await accepted(source.register(TrustedOwnerRecorder().owner(service: a.service)))
+        do { try await source.replay(); XCTFail("Finalization fault ignored") } catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        backend.failReads(true); let proposal = TrustedOwnerRecorder().owner(service: b.service)
+        do { _ = try await accepted(source.register(proposal)); XCTFail("Inspection accepted") } catch { XCTAssertTrue(error is POSIXError) }
+        backend.failReads(false); fail.on = false
+        do { try await source.replay(); XCTFail("Unknown target forgotten") } catch { XCTAssertTrue(error.localizedDescription.contains("proposed request service")) }
+        let settled = await source.observation; XCTAssertEqual(settled.obligations, 0); XCTAssertEqual(settled.uninspectedTargets, 1)
+        let destination = TrustedApprovalsCoordinator(read: { nil }, write: { _ in })
+        let binding = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: a.service)))
+        XCTAssertEqual(binding.permit.authority, destination.id)
+        proposal.eligibility.invalidate(); await source.withdraw(serverID: proposal.serverID, eligibility: proposal.eligibility)
+        try await wait { let state = await source.observation; return state.uninspectedTargets == 0 && state.uninspectedCleanupTasks == 0 }
+        let jobs = await b.service.allJobs(); XCTAssertEqual(jobs.first { $0.id == job }?.stage, .cancelled)
+        XCTAssertEqual(backend.writes, 1)
     }
 
 }
