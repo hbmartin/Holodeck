@@ -919,8 +919,13 @@ actor TrustedApprovalsCoordinator {
             try Task.checkCancellation()
             for entry in uninspectedTargets.values.filter(\.withdrawn).sorted(by: { $0.service.runtimeID.uuidString < $1.service.runtimeID.uuidString }) {
                 try Task.checkCancellation()
-                do { try await cleanupUninspectedTask(entry).subscribe().value() }
-                catch { try Task.checkCancellation(); errors.append("Withdrawn proposal " + entry.id.uuidString + ": " + error.localizedDescription) }
+                let cleanup = cleanupUninspectedTask(entry)
+                // A durable cleanup owns itself. Unrelated participants must not
+                // wait for another service's local disk or process recovery.
+                if !outstandingIntents.isEmpty || recoveryPass?.participants.values.contains(where: { $0.requester == entry.service.runtimeID }) == true {
+                    do { try await cleanup.subscribe().value() }
+                    catch { try Task.checkCancellation(); errors.append("Withdrawn proposal " + entry.id.uuidString + ": " + error.localizedDescription) }
+                }
             }
             if let candidate = failedRegistration {
                 if candidate.eligibility.isCurrent {
@@ -1034,7 +1039,7 @@ actor TrustedApprovalsCoordinator {
             // the lane or recursively join the trusted pass calling it.
             errors += await finishRecoveredDepartures()
             if let pass = recoveryPass, pass.id == passID {
-                for serviceID in Set(pass.participants.values.map(\.requester)) where uninspectedTargets[serviceID] != nil {
+                for serviceID in Set(pass.participants.values.map(\.requester)) where uninspectedTargets[serviceID]?.withdrawn == false {
                     errors.append("Service " + serviceID.uuidString + " remains unaccepted after its failed trusted inspection. Explicitly register its intended server; superseded proposals cannot reactivate themselves.")
                 }
             }
@@ -1453,6 +1458,7 @@ actor TrustedApprovalsCoordinator {
                     }
                     catch {
                         token = await acquireReplacement()
+                        try checkRegistrationPreparation(request, transfer: transfer)
                         throw error
                     }
                     token = await acquireReplacement()
@@ -1596,7 +1602,10 @@ actor TrustedApprovalsCoordinator {
                                 uninspectedTargets[serviceID] = entry
                                 if cleared { await notify() }
                                 if entry.withdrawn { _ = cleanupUninspectedTask(entry) }
-                            } else if !claimed, !targets.keys.contains(where: { $0.service == serviceID }) { failedRegistration = nil }
+                            } else if !claimed, !targets.keys.contains(where: { $0.service == serviceID }),
+                                      await target.hasConflictingTrustedPreparation(authority: id) {
+                                failedRegistration = nil
+                            }
                         }
                     }
                     request.registration.completion.complete(.failure(error))
@@ -1691,6 +1700,7 @@ actor TrustedApprovalsCoordinator {
                             // Successful proposal cleanup must not clear it.
                         }
                         fresh = true
+                        scheduleReplay()
                     }
                     let intents = outstandingIntents, observedAttempt = writeAttempt
                     release(token)
@@ -2032,6 +2042,10 @@ actor TrustedApprovalsCoordinator {
             } else { replayAll.append(c) }
             if replayTask == nil { replayTask = Task { await self.drainReplay() } }
         }
+    }
+    private func scheduleReplay() {
+        guard loaded, uncertainWrite == nil, !outstandingIntents.isEmpty, replayTask == nil else { return }
+        replayTask = Task { await self.drainReplay() }
     }
     private func replayDeparture(serviceID: UUID) async throws {
         guard required.values.contains(where: { $0.contains(where: { $0.service == serviceID }) }) else { return }
