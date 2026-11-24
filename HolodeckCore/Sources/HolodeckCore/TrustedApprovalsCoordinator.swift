@@ -165,6 +165,7 @@ actor TrustedApprovalsCoordinator {
         let revocationCompletionSubscribers: Int
         let automaticValidationTasks: Int
         let uninspectedTargets: Int
+        let recoveryCleanupWaiters: Int
         let uninspectedCleanupTasks: Int
         let uncertainWrites: Int
         let writeReadbacks: Int
@@ -237,7 +238,7 @@ actor TrustedApprovalsCoordinator {
         }
     }
     nonisolated let id = UUID()
-    enum CleanupCheckpoint { case willPublish, didPublish }
+    enum CleanupCheckpoint { case willAdmit, willPublish, didPublish }
     private let cleanupCheckpoint: (@Sendable (UUID, CleanupCheckpoint) async -> Void)?
     private let beforeRemovalFinalization: (@Sendable (UUID, UUID) async throws -> Void)?
     private let beforeDepartureRetirementAdmission: (@Sendable (UUID) async throws -> Void)?
@@ -280,7 +281,13 @@ actor TrustedApprovalsCoordinator {
         var withdrawn = false
     }
     private var uninspectedTargets: [UUID: UninspectedTarget] = [:]
-    private var uninspectedCleanup: [UUID: (id: UUID, task: TrustedRecoveryTask<Void>)] = [:]
+    private struct ProposalCleanup {
+        let job: UUID
+        let service: UUID
+        let task: TrustedRecoveryTask<Void>
+    }
+    // Entries remain tracked until physical work and its exact completion finish.
+    private var uninspectedCleanup: [UUID: ProposalCleanup] = [:]
     private struct RecoveryHandle {
         let reference: WeakRequestService
         let revision: UInt64
@@ -550,7 +557,7 @@ actor TrustedApprovalsCoordinator {
               revocationCompletionTasks: revocationCompletions.count,
               revocationCompletionSubscribers: revocationCompletions.values.reduce(0) { $0 + $1.task.waiterCount },
               automaticValidationTasks: automaticValidations.count,
-              uninspectedTargets: uninspectedTargets.count, uninspectedCleanupTasks: uninspectedCleanup.count,
+              uninspectedTargets: uninspectedTargets.count, recoveryCleanupWaiters: uninspectedCleanup.values.reduce(0) { $0 + $1.task.waiterCount }, uninspectedCleanupTasks: uninspectedCleanup.count,
               uncertainWrites: uncertainWrite == nil ? 0 : 1, writeReadbacks: writeReadbacks,
               recoveryDiagnostics: diagnostics.values.filter(\.requiresRecovery).count,
               historicalDiagnostics: diagnostics.values.filter { !$0.requiresRecovery }.count)
@@ -924,6 +931,7 @@ actor TrustedApprovalsCoordinator {
         var completedReceipts: [UUID: TrustedLocalRecoveryReceipt] = [:]
         var preparedOutcomes: [UUID: TrustedLocalRecovery] = [:]
         var heldTargets: [UUID: ShaderRequestService] = [:]
+        var awaitedCleanups: Set<UUID> = []
         do {
             if uncertainWrite != nil {
                 let resolving = await acquireProgress()
@@ -933,16 +941,7 @@ actor TrustedApprovalsCoordinator {
             }
             var registrationInspection: InspectionPass?
             try Task.checkCancellation()
-            for entry in uninspectedTargets.values.filter(\.withdrawn).sorted(by: { $0.service.runtimeID.uuidString < $1.service.runtimeID.uuidString }) {
-                try Task.checkCancellation()
-                let cleanup = cleanupUninspectedTask(entry)
-                // A durable cleanup owns itself. Unrelated participants must not
-                // wait for another service's local disk or process recovery.
-                if !outstandingIntents.isEmpty || recoveryPass?.participants.values.contains(where: { $0.requester == entry.service.runtimeID }) == true {
-                    do { try await cleanup.subscribe().value() }
-                    catch { try Task.checkCancellation(); errors.append("Withdrawn proposal " + entry.id.uuidString + ": " + error.localizedDescription) }
-                }
-            }
+            errors += try await recoverRequiredCleanups(passID, awaited: &awaitedCleanups)
             if let candidate = failedRegistration {
                 if candidate.eligibility.isCurrent {
                     do {
@@ -1002,12 +1001,14 @@ actor TrustedApprovalsCoordinator {
                 catch { errors.append("Inspection: " + error.localizedDescription) }
             }
             release(inspection)
+            errors += try await recoverRequiredCleanups(passID, awaited: &awaitedCleanups)
             try Task.checkCancellation()
             try await beforeRecoverySealing()
             try Task.checkCancellation()
             // Seal synchronously on the authority actor. Later callers belong
             // only to the successor, even while this pass is awaiting a target.
             if recoveryPass?.id == passID { recoveryPass?.state = .sealed }
+            errors += try await recoverRequiredCleanups(passID, awaited: &awaitedCleanups)
             let suppliedInputs = recoveryPass?.id == passID ? recoveryPass!.inputs : [:]
             // Target-local repairs discovered by this pass need the same sealed
             // receipt validation as explicit participants. Late participants win.
@@ -1054,9 +1055,17 @@ actor TrustedApprovalsCoordinator {
             // Original-target repair must never run while this authority owns
             // the lane or recursively join the trusted pass calling it.
             errors += await finishRecoveredDepartures()
+            errors += try await recoverRequiredCleanups(passID, awaited: &awaitedCleanups)
             if let pass = recoveryPass, pass.id == passID {
-                for serviceID in Set(pass.participants.values.map(\.requester)) where uninspectedTargets[serviceID]?.withdrawn == false {
-                    errors.append("Service " + serviceID.uuidString + " remains unaccepted after its failed trusted inspection. Explicitly register its intended server; superseded proposals cannot reactivate themselves.")
+                for serviceID in Set(pass.participants.values.map(\.requester)) {
+                    guard let entry = uninspectedTargets[serviceID] else { continue }
+                    if entry.withdrawn {
+                        if !awaitedCleanups.contains(entry.id) {
+                            errors.append("Withdrawn proposal " + entry.id.uuidString + " changed during recovery; its exact cleanup remains pending. Choose Retry Recovery.")
+                        }
+                    } else {
+                        errors.append("Service " + serviceID.uuidString + " remains unaccepted after its failed trusted inspection. Explicitly register its intended server; superseded proposals cannot reactivate themselves.")
+                    }
                 }
             }
             let readiness = try await acquire(.progress)
@@ -1660,38 +1669,73 @@ actor TrustedApprovalsCoordinator {
     }
     /// The withdrawn lifetime never receives a binding. Its retained service is
     /// inspected and cancelled only through an exact, non-dispatching capability.
-    private func cleanupUninspectedTask(_ entry: UninspectedTarget) -> TrustedRecoveryTask<Void> {
+    private func cleanupUninspectedTask(_ entry: UninspectedTarget) -> TrustedRecoveryTask<Void>? {
         let serviceID = entry.service.runtimeID
-        if let job = uninspectedCleanup[serviceID], job.id == entry.id { return job.task }
-        let diagnostic = beginDiagnostic(.cleanup(entry.id), operation: entry.id)
+        guard uninspectedTargets[serviceID]?.id == entry.id, entry.withdrawn else { return nil }
+        if let job = uninspectedCleanup[entry.id] { return job.task }
+        let predecessors = uninspectedCleanup.values.filter { $0.service == serviceID }.map(\.task)
+        let job = UUID()
         let task = TrustedRecoveryTask<Void>(cancelWhenEmpty: false) {
+            // A replacement cannot steal an admitted preparation capability.
+            for predecessor in predecessors { await predecessor.settle() }
+            await self.cleanupCheckpoint?(entry.id, .willAdmit)
+            guard let diagnostic = await self.admitUninspectedCleanup(entry, job: job) else { return }
             do {
                 try await self.cleanupUninspected(entry)
                 await self.cleanupCheckpoint?(entry.id, .willPublish)
-                await self.finishedUninspectedCleanup(entry, diagnostic: diagnostic, error: nil)
+                await self.finishedUninspectedCleanup(entry, job: job, diagnostic: diagnostic, error: nil)
                 await self.cleanupCheckpoint?(entry.id, .didPublish)
             } catch {
                 await self.cleanupCheckpoint?(entry.id, .willPublish)
-                await self.finishedUninspectedCleanup(entry, diagnostic: diagnostic, error: error)
+                await self.finishedUninspectedCleanup(entry, job: job, diagnostic: diagnostic, error: error)
                 await self.cleanupCheckpoint?(entry.id, .didPublish)
                 throw error
             }
         }
-        uninspectedCleanup[serviceID] = (entry.id, task)
+        uninspectedCleanup[entry.id] = .init(job: job, service: serviceID, task: task)
         return task
     }
-    private func finishedUninspectedCleanup(_ entry: UninspectedTarget, diagnostic: DiagnosticAttempt, error: Error?) async {
+    private func admitUninspectedCleanup(_ entry: UninspectedTarget, job: UUID) -> DiagnosticAttempt? {
+        guard uninspectedCleanup[entry.id]?.job == job else { return nil }
+        guard uninspectedTargets[entry.service.runtimeID]?.id == entry.id, entry.withdrawn else {
+            uninspectedCleanup[entry.id] = nil; updateRetention(); return nil
+        }
+        return beginDiagnostic(.cleanup(entry.id), operation: entry.id)
+    }
+    private func finishedUninspectedCleanup(_ entry: UninspectedTarget, job: UUID, diagnostic: DiagnosticAttempt, error: Error?) async {
         let token = await acquireProgress(); defer { release(token) }
         let serviceID = entry.service.runtimeID
-        if uninspectedCleanup[serviceID]?.id == entry.id { uninspectedCleanup[serviceID] = nil }
+        if uninspectedCleanup[entry.id]?.job == job { uninspectedCleanup[entry.id] = nil }
+        guard uninspectedTargets[serviceID]?.id == entry.id else {
+            if clearDiagnostic(diagnostic) { await notify() }; return
+        }
         guard let error else { if clearDiagnostic(diagnostic) { await notify() }; return }
-        guard uninspectedTargets[serviceID]?.id == entry.id else { discardUnrecordedAttempt(diagnostic); return }
         _ = await entry.service.failedTrustedRegistration(error, authority: id) { [weak self] local in
             guard let self else { throw Self.unavailable("The retained TV authority is unavailable; preserve its journal for manual repair.") }
             return try await self.retry(requester: serviceID, local: local)
         }
         setDiagnostic(diagnostic, error: error, context: "Withdrawn TV proposal cleanup", requiresRecovery: true)
         await notify()
+    }
+    /// Snapshot admission is checked again at the factory and before service work.
+    /// Waits never own an authority lane; unrelated cleanup remains self-owned.
+    private func recoverRequiredCleanups(_ passID: UUID, awaited: inout Set<UUID>) async throws -> [String] {
+        var errors: [String] = []
+        let entries = uninspectedTargets.values.filter(\.withdrawn).sorted { $0.service.runtimeID.uuidString < $1.service.runtimeID.uuidString }
+        for entry in entries {
+            try Task.checkCancellation()
+            guard let cleanup = cleanupUninspectedTask(entry) else { continue }
+            let participating = recoveryPass?.id == passID && recoveryPass?.participants.values.contains { $0.requester == entry.service.runtimeID } == true
+            guard !outstandingIntents.isEmpty || participating, awaited.insert(entry.id).inserted else { continue }
+            do { try await cleanup.subscribe().value() }
+            catch {
+                try Task.checkCancellation()
+                if uninspectedTargets[entry.service.runtimeID]?.id == entry.id {
+                    errors.append("Withdrawn proposal " + entry.id.uuidString + ": " + error.localizedDescription)
+                }
+            }
+        }
+        return errors
     }
     private func cleanupUninspected(_ entry: UninspectedTarget) async throws {
         let target = entry.service, serviceID = target.runtimeID
