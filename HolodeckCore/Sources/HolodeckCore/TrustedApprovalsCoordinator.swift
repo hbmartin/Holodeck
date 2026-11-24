@@ -237,6 +237,8 @@ actor TrustedApprovalsCoordinator {
         }
     }
     nonisolated let id = UUID()
+    enum CleanupCheckpoint { case willPublish, didPublish }
+    private let cleanupCheckpoint: (@Sendable (UUID, CleanupCheckpoint) async -> Void)?
     private let beforeRemovalFinalization: (@Sendable (UUID, UUID) async throws -> Void)?
     private let beforeDepartureRetirementAdmission: (@Sendable (UUID) async throws -> Void)?
     private let afterTargetActivation: (@Sendable (UUID) async -> Void)?
@@ -499,7 +501,9 @@ actor TrustedApprovalsCoordinator {
          beforeTargetActivation: (@Sendable (UUID) async throws -> Void)? = nil,
          afterTargetActivation: (@Sendable (UUID) async -> Void)? = nil,
          beforeRemovalFinalization: (@Sendable (UUID, UUID) async throws -> Void)? = nil,
-         beforeDepartureRetirementAdmission: (@Sendable (UUID) async throws -> Void)? = nil) {
+         beforeDepartureRetirementAdmission: (@Sendable (UUID) async throws -> Void)? = nil,
+         cleanupCheckpoint: (@Sendable (UUID, CleanupCheckpoint) async -> Void)? = nil) {
+        self.cleanupCheckpoint = cleanupCheckpoint
         self.beforeTrustedWrite = beforeTrustedWrite
         self.beforeRemovalFinalization = beforeRemovalFinalization
         self.beforeDepartureRetirementAdmission = beforeDepartureRetirementAdmission
@@ -1586,7 +1590,11 @@ actor TrustedApprovalsCoordinator {
                             if claimed, !targets.keys.contains(where: { $0.service == serviceID }) {
                                 var entry = UninspectedTarget(service: target, owner: request.owner, generation: request.registration.generation)
                                 entry.withdrawn = !request.owner.eligibility.isCurrent
+                                // Replacing the service slot ends the old proposal's
+                                // diagnostic lifetime, including callbacks still in flight.
+                                let cleared = uninspectedTargets[serviceID].map { clearDiagnostic(.cleanup($0.id)) } ?? false
                                 uninspectedTargets[serviceID] = entry
+                                if cleared { await notify() }
                                 if entry.withdrawn { _ = cleanupUninspectedTask(entry) }
                             } else if !claimed, !targets.keys.contains(where: { $0.service == serviceID }) { failedRegistration = nil }
                         }
@@ -1633,9 +1641,13 @@ actor TrustedApprovalsCoordinator {
         let task = TrustedRecoveryTask<Void>(cancelWhenEmpty: false) {
             do {
                 try await self.cleanupUninspected(entry)
+                await self.cleanupCheckpoint?(entry.id, .willPublish)
                 await self.finishedUninspectedCleanup(entry, diagnostic: diagnostic, error: nil)
+                await self.cleanupCheckpoint?(entry.id, .didPublish)
             } catch {
+                await self.cleanupCheckpoint?(entry.id, .willPublish)
                 await self.finishedUninspectedCleanup(entry, diagnostic: diagnostic, error: error)
+                await self.cleanupCheckpoint?(entry.id, .didPublish)
                 throw error
             }
         }
@@ -2123,11 +2135,7 @@ actor TrustedApprovalsCoordinator {
         var attempted: Set<Attempt> = [], failed: [UUID: Failure] = [:], removalAttempted: Set<UUID> = []
         drain: while true {
             let token = await acquireProgress()
-            if let uncertainWrite {
-                let ids = Set(replayWaiters.keys).union(required.keys).union([uncertainWrite.error.diagnosticID])
-                let errors = Dictionary(uniqueKeysWithValues: ids.map { ($0, Failure(uncertainWrite.error, diagnosticID: $0)) })
-                finishReplay(errors); release(token); return
-            }
+            if finishReplayIfUncertain() { release(token); return }
             var work: (RequestRevocationIntent, TargetKey, ShaderRequestService, UUID)?
             let remainingIntents = outstandingIntents
             for intent in remainingIntents {
@@ -2158,6 +2166,9 @@ actor TrustedApprovalsCoordinator {
                 if let beforeReplayApplication { try await beforeReplayApplication(key.service) }
                 try await hook?(intent)
                 let admission = await acquireProgress()
+                // Hooks ran without the lane. Certainty, target identity and epoch
+                // must all still justify starting this cancellation application.
+                if finishReplayIfUncertain() { release(admission); return }
                 let attempt = Attempt(intent: intent.operationID, target: key)
                 let eligible = targets[key]?.service === target && applicationIsCurrent(attempt, epoch: epoch)
                 release(admission)
@@ -2208,6 +2219,14 @@ actor TrustedApprovalsCoordinator {
         }.prefix(8).joined(separator: "\n")
         let unresolved = Self.unavailable("TV intent " + id.uuidString + " remains unresolved. " + detail)
         return Failure(unresolved, diagnosticID: id)
+    }
+    /// Called with progress ownership; uncertainty is not a target application fault.
+    private func finishReplayIfUncertain() -> Bool {
+        guard let uncertainWrite else { return false }
+        let ids = Set(replayWaiters.keys).union(required.keys).union([uncertainWrite.error.diagnosticID])
+        let errors = Dictionary(uniqueKeysWithValues: ids.map { ($0, Failure(uncertainWrite.error, diagnosticID: $0)) })
+        finishReplay(errors)
+        return true
     }
     private func finishReplay(_ failed: [UUID: Failure]) {
         replayTask = nil
