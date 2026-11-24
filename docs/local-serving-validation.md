@@ -1509,3 +1509,58 @@ A current-only cleanup profile repeatedly failed and withdrew 20 initial proposa
 Local evidence: `/tmp/pr56-final-tests.json`, `/tmp/pr56-debug-races.json`, `/tmp/pr56-races.json`, `/tmp/pr56-app-results.json`, `/tmp/pr56-model-results.json`, `/tmp/pr56-profile-raw.json`, `/tmp/pr56-profile-summary.json`, `/tmp/pr56-cleanup-results.json`, `/tmp/pr56-final-source.json`, `/tmp/pr56-artifact-info.json`, and matching logs. Final checks verify the frozen source hashes; totals exclude development runs and the old test expectation moved to pre-admission cancellation.
 
 Desktop UI runtime checks remain **blocked by instruction**. Physical Apple TV/tvOS simulator runtime, live Bonjour/LAN and real Codex publication were not run. The six expected skips are the two catalog profiles, directory reload profile, live Bonjour, real Codex publication and opt-in worker idle-CPU profile. Separate unchanged Python worker/checker suites, external library compile-all and standalone GPU profiles were not rerun. Swift process/packaging, isolated TLS, headless Mac-model and local rendering coverage did run. Linux CI, checker artifacts/locks, public protocols and persisted formats are unchanged. No live installation, request enablement, merge or deployment was performed.
+
+
+## PR #56 follow-up — trusted write certainty and diagnostic lifetimes (2026-11-24)
+
+### Correctness boundaries
+
+Base: merged PR #56, `40c23ad` (reviewed head `2f79d3e`, identical tree). An admitted trusted write that throws now owns one fresh readback before later mutation or withdrawn-target retirement may use its baseline. Exact candidate bytes prove commitment; exact predecessor bytes prove noncommit. Conflicting or unreadable contents retain the original error, exact candidate/predecessor, intent/target receipts and fences until explicit Retry Recovery. Ordinary writes cannot bypass this uncertainty. Caller cancellation cannot abandon admitted readback or settlement.
+
+Explicit recovery adopts a confirmed candidate exactly once or releases only the matching noncommitted proposal. An approval confirmed during recovery retains its credential and reports that the TV must pair again; no plaintext token is stored or credential rollback attempted. Removal recovery preserves exact application proofs. Cleanup rechecks write-attempt freshness after local awaits, so a concurrent commit-then-error cannot resurrect an old credential or certify retirement from cached contents.
+
+Compatibility binding admission rechecks retirement and local-preparation boundaries in one loop. Registration-test completion has its own bounded probe; timing out a waiter does not abandon admitted activation. Typed diagnostic origins and generations keep backend, target-inspection, cleanup, departure and mutation failures independent. Successful cleanup clears only its exact origin, including the no-intent/no-write path. Unrelated accepted writes preserve unresolved inspection failures. Resolved diagnostics release idle authority retention; bounded rejected-write history does not pin services.
+
+### Acceptance results
+
+- Full Swift core/packaging suite: **676 tests, six expected skips, zero failures**, including opted-in local Metal/GPU fixtures.
+- Release trusted/transport/packaging selection: **234 tests, zero failures**.
+- Strict cooperative-executor repetitions: **20 × 39 Debug = 780** and **20 × 187 Release = 3,740**, all passing (**4,520 repeated executions**).
+- Headless actual Mac-model recovery check passed under Python **3.9.6** and **3.15.0**.
+- Both unsigned Release app builds passed. Neither app was installed or launched.
+- Existing rendering fixtures verified eight test scenes and **25 local authoring scenes** at revision `8348af807717ea0e436208e957c333ec271e935380a9ea68b1db5aca56df13a5`. Packaged artifact-info remains checker **1.1.1**, interface **1**, source `58ed409e023b9b1ccbc08dcedd5b38c1090e14fc`, SHA-256 `8a8229c76e6e42d91d84fe9744bf53bbcda0c9dc8064ba82a41e2b15bb66ef19`.
+
+Commands:
+
+```sh
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer HOLODECK_AUTHORING_FIXTURE=/Volumes/Pro2T/HolodeckShaders HOLODECK_GPU_TESTS=1 swift test --package-path HolodeckCore --skip-update
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --package-path HolodeckCore --skip-update -c release --filter 'Trusted|ShaderLibraryToolTests|CatalogNetworkTests|LocalClientRecoveryTests'
+/usr/bin/python3 tools/check_mac_requests_recovery.py
+/opt/homebrew/bin/python3 tools/check_mac_requests_recovery.py
+```
+
+App builds used `xcodebuild -project Holodeck.xcodeproj -configuration Release`, isolated DerivedData `/tmp/HolodeckPR57Validation`, `-disableAutomaticPackageResolution CODE_SIGNING_ALLOWED=NO`, schemes `HolodeckMac` / `Holodeck`, destinations `platform=macOS` / `generic/platform=tvOS`, and literal setting `OTHER_CPLUSPLUSFLAGS=$(inherited) -isystem $(SDKROOT)/usr/include/c++/v1`.
+
+### Release measurements
+
+Seven alternating samples used the same filesystem, Apple Swift 6.4.2 and macOS 27.2 SDK. PR #56 optimized products were frozen before editing; standalone fixtures are identical across versions. Injected trusted backends and real temporary metadata measure coordination, not Keychain, Codex or GPU throughput. Revocation fixtures have idle services and empty request histories. Medians below are descriptive milliseconds; regression assertions cover structure and counts without timing thresholds.
+
+| Workload | PR #56 ms | Follow-up ms | Follow-up reads / writes / encodings |
+|---|---:|---:|---:|
+| 200 sequential revocations | 76.630 | 74.538 | 1 / 400 / 400 |
+| 50 queued revocations | 118.049 | 115.304 | 2 / 100 / 100 |
+| 100 queued revocations | 257.122 | 256.694 | 2 / 200 / 200 |
+| 200 queued revocations | 565.873 | 578.911 | 2 / 400 / 400 |
+| 100 intent-free recoveries | 41.509 | 42.228 | 100 / 0 / 0 |
+| 100 late-recovery pairs | 264.225 | 267.478 | 200 / 100 / 100 |
+| 200 same-authority registrations | 14.841 | 15.292 | 200 / 0 / 0 |
+
+Reads/writes/encodings match the baseline for every listed healthy workload. At 50 / 100 / 200 queued revocations, admission resumes remain 351 / 701 / 1401 and advances 604 / 1204 / 2404, with 100 / 200 / 400 target applications and zero final obligations. Setup approval writes are excluded. Normal revoke/removal retains exactly two trusted writes and encodings, with no extra readback.
+
+A current-only profile of **50 revocations whose backend commits then throws on every write** has median **14.298 ms**: **101 reads, 100 actual writes/encodings and 100 readbacks**, with no remaining uncertainty, obligations or recovery pins. The one initial inspection plus one readback per failed admitted write is the selected behavior; this is not a baseline speed comparison. A current-only profile failing and withdrawing 20 initial proposals has median **145.521 ms**, **40 reads, zero trusted writes/encodings**, and zero final retained targets, cleanup tasks, obligations, pins or authority-retention requests. Both profiles passed seven samples. Cancelled-registration contention retains one raw read, zero encodings/writes and zero final subscribers.
+
+### Evidence and limits
+
+Local evidence: `/tmp/pr57-final-tests.json`, `/tmp/pr57-debug-races.json`, `/tmp/pr57-races.json`, `/tmp/pr57-app-results.json`, `/tmp/pr57-model-results.json`, `/tmp/pr57-profile-raw.json`, `/tmp/pr57-profile-summary.json`, `/tmp/pr57-cleanup-results.json`, `/tmp/pr57-write-error-results.json`, `/tmp/pr57-final-source.json`, `/tmp/pr57-app-source.json`, `/tmp/pr57-artifact-info.json`, and matching logs. Final checks verify frozen source hashes; acceptance totals exclude development runs and the separate retirement-invariant preflight.
+
+Desktop UI runtime checks remain **blocked by instruction**. Physical Apple TV/tvOS simulator runtime, live Bonjour/LAN and real Codex publication were not run. The six expected skips are two catalog profiles, directory reload profile, live Bonjour, real Codex publication and opt-in worker idle-CPU profile. Separate unchanged Python worker/checker suites, external library compile-all and standalone GPU profiles were not rerun. Swift process/packaging, isolated TLS, headless Mac-model and local rendering coverage did run. Linux CI, checker artifacts/locks, public protocols and persisted formats are unchanged. No live installation, request enablement, merge or deployment was performed.
