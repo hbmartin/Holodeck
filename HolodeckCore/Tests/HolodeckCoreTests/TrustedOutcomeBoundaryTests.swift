@@ -526,6 +526,68 @@ private final class OutcomeBackend: @unchecked Sendable {
         XCTAssertFalse(prior.permit.isCurrent)
     }
 
+    func testReplayRechecksWriteCertaintyAfterApplicationHooks() async throws {
+        for mode in [OutcomeBackend.WriteFailure.unreadableAfter, .unreadableBefore] {
+            let f = try await fixture(), job = try await submit(f.service, device: "A"), gate = RecoveryGate(), recorder = TrustedOwnerRecorder()
+            addTeardownBlock { await gate.release() }
+            let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+            let backend = OutcomeBackend(try TrustedTVApprovals(revocations: [intent]).encoded())
+            let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) }, beforeReplayApplication: { _ in try await gate.wait() })
+            let binding = try await accepted(authority.register(recorder.owner(service: f.service)))
+            let result = OutcomeResult<Void>(), replay = Task { do { try await authority.replay(); result.value = .success(()) } catch { result.value = .failure(error) } }
+            addTeardownBlock { replay.cancel(); await gate.release() }
+            try await wait { await gate.hasEntered }
+            backend.failWrites(mode)
+            do { _ = try await authority.approve(binding.permit) { .init(record: .init(id: "B", name: "B", tokenHash: "new"), token: "new", eligibility: .init()) }; XCTFail("Unknown write accepted") }
+            catch { XCTAssertTrue(error.localizedDescription.contains("unverified")) }
+            let uncertain = await recorder.snapshot
+            await gate.release()
+            try await wait { result.value != nil }
+            guard case .failure(let error) = try XCTUnwrap(result.value) else { return XCTFail("Uncertain replay succeeded") }
+            XCTAssertTrue(error.localizedDescription.contains("unverified"))
+            let jobs = await f.service.allJobs(), state = await authority.observation, after = await recorder.snapshot
+            XCTAssertEqual(jobs.first { $0.id == job }?.stage, .queued)
+            XCTAssertEqual(state.uncertainWrites, 1); XCTAssertEqual(state.obligations, 1)
+            XCTAssertEqual(state.applicationRecoveryTargets, 0)
+            XCTAssertEqual(after?.diagnostic, uncertain?.diagnostic); XCTAssertEqual(after?.diagnosticID, uncertain?.diagnosticID)
+            XCTAssertEqual(backend.writes, mode == .unreadableAfter ? 1 : 0)
+            backend.failReads(false); backend.failWrites(.none)
+            try await f.service.retryReconciliation()
+            let recovered = await f.service.allJobs(), clean = await authority.observation
+            XCTAssertEqual(recovered.first { $0.id == job }?.stage, .cancelled)
+            XCTAssertEqual(clean.uncertainWrites, 0); XCTAssertEqual(clean.obligations, 0)
+            XCTAssertEqual(clean.applicationRecoveryTargets, 0)
+        }
+    }
+    func testReplayApplicationAdmittedBeforeUncertaintyFinishesItsOutcome() async throws {
+        let arm = OutcomeSwitch(), gate = TrustedReadGate()
+        addTeardownBlock { gate.release() }
+        let f = try await fixture(beforeWrite: { url in if url.lastPathComponent == "journal.json", arm.take() { gate.wait() } })
+        let job = try await submit(f.service, device: "A"), intent = RequestRevocationIntent(operationID: UUID(), deviceID: "A")
+        let backend = OutcomeBackend(try TrustedTVApprovals(revocations: [intent]).encoded())
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) })
+        let binding = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: f.service)))
+        arm.on = true
+        let result = OutcomeResult<Void>(), replay = Task { do { try await authority.replay(); result.value = .success(()) } catch { result.value = .failure(error) } }
+        addTeardownBlock { replay.cancel(); gate.release() }
+        try await wait { gate.entered }
+        backend.failWrites(.unreadableAfter)
+        do { _ = try await authority.approve(binding.permit) { .init(record: .init(id: "B", name: "B", tokenHash: "new"), token: "new", eligibility: .init()) }; XCTFail("Unknown write accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("unverified")) }
+        gate.release()
+        try await wait { result.value != nil }
+        guard case .failure(let error) = try XCTUnwrap(result.value) else { return XCTFail("Uncertain replay succeeded") }
+        XCTAssertTrue(error.localizedDescription.contains("unverified"))
+        let jobs = await f.service.allJobs(), pending = await authority.observation
+        XCTAssertEqual(jobs.first { $0.id == job }?.stage, .cancelled)
+        XCTAssertEqual(pending.obligations, 1); XCTAssertEqual(pending.uncertainWrites, 1)
+        backend.failReads(false); backend.failWrites(.none)
+        try await f.service.retryReconciliation()
+        let clean = await authority.observation
+        XCTAssertEqual(clean.obligations, 0); XCTAssertEqual(clean.uncertainWrites, 0)
+        XCTAssertEqual(backend.writes, 2) // Confirmed B approval and one removal of A.
+    }
+
     func testReplacingFailedProposalRetiresOnlySupersededCleanupDiagnostic() async throws {
         let broken = OutcomeSwitch(), retained = OutcomeSwitch(), recorder = TrustedOwnerRecorder()
         let a = try await fixture(reconcile: { _ in if broken.on { throw POSIXError(.EIO) } }), b = try await fixture()

@@ -2135,11 +2135,7 @@ actor TrustedApprovalsCoordinator {
         var attempted: Set<Attempt> = [], failed: [UUID: Failure] = [:], removalAttempted: Set<UUID> = []
         drain: while true {
             let token = await acquireProgress()
-            if let uncertainWrite {
-                let ids = Set(replayWaiters.keys).union(required.keys).union([uncertainWrite.error.diagnosticID])
-                let errors = Dictionary(uniqueKeysWithValues: ids.map { ($0, Failure(uncertainWrite.error, diagnosticID: $0)) })
-                finishReplay(errors); release(token); return
-            }
+            if finishReplayIfUncertain() { release(token); return }
             var work: (RequestRevocationIntent, TargetKey, ShaderRequestService, UUID)?
             let remainingIntents = outstandingIntents
             for intent in remainingIntents {
@@ -2170,6 +2166,9 @@ actor TrustedApprovalsCoordinator {
                 if let beforeReplayApplication { try await beforeReplayApplication(key.service) }
                 try await hook?(intent)
                 let admission = await acquireProgress()
+                // Hooks ran without the lane. Certainty, target identity and epoch
+                // must all still justify starting this cancellation application.
+                if finishReplayIfUncertain() { release(admission); return }
                 let attempt = Attempt(intent: intent.operationID, target: key)
                 let eligible = targets[key]?.service === target && applicationIsCurrent(attempt, epoch: epoch)
                 release(admission)
@@ -2220,6 +2219,14 @@ actor TrustedApprovalsCoordinator {
         }.prefix(8).joined(separator: "\n")
         let unresolved = Self.unavailable("TV intent " + id.uuidString + " remains unresolved. " + detail)
         return Failure(unresolved, diagnosticID: id)
+    }
+    /// Called with progress ownership; uncertainty is not a target application fault.
+    private func finishReplayIfUncertain() -> Bool {
+        guard let uncertainWrite else { return false }
+        let ids = Set(replayWaiters.keys).union(required.keys).union([uncertainWrite.error.diagnosticID])
+        let errors = Dictionary(uniqueKeysWithValues: ids.map { ($0, Failure(uncertainWrite.error, diagnosticID: $0)) })
+        finishReplay(errors)
+        return true
     }
     private func finishReplay(_ failed: [UUID: Failure]) {
         replayTask = nil
