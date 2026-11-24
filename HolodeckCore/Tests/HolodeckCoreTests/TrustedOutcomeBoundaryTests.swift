@@ -526,6 +526,82 @@ private final class OutcomeBackend: @unchecked Sendable {
         XCTAssertFalse(prior.permit.isCurrent)
     }
 
+    func testReplacingFailedProposalRetiresOnlySupersededCleanupDiagnostic() async throws {
+        let broken = OutcomeSwitch(), retained = OutcomeSwitch(), recorder = TrustedOwnerRecorder()
+        let a = try await fixture(reconcile: { _ in if broken.on { throw POSIXError(.EIO) } }), b = try await fixture()
+        let backend = OutcomeBackend(try TrustedTVApprovals().encoded())
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) }, retainEvidence: { _, value in retained.on = value })
+        _ = try await accepted(authority.register(recorder.owner(service: b.service)))
+        backend.failReads(true)
+        let first = TrustedOwnerRecorder().owner(service: a.service)
+        do { _ = try await accepted(authority.register(first)); XCTFail("Failed inspection accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EACCES).localizedDescription)) }
+        backend.failReads(false); broken.on = true; first.eligibility.invalidate()
+        await authority.withdraw(serverID: first.serverID, eligibility: first.eligibility)
+        try await wait { let state = await authority.observation; return state.uninspectedTargets == 1 && state.uninspectedCleanupTasks == 0 }
+        try await wait { await recorder.snapshot?.diagnostic?.contains("Withdrawn TV proposal cleanup") == true }
+        let failed = await recorder.snapshot
+        XCTAssertTrue(failed?.diagnostic?.contains("Withdrawn TV proposal cleanup") == true)
+        backend.failReads(true)
+        do { _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: a.service))); XCTFail("Replacement inspection accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EACCES).localizedDescription)) }
+        let replaced = await recorder.snapshot
+        XCTAssertFalse(replaced?.diagnostic?.contains("Withdrawn TV proposal cleanup") == true)
+        XCTAssertTrue(replaced?.diagnostic?.contains(POSIXError(.EACCES).localizedDescription) == true)
+        broken.on = false; backend.failReads(false)
+        _ = try await accepted(authority.register(recorder.owner(service: a.service)))
+        let state = await authority.observation, snapshot = await recorder.snapshot
+        XCTAssertNil(snapshot?.diagnostic); XCTAssertEqual(state.recoveryDiagnostics, 0)
+        XCTAssertEqual(state.uninspectedTargets, 0); XCTAssertEqual(state.uninspectedCleanupTasks, 0)
+        // A real reconciliation entry still pins the service independently.
+        XCTAssertTrue(retained.on)
+        try await a.service.retryReconciliation()
+        try await wait { !retained.on }
+        XCTAssertEqual(backend.writes, 0)
+    }
+
+    func testObsoleteCleanupCompletionCannotReplaceSuccessorFailure() async throws {
+        let broken = OutcomeSwitch(), arm = OutcomeSwitch(), retained = OutcomeSwitch(), completed = OutcomePaths(), gate = RecoveryGate()
+        addTeardownBlock { await gate.release() }
+        let recorder = TrustedOwnerRecorder(), backend = OutcomeBackend(try TrustedTVApprovals().encoded())
+        let a = try await fixture(reconcile: { _ in if broken.on { throw POSIXError(.EIO) } }), b = try await fixture()
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) },
+            retainEvidence: { _, value in retained.on = value }, cleanupCheckpoint: { id, point in
+                if point == .willPublish, arm.take() { try? await gate.wait() }
+                if point == .didPublish { completed.add(id.uuidString) }
+            })
+        _ = try await accepted(authority.register(recorder.owner(service: b.service)))
+        backend.failReads(true)
+        let first = TrustedOwnerRecorder().owner(service: a.service)
+        do { _ = try await accepted(authority.register(first)); XCTFail("Failed inspection accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EACCES).localizedDescription)) }
+        backend.failReads(false); broken.on = true; arm.on = true; first.eligibility.invalidate()
+        await authority.withdraw(serverID: first.serverID, eligibility: first.eligibility)
+        try await wait { await gate.hasEntered }
+        backend.failReads(true)
+        let second = TrustedOwnerRecorder().owner(service: a.service)
+        do { _ = try await accepted(authority.register(second)); XCTFail("Successor inspection accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EACCES).localizedDescription)) }
+        backend.failReads(false); second.eligibility.invalidate()
+        await authority.withdraw(serverID: second.serverID, eligibility: second.eligibility)
+        try await wait { completed.count == 1 }
+        let successor = await recorder.snapshot, before = await authority.observation
+        XCTAssertTrue(successor?.diagnostic?.contains("Withdrawn TV proposal cleanup") == true)
+        await gate.release()
+        try await wait { completed.count == 2 }
+        let after = await recorder.snapshot, state = await authority.observation
+        XCTAssertEqual(after?.diagnostic, successor?.diagnostic); XCTAssertEqual(after?.diagnosticID, successor?.diagnosticID)
+        XCTAssertEqual(state.recoveryDiagnostics, before.recoveryDiagnostics)
+        XCTAssertEqual(state.uninspectedTargets, 1); XCTAssertEqual(state.uninspectedCleanupTasks, 0); XCTAssertTrue(retained.on)
+        broken.on = false
+        _ = try await accepted(authority.register(recorder.owner(service: a.service)))
+        let repaired = await recorder.snapshot, clean = await authority.observation
+        XCTAssertNil(repaired?.diagnostic); XCTAssertEqual(clean.recoveryDiagnostics, 0)
+        XCTAssertTrue(retained.on)
+        try await a.service.retryReconciliation()
+        try await wait { !retained.on }
+    }
+
     func testResolvedCleanupWithoutIntentClearsOnlyItsOwnErrorAndAuthorityPin() async throws {
         let broken = OutcomeSwitch(), retained = OutcomeSwitch()
         let a = try await fixture(reconcile: { _ in if broken.on { throw POSIXError(.EIO) } }), b = try await fixture(), backend = OutcomeBackend(try TrustedTVApprovals().encoded()), recorder = TrustedOwnerRecorder()

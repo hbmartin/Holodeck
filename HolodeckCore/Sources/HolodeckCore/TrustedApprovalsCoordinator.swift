@@ -237,6 +237,8 @@ actor TrustedApprovalsCoordinator {
         }
     }
     nonisolated let id = UUID()
+    enum CleanupCheckpoint { case willPublish, didPublish }
+    private let cleanupCheckpoint: (@Sendable (UUID, CleanupCheckpoint) async -> Void)?
     private let beforeRemovalFinalization: (@Sendable (UUID, UUID) async throws -> Void)?
     private let beforeDepartureRetirementAdmission: (@Sendable (UUID) async throws -> Void)?
     private let afterTargetActivation: (@Sendable (UUID) async -> Void)?
@@ -499,7 +501,9 @@ actor TrustedApprovalsCoordinator {
          beforeTargetActivation: (@Sendable (UUID) async throws -> Void)? = nil,
          afterTargetActivation: (@Sendable (UUID) async -> Void)? = nil,
          beforeRemovalFinalization: (@Sendable (UUID, UUID) async throws -> Void)? = nil,
-         beforeDepartureRetirementAdmission: (@Sendable (UUID) async throws -> Void)? = nil) {
+         beforeDepartureRetirementAdmission: (@Sendable (UUID) async throws -> Void)? = nil,
+         cleanupCheckpoint: (@Sendable (UUID, CleanupCheckpoint) async -> Void)? = nil) {
+        self.cleanupCheckpoint = cleanupCheckpoint
         self.beforeTrustedWrite = beforeTrustedWrite
         self.beforeRemovalFinalization = beforeRemovalFinalization
         self.beforeDepartureRetirementAdmission = beforeDepartureRetirementAdmission
@@ -1586,7 +1590,11 @@ actor TrustedApprovalsCoordinator {
                             if claimed, !targets.keys.contains(where: { $0.service == serviceID }) {
                                 var entry = UninspectedTarget(service: target, owner: request.owner, generation: request.registration.generation)
                                 entry.withdrawn = !request.owner.eligibility.isCurrent
+                                // Replacing the service slot ends the old proposal's
+                                // diagnostic lifetime, including callbacks still in flight.
+                                let cleared = uninspectedTargets[serviceID].map { clearDiagnostic(.cleanup($0.id)) } ?? false
                                 uninspectedTargets[serviceID] = entry
+                                if cleared { await notify() }
                                 if entry.withdrawn { _ = cleanupUninspectedTask(entry) }
                             } else if !claimed, !targets.keys.contains(where: { $0.service == serviceID }) { failedRegistration = nil }
                         }
@@ -1633,9 +1641,13 @@ actor TrustedApprovalsCoordinator {
         let task = TrustedRecoveryTask<Void>(cancelWhenEmpty: false) {
             do {
                 try await self.cleanupUninspected(entry)
+                await self.cleanupCheckpoint?(entry.id, .willPublish)
                 await self.finishedUninspectedCleanup(entry, diagnostic: diagnostic, error: nil)
+                await self.cleanupCheckpoint?(entry.id, .didPublish)
             } catch {
+                await self.cleanupCheckpoint?(entry.id, .willPublish)
                 await self.finishedUninspectedCleanup(entry, diagnostic: diagnostic, error: error)
+                await self.cleanupCheckpoint?(entry.id, .didPublish)
                 throw error
             }
         }
