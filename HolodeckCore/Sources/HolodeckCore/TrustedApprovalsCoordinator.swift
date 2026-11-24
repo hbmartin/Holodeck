@@ -248,6 +248,7 @@ actor TrustedApprovalsCoordinator {
     private var bytes: Data?
     private var loaded = false
     private var sequence: UInt64 = 0
+    private var writeAttempt: UInt64 = 0
     private var accepted: Accepted?
     private weak var service: ShaderRequestService?
     private struct TargetKey: Hashable { let service: UUID; let registration: UUID }
@@ -424,15 +425,15 @@ actor TrustedApprovalsCoordinator {
     private var outstandingIntents: [RequestRevocationIntent] {
         envelope.revocations + removals.values.map(\.intent).sorted { $0.operationID.uuidString < $1.operationID.uuidString }
     }
-    private var readFlight: (id: UUID, sequence: UInt64, baseline: UInt64, task: TrustedReadTask)?
+    private var readFlight: (id: UUID, sequence: UInt64, baseline: UInt64, writeAttempt: UInt64, task: TrustedReadTask)?
     private func finishedRead(_ id: UUID) { if readFlight?.id == id { readFlight = nil } }
     private func readTrustedBytes(changes: [TrustedCompletionSignal] = []) async throws -> Data? {
         while true {
-            let flight: (id: UUID, sequence: UInt64, baseline: UInt64, task: TrustedReadTask)
+            let flight: (id: UUID, sequence: UInt64, baseline: UInt64, writeAttempt: UInt64, task: TrustedReadTask)
             if let active = readFlight { flight = active }
             else {
                 let jobID = UUID()
-                flight = (jobID, sequence, baseline, TrustedReadTask(read, completed: { [weak self] in
+                flight = (jobID, sequence, baseline, writeAttempt, TrustedReadTask(read, completed: { [weak self] in
                     Task { await self?.finishedRead(jobID) }
                 }))
                 readFlight = flight
@@ -446,11 +447,11 @@ actor TrustedApprovalsCoordinator {
                 if readFlight?.task === flight.task { readFlight = nil }
                 // An obsolete read's failure is no more authoritative than its
                 // bytes. A fresh attempt must establish the current outcome.
-                if flight.sequence != sequence || flight.baseline != baseline { continue }
+                if flight.sequence != sequence || flight.baseline != baseline || flight.writeAttempt != writeAttempt { continue }
                 throw error
             }
             if readFlight?.task === flight.task { readFlight = nil }
-            if flight.sequence == sequence, flight.baseline == baseline { return value }
+            if flight.sequence == sequence, flight.baseline == baseline, flight.writeAttempt == writeAttempt { return value }
             try Task.checkCancellation()
         }
     }
@@ -1476,6 +1477,9 @@ actor TrustedApprovalsCoordinator {
         let encoded = try value.encoded(); encodings += 1; return encoded
     }
     private func persist(_ value: TrustedTVApprovals, bytes candidate: Data) async throws {
+        // A thrown write may already have replaced storage. Accepted revisions
+        // cannot certify a read begun before this uncertain attempt.
+        writeAttempt &+= 1
         if let beforeTrustedWrite { try await beforeTrustedWrite() }
         let write = write
         try await Task.detached { try write(candidate) }.value

@@ -582,10 +582,13 @@ public actor ShaderRequestService {
     private var pendingTrustedAuthority: UUID?
     private var authorityTransfer: UUID?
     func rememberTrustedAuthority(_ authority: TrustedApprovalsCoordinator) { trustedAuthority = authority }
-    func prepareTrustedAuthority(id: UUID, preparation: TrustedRegistrationPreparation? = nil) async throws -> AuthorityTransfer? {
+    private func requirePendingTrustedAuthority(_ id: UUID) throws {
         if let pendingTrustedAuthority, pendingTrustedAuthority != id {
             throw ShaderRequestError.unavailable("An earlier TV authority inspection is unresolved. Recover that authority and explicitly register before switching approval accounts.")
         }
+    }
+    func prepareTrustedAuthority(id: UUID, preparation: TrustedRegistrationPreparation? = nil) async throws -> AuthorityTransfer? {
+        try requirePendingTrustedAuthority(id)
         if revocationCoordinatorID == nil {
             // Inspection readiness is provisional; it does not install an
             // authority or authorize restored TV jobs before the first read.
@@ -773,6 +776,7 @@ public actor ShaderRequestService {
                                  authority: TrustedApprovalsCoordinator? = nil,
                                  installation: TrustedTargetInstallation? = nil,
                                  admitActivation: @Sendable () throws -> Void) throws -> (UUID, TrustedRevocationInspection) {
+        try requirePendingTrustedAuthority(id)
         try requireLocalPreparationFinished(changingTo: id)
         if let installation { try validateTargetInstallation(installation, authority: id) }
         return try transfer.departure.activate {
@@ -814,7 +818,8 @@ public actor ShaderRequestService {
     }
     func failedTrustedRegistration(_ error: Error, authority: UUID,
         recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) {
-        guard revocationCoordinatorID == nil || (trustedAuthority?.id == authority && revocationCoordinatorID != authority) else { return }
+        guard pendingTrustedAuthority == nil || pendingTrustedAuthority == authority,
+              revocationCoordinatorID == nil || (trustedAuthority?.id == authority && revocationCoordinatorID != authority) else { return }
         // Recovery routing is provisional; it grants no registration or request
         // authorization and local repair remains unbound until activation.
         pendingTrustedAuthority = authority
@@ -848,6 +853,7 @@ public actor ShaderRequestService {
                                      recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion,
                                      admitActivation: @Sendable () throws -> Void,
                                      intents: [RequestRevocationIntent]? = nil, revision: TrustedRevocationRevision? = nil) throws -> UUID {
+        try requirePendingTrustedAuthority(authority.id)
         try requireLocalPreparationFinished(changingTo: authority.id)
         if let installation { try validateTargetInstallation(installation, authority: authority.id) }
         if let intents, let revision {
