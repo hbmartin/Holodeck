@@ -172,6 +172,7 @@ actor TrustedApprovalsCoordinator {
         let writeReadbacks: Int
         let recoveryDiagnostics: Int
         let historicalDiagnostics: Int
+        let outcomeNotices: Int
     }
     struct Approval: Sendable {
         let record: ApprovedTV
@@ -603,7 +604,7 @@ actor TrustedApprovalsCoordinator {
               uninspectedTargets: uninspectedTargets.count, recoveryCleanupWaiters: uninspectedCleanup.values.reduce(0) { $0 + $1.task.waiterCount }, uninspectedCleanupTasks: uninspectedCleanup.count,
               uncertainWrites: uncertainWrite == nil ? 0 : 1, writeReadbacks: writeReadbacks,
               recoveryDiagnostics: diagnostics.values.filter(\.requiresRecovery).count,
-              historicalDiagnostics: diagnostics.values.filter { !$0.requiresRecovery }.count)
+              historicalDiagnostics: diagnostics.values.filter { !$0.requiresRecovery }.count, outcomeNotices: recoveryNotices.count)
     }
     private var outstandingIntents: [RequestRevocationIntent] {
         envelope.revocations + removals.values.map(\.intent).sorted { $0.operationID.uuidString < $1.operationID.uuidString }
@@ -758,6 +759,11 @@ actor TrustedApprovalsCoordinator {
         guard owner.eligibility.isCurrent else { throw Self.unavailable("The proposed catalog server lifetime ended before registration.") }
         if onlyIfVacant, accepted != nil || pending != nil || preparing != nil {
             throw Self.unavailable("Catalog server handoff is pending. Wait for its accepted binding.")
+        }
+        if let previous = failedRegistration {
+            // Exact identity protects a newer endpoint from a delayed cleanup hop.
+            let retiredGeneration = generation
+            Task { await previous.service?.forgetFailedRegistration(authority: id, server: previous.serverID, lifetime: previous.eligibility, maxGeneration: retiredGeneration) }
         }
         failedRegistration = nil
         generation &+= 1
@@ -975,6 +981,7 @@ actor TrustedApprovalsCoordinator {
         var preparedOutcomes: [UUID: TrustedLocalRecovery] = [:]
         var heldTargets: [UUID: ShaderRequestService] = [:]
         var awaitedCleanups: Set<UUID> = []
+        var cleanupTasks: [UUID: TrustedRecoveryTask<Void>] = [:]
         var retriedRegistrations: Set<UUID> = []
         do {
             if uncertainWrite != nil {
@@ -985,7 +992,7 @@ actor TrustedApprovalsCoordinator {
             }
             var registrationInspection: InspectionPass?
             try Task.checkCancellation()
-            errors += try await recoverRequiredCleanups(passID, awaited: &awaitedCleanups)
+            errors += try await recoverRequiredCleanups(passID, awaited: &awaitedCleanups, tasks: &cleanupTasks)
             registrationInspection = try await recoverParticipatingRegistration(passID, attempted: &retriedRegistrations, errors: &errors)
             try Task.checkCancellation()
             let obligated = Set(required.values.flatMap { $0 })
@@ -1031,14 +1038,14 @@ actor TrustedApprovalsCoordinator {
                 catch { errors.append("Inspection: " + error.localizedDescription) }
             }
             release(inspection)
-            errors += try await recoverRequiredCleanups(passID, awaited: &awaitedCleanups)
+            errors += try await recoverRequiredCleanups(passID, awaited: &awaitedCleanups, tasks: &cleanupTasks)
             try Task.checkCancellation()
             try await beforeRecoverySealing()
             try Task.checkCancellation()
             // Seal synchronously on the authority actor. Later callers belong
             // only to the successor, even while this pass is awaiting a target.
             if recoveryPass?.id == passID { recoveryPass?.state = .sealed }
-            errors += try await recoverRequiredCleanups(passID, awaited: &awaitedCleanups)
+            errors += try await recoverRequiredCleanups(passID, awaited: &awaitedCleanups, tasks: &cleanupTasks)
             if let fresh = try await recoverParticipatingRegistration(passID, attempted: &retriedRegistrations, errors: &errors) { registrationInspection = fresh }
             let suppliedInputs = recoveryPass?.id == passID ? recoveryPass!.inputs : [:]
             // Target-local repairs discovered by this pass need the same sealed
@@ -1095,7 +1102,8 @@ actor TrustedApprovalsCoordinator {
             // Original-target repair must never run while this authority owns
             // the lane or recursively join the trusted pass calling it.
             errors += await finishRecoveredDepartures()
-            errors += try await recoverRequiredCleanups(passID, awaited: &awaitedCleanups)
+            errors += try await recoverRequiredCleanups(passID, awaited: &awaitedCleanups, tasks: &cleanupTasks)
+            let readiness = try await acquire(.progress)
             if let pass = recoveryPass, pass.id == passID {
                 for serviceID in Set(pass.participants.values.map(\.requester)) {
                     guard let entry = uninspectedTargets[serviceID] else { continue }
@@ -1108,7 +1116,6 @@ actor TrustedApprovalsCoordinator {
                     }
                 }
             }
-            let readiness = try await acquire(.progress)
             do { try requireAuthorityReady() } catch { errors.append(error.localizedDescription) }
             if errors.isEmpty, clearSettledWriteDiagnostics() { await notify() }
             release(readiness)
@@ -1651,7 +1658,7 @@ actor TrustedApprovalsCoordinator {
                 // Acceptance is irrevocable after admission. A failed target
                 // notification remains a diagnostic, not a failed binding ticket.
                 if request.registration.generation == generation { failedRegistration = nil }
-                await admittedService?.forgetFailedRegistration(authority: id, server: request.owner.serverID, lifetime: request.owner.eligibility)
+                await admittedService?.forgetFailedRegistration(authority: id, server: request.owner.serverID, lifetime: request.owner.eligibility, maxGeneration: request.registration.generation)
                 request.registration.completion.complete(.success(.accepted(binding)))
             } catch {
                 if let transfer {
@@ -1693,10 +1700,10 @@ actor TrustedApprovalsCoordinator {
                                       await target.hasConflictingTrustedPreparation(authority: id) {
                                 failedRegistration = nil
                             } else if !claimed {
-                                let authorityID = id, server = request.owner.serverID, lifetime = request.owner.eligibility
-                                await target.rememberFailedRegistration(authority: authorityID, server: server, lifetime: lifetime, error: error) { [weak self] local in
+                                let authorityID = id, server = request.owner.serverID, lifetime = request.owner.eligibility, registration = request.registration.generation
+                                await target.rememberFailedRegistration(authority: authorityID, generation: registration, server: server, lifetime: lifetime, error: error) { [weak self] local in
                                     guard let self else { throw Self.unavailable("The proposed TV authority is unavailable; explicitly register its server again.") }
-                                    return try await self.retryFailedRegistration(server: server, lifetime: lifetime, requester: serviceID, local: local)
+                                    return try await self.retryFailedRegistration(server: server, lifetime: lifetime, registration: registration, requester: serviceID, local: local)
                                 }
                             }
                         }
@@ -1708,8 +1715,8 @@ actor TrustedApprovalsCoordinator {
         }
         registrationTask = nil
     }
-    private func retryFailedRegistration(server: UUID, lifetime: TrustedOwnerLifetime, requester: UUID, local: TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion {
-        guard lifetime.isCurrent, failedRegistration?.serverID == server, failedRegistration?.eligibility === lifetime else {
+    private func retryFailedRegistration(server: UUID, lifetime: TrustedOwnerLifetime, registration: UInt64, requester: UUID, local: TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion {
+        guard lifetime.isCurrent, generation == registration, failedRegistration?.serverID == server, failedRegistration?.eligibility === lifetime else {
             throw Self.unavailable("This failed TV registration is no longer current; explicitly register the intended server.")
         }
         return try await retry(requester: requester, local: local)
@@ -1795,12 +1802,18 @@ actor TrustedApprovalsCoordinator {
     }
     /// Snapshot admission is checked again at the factory and before service work.
     /// Waits never own an authority lane; unrelated cleanup remains self-owned.
-    private func recoverRequiredCleanups(_ passID: UUID, awaited: inout Set<UUID>) async throws -> [String] {
+    private func recoverRequiredCleanups(_ passID: UUID, awaited: inout Set<UUID>, tasks: inout [UUID: TrustedRecoveryTask<Void>]) async throws -> [String] {
         var errors: [String] = []
         let entries = uninspectedTargets.values.filter(\.withdrawn).sorted { $0.service.runtimeID.uuidString < $1.service.runtimeID.uuidString }
         for entry in entries {
             try Task.checkCancellation()
-            guard let cleanup = cleanupUninspectedTask(entry) else { continue }
+            guard uninspectedTargets[entry.service.runtimeID]?.id == entry.id else { continue }
+            let cleanup: TrustedRecoveryTask<Void>
+            if let admitted = tasks[entry.id] { cleanup = admitted }
+            else {
+                guard let admitted = cleanupUninspectedTask(entry) else { continue }
+                tasks[entry.id] = admitted; cleanup = admitted
+            }
             let participating = recoveryPass?.id == passID && recoveryPass?.participants.values.contains { $0.requester == entry.service.runtimeID } == true
             guard !outstandingIntents.isEmpty || participating, awaited.insert(entry.id).inserted else { continue }
             do { try await cleanup.subscribe().value() }

@@ -177,7 +177,7 @@ import XCTest
         do { _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: a))); XCTFail("Injected inspection failure ignored") }
         catch let error as POSIXError { XCTAssertEqual(error.code, .EACCES) }
         backend.failReads(false); armed.armed = true
-        do { try await b.retryReconciliation(); XCTFail("Interrupted registration reported success") }
+        do { try await a.retryReconciliation(); XCTFail("Interrupted registration reported success") }
         catch let error as TrustedPartialRecovery {
             let message = error.remaining.joined()
             XCTAssertTrue(message.contains("registration preparation was cancelled"))
@@ -298,7 +298,7 @@ import XCTest
         addTeardownBlock { occupying.cancel(); gate.release() }
         try await wait { gate.entered }
         let result = BoundaryOutcome(), recovery = Task {
-            do { try await b.retryReconciliation(); result.finish(nil) } catch { result.finish(error) }
+            do { try await a.retryReconciliation(); result.finish(nil) } catch { result.finish(error) }
         }
         addTeardownBlock { recovery.cancel(); gate.release() }
         try await wait { await authority.observation.queuedGeneration != nil }
@@ -307,7 +307,9 @@ import XCTest
         try await wait { await authority.observation.progressWaiters > 0 }
         XCTAssertFalse(result.finished); XCTAssertEqual(backend.reads, reads)
         gate.release(); _ = try await occupying.value
-        try await wait { result.finished }; try result.check(); _ = try await accept(latest)
+        try await wait { result.finished }
+        XCTAssertTrue((result.error as? TrustedPartialRecovery)?.remaining.joined().contains("Explicitly register") == true)
+        _ = try await accept(latest)
         XCTAssertGreaterThan(backend.reads, reads)
         let status = try await a.control(operation: "requestStatus", payload: .init(), deviceID: "A")
         // A superseded, unaccepted proposal cannot acquire a binding merely

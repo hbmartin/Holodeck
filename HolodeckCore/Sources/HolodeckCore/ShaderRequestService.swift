@@ -738,21 +738,23 @@ public actor ShaderRequestService {
     var localRecoveryPhaseCount: UInt64 { localRecoveryGeneration }
     private var trustedRecoveryHolds: Set<UUID> = []
     private struct FailedRegistrationRecovery {
+        let generation: UInt64
         let server: UUID
         let lifetime: TrustedOwnerLifetime
         let message: String
         let recover: @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion
     }
     private var failedRegistrationRecoveries: [UUID: FailedRegistrationRecovery] = [:]
-    func rememberFailedRegistration(authority: UUID, server: UUID, lifetime: TrustedOwnerLifetime, error: Error,
+    func rememberFailedRegistration(authority: UUID, generation: UInt64, server: UUID, lifetime: TrustedOwnerLifetime, error: Error,
         recover: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) {
         guard lifetime.isCurrent else { return }
-        failedRegistrationRecoveries[authority] = .init(server: server, lifetime: lifetime,
+        failedRegistrationRecoveries[authority] = .init(generation: generation, server: server, lifetime: lifetime,
             message: BoundedDiagnostics.bounded("TV server registration requires recovery: " + error.localizedDescription, bytes: 8192), recover: recover)
         emitUpdates()
     }
-    func forgetFailedRegistration(authority: UUID, server: UUID, lifetime: TrustedOwnerLifetime) {
-        guard let pending = failedRegistrationRecoveries[authority], pending.server == server, pending.lifetime === lifetime else { return }
+    func forgetFailedRegistration(authority: UUID, server: UUID, lifetime: TrustedOwnerLifetime, maxGeneration: UInt64 = .max) {
+        guard let pending = failedRegistrationRecoveries[authority], pending.server == server, pending.lifetime === lifetime,
+              pending.generation <= maxGeneration else { return }
         failedRegistrationRecoveries[authority] = nil; emitUpdates()
     }
     private var authorityRecoveryEndpoints: [UUID: TrustedAuthorityRecoveryEndpoint] = [:]
@@ -2025,7 +2027,8 @@ public actor ShaderRequestService {
         if replayTrusted {
             for (authority, pending) in failedRegistrationRecoveries.sorted(by: { $0.key.uuidString < $1.key.uuidString }) where pending.lifetime.isCurrent {
                 try Task.checkCancellation()
-                guard failedRegistrationRecoveries[authority]?.lifetime === pending.lifetime else { continue }
+                guard failedRegistrationRecoveries[authority]?.lifetime === pending.lifetime,
+                      failedRegistrationRecoveries[authority]?.generation == pending.generation else { continue }
                 do { completed.formUnion(try await pending.recover(local).completedServices) }
                 catch {
                     try Task.checkCancellation()
