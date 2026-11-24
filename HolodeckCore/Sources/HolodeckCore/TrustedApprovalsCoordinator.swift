@@ -1692,13 +1692,13 @@ actor TrustedApprovalsCoordinator {
                         }
                         fresh = true
                     }
-                    let intents = envelope.revocations, observedAttempt = writeAttempt
+                    let intents = outstandingIntents, observedAttempt = writeAttempt
                     release(token)
                     try await target.retireUnacceptedRequests(intents, preparation: preparation)
                     let commit = await acquireProgress()
                     guard uninspectedTargets[serviceID]?.id == entry.id else { release(commit); await target.endUnacceptedTargetRetirement(preparation); return }
                     do { try requireCertainWrite() } catch { release(commit); throw error }
-                    if !loaded || envelope.revocations != intents || observedAttempt != writeAttempt {
+                    if !loaded || outstandingIntents != intents || observedAttempt != writeAttempt {
                         fresh = loaded && confirmedWriteAttempt == writeAttempt
                         release(commit); continue
                     }
@@ -2113,6 +2113,12 @@ actor TrustedApprovalsCoordinator {
             if let beforeRemovalFinalization { try await beforeRemovalFinalization(intent.operationID, key.service) }
             try await target.finalizeTrustedRevocation(proof, removal: removal)
             finalizedRemovals[intent.operationID, default: []].insert(key)
+        }
+        // Known targets may finish independently, but the committed removal is
+        // still cancellation evidence for proposals not yet inspected. Preserve
+        // their inventory and the finalized receipts until each is accounted for.
+        guard uninspectedTargets.isEmpty else {
+            throw Self.unavailable("A proposed request service still needs trusted approval inspection before retained TV cancellation evidence can retire.")
         }
         finalizedRemovals[intent.operationID] = nil
         required[intent.operationID] = nil; applications[intent.operationID] = nil; removals[intent.operationID] = nil; failures[intent.operationID] = nil
