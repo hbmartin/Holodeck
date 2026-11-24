@@ -221,7 +221,7 @@ import XCTest
         XCTAssertTrue(first.permit.isCurrent)
         let latest = try await authority.register(TrustedOwnerRecorder().owner(service: service))
         addTeardownBlock { latest.completion.cancel() }
-        try await wait { await authority.observation.preparingGeneration == latest.generation }
+        try await wait { await authority.observation.rawReadSubscribers == 1 }
         backend.gateReads(nil); gate.release()
         _ = try await accepted(latest)
         XCTAssertEqual(backend.reads, reads + 1)

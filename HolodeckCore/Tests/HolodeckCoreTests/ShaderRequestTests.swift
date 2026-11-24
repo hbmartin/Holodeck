@@ -5524,11 +5524,19 @@ extension ShaderRequestTests {
         let trusted = TrustedApprovalFixture(try JSONEncoder().encode([ApprovedTV(id: "A", name: "A", tokenHash: "A"), ApprovedTV(id: "B", name: "B", tokenHash: "B")]))
         let server = LocalCatalogServer(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), testingNamespace: "join", readApprovals: { trusted.read() }, writeApprovals: { try trusted.write($0) }, beforeRevocationReplay: { if $0.deviceID == "A" { try await gate.wait() } })
         await server.setRequestService(service)
-        let first = Task { try await server.revoke("A") }; try await waitFor { await gate.hasEntered }
+        let first = Task { try await server.revoke("A") }
+        addTeardownBlock { first.cancel(); await gate.release() }
+        try await waitFor { await gate.hasEntered }
         let second = Task { try await server.revoke("B") }
+        addTeardownBlock { second.cancel(); await gate.release() }
         try await waitFor { (trusted.read().flatMap { try? TrustedTVApprovals.decode($0) }?.revocations.count) == 2 }
         first.cancel()
-        do { try await first.value; XCTFail("Cancelled caller kept waiting") } catch is CancellationError {}
+        var outcome: Result<Void, Error>?
+        let probe = Task { outcome = await first.result }
+        addTeardownBlock { probe.cancel(); await gate.release() }
+        try await waitFor { outcome != nil }
+        guard case .failure(let error) = try XCTUnwrap(outcome) else { return XCTFail("Cancelled caller reported success") }
+        XCTAssertTrue(error is CancellationError)
         await gate.release(); try await second.value
         try await waitFor { trusted.read().flatMap { try? TrustedTVApprovals.decode($0) }?.revocations.isEmpty == true }
         let envelope = try TrustedTVApprovals.decode(XCTUnwrap(trusted.read())); XCTAssertTrue(envelope.approvals.isEmpty); XCTAssertTrue(envelope.revocations.isEmpty)

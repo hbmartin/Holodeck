@@ -169,7 +169,7 @@ import XCTest
         let (a, _) = try await fixture(), (b, _) = try await fixture()
         let backend = TrustedBackendFixture(nil), armed = BoundaryFailureSwitch()
         let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
-            beforeTargetInspection: { id in
+            beforeTargetActivation: { id in
                 if id == a.runtimeID && armed.armed { armed.armed = false; throw CancellationError() }
             })
         _ = try await accept(authority.register(TrustedOwnerRecorder().owner(service: b)))

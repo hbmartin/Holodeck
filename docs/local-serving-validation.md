@@ -1454,3 +1454,58 @@ A current-only contention fixture repeated 40 cancelled registrations behind one
 Local evidence: `/tmp/pr55-final-tests.json`, `/tmp/pr55-debug-races.json`, `/tmp/pr55-races.json`, `/tmp/pr55-app-results.json`, `/tmp/pr55-model-results.json`, `/tmp/pr55-profile-raw.json`, `/tmp/pr55-profile-summary.json`, `/tmp/pr55-final-source.json`, `/tmp/pr55-artifact-info.json`, and their matching log files. Acceptance totals exclude development runs and earlier policy/fixture assumptions corrected during integration.
 
 Desktop UI runtime checks remain **blocked by the existing instruction**. Physical Apple TV/tvOS simulator execution, live Bonjour/LAN and real Codex publication were not run. The six skips are the two opt-in catalog profiles, directory reload profile, live Bonjour, real Codex publication and the existing opt-in worker profile. Separate unchanged Python worker/checker suites, external library compile-all and standalone GPU profiles were not rerun. Existing Swift process, packaging, isolated TLS, headless model and local rendering coverage did run.
+
+
+## PR #55 follow-up — trusted outcomes and withdrawn-target cleanup (2026-11-23)
+
+### Correctness boundaries
+
+Base: merged PR #55, `8e576a5` (reviewed head `b52a52d`, identical tree). The follow-up adds post-write-attempt freshness to uncertain approval readback, atomically checks pending initial authority at installation, reports installed bindings as accepted despite later inspection failures, and prevents obsolete retry candidates from replacing newer bindings.
+
+A failed initial proposal retains exact service, authority, proposal generation and server lifetime. Withdrawal starts one shared background cleanup attempt; it does not reactivate the server or install a binding. Cleanup repairs local metadata, inspects current trusted facts, durably cancels affected requests, verifies retirement, and revalidates current obligations before releasing the retained target. Fresh facts also inspect accepted targets. Failed cleanup retains its original target and Retry Recovery route. Unrelated jobs remain intact. Committed removal receipts can finish exact finalization despite unrelated initial inspection failures; new removal admission remains blocked. A failed recovery save stops retirement mutations before another journal is reconciled.
+
+The regression gates now witness actual read/completion subscription and bounded cancellation results. A separate lone-subscriber test proves caller cancellation cannot abandon durable work. Exceptional committed-removal fixtures are injected invariant coverage, not a claim that every retained finalization state has a normal producer.
+
+### Acceptance results
+
+- Full Swift core/packaging suite: **661 tests, six expected skips, zero failures**, including opted-in local Metal/GPU fixtures.
+- Release trusted/transport/packaging selection: **219 tests, zero failures**.
+- Strict cooperative-executor repetitions: **20 × 24 Debug = 480** and **20 × 172 Release = 3,440**, all passing (3,920 repeated executions).
+- Headless actual Mac-model recovery check passed under Python **3.9.6** and **3.15.0**.
+- Both unsigned Release app builds passed. Neither app was installed or launched.
+- Existing rendering fixtures verified the eight test scenes and **25 local authoring scenes** at revision `8348af807717ea0e436208e957c333ec271e935380a9ea68b1db5aca56df13a5`. Packaged artifact-info remains checker **1.1.1**, interface **1**, source `58ed409e023b9b1ccbc08dcedd5b38c1090e14fc`, SHA-256 `8a8229c76e6e42d91d84fe9744bf53bbcda0c9dc8064ba82a41e2b15bb66ef19`.
+
+Commands:
+
+```sh
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer HOLODECK_AUTHORING_FIXTURE=/Volumes/Pro2T/HolodeckShaders HOLODECK_GPU_TESTS=1 swift test --package-path HolodeckCore --skip-update
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --package-path HolodeckCore --skip-update -c release --filter 'Trusted|ShaderLibraryToolTests|CatalogNetworkTests|LocalClientRecoveryTests'
+/usr/bin/python3 tools/check_mac_requests_recovery.py
+/opt/homebrew/bin/python3 tools/check_mac_requests_recovery.py
+```
+
+App builds used `xcodebuild -project Holodeck.xcodeproj -configuration Release`, isolated DerivedData `/tmp/HolodeckPR56Validation`, `-disableAutomaticPackageResolution CODE_SIGNING_ALLOWED=NO`, schemes `HolodeckMac` / `Holodeck`, destinations `platform=macOS` / `generic/platform=tvOS`, and literal setting `OTHER_CPLUSPLUSFLAGS=$(inherited) -isystem $(SDKROOT)/usr/include/c++/v1`.
+
+### Release measurements
+
+Seven alternating samples used the same filesystem, Apple Swift 6.4.2 and macOS 27.2 SDK. PR #55 optimized products were frozen before editing; standalone fixtures are identical across versions. Injected trusted backends and real temporary metadata measure coordination, not Keychain, Codex or GPU throughput. The revocation fixtures have idle services and empty request histories. Medians below are descriptive milliseconds; regression assertions cover structure and counts, without timing thresholds.
+
+| Workload | PR #55 ms | Follow-up ms | Follow-up reads / writes / encodings |
+|---|---:|---:|---:|
+| 200 sequential revocations | 72.460 | 74.010 | 1 / 400 / 400 |
+| 50 queued revocations | 123.761 | 121.103 | 2 / 100 / 100 |
+| 100 queued revocations | 276.649 | 252.556 | 2 / 200 / 200 |
+| 200 queued revocations | 574.635 | 566.198 | 2 / 400 / 400 |
+| 100 intent-free recoveries | 40.490 | 40.057 | 100 / 0 / 0 |
+| 100 late-recovery pairs | 273.761 | 274.324 | 200 / 100 / 100 |
+| 200 same-authority registrations | 15.768 | 16.977 | 200 / 0 / 0 |
+
+Reads/writes/encodings match the baseline for every listed workload. Queued workloads retain linear admission bookkeeping: at 50 / 100 / 200 revocations, resumes are 351 / 701 / 1401 and advances 604 / 1204 / 2404, with 100 / 200 / 400 target applications and zero remaining obligations. Setup approval writes are excluded from the queued counts. Normal revoke/removal still uses exactly two trusted writes and encodings.
+
+A current-only cleanup profile repeatedly failed and withdrew 20 initial proposals: median **129.894 ms**, **40 reads, zero trusted writes/encodings**, and zero final retained targets, cleanup tasks, obligations, pins or authority-retention requests across seven samples. This is new cleanup-path coverage, not a baseline latency comparison. The cancelled-registration contention fixture also retains its one raw read, zero encodings/writes and zero final subscribers.
+
+### Evidence and limits
+
+Local evidence: `/tmp/pr56-final-tests.json`, `/tmp/pr56-debug-races.json`, `/tmp/pr56-races.json`, `/tmp/pr56-app-results.json`, `/tmp/pr56-model-results.json`, `/tmp/pr56-profile-raw.json`, `/tmp/pr56-profile-summary.json`, `/tmp/pr56-cleanup-results.json`, `/tmp/pr56-final-source.json`, `/tmp/pr56-artifact-info.json`, and matching logs. Final checks verify the frozen source hashes; totals exclude development runs and the old test expectation moved to pre-admission cancellation.
+
+Desktop UI runtime checks remain **blocked by instruction**. Physical Apple TV/tvOS simulator runtime, live Bonjour/LAN and real Codex publication were not run. The six expected skips are the two catalog profiles, directory reload profile, live Bonjour, real Codex publication and opt-in worker idle-CPU profile. Separate unchanged Python worker/checker suites, external library compile-all and standalone GPU profiles were not rerun. Swift process/packaging, isolated TLS, headless Mac-model and local rendering coverage did run. Linux CI, checker artifacts/locks, public protocols and persisted formats are unchanged. No live installation, request enablement, merge or deployment was performed.
