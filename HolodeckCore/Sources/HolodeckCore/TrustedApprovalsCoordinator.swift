@@ -466,6 +466,7 @@ actor TrustedApprovalsCoordinator {
         await notify()
     }
     private var replayTask: Task<Void, Never>?
+    private var replayNeedsRescan = false
     private enum RecoveryPassState { case collecting, sealed, replaying, finishing, finished }
     private struct RecoveryParticipant {
         let requester: UUID
@@ -759,7 +760,10 @@ actor TrustedApprovalsCoordinator {
                 admitActivation: admitActivation, intents: outstandingIntents.filter { finalizedRemovals[$0.operationID]?.contains(key) != true }, revision: revision)
             inspection = .init(registrationID: registration)
         }
-        if let retired = uninspectedTargets.removeValue(forKey: serviceID) { clearDiagnostic(.cleanup(retired.id)) }
+        if let retired = uninspectedTargets.removeValue(forKey: serviceID) {
+            clearDiagnostic(.cleanup(retired.id))
+            if replayTask != nil { replayNeedsRescan = true }
+        }
         if let afterTargetActivation { await afterTargetActivation(serviceID) }
         let previous = targets.keys.filter { $0.service == serviceID && $0 != key }
         for old in previous {
@@ -1728,6 +1732,7 @@ actor TrustedApprovalsCoordinator {
                     do { try await target.completeUnacceptedTargetRetirement(preparation) }
                     catch { release(commit); throw error }
                     uninspectedTargets[serviceID] = nil
+                    if replayTask != nil { replayNeedsRescan = true }
                     release(commit)
                     // Other targets may already have applied the retained intent.
                     // Their replay owns any remaining failure independently.
@@ -2193,6 +2198,11 @@ actor TrustedApprovalsCoordinator {
                 }
             }
             guard let (intent, key, target, epoch) = work else {
+                if replayNeedsRescan {
+                    replayNeedsRescan = false
+                    removalAttempted.removeAll()
+                    release(token); continue
+                }
                 let remaining = Set(envelope.revocations.map(\.operationID)).union(removals.keys)
                 failed = failed.filter { remaining.contains($0.key) }
                 // A successful target cannot erase another target's unresolved application.
@@ -2271,7 +2281,7 @@ actor TrustedApprovalsCoordinator {
         return true
     }
     private func finishReplay(_ failed: [UUID: Failure]) {
-        replayTask = nil
+        replayTask = nil; replayNeedsRescan = false
         let departures = departureReplay; departureReplay.removeAll()
         for (serviceID, waiting) in departures {
             let error = departureFailure(serviceID: serviceID)

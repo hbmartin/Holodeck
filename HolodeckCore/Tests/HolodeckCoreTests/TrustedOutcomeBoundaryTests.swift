@@ -54,13 +54,36 @@ private final class OutcomeBackend: @unchecked Sendable {
             try await Task.sleep(for: .milliseconds(3))
         }
     }
+    private struct RegistrationObservation {
+        let ticket: RequestPersistence.CommitTicket<TrustedApprovalsCoordinator.BindingOutcome>
+        let result: OutcomeResult<TrustedApprovalsCoordinator.BindingOutcome>
+        let relay: Task<Void, Never>
+    }
+    private var registrationObservations: [ObjectIdentifier: RegistrationObservation] = [:]
+    override func tearDown() async throws {
+        // XCTest runs gate-release teardown blocks first. One owner cancellation
+        // per ticket then drains its sole relay; observers never cancel owners.
+        for value in registrationObservations.values { value.ticket.cancel(); value.relay.cancel() }
+        try await wait { self.registrationObservations.values.allSatisfy { $0.result.value != nil } }
+        registrationObservations.removeAll()
+        try await super.tearDown()
+    }
     func accepted(_ ticket: TrustedApprovalsCoordinator.Registration, timeout: Duration = .seconds(8)) async throws -> TrustedApprovalsCoordinator.Binding {
-        let result = OutcomeResult<TrustedApprovalsCoordinator.BindingOutcome>()
-        let probe = Task { do { result.value = .success(try await ticket.value()) } catch { result.value = .failure(error) } }
-        addTeardownBlock { ticket.completion.cancel(); probe.cancel() }
-        defer { probe.cancel() }
-        // An independent probe can time out without joining an admitted owner.
+        let key = ObjectIdentifier(ticket.completion)
+        let result: OutcomeResult<TrustedApprovalsCoordinator.BindingOutcome>
+        if let observation = registrationObservations[key] { result = observation.result }
+        else {
+            result = OutcomeResult()
+            let relay = Task {
+                do { result.value = .success(try await ticket.completion.value(cancellable: false)) }
+                catch { result.value = .failure(error) }
+            }
+            registrationObservations[key] = .init(ticket: ticket.completion, result: result, relay: relay)
+        }
+        // Repeated/concurrent observers share the one completion subscription.
+        // Poll cancellation and timeout affect only this caller's observation.
         try await wait(timeout: timeout) { result.value != nil }
+        try Task.checkCancellation()
         guard case .accepted(let binding) = try XCTUnwrap(result.value).get() else { throw ShaderRequestError.invalidRequest }
         return binding
     }
@@ -1135,6 +1158,64 @@ private final class OutcomeBackend: @unchecked Sendable {
         let closed = TrustedApprovalEligibility(recovered: { callbacks.add($0.uuidString) })
         try closed.beginWrite(); closed.close(); await closed.recoveredWithoutDelivery()
         XCTAssertEqual(callbacks.count, 1)
+    }
+
+    func testPreAdmissionObservationTimeoutCannotCancelRegistration() async throws {
+        let f = try await fixture(), gate = RecoveryGate()
+        addTeardownBlock { await gate.release() }
+        let authority = TrustedApprovalsCoordinator(read: { nil }, write: { _ in }, beforeTargetActivation: { _ in try await gate.wait() })
+        let ticket = try await authority.register(TrustedOwnerRecorder().owner(service: f.service))
+        addTeardownBlock { ticket.completion.cancel(); await gate.release() }
+        try await wait { await gate.hasEntered }
+        do { _ = try await accepted(ticket, timeout: .milliseconds(20)); XCTFail("Held registration completed") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("Outcome boundary backstop")) }
+        XCTAssertFalse(ticket.completion.hasStarted)
+        let cancelled = Task { try await self.accepted(ticket) }
+        await Task.yield(); cancelled.cancel()
+        do { _ = try await cancelled.value; XCTFail("Observer ignored cancellation") } catch is CancellationError {}
+        let first = Task { try await self.accepted(ticket) }, second = Task { try await self.accepted(ticket) }
+        addTeardownBlock { first.cancel(); second.cancel(); await gate.release() }
+        await gate.release()
+        let a = try await first.value, b = try await second.value
+        XCTAssertTrue(a.permit === b.permit); XCTAssertTrue(a.permit.isCurrent)
+        XCTAssertEqual(registrationObservations.count, 1)
+    }
+
+    func testCleanupCompletionRescansAnAlreadyAttemptedRemoval() async throws {
+        let read = OutcomeSwitch(), armWrite = OutcomeSwitch(), write = TrustedReadGate(), publication = RecoveryGate()
+        let a = try await fixture(beforeWrite: { url in if url.lastPathComponent == "journal.json", armWrite.take() { write.wait() } }), b = try await fixture()
+        addTeardownBlock { write.release(); await publication.release(); XCTAssertFalse(write.timedOut, "Writer barrier expired instead of being released") }
+        _ = try await submit(a.service); let job = try await submit(b.service)
+        let backend = OutcomeBackend(), server = UUID()
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) },
+            beforeInspectionRead: { if read.take() { armWrite.on = true } })
+        let owner = TrustedApprovalsCoordinator.Owner(serverID: server, service: b.service, changed: { snapshot, _ in
+            if snapshot.diagnostic?.contains("proposed request service") == true { try? await publication.wait() }
+        }, retired: {}, beforeReplay: { _ in })
+        _ = try await accepted(authority.register(owner))
+        backend.failReads(true); let proposal = TrustedOwnerRecorder().owner(service: a.service)
+        do { _ = try await accepted(authority.register(proposal)); XCTFail("Failed inspection accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EACCES).localizedDescription)) }
+        backend.failReads(false)
+        try backend.write(TrustedTVApprovals(revocations: [.init(operationID: UUID(), deviceID: "TV")]).encoded())
+        read.on = true; proposal.eligibility.invalidate()
+        await authority.withdraw(serverID: proposal.serverID, eligibility: proposal.eligibility)
+        try await wait { let notified = await publication.hasEntered; return write.entered && notified }
+        print("Rescan regression: writer and rejection notification witnessed")
+        // The old replay has rejected removal but still owns its notification.
+        // Let cleanup queue its exact completion before releasing that lane.
+        write.release()
+        try await wait { await authority.observation.progressWaiters > 0 }
+        print("Rescan regression: cleanup completion queued")
+        await publication.release()
+        try await wait {
+            let state = await authority.observation
+            return state.uninspectedTargets == 0 && state.uninspectedCleanupTasks == 0 && state.obligations == 0
+        }
+        let jobs = await b.service.allJobs()
+        XCTAssertEqual(jobs.first { $0.id == job }?.stage, .cancelled)
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.bytes)).revocations.isEmpty)
+        XCTAssertEqual(backend.writes, 2) // One fixture-side insertion and one removal.
     }
 
 }

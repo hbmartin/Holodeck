@@ -1625,3 +1625,57 @@ These are path/retention checks, not baseline latency claims. Cancelled-registra
 Local evidence: `/tmp/pr58-final-source.json`, `/tmp/pr58-app-source.json`, `/tmp/pr58-final-tests.json`, `/tmp/pr58-debug-races.json`, `/tmp/pr58-races.json`, `/tmp/pr58-inflight-races.json`, `/tmp/pr58-app-results.json`, `/tmp/pr58-model-results.json`, `/tmp/pr58-profile-raw.json`, `/tmp/pr58-profile-summary.json`, `/tmp/pr58-replacement-results.json`, `/tmp/pr58-cleanup-results.json`, `/tmp/pr58-write-error-results.json`, `/tmp/pr58-artifact-info.json`, and matching logs. Final checks verify frozen source hashes. Incomplete development selections with buffered output are excluded; final runs use unbuffered logs and process deadlines. The existing gated-submission case passed frozen-baseline/current isolation, the full acceptance suite and twenty final repetitions; no separate production defect is asserted from the incomplete runs.
 
 Desktop UI runtime checks remain **blocked by instruction**. Physical Apple TV/tvOS simulator runtime, live Bonjour/LAN and real Codex publication were not run. Six expected skips cover two catalog profiles, directory reload profile, live Bonjour, real Codex publication and the opt-in worker idle-CPU profile. Separate unchanged Python worker/checker suites, external library compile-all and standalone GPU profiles were not rerun. Swift process/packaging, isolated TLS, headless Mac-model and local rendering coverage did run. Linux CI, checker artifacts/locks, public protocols, persisted formats and supervision policy are unchanged. No live installation, request enablement, merge or deployment was performed.
+
+
+## PR #58 follow-up — retained cancellations and recovery completion (2026-11-24)
+
+### Correctness boundaries
+
+Base: merged PR #58, `316e894` (reviewed head `8719850`). A committed trusted removal remains cancellation evidence until every retained uninspected or withdrawn proposal is accounted for. Known targets can finish their own cancellation/fence independently, while exact finalization receipts prevent repeated finalization. Late registration and withdrawn cleanup both consume `outstandingIntents`; an already-committed removal is not rewritten.
+
+Unrelated withdrawn cleanup runs under its own durable owner, outside another caller's recovery result. Explicit participants and actual shared removal dependencies still wait/report partial recovery. Fresh inspection schedules eligible replay even if local cleanup fails. Completing cleanup or registration coalesces one removal rescan, including a removal already attempted by the active drain. A gated regression witnesses rejection notification and queued cleanup completion before release; writer-barrier expiry fails the test rather than making it pass.
+
+Live failed cross-authority proposals remain retryable without replacing the accepted source route prematurely. Withdrawn retirement is awaited outside authority lanes before a different authority is rejected; generations/cancellation are rechecked. Withdrawn cleanup, failed live registration and an unbound service needing a server now have distinct recovery guidance. Superseded and withdrawn owners cannot reactivate through retry.
+
+Uncertainty short-circuits replay before per-intent failure accounting, and replay callers preserve the initiating write diagnostic identity. Cancelled reads retain uncertainty without recording cancellation as storage failure. The selected presentation policy clears settled write history after successful trusted writes/verified recovery; unresolved diagnostics retain priority. Discarded successor attempts no longer defeat the eight-entry history bound.
+
+Confirmed but undelivered approval recovery closes only its exact live pairing session and keeps the saved credential. A separate local pair-again message survives settled trusted-history clearing; real TLS coverage verifies a new pairing and token delivery. Registration test observers share one noncancelling completion relay per ticket; timeouts and independently cancelled observations cannot cancel or overwrite the registration subscription. Teardown releases gates and drains owners with bounded backstops.
+
+### Manual trusted-storage conflicts
+
+Retry Recovery resolves an uncertain write only when storage matches its recorded predecessor or candidate. Fix unreadable storage access first. If bytes match neither state, preserve the trusted record and request journals for explicit manual repair; restore an exact recorded state only through authorized trusted-storage maintenance, then retry verification. Do not delete the record, adopt unfamiliar bytes automatically or treat relaunch as proof of cancellation/settlement. This change adds no adoption action or persisted handoff log.
+
+### Acceptance results
+
+- Full Swift core/packaging: **697 tests, six expected skips, zero failures**, including existing opted-in local Metal/GPU fixtures.
+- Focused Release trusted/transport/packaging selection: **255 tests, zero failures**.
+- Strict-executor repetitions: **20 × 59 Debug = 1,180**, **20 × 208 Release = 4,160**, all passing (**5,340 repeated executions**). Isolated TLS/transport: **3 × 39**, all passing.
+- Headless actual Mac-model recovery checks passed under Python 3.9.6 and 3.15.0. Both unsigned Release app builds passed in `/tmp/HolodeckPR59Validation`; neither app was installed or launched.
+- Existing rendering tests verified eight test scenes and 25 local authoring scenes at `8348af807717ea0e436208e957c333ec271e935380a9ea68b1db5aca56df13a5`. The packaged native tool reports checksum-verified checker 1.1.1/interface 1, source `58ed409e023b9b1ccbc08dcedd5b38c1090e14fc`, SHA-256 `8a8229c76e6e42d91d84fe9744bf53bbcda0c9dc8064ba82a41e2b15bb66ef19`.
+
+Commands retain the prior full-suite invocation with `HOLODECK_AUTHORING_FIXTURE=/Volumes/Pro2T/HolodeckShaders HOLODECK_GPU_TESTS=1`, the Release filter `Trusted|ShaderLibraryToolTests|CatalogNetworkTests|LocalClientRecoveryTests`, and both interpreter invocations of `tools/check_mac_requests_recovery.py`. App builds use isolated DerivedData, `CODE_SIGNING_ALLOWED=NO`, macOS/tvOS destinations and the existing literal C++ SDK include setting.
+
+### Paired Release measurements
+
+Seven alternating samples compare frozen PR #58 products and final products on the same filesystem, Apple Swift 6.4.2/macOS 27.2 SDK, with identical standalone workloads. Injected trusted storage and temporary real metadata measure coordination rather than Keychain, Codex or GPU throughput. Medians are descriptive milliseconds; structural assertions impose no CI timing thresholds.
+
+| Workload | PR #58 ms | Follow-up ms | Follow-up reads / writes / encodings |
+|---|---:|---:|---:|
+| 200 sequential revocations | 79.650 | 80.437 | 1 / 400 / 400 |
+| 50 queued revocations | 117.927 | 118.844 | 2 / 100 / 100 |
+| 100 queued revocations | 252.582 | 255.868 | 2 / 200 / 200 |
+| 200 queued revocations | 575.524 | 567.927 | 2 / 400 / 400 |
+| 100 intent-free recoveries | 46.668 | 47.326 | 100 / 0 / 0 |
+| 100 late-recovery pairs | 278.828 | 272.528 | 200 / 100 / 100 |
+| 200 same-authority registrations | 17.265 | 18.260 | 200 / 0 / 0 |
+| 20 failed-cleanup/replacement/recovery cycles | 187.925 | 199.478 | 81 / 0 / 0 |
+| 20 failed and withdrawn proposals | 137.906 | 142.046 | 40 / 0 / 0 |
+| 50 commit-then-error revocations | 13.984 | 16.363 | 101 / 100 / 100 |
+
+All listed read/write/encoding counts match the baseline. Normal revoke/removal retains two writes/encodings, without another backend read. Queued 50/100/200 workloads retain linear admission bookkeeping and zero final obligations. Cleanup profiles release obsolete entries, tasks and recovery pins; failed-write profiles retain one readback per admitted failed write and no final uncertainty. Cancelled-registration contention remains bounded to one raw read and zero encodings/writes/final subscribers.
+
+### Evidence and limits
+
+Local receipts: `/tmp/pr59-final-tests.json`, `/tmp/pr59-model-results.json`, `/tmp/pr59-app-results.json`, `/tmp/pr59-debug-races.json`, `/tmp/pr59-races.json`, `/tmp/pr59-tls-results.json`, `/tmp/pr59-profile-raw.json`, `/tmp/pr59-profile-summary.json`, `/tmp/pr59-extra-profile-raw.json`, `/tmp/pr59-extra-profile-summary.json`, `/tmp/pr59-artifact-info.json`, and source-hash inventories `/tmp/pr59-final-source.json` / `/tmp/pr59-app-source.json`. Original removal regressions failed before their fixes. Repetition exposed the missed rescan, then `/tmp/pr59-rescan-witness.log` reproduced it with both gates witnessed. Superseded/interrupted development acceptance results are retained separately in `/tmp/pr59-development` and are excluded from final totals.
+
+Desktop UI runtime checks remain **blocked by instruction**. Physical Apple TV/tvOS simulator runtime, live Bonjour/LAN and real Codex publication were not run. Six expected skips cover two catalog profiles, directory reload profile, live Bonjour, real Codex publication and the opt-in worker idle-CPU profile. Separate unchanged Python worker/checker suites, external library compile-all and standalone GPU profiles were not rerun; Swift process/packaging, isolated TLS, headless Mac-model and existing local rendering fixtures did run. Linux CI, checker artifacts/locks, network messages, persisted formats and supervision policy are unchanged. No live installation, request enablement, merge or deployment was performed.

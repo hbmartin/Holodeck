@@ -29,13 +29,14 @@ final class TrustedBackendFixture: @unchecked Sendable {
 }
 final class TrustedReadGate: @unchecked Sendable {
     private let condition = NSCondition()
-    private var open = false, reached = false
+    private var open = false, reached = false, expired = false
+    var timedOut: Bool { condition.lock(); defer { condition.unlock() }; return expired }
     var entered: Bool { condition.lock(); defer { condition.unlock() }; return reached }
     func wait() {
         condition.lock(); defer { condition.unlock() }
         reached = true
         let limit = Date().addingTimeInterval(8)
-        while !open { if !condition.wait(until: limit) { return } }
+        while !open { if !condition.wait(until: limit) { expired = true; return } }
     }
     func release() { condition.lock(); open = true; condition.broadcast(); condition.unlock() }
 }
