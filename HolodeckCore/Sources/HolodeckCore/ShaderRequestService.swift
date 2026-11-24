@@ -3293,6 +3293,9 @@ public actor ShaderRequestService {
         startRetirementDrain(recoveryToken: recoveryToken)
         if let active = retirementTask { try await active.value }
     }
+    private func requireRetirementStorage() throws {
+        if let persistenceFailure { throw persistenceFault as Error? ?? MetadataUnavailable(message: persistenceFailure) }
+    }
     private func drainPendingWorkers(recoveryToken: RequestPersistence.RecoveryToken?) async throws {
         try admitMetadataMutation()
         var parked: [UUID: UUID] = [:], diagnostics: [UUID: String] = [:]
@@ -3313,6 +3316,7 @@ public actor ShaderRequestService {
                     catch {
                         if Self.isMetadataBlocker(error) { throw error }
                         await holdForRecovery(journal: job, configuration: records[id]?.configuration, error: error)
+                        try requireRetirementStorage()
                         parked[id] = operation; diagnostics[id] = error.localizedDescription
                         continue
                     }
@@ -3329,6 +3333,7 @@ public actor ShaderRequestService {
                     if Self.isMetadataBlocker(error) { throw error }
                     let detail = "Cannot retire active marker at " + marker.path + ": " + error.localizedDescription
                     await holdForRecovery(journal: job, configuration: records[id]?.configuration, error: RequestWorkerEvidenceError(cause: detail))
+                    try requireRetirementStorage()
                     parked[id] = operation; diagnostics[id] = detail
                     continue
                 }

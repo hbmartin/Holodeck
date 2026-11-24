@@ -248,6 +248,72 @@ private final class OutcomeBackend: @unchecked Sendable {
         XCTAssertEqual(after.acceptedGeneration, replacement.generation)
     }
 
+    func testCommittedRemovalFinalizesDespiteUnrelatedUninspectedProposal() async throws {
+        let a = try await fixture(), b = try await fixture(), job = try await submit(a.service), fail = OutcomeSwitch()
+        let backend = OutcomeBackend(try TrustedTVApprovals(revocations: [.init(operationID: UUID(), deviceID: "TV")]).encoded())
+        fail.on = true
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) }, beforeRemovalFinalization: { _, _ in
+            if fail.on { throw POSIXError(.EIO) }
+        })
+        _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: a.service)))
+        // Inject exact committed-removal recovery evidence; no normal producer
+        // of every exceptional finalization state is claimed by this fixture.
+        do { try await authority.replay(); XCTFail("Finalization failure ignored") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.bytes)).revocations.isEmpty)
+        XCTAssertEqual(backend.writes, 1)
+        backend.failReads(true)
+        do { _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: b.service))); XCTFail("Failed inspection accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EACCES).localizedDescription)) }
+        backend.failReads(false); fail.on = false
+        try await authority.replay()
+        let state = await authority.observation, jobs = await a.service.allJobs()
+        XCTAssertEqual(state.obligations, 0); XCTAssertEqual(state.uninspectedTargets, 1)
+        XCTAssertEqual(jobs.first { $0.id == job }?.stage, .cancelled)
+        XCTAssertEqual(backend.writes, 1) // Finalization consumes the original receipt; no second write.
+        _ = try await submit(a.service)
+    }
+    func testRecoverySaveFaultStopsRetirementBeforeNextJournalAndRetryDrainsIt() async throws {
+        let seed = try await fixture(), first = try await submit(seed.service, device: "A"), second = try await submit(seed.service, device: "B")
+        let journal = seed.root.appendingPathComponent("journal.json"), marker = seed.root.appendingPathComponent("active.json")
+        var rows = try JSONSerialization.jsonObject(with: Data(contentsOf: journal)) as! [[String: Any]]
+        for index in rows.indices {
+            let operation = UUID()
+            rows[index]["executionID"] = operation.uuidString
+            rows[index]["dispatch"] = ["executionID": operation.uuidString, "priorStage": "queued", "launched": false, "retirementPending": true]
+        }
+        try JSONSerialization.data(withJSONObject: rows).write(to: journal)
+        try JSONEncoder().encode(second).write(to: marker)
+        let observed = OutcomePaths(), fail = OutcomeSwitch()
+        let service = ShaderRequestService(catalog: DirectoryCatalog(directory: seed.root.appendingPathComponent("catalog")), directory: seed.root,
+            workerScript: seed.root.appendingPathComponent("unused.py"), reconcileWorker: { path in
+                observed.add(path.lastPathComponent)
+                if observed.count == 1 { fail.on = true; throw RequestWorkerEvidenceError(cause: "Original retirement observation failure") }
+            }, beforePersistenceReplacement: { path in
+                if path.lastPathComponent == "recovery.json" && fail.on { throw POSIXError(.EIO) }
+            })
+        addTeardownBlock { await service.suspend() }
+        await service.suspend(); try await service.initialize(configuration: .init(repository: seed.root.path, enabled: true))
+        XCTAssertEqual(observed.count, 1)
+        XCTAssertTrue(RequestProcessIdentity.evidenceExists(marker))
+        let blockers = await service.recoveryStatuses()
+        XCTAssertTrue(blockers.contains { $0.message.contains("Original retirement observation failure") })
+        XCTAssertTrue(blockers.contains { $0.message.contains(POSIXError(.EIO).localizedDescription) })
+        fail.on = false; try await service.retryReconciliation()
+        XCTAssertGreaterThanOrEqual(observed.count, 3)
+        XCTAssertFalse(RequestProcessIdentity.evidenceExists(marker))
+        let saved = try JSONSerialization.jsonObject(with: Data(contentsOf: journal)) as! [[String: Any]]
+        for id in [first, second] {
+            let row = try XCTUnwrap(saved.first { ($0["status"] as? [String: Any])?["id"] as? String == id.uuidString })
+            XCTAssertNil(row["dispatch"])
+        }
+    }
+
+}
+private final class OutcomePaths: @unchecked Sendable {
+    private let lock = NSLock(); private var values: [String] = []
+    func add(_ value: String) { lock.withLock { values.append(value) } }
+    var count: Int { lock.withLock { values.count } }
 }
 private final class OutcomeSwitch: @unchecked Sendable {
     private let lock = NSLock(); private var value = false

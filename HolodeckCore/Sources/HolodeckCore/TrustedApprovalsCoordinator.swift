@@ -1832,7 +1832,7 @@ actor TrustedApprovalsCoordinator {
             diagnostic: BoundedDiagnostics.bounded(diagnostic, bytes: 8192))
     }
     private func acknowledgeIfReady(_ intent: RequestRevocationIntent) async throws -> Bool {
-        guard uninspectedTargets.isEmpty else {
+        guard removals[intent.operationID] != nil || uninspectedTargets.isEmpty else {
             throw Self.unavailable("A proposed request service still needs trusted approval inspection: " + uninspectedTargets.keys.map(\.uuidString).sorted().prefix(8).joined(separator: ", ") + ". Explicitly register that service before removing retained TV cancellation evidence.")
         }
         guard !failedRemovalWrites.contains(intent.operationID), let needed = required[intent.operationID], !needed.isEmpty else { return false }
