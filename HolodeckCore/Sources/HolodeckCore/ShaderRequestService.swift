@@ -738,24 +738,29 @@ public actor ShaderRequestService {
     var localRecoveryPhaseCount: UInt64 { localRecoveryGeneration }
     private var trustedRecoveryHolds: Set<UUID> = []
     private struct FailedRegistrationRecovery {
-        let generation: UInt64
-        let server: UUID
-        let lifetime: TrustedOwnerLifetime
+        let identity: TrustedFailedRegistration
         let message: String
         let recover: @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion
     }
     private var failedRegistrationRecoveries: [UUID: FailedRegistrationRecovery] = [:]
-    func rememberFailedRegistration(authority: UUID, generation: UInt64, server: UUID, lifetime: TrustedOwnerLifetime, error: Error,
+    private var ordinaryRecoveryAuthority: UUID? { revocationCoordinatorID ?? pendingTrustedAuthority }
+
+    func rememberFailedRegistration(_ identity: TrustedFailedRegistration, error: Error,
         recover: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) {
-        guard lifetime.isCurrent else { return }
-        failedRegistrationRecoveries[authority] = .init(generation: generation, server: server, lifetime: lifetime,
-            message: BoundedDiagnostics.bounded("TV server registration requires recovery: " + error.localizedDescription, bytes: 8192), recover: recover)
+        let authority = identity.authority
+        guard authority != ordinaryRecoveryAuthority,
+              !(failedRegistrationRecoveries[authority].map { $0.identity.generation > identity.generation } ?? false) else { return }
+        let message = BoundedDiagnostics.bounded("TV server registration requires recovery: " + error.localizedDescription, bytes: 8192)
+        guard identity.whileCurrent({
+            failedRegistrationRecoveries[authority] = .init(identity: identity, message: message, recover: recover)
+        }) != nil else { return }
         emitUpdates()
     }
-    func forgetFailedRegistration(authority: UUID, server: UUID, lifetime: TrustedOwnerLifetime, maxGeneration: UInt64 = .max) {
-        guard let pending = failedRegistrationRecoveries[authority], pending.server == server, pending.lifetime === lifetime,
-              pending.generation <= maxGeneration else { return }
-        failedRegistrationRecoveries[authority] = nil; emitUpdates()
+
+    func forgetFailedRegistration(_ identity: TrustedFailedRegistration) {
+        guard failedRegistrationRecoveries[identity.authority]?.identity === identity else { return }
+        failedRegistrationRecoveries[identity.authority] = nil
+        emitUpdates()
     }
     private var authorityRecoveryEndpoints: [UUID: TrustedAuthorityRecoveryEndpoint] = [:]
     func trustedRecoveryJournal() -> URL { directory }
@@ -863,14 +868,19 @@ public actor ShaderRequestService {
     func hasConflictingTrustedPreparation(authority: UUID) -> Bool {
         pendingTrustedAuthority.map { $0 != authority } ?? false
     }
-    @discardableResult func failedTrustedRegistration(_ error: Error, authority: UUID,
+    @discardableResult func failedTrustedRegistration(_ error: Error, authority: UUID, proposal: TrustedFailedRegistration? = nil,
         recovery: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) -> Bool {
         guard pendingTrustedAuthority == nil || pendingTrustedAuthority == authority,
               revocationCoordinatorID == nil || (trustedAuthority?.id == authority && revocationCoordinatorID != authority) else { return false }
         // Recovery routing is provisional; it grants no registration or request
         // authorization and local repair remains unbound until activation.
-        pendingTrustedAuthority = authority
-        revocationCoordinator = recovery
+        let claim = {
+            self.pendingTrustedAuthority = authority
+            self.revocationCoordinator = recovery
+        }
+        if let proposal {
+            guard proposal.whileCurrent(claim) != nil else { return false }
+        } else { claim() }
         revocationReplayFailed(ShaderRequestError.unavailable("Trusted TV approval inspection requires recovery: " + error.localizedDescription))
         return true
     }
@@ -1593,7 +1603,7 @@ public actor ShaderRequestService {
             statuses.append(.init(id: endpoint.ticketID, kind: .persistence, repository: "", python: "", git: "",
                 message: endpoint.message, isRunning: localRecoveryAttempt != nil, journal: endpoint.journal))
         }
-        for (authority, pending) in failedRegistrationRecoveries where pending.lifetime.isCurrent {
+        for (authority, pending) in failedRegistrationRecoveries where pending.identity.isCurrent {
             statuses.append(.init(id: authority, kind: .persistence, repository: "", python: "", git: "",
                 message: pending.message, isRunning: localRecoveryAttempt != nil, journal: directory, blocksCheckoutWork: false))
         }
@@ -1996,7 +2006,8 @@ public actor ShaderRequestService {
         try Task.checkCancellation()
         let hasTrustedPhase = replayTrusted && revocationCoordinator != nil
         var failures: [String] = [], completed: Set<UUID> = !hasTrustedPhase && local.completed ? [runtimeID] : []
-        let hasIndependentPhase = replayTrusted && (revocationCoordinator != nil || authorityRecoveryEndpoints.values.contains(where: \.isCurrent) || failedRegistrationRecoveries.values.contains(where: { $0.lifetime.isCurrent }))
+        let hasIndependentPhase = replayTrusted && (revocationCoordinator != nil || authorityRecoveryEndpoints.values.contains(where: \.isCurrent) || failedRegistrationRecoveries.values.contains(where: { $0.identity.isCurrent }))
+        let recoveredAuthority = replayTrusted ? ordinaryRecoveryAuthority : nil
         if replayTrusted, let coordinator = revocationCoordinator {
             do { completed.formUnion(try await coordinator(local).completedServices) }
             catch {
@@ -2025,10 +2036,10 @@ public actor ShaderRequestService {
             }
         }
         if replayTrusted {
-            for (authority, pending) in failedRegistrationRecoveries.sorted(by: { $0.key.uuidString < $1.key.uuidString }) where pending.lifetime.isCurrent {
+            for (authority, pending) in failedRegistrationRecoveries.sorted(by: { $0.key.uuidString < $1.key.uuidString }) where pending.identity.isCurrent {
                 try Task.checkCancellation()
-                guard failedRegistrationRecoveries[authority]?.lifetime === pending.lifetime,
-                      failedRegistrationRecoveries[authority]?.generation == pending.generation else { continue }
+                guard authority != recoveredAuthority, authority != ordinaryRecoveryAuthority,
+                      failedRegistrationRecoveries[authority]?.identity === pending.identity else { continue }
                 do { completed.formUnion(try await pending.recover(local).completedServices) }
                 catch {
                     try Task.checkCancellation()

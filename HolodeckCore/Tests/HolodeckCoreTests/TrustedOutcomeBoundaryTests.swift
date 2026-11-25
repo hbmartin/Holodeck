@@ -1474,15 +1474,67 @@ private final class OutcomeBackend: @unchecked Sendable {
 
     func testDelayedFailedRegistrationCleanupCannotClearNewerAttempt() async throws {
         let a = try await fixture(), authority = UUID(), server = UUID(), lifetime = TrustedOwnerLifetime()
-        await a.service.rememberFailedRegistration(authority: authority, generation: 1, server: server, lifetime: lifetime,
-            error: ShaderRequestError.unavailable("old attempt")) { _ in .init(completedServices: []) }
-        await a.service.rememberFailedRegistration(authority: authority, generation: 2, server: server, lifetime: lifetime,
-            error: ShaderRequestError.unavailable("new attempt")) { _ in .init(completedServices: []) }
-        await a.service.forgetFailedRegistration(authority: authority, server: server, lifetime: lifetime, maxGeneration: 1)
+        let first = TrustedFailedRegistration(authority: authority, generation: 1, server: server, lifetime: lifetime)
+        let second = TrustedFailedRegistration(authority: authority, generation: 2, server: server, lifetime: lifetime)
+        await a.service.rememberFailedRegistration(first, error: ShaderRequestError.unavailable("old attempt")) { _ in .init(completedServices: []) }
+        first.invalidate()
+        await a.service.rememberFailedRegistration(second, error: ShaderRequestError.unavailable("new attempt")) { _ in .init(completedServices: []) }
+        await a.service.forgetFailedRegistration(first)
+        await a.service.rememberFailedRegistration(first, error: ShaderRequestError.unavailable("late old attempt")) { _ in .init(completedServices: []) }
         let current = await a.service.recoveryStatuses()
         XCTAssertTrue(current.contains { $0.id == authority && $0.message.contains("new attempt") })
-        await a.service.forgetFailedRegistration(authority: authority, server: server, lifetime: lifetime, maxGeneration: 2)
-        let retired = await a.service.recoveryStatuses(); XCTAssertFalse(retired.contains { $0.id == authority })
+        await a.service.forgetFailedRegistration(second)
+        await a.service.rememberFailedRegistration(first, error: ShaderRequestError.unavailable("late old attempt")) { _ in .init(completedServices: []) }
+        let retired = await a.service.recoveryStatuses()
+        XCTAssertFalse(retired.contains { $0.id == authority })
+    }
+
+    func testFailureSuspendedBeforeRoutePublicationCannotRestoreSupersededRoute() async throws {
+        let a = try await fixture(), b = try await fixture(), destinationStore = OutcomeBackend(), publication = RecoveryGate()
+        addTeardownBlock { await publication.release() }
+        let source = TrustedApprovalsCoordinator(read: { nil }, write: { _ in })
+        let destination = TrustedApprovalsCoordinator(read: { try destinationStore.read() }, write: { try destinationStore.write($0) },
+            beforeFailedRegistrationRoute: { try? await publication.wait() })
+        let original = try await accepted(source.register(TrustedOwnerRecorder().owner(service: a.service)))
+        _ = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: b.service)))
+        destinationStore.failReads(true)
+        let failed = try await destination.register(TrustedOwnerRecorder().owner(service: a.service))
+        addTeardownBlock { failed.completion.cancel() }
+        try await wait { await publication.hasEntered }
+        destinationStore.failReads(false)
+        let replacement = try await destination.register(TrustedOwnerRecorder().owner(service: b.service))
+        addTeardownBlock { replacement.completion.cancel() }
+        await publication.release()
+        do { _ = try await accepted(failed); XCTFail("Failed registration accepted") }
+        catch let error as POSIXError { XCTAssertEqual(error.code, .EACCES) }
+        _ = try await accepted(replacement)
+        let statuses = await a.service.recoveryStatuses()
+        XCTAssertFalse(statuses.contains { $0.id == destination.id })
+        try await a.service.retryReconciliation()
+        let current = await destination.observation
+        XCTAssertEqual(current.requestedGeneration, replacement.generation)
+        XCTAssertTrue(original.permit.isCurrent)
+    }
+
+    func testSameAuthorityRetryAttemptsFailedRegistrationOnlyOnce() async throws {
+        let a = try await fixture(), backend = OutcomeBackend(), recorder = TrustedOwnerRecorder()
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) })
+        _ = try await accepted(authority.register(recorder.owner(service: a.service)))
+        backend.failReads(true)
+        do { _ = try await accepted(authority.register(recorder.owner(service: a.service))); XCTFail("Failed inspection accepted") }
+        catch let error as POSIXError { XCTAssertEqual(error.code, .EACCES) }
+        let before = await authority.observation, reads = backend.reads
+        do { try await a.service.retryReconciliation(); XCTFail("Failed retry reported success") }
+        catch let error as TrustedPartialRecovery {
+            XCTAssertEqual(error.remaining.filter { $0.hasPrefix("Registration:") }.count, 1)
+        }
+        let after = await authority.observation
+        XCTAssertEqual(after.requestedGeneration, before.requestedGeneration + 1)
+        XCTAssertEqual(backend.reads - reads, 2)
+        backend.failReads(false)
+        try await a.service.retryReconciliation()
+        let recovered = await authority.observation
+        XCTAssertEqual(recovered.requestedGeneration, after.requestedGeneration + 1)
     }
 
 }
