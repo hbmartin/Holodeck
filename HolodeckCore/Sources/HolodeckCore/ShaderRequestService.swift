@@ -739,20 +739,21 @@ public actor ShaderRequestService {
     private var trustedRecoveryHolds: Set<UUID> = []
     private struct FailedRegistrationRecovery {
         let identity: TrustedFailedRegistration
+        let departure: TrustedAuthorityRecoveryEndpoint?
         let message: String
         let recover: @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion
     }
     private var failedRegistrationRecoveries: [UUID: FailedRegistrationRecovery] = [:]
     private var ordinaryRecoveryAuthority: UUID? { revocationCoordinatorID ?? pendingTrustedAuthority }
 
-    func rememberFailedRegistration(_ identity: TrustedFailedRegistration, error: Error,
+    func rememberFailedRegistration(_ identity: TrustedFailedRegistration, error: Error, departure: TrustedAuthorityRecoveryEndpoint? = nil,
         recover: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) {
         let authority = identity.authority
-        guard authority != ordinaryRecoveryAuthority,
+        guard departure != nil || authority != ordinaryRecoveryAuthority,
               !(failedRegistrationRecoveries[authority].map { $0.identity.generation > identity.generation } ?? false) else { return }
         let message = BoundedDiagnostics.bounded("TV server registration requires recovery: " + error.localizedDescription, bytes: 8192)
         guard identity.whileCurrent({
-            failedRegistrationRecoveries[authority] = .init(identity: identity, message: message, recover: recover)
+            failedRegistrationRecoveries[authority] = .init(identity: identity, departure: departure, message: message, recover: recover)
         }) != nil else { return }
         emitUpdates()
     }
@@ -2026,17 +2027,22 @@ public actor ShaderRequestService {
            refreshed.receipt?.attemptID != local.receipt?.attemptID, validateTrustedRecovery(refreshed).completed {
             local = refreshed
         }
+        let independentRegistrations = failedRegistrationRecoveries.filter {
+            $0.key != recoveredAuthority && $0.key != ordinaryRecoveryAuthority && $0.value.identity.isCurrent
+        }.sorted { $0.key.uuidString < $1.key.uuidString }
+        let registrationDependencies = Set(independentRegistrations.compactMap { $0.value.departure?.ticketID })
         // These exact old-authority routes survive replacement of the ordinary
         // coordinator callback. Each owns only its retained departure evidence.
         if replayTrusted {
-            for endpoint in authorityRecoveryEndpoints.values.filter(\.isCurrent).sorted(by: { $0.ticketID.uuidString < $1.ticketID.uuidString }) {
+            for endpoint in authorityRecoveryEndpoints.values.filter(\.isCurrent).sorted(by: { $0.ticketID.uuidString < $1.ticketID.uuidString })
+                where !registrationDependencies.contains(endpoint.ticketID) {
                 try Task.checkCancellation()
                 do { try await endpoint.retry() }
                 catch { try Task.checkCancellation(); failures.append(error.localizedDescription) }
             }
         }
         if replayTrusted {
-            for (authority, pending) in failedRegistrationRecoveries.sorted(by: { $0.key.uuidString < $1.key.uuidString }) where pending.identity.isCurrent {
+            for (authority, pending) in independentRegistrations where pending.identity.isCurrent {
                 try Task.checkCancellation()
                 guard authority != recoveredAuthority, authority != ordinaryRecoveryAuthority,
                       failedRegistrationRecoveries[authority]?.identity === pending.identity else { continue }

@@ -24,10 +24,16 @@ nonisolated public struct TrustedRecoveryNotice: Identifiable, Equatable, Sendab
     public let deviceID: String?
     public let message: String
 }
+/// A retry action for this server's exact failed registration without a request service.
+nonisolated public struct LocalServerRegistrationRecovery: Identifiable, Sendable {
+    public let id: UUID
+    public let message: String
+}
 nonisolated public struct LocalServerState: Sendable {
     public var message = "Choose a shader folder to start sharing."
     public var trustedMessage: String?
     public var recoveryNotices: [TrustedRecoveryNotice] = []
+    public var registrationRecovery: LocalServerRegistrationRecovery?
     public var transportFailure: String?
     public var pending: [TVApproval] = []
     public var approved: [ApprovedTV] = []
@@ -101,6 +107,7 @@ public actor LocalCatalogServer {
     private enum RegistrationState: Equatable { case idle, pending(UUID), superseded }
     private var registrationState: RegistrationState = .idle
     private var registrationEligibility = TrustedOwnerLifetime()
+    private var failedServerRegistration: (identity: TrustedFailedRegistration, message: String)?
     private weak var proposedService: ShaderRequestService?
     private var serviceOwner: RequestServiceOwnerLease?
     private var ownerServiceID: UUID?
@@ -114,7 +121,29 @@ public actor LocalCatalogServer {
         let revision = lifetimeRevision
         return .init(serverID: instanceID, service: service,
               changed: { [weak self] in await self?.acceptTrustedSnapshot($0, binding: $1, lifetime: revision) },
-              retired: { [weak self] in await self?.retireTrustedBinding() }, beforeReplay: beforeRevocationReplay, eligibility: registrationEligibility)
+              retired: { [weak self] in await self?.retireTrustedBinding() }, beforeReplay: beforeRevocationReplay, eligibility: registrationEligibility,
+              registrationRecovery: { [weak self] identity, message in await self?.publishRegistrationRecovery(identity, message: message) })
+    }
+    private func publishRegistrationRecovery(_ identity: TrustedFailedRegistration, message: String?) {
+        guard identity.lifetime === registrationEligibility, identity.server == instanceID else { return }
+        if let message {
+            guard identity.isCurrent else { return }
+            failedServerRegistration = (identity, message)
+        } else {
+            guard failedServerRegistration?.identity === identity else { return }
+            failedServerRegistration = nil
+        }
+        publish()
+    }
+    /// Retry the displayed registration without starting a stopped listener.
+    public func retryRegistration(_ id: UUID) async throws {
+        guard let failure = failedServerRegistration, failure.identity.id == id, failure.identity.isCurrent else { return }
+        switch try await trusted.retryServerRegistration(id, server: instanceID, lifetime: registrationEligibility) {
+        case .accepted:
+            try await trusted.replay()
+        case .superseded:
+            return
+        }
     }
     private func registerTrustedBinding(service: ShaderRequestService?, onlyIfVacant: Bool = false) async throws -> Bool {
         if !registrationEligibility.isCurrent { registrationEligibility = .init(); withdrawal = nil }
@@ -263,6 +292,9 @@ public actor LocalCatalogServer {
     private func removeObserver(_ id: UUID) { observers[id] = nil }
     private func publish(_ message: String? = nil) {
         if let message { transportMessage = message; transportFailure = nil }
+        state.registrationRecovery = failedServerRegistration.flatMap { failure in
+            failure.identity.isCurrent ? .init(id: failure.identity.id, message: failure.message) : nil
+        }
         state.trustedMessage = trustedDiagnostic; state.transportFailure = transportFailure
         state.message = [transportFailure, state.trustedMessage].compactMap { $0 }.joined(separator: "\n")
         if state.message.isEmpty { state.message = transportMessage }
@@ -332,7 +364,7 @@ public actor LocalCatalogServer {
         registrationTicket?.ticket.completion.cancel(); registrationTicket = nil
         let prior = binding
         prior?.permit.invalidate(); prior?.permit.lifetime.invalidate()
-        binding = nil; retired = true; proposedService = nil
+        binding = nil; retired = true; proposedService = nil; failedServerRegistration = nil
         serviceOwner?.release(); serviceOwner = nil; ownerServiceID = nil
         stop()
         let eligibility = registrationEligibility, serverID = instanceID, trusted = trusted
