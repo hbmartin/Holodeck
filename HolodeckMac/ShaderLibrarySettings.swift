@@ -27,7 +27,22 @@ final class MacLibraryModel {
     }
     var error: String? { (errors[.folder] ?? errors[.server] ?? errors[.manualReload] ?? errors[.publication] ?? errors[.approval] ?? errors[.revocation])?.message }
     var previewWarnings: [ShaderPreviewWarning] = []
-    var serverState = LocalServerState()
+    private struct NoticeDismissal {
+        let attempt: UUID
+        let revision: UInt64
+        var error: String? = nil
+    }
+    private var noticeDismissals: [UUID: NoticeDismissal] = [:]
+    private var registrationRetry: UUID?
+    private var registrationRetryFailure: (id: UUID, message: String)?
+    var serverState = LocalServerState() {
+        didSet {
+            noticeDismissals = noticeDismissals.filter { id, action in
+                serverState.recoveryNotices.contains { $0.id == id && $0.revision == action.revision }
+            }
+            if registrationRetryFailure?.id != serverState.registrationRecovery?.id { registrationRetryFailure = nil }
+        }
+    }
     @ObservationIgnored private let catalog: DirectoryCatalog
     @ObservationIgnored private let server: LocalCatalogServer
     @ObservationIgnored private let session: ViewerSession
@@ -299,9 +314,43 @@ final class MacLibraryModel {
     }
     #endif
     func approve(_ id: UUID) { Task { do { try await server.approve(id); clearError(from: .approval) } catch { self.setError(error.localizedDescription, from: .approval) } } }
-    func dismissRecoveryNotice(_ notice: TrustedRecoveryNotice) {
-        Task { do { try await server.dismissRecoveryNotice(notice.id, revision: notice.revision) } catch { setError(error.localizedDescription, from: .server) } }
+    func noticeDismissalError(_ notice: TrustedRecoveryNotice) -> String? {
+        guard let action = noticeDismissals[notice.id], action.revision == notice.revision else { return nil }
+        return action.error
     }
+    func dismissRecoveryNotice(_ notice: TrustedRecoveryNotice) {
+        guard serverState.recoveryNotices.contains(notice) else { return }
+        let attempt = UUID()
+        noticeDismissals[notice.id] = .init(attempt: attempt, revision: notice.revision)
+        Task {
+            do {
+                try await server.dismissRecoveryNotice(notice.id, revision: notice.revision)
+                if noticeDismissals[notice.id]?.attempt == attempt { noticeDismissals[notice.id] = nil }
+            } catch {
+                guard noticeDismissals[notice.id]?.attempt == attempt else { return }
+                noticeDismissals[notice.id]?.error = error.localizedDescription
+            }
+        }
+    }
+    func registrationRetryError(_ recovery: LocalServerRegistrationRecovery) -> String? {
+        registrationRetryFailure?.id == recovery.id ? registrationRetryFailure?.message : nil
+    }
+    func retryRegistration(_ recovery: LocalServerRegistrationRecovery) {
+        guard registrationRetry == nil else { return }
+        registrationRetry = recovery.id
+        registrationRetryFailure = nil
+        Task {
+            defer { registrationRetry = nil }
+            do { try await server.retryRegistration(recovery.id) }
+            catch {
+                // If the retry replaced the proposal, its new status owns the error.
+                if serverState.registrationRecovery?.id == recovery.id {
+                    registrationRetryFailure = (recovery.id, error.localizedDescription)
+                }
+            }
+        }
+    }
+    var retryingRegistration: Bool { registrationRetry != nil }
     func decline(_ id: UUID) { Task { await server.decline(id) } }
     func revoke(_ id: String) { Task { do { try await server.revoke(id); clearError(from: .revocation) } catch { self.setError(error.localizedDescription, from: .revocation) } } }
 }
@@ -330,12 +379,29 @@ struct ShaderLibrarySettings: View {
                 }
                 HStack { Text(library.serverState.message); Spacer() }
                     .accessibilityElement(children: .combine).accessibilityIdentifier("shader-serving-status")
-                ForEach(library.serverState.recoveryNotices) { notice in
-                    HStack(alignment: .top) {
-                        Text(notice.message).textSelection(.enabled)
+                if let recovery = library.serverState.registrationRecovery {
+                    HStack {
+                        Text(recovery.message).textSelection(.enabled)
                         Spacer()
-                        Button("Dismiss") { library.dismissRecoveryNotice(notice) }
-                            .accessibilityIdentifier("dismiss-trusted-outcome-" + notice.id.uuidString)
+                        Button("Retry Registration") { library.retryRegistration(recovery) }
+                            .disabled(library.retryingRegistration)
+                            .accessibilityIdentifier("retry-server-registration")
+                    }
+                    if let error = library.registrationRetryError(recovery) {
+                        Text(error).foregroundStyle(.red).textSelection(.enabled)
+                    }
+                }
+                ForEach(library.serverState.recoveryNotices) { notice in
+                    VStack(alignment: .leading) {
+                        HStack(alignment: .top) {
+                            Text(notice.message).textSelection(.enabled)
+                            Spacer()
+                            Button("Dismiss") { library.dismissRecoveryNotice(notice) }
+                                .accessibilityIdentifier("dismiss-trusted-outcome-" + notice.id.uuidString)
+                        }
+                        if let error = library.noticeDismissalError(notice) {
+                            Text(error).foregroundStyle(.red).textSelection(.enabled)
+                        }
                     }.accessibilityIdentifier("trusted-recovery-outcome-" + notice.id.uuidString)
                 }
                 if let error = library.error {
