@@ -1615,6 +1615,103 @@ private final class OutcomeBackend: @unchecked Sendable {
         XCTAssertTrue(accepted?.service === moving.service); XCTAssertEqual(backend.writes, 0)
     }
 
+    func testSealedPassReplaysHealthyTargetWhileUnrelatedRecoveryIsSettling() async throws {
+        let aArmed = OutcomeSwitch(), replayFails = OutcomeSwitch(), sealing = RecoveryGate()
+        let aEntered = TrustedCompletionSignal(), releaseA = TrustedCompletionSignal()
+        let a = try await fixture(reconcile: { _ in
+            if aArmed.on {
+                aEntered.finish()
+                try await releaseA.wait(cancellable: false)
+            }
+        }), b = try await fixture()
+        addTeardownBlock { releaseA.finish(); await sealing.release() }
+        let backend = OutcomeBackend(try TrustedTVApprovals(approvals: [.init(id: "TV", name: "TV", tokenHash: "old")]).encoded())
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) },
+            beforeRecoverySealing: { try await sealing.wait() })
+        _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: a.service)))
+        let owner = TrustedApprovalsCoordinator.Owner(serverID: UUID(), service: b.service, changed: { _, _ in },
+            retired: {}, beforeReplay: { _ in if replayFails.on { throw POSIXError(.EIO) } })
+        let binding = try await accepted(authority.register(owner))
+        let job = try await submit(b.service)
+        replayFails.on = true
+        do { try await authority.revoke("TV", permit: binding.permit) { _ in }; XCTFail("Replay fault ignored") }
+        catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        replayFails.on = false
+        backend.failReads(true)
+        do { _ = try await accepted(authority.register(owner)); XCTFail("Failed registration accepted") }
+        catch let error as POSIXError { XCTAssertEqual(error.code, .EACCES) }
+        backend.failReads(false)
+
+        aArmed.on = true
+        let abandoned = Task { try await a.service.trustedRecoveryOutcome() }
+        addTeardownBlock { abandoned.cancel(); releaseA.finish() }
+        try await wait { aEntered.isFinished }
+        abandoned.cancel()
+        _ = await abandoned.result
+        let result = OutcomeResult<Void>()
+        let retry = Task { do { try await b.service.retryReconciliation(); result.value = .success(()) } catch { result.value = .failure(error) } }
+        addTeardownBlock { retry.cancel(); await sealing.release() }
+        try await wait { await sealing.hasEntered }
+        await sealing.release()
+        try await wait { result.value != nil }
+        guard case .failure(let error as TrustedPartialRecovery) = result.value else {
+            return XCTFail("Unapplied target did not produce partial recovery")
+        }
+        XCTAssertTrue(error.completedServices.contains(b.service.runtimeID))
+        XCTAssertFalse(error.completedServices.contains(a.service.runtimeID))
+        let jobs = await b.service.allJobs(), status = await authority.observation
+        XCTAssertEqual(jobs.first { $0.id == job }?.stage, .cancelled)
+        XCTAssertEqual(status.obligations, 1) // One intent still needs A; B is durably cancelled.
+        XCTAssertEqual(status.applicationRecoveryTargets, 1)
+        XCTAssertEqual(try TrustedTVApprovals.decode(XCTUnwrap(backend.bytes)).revocations.count, 1)
+        aArmed.on = false
+        releaseA.finish()
+    }
+
+    func testReportingStaleLocalRecoveryEvidenceIsIdempotent() async throws {
+        let a = try await fixture(), original = try await a.service.trustedRecoveryOutcome()
+        await a.service.registerRevocationCoordinator(id: UUID()) {}
+        let invalid = await a.service.validateTrustedRecovery(original)
+        let repeated = await a.service.validateTrustedRecovery(invalid)
+        XCTAssertFalse(repeated.completed); XCTAssertNil(repeated.receipt)
+        XCTAssertEqual(invalid.failure, repeated.failure)
+        XCTAssertTrue(repeated.failure?.contains("Local recovery evidence changed") == true)
+    }
+
+    func testRecoveryJoinsWithdrawnCleanupThroughDiagnosticPublication() async throws {
+        let aFails = OutcomeSwitch(), publication = RecoveryGate(), attempts = OutcomePaths(), backend = OutcomeBackend()
+        let a = try await fixture(reconcile: { _ in if aFails.on { throw POSIXError(.EIO) } }), b = try await fixture()
+        addTeardownBlock { await publication.release() }
+        let recorder = TrustedOwnerRecorder()
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) },
+            cleanupCheckpoint: { _, point in
+                if point == .willAdmit { attempts.add("admission") }
+                if point == .willPublishDiagnostic { try? await publication.wait() }
+            })
+        _ = try await accepted(authority.register(recorder.owner(service: b.service)))
+        backend.failReads(true)
+        let proposal = TrustedOwnerRecorder().owner(service: a.service)
+        do { _ = try await accepted(authority.register(proposal)); XCTFail("Failed proposal accepted") }
+        catch let error as POSIXError { XCTAssertEqual(error.code, .EACCES) }
+        backend.failReads(false); aFails.on = true
+        proposal.eligibility.invalidate()
+        await authority.withdraw(serverID: proposal.serverID, eligibility: proposal.eligibility)
+        try await wait { await publication.hasEntered }
+        let result = OutcomeResult<Void>()
+        let retry = Task { do { try await a.service.retryReconciliation(); result.value = .success(()) } catch { result.value = .failure(error) } }
+        addTeardownBlock { retry.cancel(); await publication.release() }
+        try await wait { await authority.observation.recoveryCleanupWaiters == 1 }
+        let held = await authority.observation
+        XCTAssertEqual(held.uninspectedCleanupTasks, 1); XCTAssertEqual(attempts.count, 1); XCTAssertNil(result.value)
+        await publication.release()
+        try await wait { result.value != nil }
+        guard case .failure(let error) = result.value else { return XCTFail("Failed cleanup reported success") }
+        XCTAssertTrue(error.localizedDescription.contains("Withdrawn proposal"))
+        let current = await recorder.snapshot, state = await authority.observation
+        XCTAssertTrue(current?.diagnostic?.contains("Withdrawn TV proposal cleanup") == true)
+        XCTAssertEqual(attempts.count, 1); XCTAssertEqual(state.uninspectedCleanupTasks, 0)
+    }
+
 }
 private final class OutcomePaths: @unchecked Sendable {
     private let lock = NSLock(); private var values: [String] = []

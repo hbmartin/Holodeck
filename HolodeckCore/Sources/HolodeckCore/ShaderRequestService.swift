@@ -2144,6 +2144,8 @@ public actor ShaderRequestService {
         }
     }
     func validateTrustedRecovery(_ outcome: TrustedLocalRecovery, pass: UUID? = nil) -> TrustedLocalRecovery {
+        // Receipt-less failures carry no authority and need no second wrapper.
+        if outcome.receipt == nil, !outcome.completed { return outcome }
         guard let receipt = outcome.receipt, receipt.serviceID == runtimeID,
               receipt.registrationID == revocationRegistration, receipt.authority == revocationCoordinatorID,
               receipt.generation == localRecoveryGeneration, receipt.metadataRevision == persistenceRevision,
@@ -2154,10 +2156,12 @@ public actor ShaderRequestService {
         if let pass { trustedRecoveryHolds.insert(pass) }
         return outcome
     }
-    func recoverAfterTrustedBinding(pass: UUID, authority: UUID) async throws -> TrustedLocalRecovery {
-        guard revocationCoordinatorID == authority, localRecoveryPhase == nil else { throw TrustedRecoveryInterrupted() }
+    func recoverAfterTrustedBinding(pass: UUID, installation: TrustedTargetInstallation) async throws -> TrustedLocalRecovery {
+        guard installation.isPublished, installation.serviceID == runtimeID,
+              revocationCoordinatorID == installation.authority, revocationRegistration == installation.registration,
+              localRecoveryPhase == nil else { throw TrustedRecoveryInterrupted() }
         if localRecoveryResult?.receipt?.registrationID != revocationRegistration { localRecoveryResult = nil }
-        return try await trustedRecoveryOutcome(pass: pass, authority: authority)
+        return try await trustedRecoveryOutcome(pass: pass, authority: installation.authority)
     }
     /// Join only the local phase, never the authority pass which is asking us.
     func trustedRecoveryOutcome(pass: UUID? = nil, authority: UUID? = nil) async throws -> TrustedLocalRecovery {
