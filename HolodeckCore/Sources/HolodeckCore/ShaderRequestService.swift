@@ -579,13 +579,12 @@ public actor ShaderRequestService {
         let departure: TrustedAuthorityDeparture
     }
     private weak var trustedAuthority: TrustedApprovalsCoordinator?
-    private var trustedRegistrationPreparation: (authority: UUID, ticket: UUID)?
-    func beginTrustedRegistration(authority: UUID, ticket: UUID) {
-        trustedRegistrationPreparation = (authority, ticket); emitUpdates()
+    private var trustedRegistrationPreparations: Set<UUID> = []
+    func beginTrustedRegistration(ticket: UUID) {
+        if trustedRegistrationPreparations.insert(ticket).inserted { emitUpdates() }
     }
     func endTrustedRegistration(ticket: UUID) {
-        guard trustedRegistrationPreparation?.ticket == ticket else { return }
-        trustedRegistrationPreparation = nil; emitUpdates()
+        if trustedRegistrationPreparations.remove(ticket) != nil { emitUpdates() }
     }
     private var pendingTrustedAuthority: UUID?
     private var unacceptedRetirement: TrustedLocalPreparation?
@@ -749,8 +748,7 @@ public actor ShaderRequestService {
     func rememberFailedRegistration(_ identity: TrustedFailedRegistration, error: Error, departure: TrustedAuthorityRecoveryEndpoint? = nil,
         recover: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) {
         let authority = identity.authority
-        guard departure != nil || authority != ordinaryRecoveryAuthority,
-              !(failedRegistrationRecoveries[authority].map { $0.identity.generation > identity.generation } ?? false) else { return }
+        guard !(failedRegistrationRecoveries[authority].map { $0.identity.generation > identity.generation } ?? false) else { return }
         let message = BoundedDiagnostics.bounded("TV server registration requires recovery: " + error.localizedDescription, bytes: 8192)
         guard identity.whileCurrent({
             failedRegistrationRecoveries[authority] = .init(identity: identity, departure: departure, message: message, recover: recover)
@@ -766,6 +764,8 @@ public actor ShaderRequestService {
     private var authorityRecoveryEndpoints: [UUID: TrustedAuthorityRecoveryEndpoint] = [:]
     func trustedRecoveryJournal() -> URL { directory }
     func rememberAuthorityRecovery(_ endpoint: TrustedAuthorityRecoveryEndpoint) {
+        authorityRecoveryEndpoints = authorityRecoveryEndpoints.filter { $0.value.isCurrent }
+        guard endpoint.isCurrent else { return }
         authorityRecoveryEndpoints[endpoint.ticketID] = endpoint; emitUpdates(); scheduleWakeup()
     }
     func authorityRecoveryChanged(_ endpoint: TrustedAuthorityRecoveryEndpoint) {
@@ -788,7 +788,7 @@ public actor ShaderRequestService {
     private var approvalInspectionBlocker: String? {
         if let revocationFailure { return "TV approval inspection requires recovery: " + revocationFailure }
         guard revocationInspectionPending else { return nil }
-        if trustedRegistrationPreparation != nil { return "Local catalog server registration is inspecting TV approvals. TV requests remain paused until acceptance." }
+        if !trustedRegistrationPreparations.isEmpty { return "Local catalog server registration is inspecting TV approvals. TV requests remain paused until acceptance." }
         return revocationCoordinator == nil
             ? "TV approvals have not been inspected. Register a local catalog server for this service before TV requests resume."
             : "TV approvals have not been inspected. TV requests are paused; choose Retry Recovery."
@@ -1604,7 +1604,8 @@ public actor ShaderRequestService {
             statuses.append(.init(id: endpoint.ticketID, kind: .persistence, repository: "", python: "", git: "",
                 message: endpoint.message, isRunning: localRecoveryAttempt != nil, journal: endpoint.journal))
         }
-        for (authority, pending) in failedRegistrationRecoveries where pending.identity.isCurrent {
+        for (authority, pending) in failedRegistrationRecoveries.sorted(by: { $0.key.uuidString < $1.key.uuidString })
+            where pending.identity.isCurrent && (authority != ordinaryRecoveryAuthority || approvalInspectionBlocker == nil) {
             statuses.append(.init(id: authority, kind: .persistence, repository: "", python: "", git: "",
                 message: pending.message, isRunning: localRecoveryAttempt != nil, journal: directory, blocksCheckoutWork: false))
         }
@@ -2008,13 +2009,19 @@ public actor ShaderRequestService {
         let hasTrustedPhase = replayTrusted && revocationCoordinator != nil
         var failures: [String] = [], completed: Set<UUID> = !hasTrustedPhase && local.completed ? [runtimeID] : []
         let hasIndependentPhase = replayTrusted && (revocationCoordinator != nil || authorityRecoveryEndpoints.values.contains(where: \.isCurrent) || failedRegistrationRecoveries.values.contains(where: { $0.identity.isCurrent }))
+        var attemptedDepartures: Set<UUID> = []
         let recoveredAuthority = replayTrusted ? ordinaryRecoveryAuthority : nil
         if replayTrusted, let coordinator = revocationCoordinator {
-            do { completed.formUnion(try await coordinator(local).completedServices) }
-            catch {
+            do {
+                let result = try await coordinator(local)
+                completed.formUnion(result.completedServices)
+                attemptedDepartures.formUnion(result.attemptedDepartures)
+            } catch {
                 try Task.checkCancellation()
                 if let partial = error as? TrustedPartialRecovery {
-                    completed.formUnion(partial.completedServices); failures += partial.remaining
+                    completed.formUnion(partial.completedServices)
+                    attemptedDepartures.formUnion(partial.attemptedDepartures)
+                    failures += partial.remaining
                 } else {
                     // This set records verified local phases, not whole-pass
                     // success. The trusted failure still makes the result partial.
@@ -2035,7 +2042,7 @@ public actor ShaderRequestService {
         // coordinator callback. Each owns only its retained departure evidence.
         if replayTrusted {
             for endpoint in authorityRecoveryEndpoints.values.filter(\.isCurrent).sorted(by: { $0.ticketID.uuidString < $1.ticketID.uuidString })
-                where !registrationDependencies.contains(endpoint.ticketID) {
+                where !registrationDependencies.contains(endpoint.ticketID) && attemptedDepartures.insert(endpoint.ticketID).inserted {
                 try Task.checkCancellation()
                 do { try await endpoint.retry() }
                 catch { try Task.checkCancellation(); failures.append(error.localizedDescription) }
@@ -2046,11 +2053,18 @@ public actor ShaderRequestService {
                 try Task.checkCancellation()
                 guard authority != recoveredAuthority, authority != ordinaryRecoveryAuthority,
                       failedRegistrationRecoveries[authority]?.identity === pending.identity else { continue }
-                do { completed.formUnion(try await pending.recover(local).completedServices) }
-                catch {
+                if let departure = pending.departure, departure.isCurrent, attemptedDepartures.contains(departure.ticketID) { continue }
+                do {
+                    let result = try await pending.recover(local)
+                    completed.formUnion(result.completedServices)
+                    attemptedDepartures.formUnion(result.attemptedDepartures)
+                } catch {
                     try Task.checkCancellation()
-                    if let partial = error as? TrustedPartialRecovery { completed.formUnion(partial.completedServices); failures += partial.remaining }
-                    else { failures.append(error.localizedDescription) }
+                    if let partial = error as? TrustedPartialRecovery {
+                        completed.formUnion(partial.completedServices)
+                        attemptedDepartures.formUnion(partial.attemptedDepartures)
+                        failures += partial.remaining
+                    } else { failures.append(error.localizedDescription) }
                 }
             }
         }

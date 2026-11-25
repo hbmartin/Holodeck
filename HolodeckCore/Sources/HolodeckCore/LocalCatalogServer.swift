@@ -137,12 +137,19 @@ public actor LocalCatalogServer {
     }
     /// Retry the displayed registration without starting a stopped listener.
     public func retryRegistration(_ id: UUID) async throws {
-        guard let failure = failedServerRegistration, failure.identity.id == id, failure.identity.isCurrent else { return }
-        switch try await trusted.retryServerRegistration(id, server: instanceID, lifetime: registrationEligibility) {
+        guard let failure = failedServerRegistration, failure.identity.id == id, failure.identity.isCurrent,
+              registrationState == .idle, !retired else { return }
+        let attempt = UUID(), revision = lifetimeRevision
+        registrationState = .pending(attempt)
+        defer { if registrationState == .pending(attempt) { registrationState = .idle } }
+        let result = try await trusted.retryServerRegistration(id, server: instanceID, lifetime: failure.identity.lifetime)
+        guard revision == lifetimeRevision, registrationState == .pending(attempt) else { return }
+        switch result {
         case .accepted:
+            registrationState = .idle
             try await trusted.replay()
         case .superseded:
-            return
+            if binding?.permit.isCurrent != true { registrationState = .superseded }
         }
     }
     private func registerTrustedBinding(service: ShaderRequestService?, onlyIfVacant: Bool = false) async throws -> Bool {

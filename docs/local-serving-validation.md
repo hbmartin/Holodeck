@@ -1723,3 +1723,29 @@ All listed workload read/write/encoding counts match PR #59. Normal revoke/remov
 ### Limits
 
 Desktop UI runtime checks remain **blocked by the standing instruction**. Physical Apple TV/simulator runtime, live Bonjour/LAN, and real Codex publication were not run. The existing six opt-in/environment skips remain explicit in the suite log. Separate unchanged Python worker/checker suites, external shader-library compile-all and standalone GPU profiles were not rerun; the existing Swift/native/GPU fixtures did run. Linux CI, checker artifacts/locks, worker/checker/shader code, network messages and persisted formats remain unchanged.
+
+## PR #60 follow-up — exact registration retries and independent replay (2026-11-25)
+
+- Failed proposals now own an invalidatable registration identity. Request recovery makes one attempt per authority and exact candidate. The bound service retains its ordinary retry action, while an unbound catalog server has an explicit Retry Registration action.
+- Failed departure dependencies carry their source ticket. Recovery shares that endpoint and resumes only the eligible dependent proposal. Exceptional departure coverage uses explicit fixture injection.
+- Sealed recovery continues independent cancellation after a target interruption. A refreshed receipt requires the exact predecessor and accepted installation. Withdrawn cleanup remains tracked through diagnostic publication. An independently settled target does not report a recovery failure merely because its old receipt can no longer authorize replay.
+- Settings keep inspection tickets and dismissal errors separate, with stable recovery rows and singular notice wording.
+
+Validation on macOS, from the Swift source inventory in `/tmp/pr61-stable-source.json`:
+
+- **721 core tests accounted for** across bounded selections, with **715 passing and 6 expected skips**. The usual executor runs stalled in unchanged clock tests. Local fallback runs used the dependency's `TASK_MEGA_YIELD_COUNT` setting. An unchanged client backoff test timed out in separate selections and passed in the bounded core run. All tests in the inventory have a passing or expected-skip result on the frozen sources.
+- **248 Release tests** passed. The 16 focused boundary tests passed eight Debug and fifteen Release repetitions, **368** executions with no failures. The focused compatibility and outcome selection passed **72** tests.
+- The isolated TLS/network selection passed **39** tests. The client backoff case passed in the bounded core run. Headless MacRequestsModel checks passed with Python 3.9 and the current local interpreter. The headless dismissal probe used the actual MacLibraryModel logic with an injected isolated server.
+- The **14** native packaging, compiler and GPU checks passed. Core coverage included the local authoring fixture. Both unsigned Release apps built and the tvOS product includes the merged privacy manifest. The packaged Mac checker reported version **1.1.1**, interface **1**, and the pinned artifact SHA-256.
+- Desktop UI runtime remains blocked by instruction. Physical-device and simulator runtime, live Bonjour/LAN, real Codex publication, and standalone unchanged worker/checker/shader suites were outside this validation.
+
+Five paired Release samples per build used the same compiler and filesystem. Each sample injected 50 failed same-authority registrations, each followed by one Retry Recovery click while the backend still rejected reads.
+
+| Work per sample | Merged PR #60 | Follow-up |
+| --- | ---: | ---: |
+| Registration admissions | 150 | 100 |
+| Trusted reads | 250 | 150 |
+| Trusted writes / encodings | 0 / 0 | 0 / 0 |
+| Descriptive median | 67.3 ms | 55.2 ms |
+
+Structural checks enforce the attempt and read counts. The timings do not set a threshold. Receipts are in `/tmp/pr61-stable-core-coverage.json`, `/tmp/pr61-stable-release-results.json`, `/tmp/pr61-stable-debug-results.json`, `/tmp/pr61-stable-apps-results.json`, `/tmp/pr61-stable-races-*-results.json`, `/tmp/pr61-stable-profile-results.json`, and `/tmp/pr61-stable-packaged-tool.log`. The successful packaged command used `library artifact-info --json`.
