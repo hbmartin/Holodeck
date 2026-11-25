@@ -61,7 +61,7 @@ import XCTest
             try await wait { gate.entered }; XCTAssertFalse(ticket.completion.hasStarted)
             if initial {
                 let status = try await service.control(operation: "requestStatus", payload: .init(), deviceID: "TV")
-                XCTAssertFalse(status.enabled); XCTAssertTrue(status.message.contains("not been inspected"))
+                XCTAssertFalse(status.enabled); XCTAssertTrue(status.message.contains("registration is inspecting"))
             }
             let withdrawal = Task { await authority.withdraw(serverID: owner.serverID, eligibility: owner.eligibility) }
             addTeardownBlock { withdrawal.cancel() }

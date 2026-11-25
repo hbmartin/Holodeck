@@ -17,9 +17,17 @@ nonisolated public struct ApprovedTV: Identifiable, Codable, Sendable {
     public let name: String
     let tokenHash: String
 }
+/// A session-local result of a recovered user action, separate from blockers.
+nonisolated public struct TrustedRecoveryNotice: Identifiable, Equatable, Sendable {
+    public let id: UUID
+    public let revision: UInt64
+    public let deviceID: String?
+    public let message: String
+}
 nonisolated public struct LocalServerState: Sendable {
     public var message = "Choose a shader folder to start sharing."
     public var trustedMessage: String?
+    public var recoveryNotices: [TrustedRecoveryNotice] = []
     public var transportFailure: String?
     public var pending: [TVApproval] = []
     public var approved: [ApprovedTV] = []
@@ -165,6 +173,7 @@ public actor LocalCatalogServer {
         approved = snapshot.approvals; self.binding = binding; retired = false
         for (session, record) in authenticated where approved[record.id]?.tokenHash != record.tokenHash { cancelSession(session) }
         trustedDiagnostic = snapshot.diagnostic; trustedDiagnosticID = snapshot.diagnosticID
+        state.recoveryNotices = snapshot.notices
         publish()
     }
     private func retireTrustedBinding() {
@@ -185,7 +194,6 @@ public actor LocalCatalogServer {
     private var closing: Set<UUID> = []
     private struct Pending { let deviceID: String; let approval: TVApproval }
     private var pending: [UUID: Pending] = [:]
-    private var pairingFailure: String?
     private var issued: [UUID: String] = [:]
     private var approvalEligibility: [UUID: TrustedApprovalEligibility] = [:]
     private var declined: Set<UUID> = []
@@ -255,8 +263,7 @@ public actor LocalCatalogServer {
     private func removeObserver(_ id: UUID) { observers[id] = nil }
     private func publish(_ message: String? = nil) {
         if let message { transportMessage = message; transportFailure = nil }
-        let trustedMessages = [trustedDiagnostic, pairingFailure].compactMap { $0 }.joined(separator: "\n")
-        state.trustedMessage = trustedMessages.isEmpty ? nil : trustedMessages; state.transportFailure = transportFailure
+        state.trustedMessage = trustedDiagnostic; state.transportFailure = transportFailure
         state.message = [transportFailure, state.trustedMessage].compactMap { $0 }.joined(separator: "\n")
         if state.message.isEmpty { state.message = transportMessage }
         state.pending = pending.values.map(\.approval).sorted { $0.name < $1.name }
@@ -373,7 +380,6 @@ public actor LocalCatalogServer {
         guard proposal.eligibility.canIssue, pending[id] != nil, sessions[id] != nil, !closing.contains(id), permit.lifetime.isCurrent else {
             cancelSession(id); throw CommittedApprovalDeliveryError()
         }
-        pairingFailure = nil
         issued[id] = proposal.token; pending[id] = nil; authenticated[id] = proposal.record
         deadlineTasks.removeValue(forKey: id)?.cancel(); deadlines[id] = nil
         publish()
@@ -389,8 +395,11 @@ public actor LocalCatalogServer {
     private func approvalRecoveredWithoutDelivery(session: UUID, eligibility: UUID, lifetime: UInt64) {
         guard lifetime == lifetimeRevision, approvalEligibility[session]?.id == eligibility,
               pending[session] != nil, sessions[session] != nil, !closing.contains(session) else { return }
-        pairingFailure = CommittedApprovalDeliveryError(recoveredAfterFailure: true).localizedDescription
         cancelSession(session); publish()
+    }
+    public func dismissRecoveryNotice(_ id: UUID, revision: UInt64) async throws {
+        guard let permit = binding?.permit else { throw ShaderRequestError.unavailable("Register the local server before dismissing its recovery outcomes.") }
+        try await trusted.dismissRecoveryNotice(id, revision: revision, permit: permit)
     }
     public func decline(_ id: UUID) { approvalEligibility.removeValue(forKey: id)?.close(); pending[id] = nil; declined.insert(id); publish() }
     public func revoke(_ id: String) async throws {
@@ -521,7 +530,6 @@ public actor LocalCatalogServer {
             approvalEligibility[id] = .init(withinDeadline: { clock.now < deadline }, recovered: { [weak self] eligibility in
                 await self?.approvalRecoveredWithoutDelivery(session: id, eligibility: eligibility, lifetime: revision)
             })
-            pairingFailure = nil
             pending[id] = Pending(deviceID: deviceID, approval: TVApproval(id: id, name: name, code: code))
             response.operation = "pending"; publish()
         case "pairStatus":

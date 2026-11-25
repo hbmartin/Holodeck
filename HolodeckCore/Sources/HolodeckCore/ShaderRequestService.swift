@@ -579,6 +579,14 @@ public actor ShaderRequestService {
         let departure: TrustedAuthorityDeparture
     }
     private weak var trustedAuthority: TrustedApprovalsCoordinator?
+    private var trustedRegistrationPreparation: (authority: UUID, ticket: UUID)?
+    func beginTrustedRegistration(authority: UUID, ticket: UUID) {
+        trustedRegistrationPreparation = (authority, ticket); emitUpdates()
+    }
+    func endTrustedRegistration(ticket: UUID) {
+        guard trustedRegistrationPreparation?.ticket == ticket else { return }
+        trustedRegistrationPreparation = nil; emitUpdates()
+    }
     private var pendingTrustedAuthority: UUID?
     private var unacceptedRetirement: TrustedLocalPreparation?
     private var authorityTransfer: UUID?
@@ -729,6 +737,26 @@ public actor ShaderRequestService {
     var localPreparationWaiters: Int { localPreparation?.waiterCount ?? 0 }
     var localRecoveryPhaseCount: UInt64 { localRecoveryGeneration }
     private var trustedRecoveryHolds: Set<UUID> = []
+    private struct FailedRegistrationRecovery {
+        let generation: UInt64
+        let server: UUID
+        let lifetime: TrustedOwnerLifetime
+        let message: String
+        let recover: @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion
+    }
+    private var failedRegistrationRecoveries: [UUID: FailedRegistrationRecovery] = [:]
+    func rememberFailedRegistration(authority: UUID, generation: UInt64, server: UUID, lifetime: TrustedOwnerLifetime, error: Error,
+        recover: @escaping @Sendable (TrustedLocalRecovery) async throws -> TrustedRecoveryCompletion) {
+        guard lifetime.isCurrent else { return }
+        failedRegistrationRecoveries[authority] = .init(generation: generation, server: server, lifetime: lifetime,
+            message: BoundedDiagnostics.bounded("TV server registration requires recovery: " + error.localizedDescription, bytes: 8192), recover: recover)
+        emitUpdates()
+    }
+    func forgetFailedRegistration(authority: UUID, server: UUID, lifetime: TrustedOwnerLifetime, maxGeneration: UInt64 = .max) {
+        guard let pending = failedRegistrationRecoveries[authority], pending.server == server, pending.lifetime === lifetime,
+              pending.generation <= maxGeneration else { return }
+        failedRegistrationRecoveries[authority] = nil; emitUpdates()
+    }
     private var authorityRecoveryEndpoints: [UUID: TrustedAuthorityRecoveryEndpoint] = [:]
     func trustedRecoveryJournal() -> URL { directory }
     func rememberAuthorityRecovery(_ endpoint: TrustedAuthorityRecoveryEndpoint) {
@@ -754,6 +782,7 @@ public actor ShaderRequestService {
     private var approvalInspectionBlocker: String? {
         if let revocationFailure { return "TV approval inspection requires recovery: " + revocationFailure }
         guard revocationInspectionPending else { return nil }
+        if trustedRegistrationPreparation != nil { return "Local catalog server registration is inspecting TV approvals. TV requests remain paused until acceptance." }
         return revocationCoordinator == nil
             ? "TV approvals have not been inspected. Register a local catalog server for this service before TV requests resume."
             : "TV approvals have not been inspected. TV requests are paused; choose Retry Recovery."
@@ -1564,6 +1593,10 @@ public actor ShaderRequestService {
             statuses.append(.init(id: endpoint.ticketID, kind: .persistence, repository: "", python: "", git: "",
                 message: endpoint.message, isRunning: localRecoveryAttempt != nil, journal: endpoint.journal))
         }
+        for (authority, pending) in failedRegistrationRecoveries where pending.lifetime.isCurrent {
+            statuses.append(.init(id: authority, kind: .persistence, repository: "", python: "", git: "",
+                message: pending.message, isRunning: localRecoveryAttempt != nil, journal: directory, blocksCheckoutWork: false))
+        }
         return statuses
     }
     private static let startupStatusID = UUID(uuidString: "B61AC7DF-7CEB-44D2-869B-D0FE952F469B")!
@@ -1963,7 +1996,7 @@ public actor ShaderRequestService {
         try Task.checkCancellation()
         let hasTrustedPhase = replayTrusted && revocationCoordinator != nil
         var failures: [String] = [], completed: Set<UUID> = !hasTrustedPhase && local.completed ? [runtimeID] : []
-        let hasIndependentPhase = replayTrusted && (revocationCoordinator != nil || authorityRecoveryEndpoints.values.contains(where: \.isCurrent))
+        let hasIndependentPhase = replayTrusted && (revocationCoordinator != nil || authorityRecoveryEndpoints.values.contains(where: \.isCurrent) || failedRegistrationRecoveries.values.contains(where: { $0.lifetime.isCurrent }))
         if replayTrusted, let coordinator = revocationCoordinator {
             do { completed.formUnion(try await coordinator(local).completedServices) }
             catch {
@@ -1989,6 +2022,19 @@ public actor ShaderRequestService {
                 try Task.checkCancellation()
                 do { try await endpoint.retry() }
                 catch { try Task.checkCancellation(); failures.append(error.localizedDescription) }
+            }
+        }
+        if replayTrusted {
+            for (authority, pending) in failedRegistrationRecoveries.sorted(by: { $0.key.uuidString < $1.key.uuidString }) where pending.lifetime.isCurrent {
+                try Task.checkCancellation()
+                guard failedRegistrationRecoveries[authority]?.lifetime === pending.lifetime,
+                      failedRegistrationRecoveries[authority]?.generation == pending.generation else { continue }
+                do { completed.formUnion(try await pending.recover(local).completedServices) }
+                catch {
+                    try Task.checkCancellation()
+                    if let partial = error as? TrustedPartialRecovery { completed.formUnion(partial.completedServices); failures += partial.remaining }
+                    else { failures.append(error.localizedDescription) }
+                }
             }
         }
         if !failures.isEmpty {

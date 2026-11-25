@@ -310,7 +310,7 @@ private final class OutcomeBackend: @unchecked Sendable {
         do { try await authority.replay(); XCTFail("Uninspected evidence retired") }
         catch { XCTAssertTrue(error.localizedDescription.contains("proposed request service")) }
         let state = await authority.observation, jobs = await a.service.allJobs()
-        XCTAssertEqual(state.obligations, 1); XCTAssertEqual(state.uninspectedTargets, 1)
+        XCTAssertEqual(state.obligations, 0); XCTAssertEqual(state.uninspectedTargets, 1)
         XCTAssertEqual(jobs.first { $0.id == job }?.stage, .cancelled)
         XCTAssertEqual(backend.writes, 1) // Known target finalizes without rewriting removal.
         _ = try await submit(a.service)
@@ -499,7 +499,7 @@ private final class OutcomeBackend: @unchecked Sendable {
         try await wait { backend.writes > 0 }
         inspecting.on = false; gate.release()
         try await wait { let value = await authority.observation; return value.uninspectedTargets == 0 && value.uninspectedCleanupTasks == 0 && result.value != nil }
-        if case .failure(let error) = result.value { XCTAssertTrue(error.localizedDescription.contains("proposed request service")) }
+        if case .failure(let error) = result.value { XCTAssertTrue(error.localizedDescription.contains("Withdrawn TV proposal cleanup")) }
         let jobs = await a.service.allJobs(), bytes = try TrustedTVApprovals.decode(XCTUnwrap(backend.bytes))
         XCTAssertEqual(jobs.first { $0.id == job }?.stage, .cancelled)
         XCTAssertTrue(bytes.approvals.isEmpty); XCTAssertTrue(bytes.revocations.isEmpty)
@@ -725,14 +725,15 @@ private final class OutcomeBackend: @unchecked Sendable {
         catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EACCES).localizedDescription)) }
         backend.failReads(false); second.eligibility.invalidate()
         await authority.withdraw(serverID: second.serverID, eligibility: second.eligibility)
-        try await wait { completed.count == 1 }
-        let successor = await recorder.snapshot, before = await authority.observation
-        XCTAssertTrue(successor?.diagnostic?.contains("Withdrawn TV proposal cleanup") == true)
+        try await wait { await authority.observation.uninspectedCleanupTasks == 2 }
+        XCTAssertEqual(completed.count, 0, "Successor bypassed the predecessor's physical completion")
+        let before = await recorder.snapshot
+        XCTAssertFalse(before?.diagnostic?.contains("Withdrawn TV proposal cleanup") == true)
         await gate.release()
         try await wait { completed.count == 2 }
         let after = await recorder.snapshot, state = await authority.observation
-        XCTAssertEqual(after?.diagnostic, successor?.diagnostic); XCTAssertEqual(after?.diagnosticID, successor?.diagnosticID)
-        XCTAssertEqual(state.recoveryDiagnostics, before.recoveryDiagnostics)
+        XCTAssertTrue(after?.diagnostic?.contains("Withdrawn TV proposal cleanup") == true)
+        XCTAssertFalse(after?.diagnostic?.contains("ownership changed") == true)
         XCTAssertEqual(state.uninspectedTargets, 1); XCTAssertEqual(state.uninspectedCleanupTasks, 0); XCTAssertTrue(retained.on)
         broken.on = false
         _ = try await accepted(authority.register(recorder.owner(service: a.service)))
@@ -837,7 +838,11 @@ private final class OutcomeBackend: @unchecked Sendable {
         XCTAssertThrowsError(try eligibility.check()) { error in XCTAssertTrue(error.localizedDescription.contains("saved during recovery")) }
         let snapshot = await recorder.snapshot, state = await authority.observation
         XCTAssertNil(snapshot?.diagnostic) // Successful recovery clears settled write history.
-        XCTAssertEqual(state.recoveryDiagnostics, 0); XCTAssertFalse(retained.on)
+        XCTAssertEqual(state.recoveryDiagnostics, 0); XCTAssertTrue(retained.on)
+        let notice = try XCTUnwrap(snapshot?.notices.first)
+        XCTAssertTrue(notice.message.contains("Pair this TV again"))
+        try await authority.dismissRecoveryNotice(notice.id, revision: notice.revision, permit: binding.permit)
+        XCTAssertFalse(retained.on)
         XCTAssertEqual(backend.writes, 1)
     }
 
@@ -873,6 +878,8 @@ private final class OutcomeBackend: @unchecked Sendable {
         XCTAssertEqual(repaired.uncertainWrites, 0); XCTAssertEqual(repaired.recoveryDiagnostics, 0)
         XCTAssertFalse(snapshot?.diagnostic?.contains("unverified") == true)
         XCTAssertNil(snapshot?.diagnostic)
+        XCTAssertEqual(snapshot?.notices.count, 1)
+        XCTAssertTrue(snapshot?.notices.first?.message.contains("remains approved") == true)
         XCTAssertEqual(backend.bytes, original)
     }
     func testCancellationCannotAbandonAdmittedReadbackOrDurableCompletion() async throws {
@@ -933,7 +940,7 @@ private final class OutcomeBackend: @unchecked Sendable {
                 catch { XCTAssertTrue(error.localizedDescription.contains("proposed request service")) }
             }
             let pending = await authority.observation
-            XCTAssertEqual(pending.obligations, 1)
+            XCTAssertEqual(pending.obligations, 0)
             XCTAssertEqual(finalized.count, 1, "Known target finalized more than once")
             _ = try await accepted(authority.register(recorder.owner(service: b.service)))
             try await authority.replay()
@@ -1029,8 +1036,13 @@ private final class OutcomeBackend: @unchecked Sendable {
         let before = await destination.observation
         XCTAssertTrue(old.permit.isCurrent)
         destinationStore.failReads(false); try await b.service.retryReconciliation()
+        let unrelated = await destination.observation
+        XCTAssertEqual(unrelated.requestedGeneration, before.requestedGeneration)
+        let unmoved = await recorder.binding; XCTAssertNil(unmoved)
+        try await a.service.retryReconciliation()
         let after = await destination.observation
         XCTAssertGreaterThan(after.requestedGeneration, before.requestedGeneration)
+        try await wait { await source.observation.targets == 0 }
         let moved = await recorder.binding, retired = await source.observation
         XCTAssertEqual(moved?.permit.authority, destination.id)
         XCTAssertTrue(moved?.permit.isCurrent == true); XCTAssertEqual(retired.targets, 0)
@@ -1047,11 +1059,15 @@ private final class OutcomeBackend: @unchecked Sendable {
         backend.failReads(false); blocked.on = true; proposal.eligibility.invalidate()
         await old.withdraw(serverID: proposal.serverID, eligibility: proposal.eligibility)
         try await wait { await gate.hasEntered }
-        let new = TrustedApprovalsCoordinator(read: { nil }, write: { _ in })
+        let destinationStore = OutcomeBackend(), new = TrustedApprovalsCoordinator(read: { try destinationStore.read() }, write: { try destinationStore.write($0) })
+        let current = try await accepted(new.register(TrustedOwnerRecorder().owner()))
         let registration = try await new.register(TrustedOwnerRecorder().owner(service: a.service))
         addTeardownBlock { registration.completion.cancel(); await gate.release() }
         try await wait { await new.observation.preparingGeneration == registration.generation }
         XCTAssertFalse(registration.completion.hasStarted)
+        _ = try await new.approve(current.permit) { .init(record: .init(id: "DESTINATION", name: "Destination TV", tokenHash: "new"), token: "new", eligibility: .init()) }
+        XCTAssertEqual(destinationStore.writes, 1)
+        XCTAssertTrue(current.permit.isCurrent)
         blocked.on = false; await gate.release()
         let binding = try await accepted(registration)
         XCTAssertTrue(binding.permit.isCurrent)
@@ -1182,7 +1198,7 @@ private final class OutcomeBackend: @unchecked Sendable {
     }
 
     func testCleanupCompletionRescansAnAlreadyAttemptedRemoval() async throws {
-        let read = OutcomeSwitch(), armWrite = OutcomeSwitch(), write = TrustedReadGate(), publication = RecoveryGate()
+        let read = OutcomeSwitch(), armWrite = OutcomeSwitch(), write = TrustedReadGate(), publication = RecoveryGate(), incorrectAdvice = OutcomeSwitch()
         let a = try await fixture(beforeWrite: { url in if url.lastPathComponent == "journal.json", armWrite.take() { write.wait() } }), b = try await fixture()
         addTeardownBlock { write.release(); await publication.release(); XCTAssertFalse(write.timedOut, "Writer barrier expired instead of being released") }
         _ = try await submit(a.service); let job = try await submit(b.service)
@@ -1190,7 +1206,10 @@ private final class OutcomeBackend: @unchecked Sendable {
         let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) },
             beforeInspectionRead: { if read.take() { armWrite.on = true } })
         let owner = TrustedApprovalsCoordinator.Owner(serverID: server, service: b.service, changed: { snapshot, _ in
-            if snapshot.diagnostic?.contains("proposed request service") == true { try? await publication.wait() }
+            if snapshot.diagnostic?.contains("Withdrawn TV proposal cleanup") == true {
+                incorrectAdvice.on = snapshot.diagnostic?.contains("Explicitly register") == true
+                try? await publication.wait()
+            }
         }, retired: {}, beforeReplay: { _ in })
         _ = try await accepted(authority.register(owner))
         backend.failReads(true); let proposal = TrustedOwnerRecorder().owner(service: a.service)
@@ -1201,12 +1220,11 @@ private final class OutcomeBackend: @unchecked Sendable {
         read.on = true; proposal.eligibility.invalidate()
         await authority.withdraw(serverID: proposal.serverID, eligibility: proposal.eligibility)
         try await wait { let notified = await publication.hasEntered; return write.entered && notified }
-        print("Rescan regression: writer and rejection notification witnessed")
+        XCTAssertFalse(incorrectAdvice.on)
         // The old replay has rejected removal but still owns its notification.
         // Let cleanup queue its exact completion before releasing that lane.
         write.release()
         try await wait { await authority.observation.progressWaiters > 0 }
-        print("Rescan regression: cleanup completion queued")
         await publication.release()
         try await wait {
             let state = await authority.observation
@@ -1216,6 +1234,255 @@ private final class OutcomeBackend: @unchecked Sendable {
         XCTAssertEqual(jobs.first { $0.id == job }?.stage, .cancelled)
         XCTAssertTrue(try TrustedTVApprovals.decode(XCTUnwrap(backend.bytes)).revocations.isEmpty)
         XCTAssertEqual(backend.writes, 2) // One fixture-side insertion and one removal.
+    }
+
+    func testStaleCleanupAdmissionCannotReplaceSuccessorTask() async throws {
+        let gate = RecoveryGate(), arm = OutcomeSwitch(), completed = OutcomePaths(), backend = OutcomeBackend(), recorder = TrustedOwnerRecorder()
+        let a = try await fixture(), b = try await fixture()
+        addTeardownBlock { await gate.release() }
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) }, cleanupCheckpoint: { id, point in
+            if point == .willAdmit, arm.take() { try? await gate.wait() }
+            if point == .didPublish { completed.add(id.uuidString) }
+        })
+        _ = try await accepted(authority.register(recorder.owner(service: b.service)))
+        backend.failReads(true); let first = recorder.owner(service: a.service)
+        do { _ = try await accepted(authority.register(first)); XCTFail("Inspection accepted") } catch { XCTAssertTrue(error is POSIXError) }
+        backend.failReads(false); arm.on = true; first.eligibility.invalidate()
+        await authority.withdraw(serverID: first.serverID, eligibility: first.eligibility)
+        try await wait { await gate.hasEntered }
+        backend.failReads(true); let successor = recorder.owner(service: a.service)
+        do { _ = try await accepted(authority.register(successor)); XCTFail("Inspection accepted") } catch { XCTAssertTrue(error is POSIXError) }
+        backend.failReads(false); successor.eligibility.invalidate()
+        await authority.withdraw(serverID: successor.serverID, eligibility: successor.eligibility)
+        let held = await authority.observation
+        XCTAssertEqual(held.uninspectedCleanupTasks, 2)
+        await gate.release()
+        try await wait { let state = await authority.observation; return state.uninspectedTargets == 0 && state.uninspectedCleanupTasks == 0 }
+        XCTAssertEqual(completed.count, 1, "The stale proposal must never admit service work")
+        let snapshot = await recorder.snapshot
+        XCTAssertNil(snapshot?.diagnostic)
+    }
+
+    func testLateParticipantWithdrawalCannotEscapeCleanupFailure() async throws {
+        let sealing = RecoveryGate(), cleanup = RecoveryGate(), backend = OutcomeBackend(), a = try await fixture(), b = try await fixture()
+        addTeardownBlock { await sealing.release(); await cleanup.release() }
+        let recorder = TrustedOwnerRecorder()
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) },
+            beforeRecoverySealing: { try await sealing.wait() }, cleanupCheckpoint: { _, point in
+                if point == .willPublish { try? await cleanup.wait() }
+            })
+        let owner = recorder.owner(service: b.service)
+        _ = try await accepted(authority.register(owner))
+        backend.failReads(true); let proposal = recorder.owner(service: a.service)
+        do { _ = try await accepted(authority.register(proposal)); XCTFail("Inspection accepted") } catch { XCTAssertTrue(error is POSIXError) }
+        backend.failReads(false); _ = try await accepted(authority.register(owner))
+        let first = OutcomeResult<Void>(), second = OutcomeResult<Void>()
+        let one = Task { do { try await b.service.retryReconciliation(); first.value = .success(()) } catch { first.value = .failure(error) } }
+        addTeardownBlock { one.cancel(); await sealing.release(); await cleanup.release() }
+        try await wait { await sealing.hasEntered }
+        let two = Task { do { try await a.service.retryReconciliation(); second.value = .success(()) } catch { second.value = .failure(error) } }
+        addTeardownBlock { two.cancel(); await sealing.release(); await cleanup.release() }
+        try await wait { await authority.observation.recoveryParticipants == 2 }
+        backend.failReads(true); proposal.eligibility.invalidate()
+        await authority.withdraw(serverID: proposal.serverID, eligibility: proposal.eligibility)
+        try await wait { await cleanup.hasEntered }
+        await sealing.release()
+        // Admission is witnessed: the sealed pass subscribes to this exact cleanup.
+        try await wait { await authority.observation.recoveryCleanupWaiters > 0 }
+        XCTAssertNil(first.value); XCTAssertNil(second.value)
+        await cleanup.release()
+        try await wait { first.value != nil && second.value != nil }
+        for result in [first.value, second.value] {
+            guard case .failure(let error) = result else { XCTFail("Participant cleanup failure was reported as success"); continue }
+            XCTAssertTrue(error.localizedDescription.contains("Withdrawn proposal"))
+        }
+    }
+
+    func testFinalizedTargetCanDepartWhileUninspectedEvidenceRemains() async throws {
+        let a = try await fixture(), b = try await fixture(), job = try await submit(b.service), fail = OutcomeSwitch()
+        let backend = OutcomeBackend(try TrustedTVApprovals(revocations: [.init(operationID: UUID(), deviceID: "TV")]).encoded())
+        fail.on = true
+        let source = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) }, beforeRemovalFinalization: { _, _ in if fail.on { throw POSIXError(.EIO) } })
+        _ = try await accepted(source.register(TrustedOwnerRecorder().owner(service: a.service)))
+        do { try await source.replay(); XCTFail("Finalization fault ignored") } catch { XCTAssertTrue(error.localizedDescription.contains(POSIXError(.EIO).localizedDescription)) }
+        backend.failReads(true); let proposal = TrustedOwnerRecorder().owner(service: b.service)
+        do { _ = try await accepted(source.register(proposal)); XCTFail("Inspection accepted") } catch { XCTAssertTrue(error is POSIXError) }
+        backend.failReads(false); fail.on = false
+        do { try await source.replay(); XCTFail("Unknown target forgotten") } catch { XCTAssertTrue(error.localizedDescription.contains("proposed request service")) }
+        let settled = await source.observation; XCTAssertEqual(settled.obligations, 0); XCTAssertEqual(settled.uninspectedTargets, 1)
+        let destination = TrustedApprovalsCoordinator(read: { nil }, write: { _ in })
+        let binding = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: a.service)))
+        XCTAssertEqual(binding.permit.authority, destination.id)
+        proposal.eligibility.invalidate(); await source.withdraw(serverID: proposal.serverID, eligibility: proposal.eligibility)
+        try await wait { let state = await source.observation; return state.uninspectedTargets == 0 && state.uninspectedCleanupTasks == 0 }
+        let jobs = await b.service.allJobs(); XCTAssertEqual(jobs.first { $0.id == job }?.stage, .cancelled)
+        XCTAssertEqual(backend.writes, 1)
+    }
+
+    @discardableResult private func recoveredApprovalNotice(_ service: ShaderRequestService, authority: TrustedApprovalsCoordinator,
+        backend: OutcomeBackend, permit: TrustedOwnerPermit, device: String) async throws -> UUID {
+        let eligibility = TrustedApprovalEligibility()
+        backend.failWrites(.unreadableAfter)
+        do { _ = try await authority.approve(permit) { .init(record: .init(id: device, name: device, tokenHash: eligibility.id.uuidString), token: "lost", eligibility: eligibility) }; XCTFail("Unknown approval accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("unverified")) }
+        backend.failReads(false); backend.failWrites(.none)
+        try await service.retryReconciliation()
+        return eligibility.id
+    }
+    func testRecoveredNoncommitNoticeRequiresExactExplicitDismissal() async throws {
+        let a = try await fixture(), backend = OutcomeBackend(try TrustedTVApprovals(approvals: [.init(id: "TV", name: "TV", tokenHash: "old")]).encoded()), recorder = TrustedOwnerRecorder()
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) })
+        let binding = try await accepted(authority.register(recorder.owner(service: a.service)))
+        backend.failWrites(.unreadableBefore)
+        do { try await authority.revoke("TV", permit: binding.permit) { _ in }; XCTFail("Unknown revocation accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("unverified")) }
+        backend.failReads(false); backend.failWrites(.none)
+        try await a.service.retryReconciliation()
+        let recovered = await recorder.snapshot, notice = try XCTUnwrap(recovered?.notices.first)
+        XCTAssertEqual(recovered?.approvals["TV"]?.tokenHash, "old")
+        XCTAssertTrue(notice.message.contains("remains approved")); XCTAssertNil(recovered?.diagnostic)
+        try await a.service.retryReconciliation()
+        _ = try await authority.approve(binding.permit) { .init(record: .init(id: "OTHER", name: "Other", tokenHash: "h"), token: "t", eligibility: .init()) }
+        let saved = await recorder.snapshot; XCTAssertEqual(saved?.notices.first, notice)
+        let before = await authority.observation
+        try await authority.dismissRecoveryNotice(notice.id, revision: notice.revision + 1, permit: binding.permit)
+        let stale = await recorder.snapshot; XCTAssertEqual(stale?.notices.first, notice)
+        try await authority.dismissRecoveryNotice(notice.id, revision: notice.revision, permit: binding.permit)
+        let after = await authority.observation, dismissed = await recorder.snapshot
+        XCTAssertTrue(dismissed?.notices.isEmpty == true)
+        XCTAssertEqual(after.encodings, before.encodings); XCTAssertEqual(after.writes, before.writes)
+    }
+    func testRecoveryNoticesSurviveReplacementAndRejectRetiredDismissal() async throws {
+        let a = try await fixture(), backend = OutcomeBackend(), first = TrustedOwnerRecorder(), second = TrustedOwnerRecorder()
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) })
+        let old = try await accepted(authority.register(first.owner(service: a.service)))
+        let operation = try await recoveredApprovalNotice(a.service, authority: authority, backend: backend, permit: old.permit, device: "A")
+        let firstSnapshot = await first.snapshot
+        let original = try XCTUnwrap(firstSnapshot?.notices.first)
+        let next = try await accepted(authority.register(second.owner(service: a.service)))
+        let current = await second.snapshot
+        XCTAssertEqual(current?.notices.first?.id, operation); XCTAssertEqual(current?.notices.first, original)
+        do { try await authority.dismissRecoveryNotice(original.id, revision: original.revision, permit: old.permit); XCTFail("Retired permit dismissed notice") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("replaced")) }
+        try await authority.dismissRecoveryNotice(original.id, revision: original.revision, permit: next.permit)
+        let cleared = await second.snapshot; XCTAssertTrue(cleared?.notices.isEmpty == true)
+    }
+    func testNoticeOverflowKeepsBoundedExplicitlyDismissibleSummary() async throws {
+        let a = try await fixture(), backend = OutcomeBackend(), recorder = TrustedOwnerRecorder()
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) })
+        let binding = try await accepted(authority.register(recorder.owner(service: a.service)))
+        for index in 0..<10 { try await recoveredApprovalNotice(a.service, authority: authority, backend: backend, permit: binding.permit, device: "TV-" + String(index)) }
+        let before = await recorder.snapshot, summary = try XCTUnwrap(before?.notices.first { $0.deviceID == nil })
+        XCTAssertEqual(before?.notices.count, 8); XCTAssertTrue(summary.message.contains("3 saved approvals"))
+        try await recoveredApprovalNotice(a.service, authority: authority, backend: backend, permit: binding.permit, device: "LATEST")
+        try await authority.dismissRecoveryNotice(summary.id, revision: summary.revision, permit: binding.permit)
+        let updated = await recorder.snapshot
+        XCTAssertTrue(updated?.notices.contains { $0.id == summary.id && $0.message.contains("4 saved approvals") } == true)
+        for notice in updated?.notices ?? [] { try await authority.dismissRecoveryNotice(notice.id, revision: notice.revision, permit: binding.permit) }
+        let empty = await recorder.snapshot; XCTAssertTrue(empty?.notices.isEmpty == true)
+        XCTAssertEqual(backend.writes, 11)
+    }
+    func testNoticeRetentionDoesNotPinAnIdleRequestService() async throws {
+        let root = URL(fileURLWithPath: "/private/tmp/pr60-notice-release-" + UUID().uuidString), backend = OutcomeBackend(), recorder = TrustedOwnerRecorder(), retained = OutcomeSwitch()
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) }, retainEvidence: { _, flag in retained.on = flag })
+        func create() async throws -> (WeakRequestService, TrustedOwnerPermit) {
+            let target = ShaderRequestService(catalog: DirectoryCatalog(directory: root.appendingPathComponent("catalog")), directory: root)
+            await target.suspend(); try await target.initialize(configuration: .init(repository: root.path))
+            let binding = try await accepted(authority.register(recorder.owner(service: target)))
+            try await recoveredApprovalNotice(target, authority: authority, backend: backend, permit: binding.permit, device: "TV")
+            return (.init(target), binding.permit)
+        }
+        let (weak, permit) = try await create()
+        try await wait { weak.value == nil }
+        let state = await authority.observation; XCTAssertEqual(state.recoveryPins, 0); XCTAssertTrue(retained.on)
+        let snapshot = await recorder.snapshot
+        for notice in snapshot?.notices ?? [] { try await authority.dismissRecoveryNotice(notice.id, revision: notice.revision, permit: permit) }
+        XCTAssertFalse(retained.on)
+    }
+
+    func testInitialRegistrationShowsInspectionProgressWithoutAnotherRegistrationPrompt() async throws {
+        let a = try await fixture(), gate = RecoveryGate()
+        addTeardownBlock { await gate.release() }
+        let authority = TrustedApprovalsCoordinator(read: { nil }, write: { _ in }, beforeInspectionRead: { try await gate.wait() })
+        let registration = try await authority.register(TrustedOwnerRecorder().owner(service: a.service))
+        addTeardownBlock { registration.completion.cancel(); await gate.release() }
+        try await wait { await gate.hasEntered }
+        let reply = try await a.service.control(operation: "requestStatus", payload: .init(), deviceID: "TV")
+        XCTAssertTrue(reply.message.contains("registration is inspecting"))
+        XCTAssertFalse(reply.message.contains("Register a local catalog server"))
+        await gate.release(); _ = try await accepted(registration)
+    }
+
+    func testSupersedingFailedRegistrationRetiresOnlyItsExactRecoveryRoute() async throws {
+        let a = try await fixture(), b = try await fixture(), sourceStore = OutcomeBackend(), destinationStore = OutcomeBackend()
+        let source = TrustedApprovalsCoordinator(read: { try sourceStore.read() }, write: { try sourceStore.write($0) })
+        let destination = TrustedApprovalsCoordinator(read: { try destinationStore.read() }, write: { try destinationStore.write($0) })
+        _ = try await accepted(source.register(TrustedOwnerRecorder().owner(service: a.service)))
+        _ = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: b.service)))
+        destinationStore.failReads(true)
+        do { _ = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: a.service))); XCTFail("Failed destination accepted") }
+        catch { XCTAssertTrue(error is POSIXError) }
+        let pending = await a.service.recoveryStatuses(); XCTAssertTrue(pending.contains { $0.id == destination.id && !$0.blocksCheckoutWork })
+        destinationStore.failReads(false)
+        _ = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: b.service)))
+        try await wait { await !a.service.recoveryStatuses().contains { $0.id == destination.id } }
+        let before = await destination.observation.requestedGeneration
+        try await a.service.retryReconciliation()
+        let after = await destination.observation.requestedGeneration; XCTAssertEqual(before, after)
+    }
+
+    func testOneRecoveryPassDoesNotRestartCompletedUnrelatedCleanup() async throws {
+        let broken = OutcomeSwitch(), attempts = OutcomePaths(), sealing = RecoveryGate(), backend = OutcomeBackend(), recorder = TrustedOwnerRecorder()
+        let a = try await fixture(reconcile: { _ in if broken.on { attempts.add("cleanup"); throw POSIXError(.EIO) } }), b = try await fixture()
+        addTeardownBlock { await sealing.release() }
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) }, beforeRecoverySealing: { try await sealing.wait() })
+        _ = try await accepted(authority.register(recorder.owner(service: b.service)))
+        backend.failReads(true); let proposal = recorder.owner(service: a.service)
+        do { _ = try await accepted(authority.register(proposal)); XCTFail("Inspection accepted") } catch { XCTAssertTrue(error is POSIXError) }
+        backend.failReads(false); broken.on = true; proposal.eligibility.invalidate()
+        await authority.withdraw(serverID: proposal.serverID, eligibility: proposal.eligibility)
+        try await wait { await authority.observation.uninspectedCleanupTasks == 0 }
+        let before = attempts.count, retry = Task { try await b.service.retryReconciliation() }
+        addTeardownBlock { retry.cancel(); await sealing.release() }
+        try await wait { await sealing.hasEntered }
+        try await wait { await authority.observation.uninspectedCleanupTasks == 0 }
+        await sealing.release(); try await retry.value
+        try await wait { await authority.observation.uninspectedCleanupTasks == 0 }
+        XCTAssertEqual(attempts.count - before, 1)
+    }
+
+    func testDismissingAnOlderNoticeCannotClearLiveWriteUncertainty() async throws {
+        let a = try await fixture(), backend = OutcomeBackend(), recorder = TrustedOwnerRecorder()
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) })
+        let binding = try await accepted(authority.register(recorder.owner(service: a.service)))
+        let prior = try await recoveredApprovalNotice(a.service, authority: authority, backend: backend, permit: binding.permit, device: "TV")
+        let saved = await recorder.snapshot, notice = try XCTUnwrap(saved?.notices.first { $0.id == prior })
+        backend.failWrites(.unreadableBefore)
+        do { try await authority.revoke("TV", permit: binding.permit) { _ in }; XCTFail("Unknown revoke accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("unverified")) }
+        let before = await authority.observation
+        try await authority.dismissRecoveryNotice(notice.id, revision: notice.revision, permit: binding.permit)
+        let pending = await recorder.snapshot, state = await authority.observation
+        XCTAssertTrue(pending?.notices.isEmpty == true); XCTAssertTrue(pending?.diagnostic?.contains("unverified") == true)
+        XCTAssertEqual(state.uncertainWrites, 1); XCTAssertEqual(state.writes, before.writes); XCTAssertEqual(state.encodings, before.encodings)
+        let reply = try await a.service.control(operation: "requestStatus", payload: .init(), deviceID: "TV")
+        XCTAssertFalse(reply.enabled)
+        backend.failReads(false); backend.failWrites(.none); try await a.service.retryReconciliation()
+        let recovered = await recorder.snapshot; XCTAssertTrue(recovered?.notices.first?.message.contains("remains approved") == true)
+    }
+
+    func testDelayedFailedRegistrationCleanupCannotClearNewerAttempt() async throws {
+        let a = try await fixture(), authority = UUID(), server = UUID(), lifetime = TrustedOwnerLifetime()
+        await a.service.rememberFailedRegistration(authority: authority, generation: 1, server: server, lifetime: lifetime,
+            error: ShaderRequestError.unavailable("old attempt")) { _ in .init(completedServices: []) }
+        await a.service.rememberFailedRegistration(authority: authority, generation: 2, server: server, lifetime: lifetime,
+            error: ShaderRequestError.unavailable("new attempt")) { _ in .init(completedServices: []) }
+        await a.service.forgetFailedRegistration(authority: authority, server: server, lifetime: lifetime, maxGeneration: 1)
+        let current = await a.service.recoveryStatuses()
+        XCTAssertTrue(current.contains { $0.id == authority && $0.message.contains("new attempt") })
+        await a.service.forgetFailedRegistration(authority: authority, server: server, lifetime: lifetime, maxGeneration: 2)
+        let retired = await a.service.recoveryStatuses(); XCTAssertFalse(retired.contains { $0.id == authority })
     }
 
 }

@@ -656,7 +656,11 @@ private final class LifecycleClientSecrets: @unchecked Sendable {
         try await wait { await server.sessionCount == 0 }
         let recovered = await server.currentState
         XCTAssertTrue(recovered.pending.isEmpty); XCTAssertEqual(recovered.approved.map(\.id), [device])
-        XCTAssertTrue(recovered.message.contains("Pair this TV again")); XCTAssertEqual(backend.read(), saved)
+        XCTAssertFalse(recovered.message.contains("Pair this TV again"))
+        XCTAssertEqual(recovered.recoveryNotices.count, 1)
+        let notice = try XCTUnwrap(recovered.recoveryNotices.first)
+        XCTAssertTrue(notice.message.contains("Pair this TV again")); XCTAssertEqual(notice.deviceID, device)
+        XCTAssertEqual(backend.read(), saved)
         let next = try await tls(server), repeated = try await pair(server, client: next, device: device)
         try await fixture.service.retryReconciliation() // Old completion cannot close the new pairing.
         let stillPending = await server.currentState
@@ -666,6 +670,13 @@ private final class LifecycleClientSecrets: @unchecked Sendable {
         XCTAssertNotNil(issued.message.token); XCTAssertEqual(backend.writes, 2)
         let final = await server.currentState
         XCTAssertFalse(final.message.contains("Pair this TV again"))
+        XCTAssertEqual(final.recoveryNotices, recovered.recoveryNotices)
+        await server.stop()
+        let stopped = await server.currentState
+        XCTAssertEqual(stopped.message, "Local sharing is stopped."); XCTAssertEqual(stopped.recoveryNotices, recovered.recoveryNotices)
+        try await server.dismissRecoveryNotice(notice.id, revision: notice.revision)
+        let dismissed = await server.currentState; XCTAssertTrue(dismissed.recoveryNotices.isEmpty)
+        XCTAssertEqual(backend.writes, 2)
     }
 
 }
