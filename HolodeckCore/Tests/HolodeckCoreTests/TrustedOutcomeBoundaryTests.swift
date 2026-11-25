@@ -1853,6 +1853,76 @@ private final class OutcomeBackend: @unchecked Sendable {
         }
     }
 
+    func testDepartureRecoveryFallsBackAfterDestinationPassExitsBeforeAttempt() async throws {
+        let original = try await fixture(), moving = try await fixture(), calls = OutcomePaths(), destinationStore = OutcomeBackend()
+        let failOrdinaryPass = OutcomeSwitch()
+        let source = TrustedApprovalsCoordinator(read: { nil }, write: { _ in },
+            beforeRecoverySealing: { if failOrdinaryPass.on { throw POSIXError(.EBUSY) } },
+            beforeDepartureRetirementAdmission: { _ in calls.add("retirement") })
+        let destination = destinationStore.coordinator()
+        _ = try await accepted(source.register(TrustedOwnerRecorder().owner(service: original.service)))
+        _ = try await accepted(source.register(TrustedOwnerRecorder().owner(service: moving.service)))
+        let owner = try await accepted(destination.register(TrustedOwnerRecorder().owner()))
+        let departure = try await source.prepareDeparture(original.service, ticket: UUID())
+        // Inject exceptional departure state and an early ordinary-pass fault.
+        try departure.activate {}
+        await source.retainDepartureRecovery(serviceID: original.service.runtimeID, ticket: departure.id)
+        do {
+            _ = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: moving.service)))
+            XCTFail("Blocked handoff accepted")
+        } catch let error as TrustedDepartureRecoveryError { XCTAssertEqual(error.diagnosticID, departure.id) }
+        failOrdinaryPass.on = true
+        destinationStore.failWrites(.unreadableAfter)
+        do {
+            _ = try await destination.approve(owner.permit) {
+                .init(record: .init(id: "TV", name: "TV", tokenHash: "h"), token: "t", eligibility: .init())
+            }
+            XCTFail("Uncertain write accepted")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("unverified")) }
+
+        do { try await moving.service.retryReconciliation(); XCTFail("Destination failure ignored") }
+        catch let error as TrustedPartialRecovery {
+            XCTAssertTrue(error.remaining.contains { $0.contains("unverified") })
+        }
+        let statuses = await moving.service.recoveryStatuses(), destinationState = await destination.observation
+        XCTAssertFalse(statuses.contains { $0.id == departure.id })
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(destinationState.uncertainWrites, 1)
+        XCTAssertTrue(owner.permit.isCurrent)
+    }
+
+    func testDependentRegistrationWaitsForConflictingPreparationWithoutAdmission() async throws {
+        let moving = try await fixture(), original = try await fixture(), earlierStore = OutcomeBackend()
+        let earlier = earlierStore.coordinator(), destination = OutcomeBackend().coordinator()
+        earlierStore.failReads(true)
+        do {
+            _ = try await accepted(earlier.register(TrustedOwnerRecorder().owner(service: moving.service)))
+            XCTFail("Unreadable earlier authority accepted")
+        } catch let error as POSIXError { XCTAssertEqual(error.code, .EACCES) }
+        let owner = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: original.service)))
+        let departure = try await destination.prepareDeparture(original.service, ticket: UUID())
+        // Inject exceptional departure state while the other preparation is unresolved.
+        try departure.activate {}
+        await destination.retainDepartureRecovery(serviceID: original.service.runtimeID, ticket: departure.id)
+        let proposal = try await destination.register(TrustedOwnerRecorder().owner(service: moving.service))
+        do { _ = try await accepted(proposal); XCTFail("Blocked proposal accepted") }
+        catch let error as TrustedDepartureRecoveryError { XCTAssertEqual(error.diagnosticID, departure.id) }
+
+        do { try await moving.service.retryReconciliation(); XCTFail("Conflicting preparation ignored") }
+        catch let error as TrustedPartialRecovery {
+            XCTAssertTrue(error.remaining.contains { $0.contains("earlier TV authority inspection is unresolved") })
+        }
+        let after = await destination.observation, statuses = await moving.service.recoveryStatuses()
+        XCTAssertEqual(after.requestedGeneration, proposal.generation)
+        XCTAssertFalse(statuses.contains { $0.id == departure.id })
+        XCTAssertTrue(statuses.contains { $0.id == destination.id })
+        XCTAssertTrue(owner.permit.isCurrent)
+        earlierStore.failReads(false)
+        try await moving.service.retryReconciliation()
+        let accepted = await destination.observation
+        XCTAssertEqual(accepted.acceptedGeneration, proposal.generation + 1)
+    }
+
 }
 private final class OutcomePaths: @unchecked Sendable {
     private let lock = NSLock(); private var values: [String] = []

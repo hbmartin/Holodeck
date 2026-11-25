@@ -267,11 +267,17 @@ struct TrustedLocalRecoveryReceipt: Sendable {
 }
 /// Local-only entry point remains callable after the target changed registration.
 /// Its weak authority reference cannot keep an otherwise idle account alive.
+struct TrustedDepartureRecoveryKey: Hashable, Sendable {
+    let authority: UUID
+    let ticket: UUID
+}
+
 nonisolated final class TrustedAuthorityRecoveryEndpoint: @unchecked Sendable {
     let authorityID: UUID
     let ticketID: UUID
     let serviceID: UUID
     let journal: URL?
+    var key: TrustedDepartureRecoveryKey { .init(authority: authorityID, ticket: ticketID) }
     private weak var authority: TrustedApprovalsCoordinator?
     private let token = TrustedInvalidationToken()
     private let lock = NSLock()

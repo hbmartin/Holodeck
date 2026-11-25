@@ -59,12 +59,12 @@ struct TrustedRecoveryInterrupted: LocalizedError, Sendable {
 }
 struct TrustedRecoveryCompletion: Sendable {
     let completedServices: [UUID]
-    var attemptedDepartures: Set<UUID> = []
+    var attemptedDepartures: Set<TrustedDepartureRecoveryKey> = []
 }
 struct TrustedPartialRecovery: LocalizedError, Sendable {
     let completedServices: [UUID]
     let remaining: [String]
-    var attemptedDepartures: Set<UUID> = []
+    var attemptedDepartures: Set<TrustedDepartureRecoveryKey> = []
     var errorDescription: String? {
         remaining.joined(separator: "\n") + "\nPartial recovery: completed phases were committed; unresolved local or trusted recovery remains."
     }
@@ -587,7 +587,7 @@ actor TrustedApprovalsCoordinator {
         let completed: [UUID]
         let errors: [String]
         let localFailures: [UUID: String]
-        let attemptedDepartures: Set<UUID>
+        let attemptedDepartures: Set<TrustedDepartureRecoveryKey>
     }
     private var recoveryPass: RecoveryPass?
     private var successorRecoveryPass: RecoveryPass?
@@ -1038,7 +1038,8 @@ actor TrustedApprovalsCoordinator {
         var heldTargets: [UUID: ShaderRequestService] = [:]
         var awaitedCleanups: Set<UUID> = []
         var cleanupTasks: [UUID: TrustedRecoveryTask<Void>] = [:]
-        var retriedRegistrations: Set<UUID> = [], recoveredDepartureTickets: Set<UUID> = []
+        var retriedRegistrations: Set<UUID> = []
+        var recoveredDepartureTickets: Set<TrustedDepartureRecoveryKey> = []
         do {
             if uncertainWrite != nil {
                 let resolving = await acquireProgress()
@@ -1132,7 +1133,7 @@ actor TrustedApprovalsCoordinator {
             release(finishing)
             // Original-target repair must never run while this authority owns
             // the lane or recursively join the trusted pass calling it.
-            errors += await finishRecoveredDepartures(attempted: &recoveredDepartureTickets)
+            errors += try await finishRecoveredDepartures(attempted: &recoveredDepartureTickets)
             errors += try await recoverRequiredCleanups(passID, awaited: &awaitedCleanups, tasks: &cleanupTasks)
             let readiness = try await acquire(.progress)
             if let pass = recoveryPass, pass.id == passID {
@@ -1152,6 +1153,15 @@ actor TrustedApprovalsCoordinator {
             release(readiness)
         } catch {
             for target in heldTargets.values { await target.finishTrustedRecovery(pass: passID) }
+            try Task.checkCancellation()
+            if !recoveredDepartureTickets.isEmpty {
+                // Even an aborted pass must report tickets it already tried.
+                // Otherwise the caller's independent sweep would retry them.
+                let detail = errors + [error.localizedDescription]
+                throw TrustedPartialRecovery(completedServices: [],
+                    remaining: Array(detail.prefix(9)).map { BoundedDiagnostics.bounded($0, bytes: 8192) },
+                    attemptedDepartures: recoveredDepartureTickets)
+            }
             throw error
         }
         for target in heldTargets.values { await target.finishTrustedRecovery(pass: passID) }
@@ -1165,18 +1175,25 @@ actor TrustedApprovalsCoordinator {
         } == true
     }
 
-    private func recoverParticipatingRegistration(_ passID: UUID, attempted: inout Set<UUID>, departures: inout Set<UUID>, errors: inout [String]) async throws -> Binding? {
+    private func recoverParticipatingRegistration(_ passID: UUID, attempted: inout Set<UUID>, departures: inout Set<TrustedDepartureRecoveryKey>, errors: inout [String]) async throws -> Binding? {
         guard let failure = failedRegistration, failure.identity.isCurrent,
               let target = failure.owner.service, registrationParticipates(failure, serviceID: target.runtimeID, passID: passID),
               attempted.insert(target.runtimeID).inserted else { return nil }
         do {
-            if let departure = failure.departure, departure.isCurrent {
-                departures.insert(departure.ticketID)
-                try await departure.retry()
+            var conflictingPreparation = false
+            if let departure = failure.departure {
+                if departure.isCurrent {
+                    guard departures.insert(departure.key).inserted else { return nil }
+                    try await departure.retry()
+                }
+                conflictingPreparation = await target.hasConflictingTrustedPreparation(authority: id)
             }
             try Task.checkCancellation()
             guard failure.identity.isCurrent, failedRegistration?.identity === failure.identity,
                   registrationParticipates(failure, serviceID: target.runtimeID, passID: passID) else { return nil }
+            if conflictingPreparation {
+                throw Self.unavailable("An earlier TV authority inspection is unresolved. Recover that authority before retrying this server registration.")
+            }
             switch try await register(failure.owner).value() {
             case .accepted(let binding): return binding.permit.isCurrent ? binding : nil
             case .superseded: return nil
@@ -1569,12 +1586,17 @@ actor TrustedApprovalsCoordinator {
         clearDiagnostic(.departure(ticket))
         await notify()
     }
-    private func finishRecoveredDepartures(attempted: inout Set<UUID>) async -> [String] {
+    private func finishRecoveredDepartures(attempted: inout Set<TrustedDepartureRecoveryKey>) async throws -> [String] {
         var failures: [String] = []
-        let pending = departureRecovery.values.map { ($0.serviceID, $0.id) }
-        for (serviceID, ticket) in pending where attempted.insert(ticket).inserted {
-            do { try await recoverDeparture(serviceID: serviceID, ticket: ticket) }
-            catch { failures.append(error.localizedDescription) }
+        let pending = departureEndpoints.values.sorted { $0.ticketID.uuidString < $1.ticketID.uuidString }
+        for endpoint in pending where endpoint.isCurrent {
+            try Task.checkCancellation()
+            guard attempted.insert(endpoint.key).inserted else { continue }
+            do { try await endpoint.retry() }
+            catch {
+                try Task.checkCancellation()
+                failures.append(error.localizedDescription)
+            }
         }
         return failures
     }
