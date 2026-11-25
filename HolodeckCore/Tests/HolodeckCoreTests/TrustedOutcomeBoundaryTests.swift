@@ -34,6 +34,7 @@ private final class OutcomeBackend: @unchecked Sendable {
     var bytes: Data? { lock.withLock { data } }
     var reads: Int { lock.withLock { readCount } }
     var writes: Int { lock.withLock { writeCount } }
+    func coordinator() -> TrustedApprovalsCoordinator { .init(read: { try self.read() }, write: { try self.write($0) }) }
 }
 
 @MainActor final class TrustedOutcomeBoundaryTests: XCTestCase {
@@ -1779,6 +1780,77 @@ private final class OutcomeBackend: @unchecked Sendable {
         try XCTUnwrap(result.value).get()
         let configuration = await a.service.configurationValue()
         XCTAssertFalse(configuration.enabled)
+    }
+
+    func testForeignDepartureSettlementPublishesToProposalRecipient() async throws {
+        let original = try await fixture(), moving = try await fixture(), late = try await fixture()
+        let source = OutcomeBackend().coordinator(), destination = OutcomeBackend().coordinator()
+        _ = try await accepted(source.register(TrustedOwnerRecorder().owner(service: original.service)))
+        _ = try await accepted(source.register(TrustedOwnerRecorder().owner(service: moving.service)))
+        let departure = try await source.prepareDeparture(original.service, ticket: UUID())
+        // Inject exceptional state without asserting a normal producer.
+        try departure.activate {}
+        await source.retainDepartureRecovery(serviceID: original.service.runtimeID, ticket: departure.id)
+        let endpoint: TrustedAuthorityRecoveryEndpoint
+        do {
+            _ = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: moving.service)))
+            return XCTFail("Blocked handoff accepted")
+        } catch let error as TrustedDepartureRecoveryError { endpoint = error.endpoint }
+
+        let updates = await moving.service.localUpdates(), observed = OutcomeResult<Bool>()
+        let observer = Task {
+            for await state in updates {
+                observed.value = .success(state.recoveries.contains { $0.id == departure.id })
+            }
+        }
+        addTeardownBlock { observer.cancel() }
+        try await wait { (try? observed.value?.get()) == true }
+        try await endpoint.retry()
+        try await wait { (try? observed.value?.get()) == false }
+        XCTAssertFalse(endpoint.isCurrent)
+        // A delayed attachment cannot resurrect the settled ticket.
+        await endpoint.attach(to: late.service)
+        let current = await late.service.recoveryStatuses()
+        XCTAssertFalse(current.contains { $0.id == departure.id })
+    }
+
+    func testUnavailableOriginalStillHasOneCanonicalDepartureEndpoint() async throws {
+        let target = try await fixture()
+        // The fixture itself keeps its service alive. Use an independently
+        // scoped optional service to exercise an unavailable original target.
+        let folder = target.root.appendingPathComponent("unavailable")
+        var original: ShaderRequestService? = ShaderRequestService(
+            catalog: DirectoryCatalog(directory: folder.appendingPathComponent("catalog")), directory: folder)
+        await original?.suspend()
+        try await original?.initialize(configuration: .init(repository: folder.path))
+        let source = OutcomeBackend().coordinator()
+        let serviceID = try XCTUnwrap(original?.runtimeID), weak = WeakRequestService(original)
+        _ = try await accepted(source.register(TrustedOwnerRecorder().owner(service: original)))
+        let departure = try await source.prepareDeparture(XCTUnwrap(original), ticket: UUID())
+        try departure.activate {}
+        original = nil
+        try await wait { weak.value == nil }
+        await source.retainDepartureRecovery(serviceID: serviceID, ticket: departure.id)
+        let endpoints = OutcomePaths()
+        var first: TrustedAuthorityRecoveryEndpoint?
+        for service in [nil, target.service, nil] {
+            do {
+                _ = try await accepted(source.register(TrustedOwnerRecorder().owner(service: service)))
+                XCTFail("Missing departure evidence accepted")
+            } catch let error as TrustedDepartureRecoveryError {
+                if let first { XCTAssertTrue(first === error.endpoint) }
+                else { first = error.endpoint }
+                XCTAssertNil(error.endpoint.journal)
+                endpoints.add(error.endpoint.ticketID.uuidString)
+            }
+        }
+        XCTAssertEqual(endpoints.count, 3)
+        do {
+            try await XCTUnwrap(first).retry()
+            XCTFail("Missing original service was inferred")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("cannot access its original request service"))
+        }
     }
 
 }

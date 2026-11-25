@@ -762,7 +762,7 @@ public actor ShaderRequestService {
         emitUpdates()
     }
     private var authorityRecoveryEndpoints: [UUID: TrustedAuthorityRecoveryEndpoint] = [:]
-    func trustedRecoveryJournal() -> URL { directory }
+    nonisolated func trustedRecoveryJournal() -> URL { directory }
     func rememberAuthorityRecovery(_ endpoint: TrustedAuthorityRecoveryEndpoint) {
         authorityRecoveryEndpoints = authorityRecoveryEndpoints.filter { $0.value.isCurrent }
         guard endpoint.isCurrent else { return }
@@ -772,8 +772,9 @@ public actor ShaderRequestService {
         guard authorityRecoveryEndpoints[endpoint.ticketID] === endpoint else { return }
         emitUpdates()
     }
-    func forgetAuthorityRecovery(ticket: UUID) {
-        authorityRecoveryEndpoints[ticket] = nil; emitUpdates(); scheduleWakeup()
+    func forgetAuthorityRecovery(_ endpoint: TrustedAuthorityRecoveryEndpoint) {
+        guard authorityRecoveryEndpoints[endpoint.ticketID] === endpoint else { return }
+        authorityRecoveryEndpoints[endpoint.ticketID] = nil; emitUpdates(); scheduleWakeup()
     }
     private var authorityRecoveryFailure: String? {
         authorityRecoveryEndpoints.values.filter(\.isCurrent).min { $0.ticketID.uuidString < $1.ticketID.uuidString }?.message
