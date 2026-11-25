@@ -1923,6 +1923,135 @@ private final class OutcomeBackend: @unchecked Sendable {
         XCTAssertEqual(accepted.acceptedGeneration, proposal.generation + 1)
     }
 
+    func testStandaloneRetrySkippedBeforeSubmissionKeepsStartAvailable() async throws {
+        let a = try await fixture(), retirement = RecoveryGate()
+        addTeardownBlock { await retirement.release() }
+        let authority = TrustedApprovalsCoordinator(read: { nil }, write: { _ in },
+            beforeDepartureRetirementAdmission: { _ in try await retirement.wait() })
+        _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: a.service)))
+        let departure = try await authority.prepareDeparture(a.service, ticket: UUID())
+        // Force a retained departure so retry waits before submitting a registration.
+        try departure.activate {}
+        await authority.retainDepartureRecovery(serviceID: a.service.runtimeID, ticket: departure.id)
+        let server = LocalCatalogServer(catalog: DirectoryCatalog(directory: a.root.appendingPathComponent("catalog")),
+            testingNamespace: "skipped-registration-" + UUID().uuidString, trustedApprovals: authority)
+        addTeardownBlock { try await server.clearTestSecrets() }
+        do { try await server.start(); XCTFail("Blocked server started") }
+        catch let error as TrustedDepartureRecoveryError { XCTAssertEqual(error.diagnosticID, departure.id) }
+        let state = await server.currentState, notice = try XCTUnwrap(state.registrationRecovery)
+        let result = OutcomeResult<Void>()
+        let retry = Task {
+            do { try await server.retryRegistration(notice.id); result.value = .success(()) }
+            catch { result.value = .failure(error) }
+        }
+        addTeardownBlock { retry.cancel(); await retirement.release() }
+        try await wait { await retirement.hasEntered }
+        let newer = try await authority.register(TrustedOwnerRecorder().owner())
+        await retirement.release()
+        try await wait { result.value != nil }
+        try XCTUnwrap(result.value).get()
+        _ = try await accepted(newer)
+        let skipped = await server.currentState, latest = await authority.observation
+        XCTAssertEqual(skipped.registrationRetryMessage, "Registration changed before the retry started.")
+        XCTAssertNil(skipped.registrationRecovery)
+        XCTAssertEqual(latest.requestedGeneration, newer.generation)
+
+        try await server.start()
+        try await wait { await server.listeningPort != nil }
+        let started = await server.currentState
+        XCTAssertNil(started.registrationRetryMessage)
+    }
+
+    func testSubmittedStandaloneRetryCanStillBeSuperseded() async throws {
+        let a = try await fixture(), backend = OutcomeBackend(), inspection = RecoveryGate(), armed = OutcomeSwitch()
+        addTeardownBlock { await inspection.release() }
+        let authority = TrustedApprovalsCoordinator(read: { try backend.read() }, write: { try backend.write($0) },
+            beforeInspectionRead: { if armed.take() { try await inspection.wait() } })
+        let server = LocalCatalogServer(catalog: DirectoryCatalog(directory: a.root.appendingPathComponent("catalog")),
+            testingNamespace: "superseded-registration-" + UUID().uuidString, trustedApprovals: authority)
+        addTeardownBlock { await server.shutdown() }
+        backend.failReads(true)
+        do { try await server.start(); XCTFail("Failed registration started") }
+        catch let error as POSIXError { XCTAssertEqual(error.code, .EACCES) }
+        let failed = await server.currentState, notice = try XCTUnwrap(failed.registrationRecovery)
+        let before = await authority.observation
+        backend.failReads(false); armed.on = true
+        let result = OutcomeResult<Void>()
+        let retry = Task {
+            do { try await server.retryRegistration(notice.id); result.value = .success(()) }
+            catch { result.value = .failure(error) }
+        }
+        addTeardownBlock { retry.cancel(); await inspection.release() }
+        try await wait { await inspection.hasEntered }
+        let submitted = await authority.observation
+        XCTAssertEqual(submitted.requestedGeneration, before.requestedGeneration + 1)
+        let newer = try await authority.register(TrustedOwnerRecorder().owner())
+        await inspection.release()
+        try await wait { result.value != nil }
+        try XCTUnwrap(result.value).get()
+        _ = try await accepted(newer)
+        let state = await server.currentState
+        XCTAssertNil(state.registrationRetryMessage)
+        do { try await server.start(); XCTFail("Superseded server re-registered implicitly") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("server was replaced")) }
+        let latest = await authority.observation
+        XCTAssertEqual(latest.requestedGeneration, newer.generation)
+    }
+
+    func testAcceptedStandaloneRetryPublishesReplayFailureAfterActionDisappears() async throws {
+        let a = try await fixture(), backend = OutcomeBackend(), authority = backend.coordinator()
+        _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: a.service)))
+        let server = LocalCatalogServer(catalog: DirectoryCatalog(directory: a.root.appendingPathComponent("catalog")),
+            testingNamespace: "replay-after-registration-" + UUID().uuidString, trustedApprovals: authority)
+        addTeardownBlock { await server.shutdown() }
+        backend.failReads(true)
+        do { try await server.start(); XCTFail("Failed registration started") }
+        catch let error as POSIXError { XCTAssertEqual(error.code, .EACCES) }
+        let failed = await server.currentState, notice = try XCTUnwrap(failed.registrationRecovery)
+        let installation = await a.service.prepareTargetInstallation(authority: authority.id)
+        let preparation = TrustedLocalPreparation(serviceID: a.service.runtimeID, authority: authority.id,
+            registration: installation.registration, attempt: UUID(), generation: 1, consumerAuthority: authority.id)
+        let preparing = try await authority.beginTargetRecovery(a.service, preparation: preparation)
+        XCTAssertTrue(preparing)
+        let intent = RequestRevocationIntent(operationID: UUID(), deviceID: "TV")
+        try backend.write(TrustedTVApprovals(revocations: [intent]).encoded())
+        backend.failReads(false)
+        do { try await server.retryRegistration(notice.id); XCTFail("Unresolved replay reported success") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("Target local recovery is still preparing")) }
+        let state = await server.currentState
+        XCTAssertNil(state.registrationRecovery)
+        XCTAssertTrue(state.trustedMessage?.contains(intent.operationID.uuidString) == true)
+        XCTAssertTrue(state.trustedMessage?.contains("Target local recovery is still preparing") == true)
+    }
+
+    func testAbortedDestinationPassReportsItsAttemptedDeparture() async throws {
+        let original = try await fixture(), requester = try await fixture(), attempts = OutcomePaths(), abort = OutcomeSwitch()
+        let source = OutcomeBackend().coordinator()
+        let destination = TrustedApprovalsCoordinator(read: { nil }, write: { _ in },
+            beforeRecoverySealing: { if abort.on { throw POSIXError(.EBUSY) } },
+            beforeDepartureRetirementAdmission: { _ in attempts.add("retire"); throw POSIXError(.EIO) })
+        _ = try await accepted(source.register(TrustedOwnerRecorder().owner(service: requester.service)))
+        _ = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: original.service)))
+        let departure = try await destination.prepareDeparture(original.service, ticket: UUID())
+        // Inject a retained departure whose settlement fails after admission.
+        try departure.activate {}
+        await destination.retainDepartureRecovery(serviceID: original.service.runtimeID, ticket: departure.id)
+        do {
+            _ = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: requester.service)))
+            XCTFail("Unsettled departure accepted")
+        } catch let error as TrustedDepartureRecoveryError { XCTAssertEqual(error.diagnosticID, departure.id) }
+        abort.on = true
+        do { try await requester.service.retryReconciliation(); XCTFail("Failed departure reported as success") }
+        catch let error as TrustedPartialRecovery {
+            let details = error.remaining.joined()
+            XCTAssertTrue(details.contains(POSIXError(.EIO).localizedDescription))
+            XCTAssertTrue(details.contains(POSIXError(.EBUSY).localizedDescription))
+        }
+        XCTAssertEqual(attempts.count, 1, "An attempted departure must not re-enter the fallback sweep")
+        let status = await requester.service.recoveryStatuses()
+        XCTAssertTrue(status.contains { $0.id == departure.id })
+    }
+
 }
 private final class OutcomePaths: @unchecked Sendable {
     private let lock = NSLock(); private var values: [String] = []

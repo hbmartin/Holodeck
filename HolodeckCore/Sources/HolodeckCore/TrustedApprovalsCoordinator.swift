@@ -154,6 +154,10 @@ actor TrustedApprovalsCoordinator {
         }
     }
     enum BindingOutcome: Sendable { case accepted(Binding), superseded }
+    enum ServerRegistrationRetry: Sendable {
+        case skipped
+        case submitted(BindingOutcome)
+    }
     struct Registration: Sendable {
         let generation: UInt64
         let completion: RequestPersistence.CommitTicket<BindingOutcome>
@@ -1876,25 +1880,27 @@ actor TrustedApprovalsCoordinator {
         return try await retry(requester: requester, local: local, registration: identity)
     }
 
-    func retryServerRegistration(_ attempt: UUID, server: UUID, lifetime: TrustedOwnerLifetime) async throws -> BindingOutcome {
+    func retryServerRegistration(_ attempt: UUID, server: UUID, lifetime: TrustedOwnerLifetime) async throws -> ServerRegistrationRetry {
         try Task.checkCancellation()
         guard let failure = failedRegistration, !failure.owner.requiresService,
               failure.identity.id == attempt, failure.identity.server == server,
-              failure.identity.lifetime === lifetime, failure.identity.isCurrent else { return .superseded }
-        if uncertainWrite != nil {
-            let token = try await acquire(.progress)
-            do {
-                guard failure.identity.isCurrent, failedRegistration?.identity === failure.identity else {
-                    release(token); return .superseded
-                }
+              failure.identity.lifetime === lifetime, failure.identity.isCurrent else { return .skipped }
+        do {
+            if uncertainWrite != nil {
+                let token = try await acquire(.progress)
+                defer { release(token) }
+                guard failure.identity.isCurrent, failedRegistration?.identity === failure.identity else { return .skipped }
                 try await resolveUncertainWrite()
-            } catch { release(token); throw error }
-            release(token)
+            }
+            if let departure = failure.departure { try await departure.retry() }
+        } catch {
+            try Task.checkCancellation()
+            guard failure.identity.isCurrent, failedRegistration?.identity === failure.identity else { return .skipped }
+            throw error
         }
-        if let departure = failure.departure { try await departure.retry() }
         try Task.checkCancellation()
-        guard failure.identity.isCurrent, failedRegistration?.identity === failure.identity else { return .superseded }
-        return try await register(failure.owner).value()
+        guard failure.identity.isCurrent, failedRegistration?.identity === failure.identity else { return .skipped }
+        return .submitted(try await register(failure.owner).value())
     }
     private func completeRegistration(_ request: Request, error: Error) {
         if error is RegistrationAbandoned || error is TrustedRegistrationSuperseded {
