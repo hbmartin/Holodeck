@@ -210,6 +210,94 @@ class ShaderRequestWorkerTests(unittest.TestCase):
                 if mode=='approximate':self.assertTrue(result['approximations'])
                 if mode=='unchanged':self.assertFalse(result['changed']);self.assertEqual(result['commitSHA'],self.base_sha)
 
+    def new_shader_color_fixture(self, colors):
+        self.request['prompt'] = 'new'
+        self.save_request()
+        expected_body = 'NEW\n'
+        codex = CODEX.replace(
+            "        Path('shaders/gamma').mkdir(exist_ok=True)",
+            f"""        if count > 1:
+            assert sid in json.loads(Path('index.json').read_text())['shaders']
+            assert 'shaders/gamma/body.metal' in json.loads(Path('authoring.json').read_text())['sourceRequirements']
+            assert Path('shaders/gamma/body.metal').read_text() == {expected_body!r}
+            assert json.loads(Path('shaders/gamma/metadata.json').read_text())['colors'] == {colors!r}
+        Path('shaders/gamma').mkdir(exist_ok=True)"""
+        )
+        self.codex.write_text(codex.replace(
+            "        Path('shaders/gamma/metadata.json').write_text(json.dumps(meta))",
+            f"""        meta['colors'] = {colors!r} if count == 1 else {colors[:2]!r}
+        Path('shaders/gamma/metadata.json').write_text(json.dumps(meta))
+        authoring = json.loads(Path('authoring.json').read_text())
+        authoring['sourceRequirements']['shaders/gamma/body.metal'] = []
+        Path('authoring.json').write_text(json.dumps(authoring))"""
+        ))
+        self.tool.write_text(TOOL.replace(
+            "    fixture = Path('.fixture-validation.json')",
+            """    directory = Path('shaders/gamma')
+    if directory.is_dir():
+        metadata = directory / 'metadata.json'
+        if not metadata.is_file():
+            print('Missing or external asset: shaders/gamma/metadata.json', file=sys.stderr)
+            raise SystemExit(1)
+        if len(json.loads(metadata.read_text())['colors']) != 2:
+            print('Invalid colors for gamma', file=sys.stderr)
+            raise SystemExit(1)
+    fixture = Path('.fixture-validation.json')"""
+        ))
+
+    def test_new_shader_trims_extra_preview_color_before_publication(self):
+        colors = [[0.98, 0.38, 0.06], [0.4, 0.075, 0.08], [0.96, 0.69, 0.32]]
+        self.new_shader_color_fixture(colors)
+
+        code, events = self.run_worker()
+
+        self.assertEqual(code, 0, events)
+        self.assertEqual(self.result(events)['outputKind'], 'new')
+        self.assertEqual((self.job/'implementation-count').read_text(), '1')
+        self.assertEqual(self.git(self.root, 'rev-list', '--count', 'origin/main').strip(), '2')
+        published = json.loads(self.git(self.root, 'show', 'origin/main:shaders/gamma/metadata.json'))
+        self.assertEqual(published['colors'], colors[:2])
+        self.assertEqual(published['discovery']['tags'], ['fluid'])
+        self.assertEqual(self.git(self.root, 'show', 'origin/main:shaders/gamma/body.metal'), 'NEW\n')
+        self.assertTrue(any(f'Dropped {colors[2]}' in event.get('text', '') for event in events))
+
+    def test_new_shader_invalid_palette_repairs_after_pristine_baseline(self):
+        colors = [[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 1]]
+        self.new_shader_color_fixture(colors)
+
+        code, events = self.run_worker()
+
+        self.assertEqual(code, 0, events)
+        self.assertEqual(self.result(events)['shaderID'], 'gamma')
+        self.assertEqual((self.job/'implementation-count').read_text(), '2')
+        self.assertIn('"verificationFeedback": "Invalid colors for gamma', self.invocations()[1]['prompt'])
+        self.assertTrue(any(event.get('stage') == 'repairing' for event in events))
+        self.assertFalse(any('Reapplying checkpoint requires' in event.get('text', '') for event in events))
+        published = json.loads(self.git(self.root, 'show', 'origin/main:shaders/gamma/metadata.json'))
+        self.assertEqual(published['colors'], colors[:2])
+        self.assertEqual(self.git(self.root, 'rev-list', '--count', 'origin/main').strip(), '2')
+
+    def test_preview_color_normalization_leaves_invalid_colors_and_existing_shaders_untouched(self):
+        worker = worker_module.Worker(self.config, self.job)
+        worker.save(base=self.base_sha)
+        new_metadata = self.root/'shaders/gamma/metadata.json'
+        new_metadata.parent.mkdir()
+        for colors in (
+            [[1, 0, 0], [0, 1, 0], [True, 0, 0]],
+            [[1, 0, 0], [0, 1, 0], [2, 0, 0]],
+            [[1, 0, 0], [0, 1, 0], [0, 1]],
+        ):
+            with self.subTest(colors=colors):
+                source = json.dumps({'colors': colors})
+                new_metadata.write_text(source)
+                worker.normalize_preview_colors({'outputKind': 'new', 'shaderID': 'gamma'})
+                self.assertEqual(new_metadata.read_text(), source)
+        existing_metadata = self.root/'shaders/alpha/metadata.json'
+        source = json.dumps({'colors': [[1, 0, 0], [0, 1, 0], [0, 0, 1]]})
+        existing_metadata.write_text(source)
+        worker.normalize_preview_colors({'outputKind': 'new', 'shaderID': 'alpha'})
+        self.assertEqual(existing_metadata.read_text(), source)
+
     def test_clarification_parks_clean_then_resumes_explicit_session(self):
         self.request['prompt']='ambiguous';self.save_request()
         code,events=self.run_worker();self.assertEqual(code,0,events)
@@ -512,6 +600,35 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         self.assertEqual((self.root/'ignored/original').read_bytes(),b'modified')
         worker.restore_patch()
         self.assertEqual((self.root/'shaders/alpha/body.metal').read_text(),'PARKED\n')
+
+    def test_interrupted_cleanup_retries_only_owned_empty_shader_directories(self):
+        worker = self.ignored_worker()
+        empty = self.root/'shaders/gamma'
+        retained = self.root/'shaders/retained'
+        unrelated = self.root/'shaders/unrelated'
+        for directory in (empty, retained, unrelated):
+            directory.mkdir()
+        for directory in (empty, retained):
+            (directory/'body.metal').write_text('UNPUBLISHED\n')
+        ignored = retained/'ignored/source'
+        ignored.parent.mkdir()
+        ignored.write_text('keep ignored source')
+
+        with patch.object(worker_module.os, 'rmdir', side_effect=worker_module.WorkerInterrupted(15)):
+            with self.assertRaises(worker_module.WorkerInterrupted):
+                worker.clean()
+        self.assertTrue(empty.is_dir())
+        self.assertFalse(list(empty.iterdir()))
+        self.assertTrue(worker.owner.exists())
+
+        restarted = worker_module.Worker(self.config, self.job)
+        restarted.request = self.request
+        restarted.clean()
+        self.assertFalse(empty.exists())
+        self.assertEqual(ignored.read_text(), 'keep ignored source')
+        self.assertTrue(unrelated.is_dir())
+        self.assertTrue((self.root/'shaders/alpha/metadata.json').is_file())
+        self.assertFalse(restarted.owner.exists())
 
     def test_ignored_agent_edits_survive_clarification_success_and_failure(self):
         self.ignored_worker()
