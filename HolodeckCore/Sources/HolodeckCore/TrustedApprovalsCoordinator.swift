@@ -156,6 +156,7 @@ actor TrustedApprovalsCoordinator {
     enum BindingOutcome: Sendable { case accepted(Binding), superseded }
     enum ServerRegistrationRetry: Sendable {
         case skipped
+        case repairFailedAfterSkip(any Error)
         case submitted(BindingOutcome)
     }
     struct Registration: Sendable {
@@ -1895,7 +1896,9 @@ actor TrustedApprovalsCoordinator {
             if let departure = failure.departure { try await departure.retry() }
         } catch {
             try Task.checkCancellation()
-            guard failure.identity.isCurrent, failedRegistration?.identity === failure.identity else { return .skipped }
+            guard failure.identity.isCurrent, failedRegistration?.identity === failure.identity else {
+                return .repairFailedAfterSkip(error)
+            }
             throw error
         }
         try Task.checkCancellation()
