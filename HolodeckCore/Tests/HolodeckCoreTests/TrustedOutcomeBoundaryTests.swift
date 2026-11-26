@@ -2057,26 +2057,26 @@ private final class OutcomeBackend: @unchecked Sendable {
 
     func testAbortedDestinationPassReportsItsAttemptedDeparture() async throws {
         let original = try await fixture(), requester = try await fixture(), attempts = OutcomePaths(), abort = OutcomeSwitch()
-        let source = OutcomeBackend().coordinator()
-        let destination = TrustedApprovalsCoordinator(read: { nil }, write: { _ in },
+        let authority = TrustedApprovalsCoordinator(read: { nil }, write: { _ in },
             beforeRecoverySealing: { if abort.on { throw POSIXError(.EBUSY) } },
             beforeDepartureRetirementAdmission: { _ in attempts.add("retire"); throw POSIXError(.EIO) })
-        _ = try await accepted(source.register(TrustedOwnerRecorder().owner(service: requester.service)))
-        _ = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: original.service)))
-        let departure = try await destination.prepareDeparture(original.service, ticket: UUID())
+        _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: original.service)))
+        _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: requester.service)))
+        let departure = try await authority.prepareDeparture(original.service, ticket: UUID())
         // Inject a retained departure whose settlement fails after admission.
         try departure.activate {}
-        await destination.retainDepartureRecovery(serviceID: original.service.runtimeID, ticket: departure.id)
+        await authority.retainDepartureRecovery(serviceID: original.service.runtimeID, ticket: departure.id)
         do {
-            _ = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: requester.service)))
+            _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: requester.service)))
             XCTFail("Unsettled departure accepted")
         } catch let error as TrustedDepartureRecoveryError { XCTAssertEqual(error.diagnosticID, departure.id) }
         abort.on = true
         do { try await requester.service.retryReconciliation(); XCTFail("Failed departure reported as success") }
         catch let error as TrustedPartialRecovery {
-            let details = error.remaining.joined()
-            XCTAssertTrue(details.contains(POSIXError(.EIO).localizedDescription))
-            XCTAssertTrue(details.contains(POSIXError(.EBUSY).localizedDescription))
+            XCTAssertEqual(error.remaining.first, POSIXError(.EBUSY).localizedDescription)
+            XCTAssertTrue(error.remaining.contains { $0.contains(POSIXError(.EIO).localizedDescription) })
+            XCTAssertEqual(error.completedServices, [requester.service.runtimeID])
+            XCTAssertEqual(error.attemptedDepartures, [.init(authority: authority.id, ticket: departure.id)])
         }
         XCTAssertEqual(attempts.count, 1, "An attempted departure must not re-enter the fallback sweep")
         let status = await requester.service.recoveryStatuses()

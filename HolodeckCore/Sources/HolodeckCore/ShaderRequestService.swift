@@ -2009,8 +2009,17 @@ public actor ShaderRequestService {
         try Task.checkCancellation()
         let hasTrustedPhase = replayTrusted && revocationCoordinator != nil
         var failures: [String] = [], completed: Set<UUID> = !hasTrustedPhase && local.completed ? [runtimeID] : []
+        var stoppingFailures: [String] = []
         let hasIndependentPhase = replayTrusted && (revocationCoordinator != nil || authorityRecoveryEndpoints.values.contains(where: \.isCurrent) || failedRegistrationRecoveries.values.contains(where: { $0.identity.isCurrent }))
         var attemptedDepartures: Set<TrustedDepartureRecoveryKey> = []
+        func collect(_ partial: TrustedPartialRecovery) {
+            completed.formUnion(partial.completedServices)
+            attemptedDepartures.formUnion(partial.attemptedDepartures)
+            failures += partial.otherFailures
+            if let abort = partial.abortedPass {
+                stoppingFailures.append(abort.stoppingError)
+            }
+        }
         let recoveredAuthority = replayTrusted ? ordinaryRecoveryAuthority : nil
         if replayTrusted, let coordinator = revocationCoordinator {
             do {
@@ -2020,9 +2029,14 @@ public actor ShaderRequestService {
             } catch {
                 try Task.checkCancellation()
                 if let partial = error as? TrustedPartialRecovery {
-                    completed.formUnion(partial.completedServices)
-                    attemptedDepartures.formUnion(partial.attemptedDepartures)
-                    failures += partial.remaining
+                    collect(partial)
+                    // Only the requester's own coordinator can leave this
+                    // decision unmade. Later independent routes cannot reverse it.
+                    if let abort = partial.abortedPass, let receipt = local.receipt,
+                       !abort.evaluatedAttempts.contains(receipt.attemptID),
+                       validateTrustedRecovery(local).completed {
+                        completed.insert(runtimeID)
+                    }
                 } else {
                     // This set records verified local phases, not whole-pass
                     // success. The trusted failure still makes the result partial.
@@ -2062,9 +2076,7 @@ public actor ShaderRequestService {
                 } catch {
                     try Task.checkCancellation()
                     if let partial = error as? TrustedPartialRecovery {
-                        completed.formUnion(partial.completedServices)
-                        attemptedDepartures.formUnion(partial.attemptedDepartures)
-                        failures += partial.remaining
+                        collect(partial)
                     } else { failures.append(error.localizedDescription) }
                 }
             }
@@ -2077,10 +2089,10 @@ public actor ShaderRequestService {
                 catch { try Task.checkCancellation(); failures.append(error.localizedDescription) }
             }
         }
-        if !failures.isEmpty {
+        if !stoppingFailures.isEmpty || !failures.isEmpty {
             if let failure = local.failure { failures.insert(failure, at: 0) }
             throw TrustedPartialRecovery(completedServices: completed.sorted { $0.uuidString < $1.uuidString },
-                remaining: Array(failures.prefix(9)).map { BoundedDiagnostics.bounded($0, bytes: 8192) })
+                remaining: stoppingFailures + failures, attemptedDepartures: attemptedDepartures)
         }
         if hasIndependentPhase, let failure = local.failure {
             throw TrustedPartialRecovery(completedServices: completed.sorted { $0.uuidString < $1.uuidString }, remaining: [failure])

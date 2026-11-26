@@ -1774,3 +1774,18 @@ Five paired optimized samples per build used the same compiler and filesystem. E
 | Descriptive median | 1245.1 ms | 995.0 ms |
 
 The comparison checks structural counts without a timing threshold. Local receipts are in `/tmp/pr63-source.json`, `/tmp/pr63-core-coverage.json`, `/tmp/pr63-release-results.json`, `/tmp/pr63-debug-results.json`, `/tmp/pr63-races-*-results.json`, `/tmp/pr63-apps-results.json`, and `/tmp/pr63-profile-results.json`.
+
+## PR #63 follow-up — standalone retry and aborted recovery reporting (2026-11-26)
+
+- A standalone retry whose proposal changes during repair now reports the original repair failure in Settings and leaves Start available.
+- An aborted trusted pass prioritizes its stopping error in the bounded report, retains attempted departure keys, and counts a still-current requester receipt when its own pass stopped before evaluating it. Independent routes and stale receipts cannot reverse an authoritative exclusion.
+- Regression coverage exercises injected departure recovery, full diagnostic capacity, genuine supersession, stale receipts, and continued retry eligibility.
+
+Validation ran on macOS and Apple silicon. The final builds used isolated caches on the external validation volume. Validation used merged PR #63 as the baseline. PR #64 advanced main with disjoint Python worker changes during this run.
+
+- The **733-test** Swift core inventory recorded **727 passes, six expected skips** in bounded runs. The focused Debug run passed **100** tests. The focused Release run passed **100** tests. The existing latest-admitted registration case hit the Debug backstop and passed in Release.
+- Nine boundary cases passed ten Debug repetitions and 10 Release repetitions, **180 executions**. The optimized recovery smoke probe passed **30** checks. The separate TLS/network and local native packaging, Metal compiler and GPU selections passed **39** and **14** tests respectively.
+- Both unsigned Release apps built. The tvOS app contains its privacy manifest, and the bundled Mac checker reports version **1.1.1**, interface **1**, and the pinned SHA-256.
+- Desktop UI runtime remains blocked by instruction. Physical-device and simulator runtime, live LAN, real Codex publication, and standalone suites for the unchanged Python worker, checker, and shaders were outside this run.
+
+Local receipts are in `/tmp/pr64-final-core-coverage.json`, `/tmp/pr64-final-*-results.json`, and `/tmp/pr64-final-focused-debug.log`.
