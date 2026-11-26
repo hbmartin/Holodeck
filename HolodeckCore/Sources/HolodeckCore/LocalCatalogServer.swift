@@ -34,6 +34,7 @@ nonisolated public struct LocalServerState: Sendable {
     public var trustedMessage: String?
     public var recoveryNotices: [TrustedRecoveryNotice] = []
     public var registrationRecovery: LocalServerRegistrationRecovery?
+    public var registrationRetryMessage: String?
     public var transportFailure: String?
     public var pending: [TVApproval] = []
     public var approved: [ApprovedTV] = []
@@ -91,15 +92,15 @@ public actor LocalCatalogServer {
             guard try await registerTrustedBinding(service: service) else { return }
             try await trusted.replay()
         } catch is CancellationError { }
-        catch {
-            let detail = BoundedDiagnostics.bounded(error.localizedDescription, bytes: 8192)
-            // The authority publishes an intent/write failure while it still owns
-            // the transition. Only preparation errors need a local publication.
-            let identity = (error as? any TrustedReportedDiagnostic)?.diagnosticID
-            if identity == nil || identity != trustedDiagnosticID {
-                trustedDiagnostic = detail; trustedDiagnosticID = identity ?? UUID(); publish()
-            }
-        }
+        catch { publishTrustedDiagnostic(error) }
+    }
+    private func publishTrustedDiagnostic(_ error: Error) {
+        // Keep the complete diagnostic already published by the authority.
+        let identity = (error as? any TrustedReportedDiagnostic)?.diagnosticID
+        guard identity == nil || identity != trustedDiagnosticID else { return }
+        trustedDiagnostic = BoundedDiagnostics.bounded(error.localizedDescription, bytes: 8192)
+        trustedDiagnosticID = identity ?? UUID()
+        publish()
     }
     private let instanceID = UUID()
     private let trusted: TrustedApprovalsCoordinator
@@ -139,23 +140,44 @@ public actor LocalCatalogServer {
     public func retryRegistration(_ id: UUID) async throws {
         guard let failure = failedServerRegistration, failure.identity.id == id, failure.identity.isCurrent,
               registrationState == .idle, !retired else { return }
-        let attempt = UUID(), revision = lifetimeRevision
+        let attempt = UUID(), revision = lifetimeRevision, transport = startGeneration
         registrationState = .pending(attempt)
+        clearRegistrationRetryMessage()
         defer { if registrationState == .pending(attempt) { registrationState = .idle } }
         let result = try await trusted.retryServerRegistration(id, server: instanceID, lifetime: failure.identity.lifetime)
         guard revision == lifetimeRevision, registrationState == .pending(attempt) else { return }
         switch result {
-        case .accepted:
+        case .skipped:
             registrationState = .idle
-            try await trusted.replay()
-        case .superseded:
+            if transport == startGeneration {
+                state.registrationRetryMessage = "Registration changed before the retry started."
+                publish()
+            }
+        case .submitted(.accepted(let accepted)):
+            registrationState = .idle
+            do { try await trusted.replay() }
+            catch is CancellationError { throw CancellationError() }
+            catch {
+                if revision == lifetimeRevision, binding?.permit === accepted.permit, accepted.permit.isCurrent {
+                    publishTrustedDiagnostic(error)
+                }
+                throw error
+            }
+        case .submitted(.superseded):
             if binding?.permit.isCurrent != true { registrationState = .superseded }
         }
+    }
+
+    private func clearRegistrationRetryMessage() {
+        guard state.registrationRetryMessage != nil else { return }
+        state.registrationRetryMessage = nil
+        publish()
     }
     private func registerTrustedBinding(service: ShaderRequestService?, onlyIfVacant: Bool = false) async throws -> Bool {
         if !registrationEligibility.isCurrent { registrationEligibility = .init(); withdrawal = nil }
         let attempt = UUID(), previous = registrationState, revision = lifetimeRevision
         registrationState = .pending(attempt); proposedService = service
+        clearRegistrationRetryMessage()
         let registration: TrustedApprovalsCoordinator.Registration
         do { registration = try await trusted.register(trustedOwner(service: service), onlyIfVacant: onlyIfVacant) }
         catch {
@@ -311,6 +333,7 @@ public actor LocalCatalogServer {
     }
 
     public func start() async throws {
+        clearRegistrationRetryMessage()
         if listener != nil, binding?.permit.isCurrent == true { return }
         let task: Task<Void, Error>
         if let startup { task = startup.task }
@@ -362,6 +385,7 @@ public actor LocalCatalogServer {
         requestAuthorizations.values.forEach { $0.invalidate() }; requestAuthorizations.removeAll()
         listenerID = nil; listener?.cancel(); listener = nil
         for id in sessions.keys { cancelSession(id) }
+        state.registrationRetryMessage = nil
         publish("Local sharing is stopped.")
     }
     public func shutdown() async { _ = shutdownReceipt() }

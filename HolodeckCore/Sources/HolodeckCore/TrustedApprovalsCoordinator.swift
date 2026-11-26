@@ -59,12 +59,12 @@ struct TrustedRecoveryInterrupted: LocalizedError, Sendable {
 }
 struct TrustedRecoveryCompletion: Sendable {
     let completedServices: [UUID]
-    var attemptedDepartures: Set<UUID> = []
+    var attemptedDepartures: Set<TrustedDepartureRecoveryKey> = []
 }
 struct TrustedPartialRecovery: LocalizedError, Sendable {
     let completedServices: [UUID]
     let remaining: [String]
-    var attemptedDepartures: Set<UUID> = []
+    var attemptedDepartures: Set<TrustedDepartureRecoveryKey> = []
     var errorDescription: String? {
         remaining.joined(separator: "\n") + "\nPartial recovery: completed phases were committed; unresolved local or trusted recovery remains."
     }
@@ -72,7 +72,7 @@ struct TrustedPartialRecovery: LocalizedError, Sendable {
 struct TrustedDepartureRecoveryError: LocalizedError, Sendable, TrustedReportedDiagnostic {
     let diagnosticID: UUID
     let serviceID: UUID
-    var endpoint: TrustedAuthorityRecoveryEndpoint? = nil
+    let endpoint: TrustedAuthorityRecoveryEndpoint
     var errorDescription: String? {
         "Authority departure " + diagnosticID.uuidString + " for service " + serviceID.uuidString +
         " requires receipt recovery. Retain its evidence and choose Retry Recovery; unverifiable receipts require manual repair."
@@ -154,6 +154,10 @@ actor TrustedApprovalsCoordinator {
         }
     }
     enum BindingOutcome: Sendable { case accepted(Binding), superseded }
+    enum ServerRegistrationRetry: Sendable {
+        case skipped
+        case submitted(BindingOutcome)
+    }
     struct Registration: Sendable {
         let generation: UInt64
         let completion: RequestPersistence.CommitTicket<BindingOutcome>
@@ -587,7 +591,7 @@ actor TrustedApprovalsCoordinator {
         let completed: [UUID]
         let errors: [String]
         let localFailures: [UUID: String]
-        let attemptedDepartures: Set<UUID>
+        let attemptedDepartures: Set<TrustedDepartureRecoveryKey>
     }
     private var recoveryPass: RecoveryPass?
     private var successorRecoveryPass: RecoveryPass?
@@ -744,7 +748,9 @@ actor TrustedApprovalsCoordinator {
     private func requireAuthorityReady() throws {
         try requireCertainWrite()
         if let ticket = departureRecovery.values.min(by: { $0.id.uuidString < $1.id.uuidString }) {
-            let endpoint = departureEndpoints[ticket.id] ?? .init(authority: self, ticketID: ticket.id, serviceID: ticket.serviceID, journal: nil)
+            guard let endpoint = departureEndpoints[ticket.id] else {
+                throw Self.unavailable("Authority departure " + ticket.id.uuidString + " has no recovery endpoint. Retain its exact evidence for manual repair.")
+            }
             throw TrustedDepartureRecoveryError(diagnosticID: ticket.id, serviceID: ticket.serviceID, endpoint: endpoint)
         }
     }
@@ -1036,7 +1042,8 @@ actor TrustedApprovalsCoordinator {
         var heldTargets: [UUID: ShaderRequestService] = [:]
         var awaitedCleanups: Set<UUID> = []
         var cleanupTasks: [UUID: TrustedRecoveryTask<Void>] = [:]
-        var retriedRegistrations: Set<UUID> = [], recoveredDepartureTickets: Set<UUID> = []
+        var retriedRegistrations: Set<UUID> = []
+        var recoveredDepartureTickets: Set<TrustedDepartureRecoveryKey> = []
         do {
             if uncertainWrite != nil {
                 let resolving = await acquireProgress()
@@ -1130,7 +1137,7 @@ actor TrustedApprovalsCoordinator {
             release(finishing)
             // Original-target repair must never run while this authority owns
             // the lane or recursively join the trusted pass calling it.
-            errors += await finishRecoveredDepartures(attempted: &recoveredDepartureTickets)
+            errors += try await finishRecoveredDepartures(attempted: &recoveredDepartureTickets)
             errors += try await recoverRequiredCleanups(passID, awaited: &awaitedCleanups, tasks: &cleanupTasks)
             let readiness = try await acquire(.progress)
             if let pass = recoveryPass, pass.id == passID {
@@ -1150,6 +1157,15 @@ actor TrustedApprovalsCoordinator {
             release(readiness)
         } catch {
             for target in heldTargets.values { await target.finishTrustedRecovery(pass: passID) }
+            try Task.checkCancellation()
+            if !recoveredDepartureTickets.isEmpty {
+                // Even an aborted pass must report tickets it already tried.
+                // Otherwise the caller's independent sweep would retry them.
+                let detail = errors + [error.localizedDescription]
+                throw TrustedPartialRecovery(completedServices: [],
+                    remaining: Array(detail.prefix(9)).map { BoundedDiagnostics.bounded($0, bytes: 8192) },
+                    attemptedDepartures: recoveredDepartureTickets)
+            }
             throw error
         }
         for target in heldTargets.values { await target.finishTrustedRecovery(pass: passID) }
@@ -1163,18 +1179,25 @@ actor TrustedApprovalsCoordinator {
         } == true
     }
 
-    private func recoverParticipatingRegistration(_ passID: UUID, attempted: inout Set<UUID>, departures: inout Set<UUID>, errors: inout [String]) async throws -> Binding? {
+    private func recoverParticipatingRegistration(_ passID: UUID, attempted: inout Set<UUID>, departures: inout Set<TrustedDepartureRecoveryKey>, errors: inout [String]) async throws -> Binding? {
         guard let failure = failedRegistration, failure.identity.isCurrent,
               let target = failure.owner.service, registrationParticipates(failure, serviceID: target.runtimeID, passID: passID),
               attempted.insert(target.runtimeID).inserted else { return nil }
         do {
-            if let departure = failure.departure, departure.isCurrent {
-                departures.insert(departure.ticketID)
-                try await departure.retry()
+            var conflictingPreparation = false
+            if let departure = failure.departure {
+                if departure.isCurrent {
+                    guard departures.insert(departure.key).inserted else { return nil }
+                    try await departure.retry()
+                }
+                conflictingPreparation = await target.hasConflictingTrustedPreparation(authority: id)
             }
             try Task.checkCancellation()
             guard failure.identity.isCurrent, failedRegistration?.identity === failure.identity,
                   registrationParticipates(failure, serviceID: target.runtimeID, passID: passID) else { return nil }
+            if conflictingPreparation {
+                throw Self.unavailable("An earlier TV authority inspection is unresolved. Recover that authority before retrying this server registration.")
+            }
             switch try await register(failure.owner).value() {
             case .accepted(let binding): return binding.permit.isCurrent ? binding : nil
             case .superseded: return nil
@@ -1425,24 +1448,30 @@ actor TrustedApprovalsCoordinator {
     }
     private func flagDepartureRecovery(serviceID: UUID, ticket: UUID) async {
         guard let departure = departures[serviceID], departure.id == ticket, departure.activated else { return }
+        let key = TargetKey(service: serviceID, registration: departure.registrationID)
+        let original = targets[key]?.service
+        let endpoint = TrustedAuthorityRecoveryEndpoint(authority: self, ticketID: ticket, serviceID: serviceID,
+            journal: original?.trustedRecoveryJournal())
         departureRecovery[serviceID] = departure
+        departureEndpoints[ticket] = endpoint
         departures[serviceID] = nil; departure.close()
-        for key in targets.keys where key.service == serviceID && key.registration == departure.registrationID {
-            if let target = targets[key]?.service { targetPins[key] = target }
-        }
-        await recordDiagnostic(.departure(ticket), error: TrustedDepartureRecoveryError(diagnosticID: ticket, serviceID: serviceID), operation: ticket, context: "Authority departure", requiresRecovery: true)
-        if let target = targets.values.first(where: { $0.key.service == serviceID })?.service { await attachDepartureRecovery(ticket: ticket, to: target) }
+        if let original { targetPins[key] = original }
+        await recordDiagnostic(.departure(ticket), error: TrustedDepartureRecoveryError(diagnosticID: ticket, serviceID: serviceID, endpoint: endpoint),
+            operation: ticket, context: "Authority departure", requiresRecovery: true)
+        if let original { await attachDepartureRecovery(endpoint, to: original) }
         advanceAdmission()
     }
-    private func attachDepartureRecovery(ticket: UUID, to target: ShaderRequestService) async {
-        guard let departure = departureRecovery.values.first(where: { $0.id == ticket }) else { return }
-        let original = targets.values.first { $0.key.service == departure.serviceID && $0.key.registration == departure.registrationID }?.service
-        let journal = await original?.trustedRecoveryJournal()
-        let endpoint = departureEndpoints[ticket] ?? .init(authority: self, ticketID: ticket, serviceID: departure.serviceID, journal: journal)
-        departureEndpoints[ticket] = endpoint
-        endpointTargets[ticket, default: [:]][target.runtimeID] = .init(target)
+
+    func attachDepartureRecovery(_ endpoint: TrustedAuthorityRecoveryEndpoint, to target: ShaderRequestService) async {
+        let ticket = endpoint.ticketID
+        guard departureEndpoints[ticket] === endpoint, endpoint.isCurrent else { return }
+        var recipients = endpointTargets[ticket, default: [:]].filter { $0.value.value != nil }
+        guard recipients[target.runtimeID]?.value !== target else { return }
+        recipients[target.runtimeID] = .init(target)
+        endpointTargets[ticket] = recipients
         await target.rememberAuthorityRecovery(endpoint)
     }
+
     /// No successful registration is required to recover an old authority's exact
     /// ticket. Never apply an old cancellation receipt to a replacement binding.
     func recoverDeparture(serviceID: UUID, ticket: UUID) async throws {
@@ -1558,16 +1587,20 @@ actor TrustedApprovalsCoordinator {
             throw Self.unavailable("Original departure ownership changed before retirement admission. Retain its journal and choose Retry Recovery.")
         }
         await retireDeparture(departure, keys: keys)
-        departureRecovery[serviceID] = nil
         clearDiagnostic(.departure(ticket))
         await notify()
     }
-    private func finishRecoveredDepartures(attempted: inout Set<UUID>) async -> [String] {
+    private func finishRecoveredDepartures(attempted: inout Set<TrustedDepartureRecoveryKey>) async throws -> [String] {
         var failures: [String] = []
-        let pending = departureRecovery.values.map { ($0.serviceID, $0.id) }
-        for (serviceID, ticket) in pending where attempted.insert(ticket).inserted {
-            do { try await recoverDeparture(serviceID: serviceID, ticket: ticket) }
-            catch { failures.append(error.localizedDescription) }
+        let pending = departureEndpoints.values.sorted { $0.ticketID.uuidString < $1.ticketID.uuidString }
+        for endpoint in pending where endpoint.isCurrent {
+            try Task.checkCancellation()
+            guard attempted.insert(endpoint.key).inserted else { continue }
+            do { try await endpoint.retry() }
+            catch {
+                try Task.checkCancellation()
+                failures.append(error.localizedDescription)
+            }
         }
         return failures
     }
@@ -1590,9 +1623,12 @@ actor TrustedApprovalsCoordinator {
         if service?.runtimeID == serviceID { service = nil }
         if departures[serviceID]?.id == departure.id { departures[serviceID] = nil }
         departure.close()
-        departureEndpoints.removeValue(forKey: departure.id)?.invalidate()
-        let recipients = endpointTargets.removeValue(forKey: departure.id) ?? [:]
-        for recipient in recipients.values { await recipient.value?.forgetAuthorityRecovery(ticket: departure.id) }
+        if departureRecovery[serviceID] === departure { departureRecovery[serviceID] = nil }
+        if let endpoint = departureEndpoints.removeValue(forKey: departure.id) {
+            endpoint.invalidate()
+            let recipients = endpointTargets.removeValue(forKey: departure.id) ?? [:]
+            for recipient in recipients.values { await recipient.value?.forgetAuthorityRecovery(endpoint) }
+        }
     }
     private func waitForRegistration(_ request: Request, transfer: ShaderRequestService.AuthorityTransfer?,
                                      _ work: @escaping @Sendable () async throws -> Void) async throws {
@@ -1765,11 +1801,11 @@ actor TrustedApprovalsCoordinator {
                 } else if error is RegistrationAbandoned || error is TrustedRegistrationSuperseded { completeRegistration(request, error: error) }
                 else {
                     if let recovery = error as? TrustedDepartureRecoveryError, let target = request.owner.service {
-                        if let endpoint = recovery.endpoint, endpoint.authorityID != id {
-                            await target.rememberAuthorityRecovery(endpoint)
-                        } else {
-                            await attachDepartureRecovery(ticket: recovery.diagnosticID, to: target)
-                        }
+                        // The issuing authority owns the observation. It must
+                        // be reachable without holding the destination lane.
+                        release(token)
+                        await recovery.endpoint.attach(to: target)
+                        token = await acquireReplacement()
                     }
                     await recordFailedRegistration(request, error: error)
                     request.registration.completion.complete(.failure(error))
@@ -1797,7 +1833,7 @@ actor TrustedApprovalsCoordinator {
         do { try request.registration.completion.check() } catch { return }
         let identity = TrustedFailedRegistration(authority: id, generation: failedGeneration, server: owner.serverID, lifetime: owner.eligibility)
         let departureError = error as? TrustedDepartureRecoveryError
-        let departure = departureError?.endpoint ?? departureError.flatMap { departureEndpoints[$0.diagnosticID] }
+        let departure = departureError?.endpoint
         failedRegistration = .init(owner: owner, identity: identity, departure: departure)
         guard let target = owner.service else {
             if !owner.requiresService {
@@ -1844,25 +1880,27 @@ actor TrustedApprovalsCoordinator {
         return try await retry(requester: requester, local: local, registration: identity)
     }
 
-    func retryServerRegistration(_ attempt: UUID, server: UUID, lifetime: TrustedOwnerLifetime) async throws -> BindingOutcome {
+    func retryServerRegistration(_ attempt: UUID, server: UUID, lifetime: TrustedOwnerLifetime) async throws -> ServerRegistrationRetry {
         try Task.checkCancellation()
         guard let failure = failedRegistration, !failure.owner.requiresService,
               failure.identity.id == attempt, failure.identity.server == server,
-              failure.identity.lifetime === lifetime, failure.identity.isCurrent else { return .superseded }
-        if uncertainWrite != nil {
-            let token = try await acquire(.progress)
-            do {
-                guard failure.identity.isCurrent, failedRegistration?.identity === failure.identity else {
-                    release(token); return .superseded
-                }
+              failure.identity.lifetime === lifetime, failure.identity.isCurrent else { return .skipped }
+        do {
+            if uncertainWrite != nil {
+                let token = try await acquire(.progress)
+                defer { release(token) }
+                guard failure.identity.isCurrent, failedRegistration?.identity === failure.identity else { return .skipped }
                 try await resolveUncertainWrite()
-            } catch { release(token); throw error }
-            release(token)
+            }
+            if let departure = failure.departure { try await departure.retry() }
+        } catch {
+            try Task.checkCancellation()
+            guard failure.identity.isCurrent, failedRegistration?.identity === failure.identity else { return .skipped }
+            throw error
         }
-        if let departure = failure.departure { try await departure.retry() }
         try Task.checkCancellation()
-        guard failure.identity.isCurrent, failedRegistration?.identity === failure.identity else { return .superseded }
-        return try await register(failure.owner).value()
+        guard failure.identity.isCurrent, failedRegistration?.identity === failure.identity else { return .skipped }
+        return .submitted(try await register(failure.owner).value())
     }
     private func completeRegistration(_ request: Request, error: Error) {
         if error is RegistrationAbandoned || error is TrustedRegistrationSuperseded {

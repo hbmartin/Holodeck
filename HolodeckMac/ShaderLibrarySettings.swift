@@ -391,6 +391,9 @@ struct ShaderLibrarySettings: View {
                         Text(error).foregroundStyle(.red).textSelection(.enabled)
                     }
                 }
+                if let message = library.serverState.registrationRetryMessage {
+                    Text(message).accessibilityIdentifier("server-registration-retry-message")
+                }
                 ForEach(library.serverState.recoveryNotices) { notice in
                     VStack(alignment: .leading) {
                         HStack(alignment: .top) {

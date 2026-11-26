@@ -267,11 +267,17 @@ struct TrustedLocalRecoveryReceipt: Sendable {
 }
 /// Local-only entry point remains callable after the target changed registration.
 /// Its weak authority reference cannot keep an otherwise idle account alive.
+struct TrustedDepartureRecoveryKey: Hashable, Sendable {
+    let authority: UUID
+    let ticket: UUID
+}
+
 nonisolated final class TrustedAuthorityRecoveryEndpoint: @unchecked Sendable {
     let authorityID: UUID
     let ticketID: UUID
     let serviceID: UUID
     let journal: URL?
+    var key: TrustedDepartureRecoveryKey { .init(authority: authorityID, ticket: ticketID) }
     private weak var authority: TrustedApprovalsCoordinator?
     private let token = TrustedInvalidationToken()
     private let lock = NSLock()
@@ -290,6 +296,9 @@ nonisolated final class TrustedAuthorityRecoveryEndpoint: @unchecked Sendable {
         lock.withLock { guard settling != value else { return false }; settling = value; return true }
     }
     func invalidate() { token.invalidate() }
+    func attach(to target: ShaderRequestService) async {
+        await authority?.attachDepartureRecovery(self, to: target)
+    }
     func retry() async throws {
         guard isCurrent else { return }
         guard let authority else { throw ShaderRequestError.unavailable(message + " The retained authority is unavailable; preserve its trusted approval evidence for manual repair.") }

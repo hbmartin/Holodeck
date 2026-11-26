@@ -104,7 +104,7 @@ import XCTest
         XCTAssertEqual(retained.acceptedGeneration, original.permit.generation)
         XCTAssertEqual(retained.departures, 0); XCTAssertNil(rejected.acceptedGeneration)
         let before = await service.setupSnapshot(); XCTAssertNil(before.configuration)
-        let journal = await service.trustedRecoveryJournal()
+        let journal = service.trustedRecoveryJournal()
         XCTAssertFalse(FileManager.default.fileExists(atPath: journal.appendingPathComponent("preferences.json").path))
         try await service.initialize(configuration: .init(repository: journal.path, model: "captured-model", enabled: true))
         let stillRejected = await next.observation; XCTAssertNil(stillRejected.acceptedGeneration)

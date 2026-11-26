@@ -1749,3 +1749,28 @@ Five paired Release samples per build used the same compiler and filesystem. Eac
 | Descriptive median | 67.3 ms | 55.2 ms |
 
 Structural checks enforce the attempt and read counts. The timings do not set a threshold. Receipts are in `/tmp/pr61-stable-core-coverage.json`, `/tmp/pr61-stable-release-results.json`, `/tmp/pr61-stable-debug-results.json`, `/tmp/pr61-stable-apps-results.json`, `/tmp/pr61-stable-races-*-results.json`, `/tmp/pr61-stable-profile-results.json`, and `/tmp/pr61-stable-packaged-tool.log`. The successful packaged command used `library artifact-info --json`.
+
+## PR #62 follow-up — issuer-owned departure recovery and registration outcomes (2026-11-25)
+
+- A retained departure has one endpoint owned by its issuing authority. Foreign recipients observe settling and retirement through that authority. A late attachment cannot restore a retired endpoint.
+- Retry Recovery reports exact attempted tickets even on early exit and independently tries any remaining dependency that its registration pass skipped. A known conflicting preparation prevents new registration admission while leaving departure repair available.
+- A standalone retry skipped before submission leaves Start available and shows a non-error status. Replay failure after an accepted retry stays visible for the accepted binding. Exceptional departures in the regressions are explicitly injected.
+
+Validation on macOS and Apple silicon, using an isolated worktree and build cache:
+
+- **729 core tests** accounted for in bounded batches, with **723 passing and six expected skips**. The local batches use `TASK_MEGA_YIELD_COUNT=0` for the test clock. A 105-test focused Debug selection and a **256**-test Release selection also passed.
+- Eight boundary tests passed ten Debug and fifteen Release repetitions, **200 executions**. The isolated TLS/network selection passed **39** tests. Headless Mac model checks passed with Python 3.9 and the current local interpreter.
+- The **14** native packing, compiler and GPU tests passed. Core coverage includes the local authoring fixture. Both unsigned Release apps built. The tvOS app includes its privacy manifest, and the packaged Mac checker reports version **1.1.1**, interface **1**, and its pinned SHA-256.
+- Desktop UI runtime remains blocked by instruction. Physical-device and simulator runtime, live LAN, real Codex publication, and the separate unchanged worker, checker, and shader suites were outside this run.
+
+Five paired optimized samples per build used the same compiler and filesystem. Each sample ran 25 conflict-blocked retry scenarios and 25 defensive missing-original scenarios. The endpoint count measures distinct handles returned by three failed proposals per missing-original ticket.
+
+| Work per sample | Merged PR #62 | Follow-up |
+| --- | ---: | ---: |
+| Registration admissions in conflict scenarios | 75 | 50 |
+| Trusted reads in conflict scenarios | 50 | 50 |
+| Trusted writes / encodings in conflict scenarios | 0 / 0 | 0 / 0 |
+| Distinct handles issued for 25 missing-original tickets | 75 | 25 |
+| Descriptive median | 1245.1 ms | 995.0 ms |
+
+The comparison checks structural counts without a timing threshold. Local receipts are in `/tmp/pr63-source.json`, `/tmp/pr63-core-coverage.json`, `/tmp/pr63-release-results.json`, `/tmp/pr63-debug-results.json`, `/tmp/pr63-races-*-results.json`, `/tmp/pr63-apps-results.json`, and `/tmp/pr63-profile-results.json`.

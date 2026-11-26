@@ -762,7 +762,7 @@ public actor ShaderRequestService {
         emitUpdates()
     }
     private var authorityRecoveryEndpoints: [UUID: TrustedAuthorityRecoveryEndpoint] = [:]
-    func trustedRecoveryJournal() -> URL { directory }
+    nonisolated func trustedRecoveryJournal() -> URL { directory }
     func rememberAuthorityRecovery(_ endpoint: TrustedAuthorityRecoveryEndpoint) {
         authorityRecoveryEndpoints = authorityRecoveryEndpoints.filter { $0.value.isCurrent }
         guard endpoint.isCurrent else { return }
@@ -772,8 +772,9 @@ public actor ShaderRequestService {
         guard authorityRecoveryEndpoints[endpoint.ticketID] === endpoint else { return }
         emitUpdates()
     }
-    func forgetAuthorityRecovery(ticket: UUID) {
-        authorityRecoveryEndpoints[ticket] = nil; emitUpdates(); scheduleWakeup()
+    func forgetAuthorityRecovery(_ endpoint: TrustedAuthorityRecoveryEndpoint) {
+        guard authorityRecoveryEndpoints[endpoint.ticketID] === endpoint else { return }
+        authorityRecoveryEndpoints[endpoint.ticketID] = nil; emitUpdates(); scheduleWakeup()
     }
     private var authorityRecoveryFailure: String? {
         authorityRecoveryEndpoints.values.filter(\.isCurrent).min { $0.ticketID.uuidString < $1.ticketID.uuidString }?.message
@@ -2009,7 +2010,7 @@ public actor ShaderRequestService {
         let hasTrustedPhase = replayTrusted && revocationCoordinator != nil
         var failures: [String] = [], completed: Set<UUID> = !hasTrustedPhase && local.completed ? [runtimeID] : []
         let hasIndependentPhase = replayTrusted && (revocationCoordinator != nil || authorityRecoveryEndpoints.values.contains(where: \.isCurrent) || failedRegistrationRecoveries.values.contains(where: { $0.identity.isCurrent }))
-        var attemptedDepartures: Set<UUID> = []
+        var attemptedDepartures: Set<TrustedDepartureRecoveryKey> = []
         let recoveredAuthority = replayTrusted ? ordinaryRecoveryAuthority : nil
         if replayTrusted, let coordinator = revocationCoordinator {
             do {
@@ -2037,12 +2038,12 @@ public actor ShaderRequestService {
         let independentRegistrations = failedRegistrationRecoveries.filter {
             $0.key != recoveredAuthority && $0.key != ordinaryRecoveryAuthority && $0.value.identity.isCurrent
         }.sorted { $0.key.uuidString < $1.key.uuidString }
-        let registrationDependencies = Set(independentRegistrations.compactMap { $0.value.departure?.ticketID })
+        let registrationDependencies = Set(independentRegistrations.compactMap { $0.value.departure?.key })
         // These exact old-authority routes survive replacement of the ordinary
         // coordinator callback. Each owns only its retained departure evidence.
         if replayTrusted {
             for endpoint in authorityRecoveryEndpoints.values.filter(\.isCurrent).sorted(by: { $0.ticketID.uuidString < $1.ticketID.uuidString })
-                where !registrationDependencies.contains(endpoint.ticketID) && attemptedDepartures.insert(endpoint.ticketID).inserted {
+                where !registrationDependencies.contains(endpoint.key) && attemptedDepartures.insert(endpoint.key).inserted {
                 try Task.checkCancellation()
                 do { try await endpoint.retry() }
                 catch { try Task.checkCancellation(); failures.append(error.localizedDescription) }
@@ -2053,7 +2054,7 @@ public actor ShaderRequestService {
                 try Task.checkCancellation()
                 guard authority != recoveredAuthority, authority != ordinaryRecoveryAuthority,
                       failedRegistrationRecoveries[authority]?.identity === pending.identity else { continue }
-                if let departure = pending.departure, departure.isCurrent, attemptedDepartures.contains(departure.ticketID) { continue }
+                if let departure = pending.departure, departure.isCurrent, attemptedDepartures.contains(departure.key) { continue }
                 do {
                     let result = try await pending.recover(local)
                     completed.formUnion(result.completedServices)
@@ -2066,6 +2067,14 @@ public actor ShaderRequestService {
                         failures += partial.remaining
                     } else { failures.append(error.localizedDescription) }
                 }
+            }
+            // A registration pass can exit before attempting its dependency.
+            // Give the issuing authority its own opportunity after those passes.
+            for endpoint in authorityRecoveryEndpoints.values.sorted(by: { $0.ticketID.uuidString < $1.ticketID.uuidString })
+                where endpoint.isCurrent && attemptedDepartures.insert(endpoint.key).inserted {
+                try Task.checkCancellation()
+                do { try await endpoint.retry() }
+                catch { try Task.checkCancellation(); failures.append(error.localizedDescription) }
             }
         }
         if !failures.isEmpty {
