@@ -2,6 +2,7 @@
 """Single-checkout Codex worker. JSONL bridge; no shell interpolation or model-owned Git writes."""
 import base64
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -15,6 +16,9 @@ import stat
 import struct
 import uuid
 import time
+
+
+SHADER_ID_PATTERN = r"[a-z0-9]+(?:-[a-z0-9]+)*"
 
 
 class CandidateError(RuntimeError):
@@ -203,25 +207,49 @@ class Worker:
 
     def clean(self, revision=None):
         # Only tracked and non-ignored candidate files belong to host cleanup.
-        if self.owner.exists() and str(json.loads(self.owner.read_text()).get("id")).lower() == str(self.request.get("id")).lower():
-            others = self.git("ls-files", "--others", "--exclude-standard", "-z").split("\0")
-            raw_changes = self.raw_workspace_changes()
-            self.quarantine_obstructions(raw_changes | set(filter(None, others)))
-            self.git("reset", "--hard", revision or self.checkpoint.get("base", "HEAD"))
-            # Git can consider a filter-hidden edit clean even with checkout --force.
-            # Remove those owned files first so checkout must reconstruct their bytes.
-            for name in raw_changes:
-                try:
-                    with self.workspace_parent(name) as (parent, leaf): os.unlink(leaf, dir_fd=parent)
-                except FileNotFoundError: pass
-            self.git("checkout-index", "--all", "--force")
-            tracked = set(filter(None, self.git('ls-files', '-z').split('\0')))
-            for name in filter(None, others):
-                if name in tracked or any(path.startswith(name + '/') for path in tracked): continue
-                try:
-                    with self.workspace_parent(name) as (parent, leaf): os.unlink(leaf, dir_fd=parent)
-                except (FileNotFoundError, NotADirectoryError): pass
-            self.owner.unlink(missing_ok=True)
+        if not self.owner.exists():
+            return
+        owner = json.loads(self.owner.read_text())
+        if str(owner.get("id")).lower() != str(self.request.get("id")).lower():
+            return
+        others = set(filter(None, self.git("ls-files", "--others", "--exclude-standard", "-z").split("\0")))
+        pending = set(owner.get("pendingShaderDirectories", []))
+        for name in others:
+            if re.fullmatch(rf"shaders/{SHADER_ID_PATTERN}/(?:body\.metal|metadata\.json)", name):
+                pending.add(name.rsplit("/", 1)[0])
+        if pending:
+            # Keep the directories discoverable even if cleanup stops after unlinking their files.
+            owner["pendingShaderDirectories"] = sorted(pending)
+            write(self.owner, owner)
+
+        raw_changes = self.raw_workspace_changes()
+        self.quarantine_obstructions(raw_changes | others)
+        self.git("reset", "--hard", revision or self.checkpoint.get("base", "HEAD"))
+        # Remove filter-hidden edits, then refresh index stat data for the three-way apply.
+        for name in raw_changes:
+            try:
+                with self.workspace_parent(name) as (parent, leaf): os.unlink(leaf, dir_fd=parent)
+            except FileNotFoundError: pass
+        self.git("checkout-index", "--all", "--force", "--index")
+        tracked = set(filter(None, self.git("ls-files", "-z").split("\0")))
+        for name in sorted(others):
+            if name in tracked or any(path.startswith(name + "/") for path in tracked):
+                continue
+            try:
+                with self.workspace_parent(name) as (parent, leaf): os.unlink(leaf, dir_fd=parent)
+            except (FileNotFoundError, NotADirectoryError): pass
+        for name in sorted(pending):
+            if not re.fullmatch(rf"shaders/{SHADER_ID_PATTERN}", name):
+                raise OperationalError("Invalid pending shader directory: " + name)
+            if name in tracked or any(path.startswith(name + "/") for path in tracked):
+                continue
+            try:
+                with self.workspace_parent(name) as (parent, leaf):
+                    os.rmdir(leaf, dir_fd=parent)
+            except OSError as error:
+                if error.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ENOTEMPTY, errno.EEXIST):
+                    raise
+        self.owner.unlink(missing_ok=True)
 
     def park(self):
         self.save_patch()
@@ -246,7 +274,10 @@ class Worker:
             result = self.git("apply", "--3way", str(patch), check=False)
             # A conflict is given to Codex; never push or verify unresolved files.
             if result.returncode:
-                emit("log", text="Reapplying checkpoint requires conflict resolution by Codex.")
+                message = "Reapplying checkpoint requires conflict resolution by Codex."
+                if result.stderr:
+                    message += "\n" + result.stderr[-4000:].strip()
+                emit("log", text=message)
         untracked = self.directory / "untracked.json"
         if untracked.exists():
             for name, data in json.loads(untracked.read_text()).items():
@@ -317,7 +348,7 @@ class Worker:
         index = json.loads(self.read_workspace('index.json'))
         paths = {"index.json"}
         for sid in index["shaders"]:
-            if not isinstance(sid, str) or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", sid) is None:
+            if not isinstance(sid, str) or re.fullmatch(SHADER_ID_PATTERN, sid) is None:
                 raise CandidateError("Invalid indexed shader ID")
             folder = f"shaders/{sid}/"
             paths.update((folder + "metadata.json", folder + "body.metal"))
@@ -491,7 +522,7 @@ class Worker:
             raise CandidateError("A request may change only one primary shader")
         if outcome:
             shader_id = outcome["shaderID"]
-            if len(shader_id) > 100 or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", shader_id) is None:
+            if len(shader_id) > 100 or re.fullmatch(SHADER_ID_PATTERN, shader_id) is None:
                 raise CandidateError("Output ID must be a valid catalog ID")
             if primary and primary != {shader_id}:
                 raise CandidateError("Output ID does not match the changed shader")
@@ -529,8 +560,10 @@ class Worker:
                 raise CandidateError("Preserve the default and existing gallery order; append a new output")
             if expected_kind == "new":
                 metadata = json.loads((self.root / f"shaders/{shader_id}/metadata.json").read_text())
+                if not isinstance(metadata, dict):
+                    raise CandidateError("Output shader metadata must be a JSON object")
                 discovery = metadata.get("discovery", {})
-                if not discovery.get("tags") or not discovery.get("moods") or not discovery.get("motion"):
+                if not isinstance(discovery, dict) or not discovery.get("tags") or not discovery.get("moods") or not discovery.get("motion"):
                     raise CandidateError("A new shader requires discovery tags, moods and motion")
             if shader_id not in new["shaders"]:
                 raise CandidateError("Output must be indexed")
@@ -583,6 +616,53 @@ class Worker:
             raise CandidateError("Resolve all merge conflicts")
         return paths
 
+    def normalize_preview_colors(self, outcome):
+        shader_id = outcome["shaderID"]
+        if outcome["outputKind"] != "new" or shader_id in self.baseline_ids():
+            return
+
+        def unique_fields(pairs):
+            fields = dict(pairs)
+            if len(fields) != len(pairs):
+                raise ValueError("Duplicate metadata key")
+            return fields
+
+        name = f"shaders/{shader_id}/metadata.json"
+        try:
+            metadata = json.loads(self.read_workspace(name), object_pairs_hook=unique_fields)
+        except ValueError:
+            return  # Let the checker report invalid metadata without rewriting it.
+        colors = metadata.get("colors")
+        if not isinstance(colors, list) or len(colors) != 3:
+            return
+        if not all(
+            isinstance(color, list) and len(color) == 3
+            and all(type(component) in (int, float) and 0 <= component <= 1 for component in color)
+            for color in colors
+        ):
+            return
+
+        metadata["colors"] = colors[:2]
+        try:
+            contents = json.dumps(metadata, indent=2, allow_nan=False) + "\n"
+        except ValueError:
+            return
+        with self.workspace_parent(name) as (parent, leaf):
+            mode = os.stat(leaf, dir_fd=parent, follow_symlinks=False).st_mode
+            if not stat.S_ISREG(mode):
+                raise WorkspaceTypeError("Preview metadata must be a regular file: " + name)
+            temporary = f".{leaf}-{uuid.uuid4().hex}.tmp"
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as target:
+                    target.write(contents)
+                    os.fchmod(target.fileno(), stat.S_IMODE(mode))
+                os.replace(temporary, leaf, src_dir_fd=parent, dst_dir_fd=parent)
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(temporary, dir_fd=parent)
+        emit("log", text=f"Trimmed preview colors for {shader_id} from three to two. Dropped {colors[2]}.")
+
     def codex(self, prompt, schema, label, images=(), resume=False):
         schema_path = self.directory / f"{label}-schema.json"
         output = self.directory / f"{label}-reply.json"
@@ -628,6 +708,7 @@ The user is viewing the captured source below; the checkout is latest origin/mai
 Choose any ONE existing shader ID to EDIT, retaining its ID, or create ONE unused ID. If the context was deleted, recreate under a fresh ID.
 Ask a concise clarification only if intent is ambiguous. Unsupported audio/textures/multipass/app capabilities must be approximated using this runtime and disclosed.
 New output: append to index.shaders and relevant EXISTING collections; preserve the default and existing ordering. Generate a name, metadata and discovery tags/moods/motion. If editing an unlisted existing shader, append its ID too so the TV can download it.
+In shader metadata, colors contains exactly two RGB triples for the preview gradient. Each component is a number between 0 and 1.
 Allowed changes: one primary shader body/metadata, index membership, canonical shared helpers, and DATA ONLY in sourceRequirements/upstreamRequirements of authoring.json. Preserve schemaVersion and regressionProfiles.
 Shared helper edits must preserve all shader, snippet and template interfaces. If a template breaks, repair or revert the helper; templates are not editable.
 No tooling, test logic, other shader bodies, originals, previews, or app changes. Do NOT commit, push, change branches, or alter Git configuration.
@@ -897,6 +978,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
                         emit("clarification", question=outcome["question"], options=outcome["options"])
                         return
                     self.scope(outcome)
+                    self.normalize_preview_colors(outcome)
                     frozen = self.fingerprint()
                     manifest = self.candidate_manifest()
                     self.technical()
@@ -1058,23 +1140,24 @@ def main():
                 sys.exit(1)
             sys.exit(130)
         if worker and worker.request and not isinstance(error, SupervisionError):
-            # A lost push acknowledgement is reconciled before any destructive cleanup.
-            published = False
-            sha = worker.checkpoint.get("commitSHA")
-            if sha:
-                with contextlib.suppress(Exception):
-                    worker.git("fetch", "origin", "main")
-                    published = worker.git("merge-base", "--is-ancestor", sha, "origin/main", check=False).returncode == 0
-            if not published:
-                try:
-                    worker.clean()
-                    for name in ("changes.patch", "untracked.json"):
-                        (worker.directory / name).unlink(missing_ok=True)
-                except Exception as cleanup_error:
-                    emit("log", text="Cleanup remains pending: " + str(cleanup_error))
-            else:
-                with contextlib.suppress(Exception):
-                    worker.clean(revision=sha)
+            try:
+                with (worker.gitdir / "holodeck-requests.lock").open("w") as lease:
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    # Reconcile a lost push acknowledgement before resetting the checkout.
+                    published = False
+                    sha = worker.checkpoint.get("commitSHA")
+                    if sha:
+                        with contextlib.suppress(Exception):
+                            worker.git("fetch", "origin", "main")
+                            published = worker.git("merge-base", "--is-ancestor", sha, "origin/main", check=False).returncode == 0
+                    if published:
+                        worker.clean(revision=sha)
+                    else:
+                        worker.clean()
+                        for name in ("changes.patch", "untracked.json"):
+                            (worker.directory / name).unlink(missing_ok=True)
+            except Exception as cleanup_error:
+                emit("log", text="Cleanup remains pending: " + str(cleanup_error))
         emit("failure", message=str(error), failureKind="supervision" if isinstance(error, SupervisionError) else "operational",
              retryable=isinstance(error, SupervisionError) and error.retryable,
              recoveryRequired=isinstance(error, ProcessRecoveryError))
