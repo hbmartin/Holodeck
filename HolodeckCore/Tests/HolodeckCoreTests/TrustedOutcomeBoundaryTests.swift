@@ -1924,10 +1924,21 @@ private final class OutcomeBackend: @unchecked Sendable {
     }
 
     func testStandaloneRetrySkippedBeforeSubmissionKeepsStartAvailable() async throws {
+        try await checkStandaloneRetryBeforeSubmission(repairError: nil)
+    }
+
+    func testObsoleteStandaloneRetryReportsRepairFailure() async throws {
+        try await checkStandaloneRetryBeforeSubmission(repairError: POSIXError(.EIO))
+    }
+
+    private func checkStandaloneRetryBeforeSubmission(repairError: POSIXError?) async throws {
         let a = try await fixture(), retirement = RecoveryGate()
         addTeardownBlock { await retirement.release() }
         let authority = TrustedApprovalsCoordinator(read: { nil }, write: { _ in },
-            beforeDepartureRetirementAdmission: { _ in try await retirement.wait() })
+            beforeDepartureRetirementAdmission: { _ in
+                try await retirement.wait()
+                if let repairError { throw repairError }
+            })
         _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: a.service)))
         let departure = try await authority.prepareDeparture(a.service, ticket: UUID())
         // Force a retained departure so retry waits before submitting a registration.
@@ -1938,7 +1949,7 @@ private final class OutcomeBackend: @unchecked Sendable {
         addTeardownBlock { try await server.clearTestSecrets() }
         do { try await server.start(); XCTFail("Blocked server started") }
         catch let error as TrustedDepartureRecoveryError { XCTAssertEqual(error.diagnosticID, departure.id) }
-        let state = await server.currentState, notice = try XCTUnwrap(state.registrationRecovery)
+        let failed = await server.currentState, notice = try XCTUnwrap(failed.registrationRecovery)
         let result = OutcomeResult<Void>()
         let retry = Task {
             do { try await server.retryRegistration(notice.id); result.value = .success(()) }
@@ -1949,17 +1960,37 @@ private final class OutcomeBackend: @unchecked Sendable {
         let newer = try await authority.register(TrustedOwnerRecorder().owner())
         await retirement.release()
         try await wait { result.value != nil }
-        try XCTUnwrap(result.value).get()
-        _ = try await accepted(newer)
-        let skipped = await server.currentState, latest = await authority.observation
-        XCTAssertEqual(skipped.registrationRetryMessage, "Registration changed before the retry started.")
-        XCTAssertNil(skipped.registrationRecovery)
-        XCTAssertEqual(latest.requestedGeneration, newer.generation)
+        let outcome = try XCTUnwrap(result.value)
 
-        try await server.start()
-        try await wait { await server.listeningPort != nil }
-        let started = await server.currentState
-        XCTAssertNil(started.registrationRetryMessage)
+        if let repairError {
+            do { try outcome.get(); XCTFail("Obsolete retry discarded its repair error") }
+            catch let error as POSIXError { XCTAssertEqual(error.code, repairError.code) }
+        } else {
+            try outcome.get()
+            _ = try await accepted(newer)
+        }
+        let state = await server.currentState, latest = await authority.observation
+        let expected = repairError.map { "Registration repair failed before resubmission: " + $0.localizedDescription }
+            ?? "Registration changed before it could be resubmitted."
+        XCTAssertEqual(state.registrationRetryMessage, expected)
+        XCTAssertNil(state.registrationRecovery)
+        XCTAssertEqual(latest.requestedGeneration, newer.generation)
+        if repairError != nil {
+            do { _ = try await accepted(newer); XCTFail("Unsettled departure accepted replacement") }
+            catch let error as TrustedDepartureRecoveryError { XCTAssertEqual(error.diagnosticID, departure.id) }
+            // The retained departure still needs repair. Start must reach authority
+            // admission instead of treating this server as a superseded registrant.
+            do { try await server.start(); XCTFail("Unsettled departure allowed Start") }
+            catch let error as TrustedDepartureRecoveryError { XCTAssertEqual(error.diagnosticID, departure.id) }
+            let started = await server.currentState
+            XCTAssertNil(started.registrationRetryMessage)
+            XCTAssertNotNil(started.registrationRecovery)
+        } else {
+            try await server.start()
+            try await wait { await server.listeningPort != nil }
+            let started = await server.currentState
+            XCTAssertNil(started.registrationRetryMessage)
+        }
     }
 
     func testSubmittedStandaloneRetryCanStillBeSuperseded() async throws {
@@ -2026,26 +2057,26 @@ private final class OutcomeBackend: @unchecked Sendable {
 
     func testAbortedDestinationPassReportsItsAttemptedDeparture() async throws {
         let original = try await fixture(), requester = try await fixture(), attempts = OutcomePaths(), abort = OutcomeSwitch()
-        let source = OutcomeBackend().coordinator()
-        let destination = TrustedApprovalsCoordinator(read: { nil }, write: { _ in },
+        let authority = TrustedApprovalsCoordinator(read: { nil }, write: { _ in },
             beforeRecoverySealing: { if abort.on { throw POSIXError(.EBUSY) } },
             beforeDepartureRetirementAdmission: { _ in attempts.add("retire"); throw POSIXError(.EIO) })
-        _ = try await accepted(source.register(TrustedOwnerRecorder().owner(service: requester.service)))
-        _ = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: original.service)))
-        let departure = try await destination.prepareDeparture(original.service, ticket: UUID())
+        _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: original.service)))
+        _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: requester.service)))
+        let departure = try await authority.prepareDeparture(original.service, ticket: UUID())
         // Inject a retained departure whose settlement fails after admission.
         try departure.activate {}
-        await destination.retainDepartureRecovery(serviceID: original.service.runtimeID, ticket: departure.id)
+        await authority.retainDepartureRecovery(serviceID: original.service.runtimeID, ticket: departure.id)
         do {
-            _ = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: requester.service)))
+            _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: requester.service)))
             XCTFail("Unsettled departure accepted")
         } catch let error as TrustedDepartureRecoveryError { XCTAssertEqual(error.diagnosticID, departure.id) }
         abort.on = true
         do { try await requester.service.retryReconciliation(); XCTFail("Failed departure reported as success") }
         catch let error as TrustedPartialRecovery {
-            let details = error.remaining.joined()
-            XCTAssertTrue(details.contains(POSIXError(.EIO).localizedDescription))
-            XCTAssertTrue(details.contains(POSIXError(.EBUSY).localizedDescription))
+            XCTAssertEqual(error.remaining.first, POSIXError(.EBUSY).localizedDescription)
+            XCTAssertTrue(error.remaining.contains { $0.contains(POSIXError(.EIO).localizedDescription) })
+            XCTAssertEqual(error.completedServices, [requester.service.runtimeID])
+            XCTAssertEqual(error.attemptedDepartures, [.init(authority: authority.id, ticket: departure.id)])
         }
         XCTAssertEqual(attempts.count, 1, "An attempted departure must not re-enter the fallback sweep")
         let status = await requester.service.recoveryStatuses()

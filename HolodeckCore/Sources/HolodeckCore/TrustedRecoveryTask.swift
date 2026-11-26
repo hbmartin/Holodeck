@@ -265,13 +265,13 @@ struct TrustedLocalRecoveryReceipt: Sendable {
     let metadataRevision: UInt64
     let ownershipGeneration: UInt64
 }
-/// Local-only entry point remains callable after the target changed registration.
-/// Its weak authority reference cannot keep an otherwise idle account alive.
 struct TrustedDepartureRecoveryKey: Hashable, Sendable {
     let authority: UUID
     let ticket: UUID
 }
 
+/// Local-only entry point remains callable after the target changed registration.
+/// Its weak authority reference cannot keep an otherwise idle account alive.
 nonisolated final class TrustedAuthorityRecoveryEndpoint: @unchecked Sendable {
     let authorityID: UUID
     let ticketID: UUID
