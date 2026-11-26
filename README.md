@@ -6,6 +6,35 @@ A Metal scene viewer for tvOS 26.0 and later and Apple silicon Macs running macO
 - **[Technical reference](docs/local-shader-serving.md):** architecture, publication, discovery, TLS pairing, protocol, caching, and developer setup.
 - **[Authoring workflow](docs/shader-catalog-workflow.md):** folder format and publication overview.
 
+## TestFlight releases
+
+Use Xcode with the macOS and tvOS SDKs, automatic signing for the project's developer team, App Store Connect app records for `me.haroldmartin.Holodeck` and `me.haroldmartin.HolodeckMac`, and `sentry-cli` on `PATH`. Set these environment variables in the release shell or CI secret store.
+
+| Variables | Values |
+| --- | --- |
+| `ASC_KEY_PATH`, `ASC_KEY_ID`, `ASC_ISSUER_ID` | Path to an App Store Connect team API key (`.p8`), its key ID, and its issuer ID. The key needs access to upload builds and manage the signing resources used by Xcode. |
+| `SENTRY_ORG`, `SENTRY_AUTH_TOKEN` | Sentry organization slug and a token allowed to upload debug information files to the selected projects. |
+| `SENTRY_PROJECT_TVOS`, `SENTRY_DSN_TVOS` | tvOS Sentry project slug and public HTTPS DSN. |
+| `SENTRY_PROJECT_MACOS`, `SENTRY_DSN_MACOS` | macOS Sentry project slug and public HTTPS DSN. |
+
+Choose an unused, increasing build number from App Store Connect. macOS build numbers must increase across marketing versions. The script reads the marketing version from the project.
+
+```sh
+tools/distribute.sh all --build-number 42 --internal-only
+```
+
+Use `tvos` or `macos` to release one app. Omit `--internal-only` to allow external TestFlight testing after Apple review. The script verifies each archive's dSYM UUIDs, waits for Sentry symbol processing, then submits the same archive to App Store Connect. Check processing, export compliance, and tester groups in App Store Connect. Declare Sentry crash and diagnostic data as applicable in the app privacy details.
+
+Use `--archive-only` to build and verify a signed archive without uploading it. Set the public DSN at archive time if you intend to upload that build later. If a symbol or Apple upload fails, inspect the logs under `.build/distribution/`. Check whether Apple already received that build before retrying the saved archive with the same target and Sentry settings.
+
+```sh
+tools/distribute.sh macos --archive '/path/to/HolodeckMac.xcarchive' --internal-only
+```
+
+TestFlight crash events use the `testflight` environment and the release name `<bundle-id>@<version>+<build>`. For a private smoke test, trigger a native crash in a disposable build launched outside the debugger, relaunch it, and verify the event and symbolicated frames in the selected project. Ordinary local builds leave the DSN empty unless explicitly configured.
+
+The Mac TestFlight build reads a shader folder you choose and supports playback and TV sharing. Select the shader folder and approve your TV when switching to that build. Use the local Mac build for Shader Requests.
+
 ## Controls
 
 - Launch restores the last successfully activated shader full screen. A first launch discovers your Mac and waits for approval before downloading its local catalog and starting the default shader. A saved ID no longer in the catalog also resolves to its default. If a remembered shader fails to compile, the picker reports the error and keeps that saved ID until another shader succeeds.

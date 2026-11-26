@@ -1,5 +1,5 @@
 {
-  "originHash" : "3f22677c652f794866c06c7799778eb67f410a4c15e46c38328957b2ff77493a",
+  "originHash" : "584a601d0f0ae1cc9dc8dbba82dbc74c6dec16ab69316e447bb4b43664380c72",
   "pins" : [
     {
       "identity" : "combine-schedulers",
@@ -8,6 +8,15 @@
       "state" : {
         "revision" : "114354e8c1667a2edc4993700fb9fa4f90157b56",
         "version" : "1.2.2"
+      }
+    },
+    {
+      "identity" : "sentry-apple-binaries",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/getsentry/sentry-apple-binaries.git",
+      "state" : {
+        "revision" : "8851964e4f4dbabb6b986c5f4c9b8f8996ed2842",
+        "version" : "9.35.0"
       }
     },
     {
