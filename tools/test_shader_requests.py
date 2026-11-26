@@ -182,6 +182,33 @@ class ShaderRequestWorkerTests(unittest.TestCase):
 
     def invocations(self): return [json.loads(line) for line in (self.job/'invocations.jsonl').read_text().splitlines()]
 
+    def repair_context(self):
+        invocation = next(call for call in self.invocations() if 'resume' in call['args'])
+        self.assertTrue(invocation['prompt'].startswith('Repair the existing Holodeck shader candidate.'))
+        return json.loads('{' + invocation['prompt'].split('\n{', 1)[1])['verificationRepair']
+
+    def trace_tool(self, tool=TOOL):
+        self.tool.write_text(tool.replace(
+            "args = sys.argv[1:]",
+            """args = sys.argv[1:]
+trace = Path(os.environ['HOLODECK_REQUEST_DIRECTORY']) / 'checks.jsonl'
+if args[:2] == ['library', 'validate']:
+    check = {'phase': 'gpu' if '--gpu-only' in args else 'compile',
+             'body': Path('shaders/alpha/body.metal').read_text().strip()}
+elif args[0] == 'render':
+    output = Path(args[2])
+    check = {'phase': 'render', 'body': Path(args[1]).read_text(), 'variant': output.parent.name,
+             'time': int(output.stem)}
+else:
+    check = None
+if check:
+    with trace.open('a') as log: log.write(json.dumps(check) + '\\n')
+"""
+        ))
+
+    def check_trace(self):
+        return [json.loads(line) for line in (self.job/'checks.jsonl').read_text().splitlines()]
+
     def test_edit_commit_push_and_idempotent_recovery(self):
         code,events=self.run_worker();self.assertEqual(code,0,events)
         result=self.result(events);self.assertEqual(result['outputKind'],'edited');self.assertEqual(result['shaderID'],'alpha')
@@ -270,7 +297,9 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         self.assertEqual(code, 0, events)
         self.assertEqual(self.result(events)['shaderID'], 'gamma')
         self.assertEqual((self.job/'implementation-count').read_text(), '2')
-        self.assertIn('"verificationFeedback": "Invalid colors for gamma', self.invocations()[1]['prompt'])
+        repair = self.repair_context()
+        self.assertEqual(repair['diagnostic'].strip(), 'Invalid colors for gamma')
+        self.assertIn('shaders/gamma/metadata.json', repair['changedPaths'])
         self.assertTrue(any(event.get('stage') == 'repairing' for event in events))
         self.assertFalse(any('Reapplying checkpoint requires' in event.get('text', '') for event in events))
         published = json.loads(self.git(self.root, 'show', 'origin/main:shaders/gamma/metadata.json'))
@@ -311,6 +340,111 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         self.assertTrue(any(e.get('stage')=='repairing' for e in events))
         self.assertEqual((self.root/'shaders/alpha/body.metal').read_text(),'EDIT\n')
         self.assertEqual((self.job/'implementation-count').read_text(),'2')
+        repair = self.repair_context()
+        self.assertEqual(repair['phase'], 'compile')
+        self.assertIn('+BAD', repair['candidateDiff'])
+
+    def test_scope_failure_gets_repair_context_and_keeps_forbidden_content_out_of_prompt(self):
+        self.codex.write_text(CODEX.replace(
+            "    if status=='completed':",
+            f"""    extra = Path('tools/library.py')
+    if count == 1: extra.write_text('out of scope content')
+    else: extra.write_text({LIBRARY!r})
+    if status=='completed':"""
+        ))
+        code, events = self.run_worker()
+
+        self.assertEqual(code, 0, events)
+        repair = self.repair_context()
+        self.assertEqual(repair['phase'], 'scope')
+        self.assertEqual(repair['diagnostic'], 'Forbidden change: tools/library.py')
+        self.assertIn('tools/library.py', repair['changedPaths'])
+        self.assertNotIn('tools/library.py', repair['candidateDiff'])
+        self.assertEqual((self.root/'tools/library.py').read_text(), LIBRARY)
+
+    def test_gpu_repair_runs_gpu_first_and_completes_compilation_once(self):
+        self.trace_tool(TOOL.replace("if any('BAD'", "if '--gpu-only' in args and any('BAD'"))
+        self.request['prompt'] = 'repair'
+        self.save_request()
+
+        code, events = self.run_worker()
+
+        self.assertEqual(code, 0, events)
+        self.assertEqual(self.repair_context()['phase'], 'gpu')
+        self.assertEqual([check['phase'] for check in self.check_trace() if check['body'] == 'EDIT'],
+                         ['gpu', 'compile'])
+
+    def test_render_repair_reruns_the_failed_sample_then_reuses_it_for_review(self):
+        tool = TOOL.replace("if any('BAD'", "if False and any('BAD'").replace(
+            "Path(sys.argv[3]).write_bytes",
+            """if '/after/' in args[2] and args[-1] == '3' and 'BAD' in Path(args[1]).read_text():
+    print('Fixture render diagnostic', file=sys.stderr)
+    raise SystemExit(1)
+Path(sys.argv[3]).write_bytes"""
+        )
+        self.trace_tool(tool)
+        self.request['prompt'] = 'repair'
+        self.save_request()
+
+        code, events = self.run_worker()
+
+        self.assertEqual(code, 0, events)
+        repair = self.repair_context()
+        self.assertEqual((repair['phase'], repair['shaderID'], repair['sampleTime']), ('render', 'alpha', 3))
+        self.assertIn('Fixture render diagnostic', repair['diagnostic'])
+        checks = self.check_trace()
+        recovered = [check for check in checks if 'EDIT' in check['body']]
+        self.assertEqual([(check['phase'], check.get('time')) for check in recovered],
+                         [('render', 3), ('compile', None), ('gpu', None), ('render', 0), ('render', 10)])
+        self.assertIn({'phase': 'render', 'body': 'COMMON\nALPHA\nFRAGMENT\n',
+                       'variant': 'alpha', 'time': 3}, checks)
+
+    def parked_gpu_repair(self):
+        worker = worker_module.Worker(self.config, self.job)
+        worker.request = self.request
+        worker.save(base=self.base_sha, attemptID='initial', threadID='00000000-0000-0000-0000-000000000042')
+        worker_module.write(worker.owner, {'id': self.request['id'], 'directory': str(self.job)})
+        (self.root/'shaders/alpha/body.metal').write_text('BAD\n')
+        worker.save(verificationRepair={
+            'attemptID': 'initial', 'base': self.base_sha, 'phase': 'gpu',
+            'diagnostic': 'Fails GPU check', 'shaderID': 'alpha', 'sampleTime': None, 'restoreConflict': False,
+        })
+        worker.park()
+        # Simulate interruption while synchronize() owns a clean checkout and validates the baseline.
+        worker_module.write(worker.owner, {'id': self.request['id'], 'directory': str(self.job), 'checkpointParked': True})
+        self.codex.write_text(CODEX.replace("    elif changed:", """    elif changed:
+        assert Path('shaders/alpha/body.metal').read_text() == 'BAD\\n'"""))
+        self.trace_tool()
+
+    def test_resumes_checkpointed_repair_after_interrupted_baseline_validation(self):
+        self.parked_gpu_repair()
+
+        code, events = self.run_worker()
+
+        self.assertEqual(code, 0, events)
+        repair = self.repair_context()
+        self.assertFalse(repair['baseAdvanced'])
+        self.assertIn('+BAD', repair['candidateDiff'])
+        self.assertEqual(repair['diagnostic'], 'Fails GPU check')
+        self.assertEqual([check['phase'] for check in self.check_trace() if check['body'] == 'EDIT'],
+                         ['gpu', 'compile'])
+        self.assertIsNone(json.loads((self.job/'checkpoint.json').read_text())['verificationRepair'])
+
+    def test_advanced_base_uses_full_validation_in_normal_order(self):
+        self.parked_gpu_repair()
+        upstream = self.base/'upstream'
+        self.git(self.base, 'clone', '-b', 'main', self.remote, upstream)
+        (upstream/'shaders/beta/body.metal').write_text('INTERVENING\n')
+        self.git(upstream, '-c', 'user.name=Upstream', '-c', 'user.email=upstream@example.invalid', 'commit', '-am', 'Advance main')
+        self.git(upstream, 'push', 'origin', 'main')
+
+        code, events = self.run_worker()
+
+        self.assertEqual(code, 0, events)
+        self.assertTrue(self.repair_context()['baseAdvanced'])
+        self.assertEqual([check['phase'] for check in self.check_trace() if check['body'] == 'EDIT'],
+                         ['compile', 'gpu'])
+        self.assertEqual((self.root/'shaders/beta/body.metal').read_text(), 'INTERVENING\n')
 
     def test_helper_changes_review_every_affected_shader(self):
         self.request['prompt']='helper';self.save_request();code,events=self.run_worker();self.assertEqual(code,0,events)
@@ -353,10 +487,24 @@ class ShaderRequestWorkerTests(unittest.TestCase):
         with self.assertRaisesRegex(worker_module.CandidateError,'Forbidden'):worker.scope()
 
     def test_visual_repair_keeps_failed_frames_and_independent_verdicts(self):
+        self.trace_tool()
         self.request['prompt']='visual-repair';self.save_request();code,events=self.run_worker();self.assertEqual(code,0,events)
         verdicts=[json.loads(p.read_text()) for p in (self.job/'evidence').glob('*/alpha/verdict.json')]
         self.assertEqual(len(verdicts),2);self.assertEqual([v['passed'] for v in verdicts],[False,True])
         self.assertEqual(len(list((self.job/'evidence').glob('*/alpha/*/*.png'))),12)
+        repair = self.repair_context()
+        self.assertEqual((repair['phase'], repair['shaderID']), ('review', 'alpha'))
+        self.assertEqual([check['phase'] for check in self.check_trace()[-8:]], ['render'] * 6 + ['compile', 'gpu'])
+
+    def test_invalid_visual_evidence_digest_is_operational_without_a_shader_repair(self):
+        self.codex.write_text(CODEX.replace("schema['properties']['evidenceDigest']['enum'][0]", "'wrong digest'"))
+
+        code, events = self.run_worker()
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual((self.job/'implementation-count').read_text(), '1')
+        self.assertTrue(any('reviewer returned an invalid verdict' in event.get('message', '') for event in events))
+        self.assertEqual(self.git(self.root, 'rev-parse', 'origin/main').strip(), self.base_sha)
 
     def test_removed_context_is_recreated_under_unused_id(self):
         self.git(self.root,'rm','-r','shaders/alpha')
