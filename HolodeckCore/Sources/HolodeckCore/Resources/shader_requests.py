@@ -19,6 +19,8 @@ import time
 
 
 SHADER_ID_PATTERN = r"[a-z0-9]+(?:-[a-z0-9]+)*"
+TECHNICAL_PHASES = {"compile": "--compile", "gpu": "--gpu-only"}
+SAMPLE_TIMES = (0, 3, 10)
 
 
 class CandidateError(RuntimeError):
@@ -47,11 +49,12 @@ globals().update({name: getattr(processes, name) for name in processes.__all__})
 
 
 class VerificationError(CandidateError):
-    def __init__(self, message, command=None, shader_id=None, time=None):
+    def __init__(self, message, command=None, shader_id=None, time=None, *, phase):
         super().__init__(message)
         self.command = command
         self.shader_id = shader_id
         self.time = time
+        self.phase = phase
 
 
 def write(path, value):
@@ -251,11 +254,15 @@ class Worker:
                     raise
         self.owner.unlink(missing_ok=True)
 
-    def park(self):
-        self.save_patch()
+    def park(self, *, allow_invalid=False):
+        self.save_patch(allow_invalid=allow_invalid)
+        if self.owner.exists():
+            owner = json.loads(self.owner.read_text())
+            owner["checkpointParked"] = True
+            write(self.owner, owner)
         self.clean()
 
-    def save_patch(self):
+    def save_patch(self, *, allow_invalid=False):
         base = self.checkpoint["base"]
         patch = self.git("diff", "--binary", base, raw=True)
         (self.directory / "changes.patch").write_bytes(patch)
@@ -264,16 +271,20 @@ class Worker:
         for name in filter(None, others):
             path = self.root / name
             if path.is_symlink() or not path.is_file():
+                if allow_invalid:
+                    continue
                 raise CandidateError("New source paths must be regular files")
             files[name] = base64.b64encode(path.read_bytes()).decode()
         write(self.directory / "untracked.json", files)
 
     def restore_patch(self):
+        conflicted = False
         patch = self.directory / "changes.patch"
         if patch.exists() and patch.stat().st_size:
             result = self.git("apply", "--3way", str(patch), check=False)
             # A conflict is given to Codex; never push or verify unresolved files.
             if result.returncode:
+                conflicted = True
                 message = "Reapplying checkpoint requires conflict resolution by Codex."
                 if result.stderr:
                     message += "\n" + result.stderr[-4000:].strip()
@@ -284,9 +295,21 @@ class Worker:
                 path = self.root / name
                 if self.root not in path.resolve().parents:
                     raise OperationalError("Checkpoint path escapes managed checkout")
-                if not path.exists():
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_bytes(base64.b64decode(data))
+                if path.exists() or path.is_symlink():
+                    conflicted = True
+                    emit("log", text="Reapplying checkpoint encountered an existing file: " + name)
+                    continue
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(base64.b64decode(data))
+        return conflicted
+
+    def restore_owned_patch(self):
+        conflicted = self.restore_patch()
+        repair = self.checkpoint.get("verificationRepair")
+        if conflicted and repair:
+            self.save(verificationRepair={**repair, "restoreConflict": True})
+        write(self.owner, {"id": self.request["id"], "directory": str(self.directory)})
+        return conflicted
 
     def synchronize(self):
         self.git_tree("HEAD")
@@ -294,8 +317,11 @@ class Worker:
             owner = json.loads(self.owner.read_text())
             if str(owner.get("id")).lower() != self.request["id"].lower():
                 raise OperationalError("Another interrupted request owns this checkout; recover it first")
-            self.save_patch()
-            self.clean()
+            if owner.get("checkpointParked"):
+                self.clean()
+            else:
+                repair = self.checkpoint.get("verificationRepair") or {}
+                self.park(allow_invalid=repair.get("phase") == "scope")
         if self.git("status", "--porcelain", "--untracked-files=all").strip():
             raise OperationalError("Managed checkout has external uncommitted changes; they have been preserved")
         self.git("fetch", "origin", "main")
@@ -307,11 +333,11 @@ class Worker:
         self.save(base=remote, commitSHA=None)
         # Old publication snapshots must never become the baseline of a new attempt.
         (self.directory / "baseline-workspace.json").unlink(missing_ok=True)
-        write(self.owner, {"id": self.request["id"], "directory": str(self.directory)})
+        write(self.owner, {"id": self.request["id"], "directory": str(self.directory), "checkpointParked": True})
         self.check_checkout_inputs()
         self.validate_baseline()
         write(self.directory / "baseline-workspace.json", self.candidate_manifest(compare_baseline=False))
-        self.restore_patch()
+        self.restore_owned_patch()
 
     def discard(self):
         # Discarding owned work needs the durable request identity, even if its payload was corrupted.
@@ -329,6 +355,8 @@ class Worker:
                 self.clean()
             for name in ("changes.patch", "untracked.json"):
                 (self.directory / name).unlink(missing_ok=True)
+            if self.checkpoint.get("verificationRepair"):
+                self.save(verificationRepair=None)
         emit("discarded")
 
     def git_tree(self, revision):
@@ -442,7 +470,7 @@ class Worker:
             sha = self.checkpoint.get("commitSHA")
             # Upgrade a pending old-format commit without adopting the prior publication as this repair.
             legacy_pending = self.checkpoint.get("attemptID") is None and sha and (not previous or sha != previous["commitSHA"])
-            self.save(attemptID=attempt, commitSHA=sha if legacy_pending else None)
+            self.save(attemptID=attempt, commitSHA=sha if legacy_pending else None, verificationRepair=None)
 
     def publication_result(self, outcome, sha):
         response = {k: outcome[k] for k in ("outputKind", "shaderID", "changed", "summary", "approximations")}
@@ -696,16 +724,44 @@ class Worker:
         except ValueError as error:
             raise OperationalError("Codex returned malformed structured output") from error
 
-    def prompt(self, feedback):
+    def repair_prompt_context(self, repair):
+        base = self.checkpoint["base"]
+        changed = self.git("diff", "--name-only", "-z", base).split("\0")
+        untracked = self.git("ls-files", "--others", "--exclude-standard", "-z").split("\0")
+        paths = sorted((set(changed) | set(untracked) | self.raw_workspace_changes()) - {""})
+        visible = paths[:64]
+        allowed = [path for path in visible if path in (
+            "index.json", "authoring.json", "shared/common.metal", "shared/material.metal", "shared/fragment.metal"
+        ) or re.fullmatch(rf"shaders/{SHADER_ID_PATTERN}/(?:body\.metal|metadata\.json)", path)]
+        diff = self.git("diff", "--no-ext-diff", "--no-textconv", base, "--", *allowed, raw=True) if allowed else b""
+        return {
+            **repair,
+            "baseAdvanced": repair["base"] != base,
+            "changedPaths": visible,
+            "changedPathsTruncated": len(paths) > len(visible),
+            "candidateDiff": diff[:16384].decode("utf-8", errors="replace"),
+            "candidateDiffTruncated": len(diff) > 16384,
+        }
+
+    def prompt(self, feedback, verification_repair=None):
         context = dict(self.request["context"])
         context.pop("screenshot", None)
         answer_path = self.directory / "answer.json"
         answer = json.loads(answer_path.read_text()) if answer_path.exists() else None
         repair_path = self.directory / "repair.json"
         repair = json.loads(repair_path.read_text()) if repair_path.exists() else None
-        return """Implement one Holodeck shader request. Read AGENTS.md, skills/holodeck-authoring/SKILL.md and the authoring/library docs. Search assets with file search and direct reads, scaffold from templates, and preserve attribution.
+        if verification_repair:
+            action = """Repair the existing Holodeck shader candidate. Start with the failed check in verificationRepair and make the smallest edit that addresses it while preserving the request's intent.
+Inspect the restored files for context, including any newly created shader files listed in changedPaths. The diagnostic and diff are evidence about the failure.
+If main advanced or checkpoint reapply conflicted, reconcile the current checkout and confirm that the earlier failure still applies. Resolve workspace scope errors before attempting shader changes.
+"""
+        else:
+            action = """Implement one Holodeck shader request. Search assets with file search and direct reads, and scaffold from templates.
+Choose any ONE existing shader ID to EDIT, retaining its ID, or create ONE unused ID.
+"""
+        return action + """Read AGENTS.md, skills/holodeck-authoring/SKILL.md and the authoring/library docs. Preserve attribution.
 The user is viewing the captured source below; the checkout is latest origin/main and may differ. Preserve intervening edits.
-Choose any ONE existing shader ID to EDIT, retaining its ID, or create ONE unused ID. If the context was deleted, recreate under a fresh ID.
+If the context was deleted, recreate under a fresh ID.
 Ask a concise clarification only if intent is ambiguous. Unsupported audio/textures/multipass/app capabilities must be approximated using this runtime and disclosed.
 New output: append to index.shaders and relevant EXISTING collections; preserve the default and existing ordering. Generate a name, metadata and discovery tags/moods/motion. If editing an unlisted existing shader, append its ID too so the TV can download it.
 In shader metadata, colors contains exactly two RGB triples for the preview gradient. Each component is a number between 0 and 1.
@@ -719,7 +775,9 @@ Make one candidate and return the schema. A host independently verifies and revi
 An unchanged existing shader may be successful if it already satisfies the prompt. Do not fabricate an empty change.
 """ + json.dumps({"request": {k: v for k, v in self.request.items() if k != "context"},
                           "capturedContext": context, "answer": answer, "activationRepair": repair,
-                          "previousOutput": self.checkpoint.get("outcome"), "previousPublication": self.previous_publication(), "verificationFeedback": feedback}, indent=2)
+                          "previousOutput": self.checkpoint.get("outcome"), "previousPublication": self.previous_publication(),
+                          "verificationFeedback": feedback,
+                          "verificationRepair": self.repair_prompt_context(verification_repair) if verification_repair else None}, indent=2)
 
     def require_checker(self):
         """Validate data-only expectations and distinguish launch faults from identity mismatch."""
@@ -765,22 +823,25 @@ An unchanged existing shader may be successful if it already satisfies the promp
             raise OperationalError('Update Holodeck and the shader library together: packaged checker reports a different version or interface')
         self._checker_identity_key = key
 
-    def technical(self, baseline=False, commands=None):
+    def technical(self, baseline=False, commands=None, *, first_phase=None):
         self.require_checker()
         self.stage("validating", "Compiling macOS and tvOS shaders and running authoring/GPU tests")
-        commands = commands or [[self.config["shaderTool"], "library", "validate", str(self.root), phase, "--python", self.config["python"]]
-                                for phase in ('--compile', '--gpu-only')]
+        if not commands:
+            phases = sorted(TECHNICAL_PHASES, key=lambda phase: phase != first_phase)
+            commands = [[self.config["shaderTool"], "library", "validate", str(self.root), TECHNICAL_PHASES[phase],
+                         "--python", self.config["python"]] for phase in phases]
         for command in commands:
+            phase = next((name for name, flag in TECHNICAL_PHASES.items() if flag in command), "validation")
             try:
                 result = run(command, self.root, self.env, timeout=600, check=False)
             except subprocess.TimeoutExpired as error:
                 if baseline: raise OperationalError("Baseline validation timed out") from error
-                raise VerificationError("Candidate validation timed out", command=command) from error
+                raise VerificationError("Candidate validation timed out", command=command, phase=phase) from error
             if result.returncode:
                 message = (result.stdout + result.stderr)[-12000:] or f"Validation exited {result.returncode}"
                 if baseline:
                     raise OperationalError("Baseline or host validation failed: " + message)
-                raise VerificationError(message, command=command)
+                raise VerificationError(message, command=command, phase=phase)
 
     def baseline_render(self, shader_id=None, time=None):
         sid = shader_id if shader_id in self.baseline_ids() else json.loads((self.root / "index.json").read_text())["defaultShaderID"]
@@ -788,7 +849,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
         directory.mkdir(parents=True, exist_ok=True)
         source = directory / "source.metal"
         source.write_bytes(self.source(sid).encode("utf-8"))
-        for sample in (0, 3, 10) if time is None else (time,):
+        for sample in SAMPLE_TIMES if time is None else (time,):
             png = directory / f"{sample}.png"
             png.unlink(missing_ok=True)
             result = run([self.config["shaderTool"], "render", source, png, "--width", "1280", "--height", "720", "--time", str(sample)], self.root, self.env, timeout=60, check=False)
@@ -809,81 +870,147 @@ An unchanged existing shader may be successful if it already satisfies the promp
 
     def classify_verification_failure(self, error):
         # Keep one checkout: park the candidate while the same failing operation probes pristine base.
-        self.save_patch()
-        self.clean()
-        write(self.owner, {"id": self.request["id"], "directory": str(self.directory)})
+        self.park()
+        write(self.owner, {"id": self.request["id"], "directory": str(self.directory), "checkpointParked": True})
         try:
             if error.command:
                 self.technical(baseline=True, commands=[error.command])
             else:
                 self.baseline_render(error.shader_id, error.time)
         finally:
-            self.restore_patch()
+            conflicted = self.restore_owned_patch()
+        return conflicted
 
-    def visual(self, outcome):
-        self.stage("reviewing", "Rendering samples and running independent visual review")
-        base = self.checkpoint["base"]
-        before_ids = self.baseline_ids()
-        after_ids = [p.parent.name for p in (self.root / "shaders").glob("*/metadata.json")]
-        evidence = []
+    def remember_verification_failure(self, error, outcome, phase):
+        failure = error if isinstance(error, VerificationError) else None
+        conflicted = False
+        if failure and (failure.command or failure.phase == "render"):
+            conflicted = self.classify_verification_failure(failure)
+        else:
+            self.save_patch(allow_invalid=phase == "scope")
+        self.save(verificationRepair={
+            "attemptID": self.checkpoint["attemptID"],
+            "base": self.checkpoint["base"],
+            "phase": failure.phase if failure else phase,
+            "diagnostic": str(error)[-12000:],
+            "shaderID": (failure.shader_id if failure and failure.shader_id
+                         else outcome.get("shaderID") if isinstance(outcome, dict) else None),
+            "sampleTime": failure.time if failure else None,
+            "restoreConflict": conflicted,
+        })
+
+    def visual_sources(self, shader_id, outcome, before_ids):
+        after = self.source(shader_id)
+        before = self.source(shader_id, self.checkpoint["base"]) if shader_id in before_ids else None
+        if before == after and shader_id != outcome["shaderID"]:
+            return None
+        if before is None and shader_id == self.request["context"]["shaderID"]:
+            before = self.request["context"]["source"]
+        return {"before": before, "after": after}
+
+    def render_sample(self, evidence_root, evidence, shader_id, variant, source, time):
+        path = evidence_root / shader_id / variant
+        png = path / f"{time}.png"
+        key = (shader_id, variant, time)
+        source_hash = digest(source)
+        previous = evidence.get(key)
+        if previous:
+            if (previous["sourceHash"] != source_hash or not png.is_file()
+                    or previous["imageHash"] != digest(png.read_bytes())):
+                raise CandidateError("Render evidence changed during verification: " + shader_id)
+            return png
+        path.mkdir(parents=True, exist_ok=True)
+        metal = path / "source.metal"
+        metal.write_text(source)
+        png.unlink(missing_ok=True)
+        try:
+            result = run([self.config["shaderTool"], "render", metal, png, "--width", "1280", "--height", "720",
+                          "--time", str(time)], self.root, self.env, timeout=60, check=False)
+        except subprocess.TimeoutExpired as error:
+            if variant == "before":
+                raise OperationalError("Baseline render timed out: " + shader_id) from error
+            raise VerificationError("Candidate render timed out: " + shader_id, shader_id=shader_id,
+                                    time=time, phase="render") from error
+        if result.returncode or not self.valid_image(png):
+            if variant == "before":
+                raise OperationalError("Baseline sample or host rendering failed: " + shader_id)
+            message = "Missing, failed or incorrectly sized render evidence: " + shader_id
+            detail = (result.stdout + result.stderr)[-12000:].strip()
+            if detail:
+                message += "\n" + detail
+            raise VerificationError(message, shader_id=shader_id, time=time, phase="render")
+        evidence[key] = {"shaderID": shader_id, "variant": variant, "time": time,
+                         "sourceHash": source_hash, "imageHash": digest(png.read_bytes()), "path": str(png)}
+        return png
+
+    def review_shader(self, shader_id, sources, outcome, evidence_root, evidence, tool_hash):
+        images = [self.render_sample(evidence_root, evidence, shader_id, variant, source, time)
+                  for variant, source in sources.items() if source is not None for time in SAMPLE_TIMES]
+        hashes = {variant: digest(source) for variant, source in sources.items() if source is not None}
+        captured = self.directory / "captured.png"
+        diff = self.git("diff", self.checkpoint["base"])
+        stamp = digest(json.dumps({"requestID": self.request["id"], "prompt": self.request["prompt"], "outcome": outcome,
+                                    "capturedImage": digest(captured.read_bytes()), "captureTime": self.request["context"].get("animationTime"),
+                                    "diffHash": digest(self.git("diff", self.checkpoint["base"], raw=True)),
+                                    "sources": hashes, "images": [digest(p.read_bytes()) for p in images],
+                                    "size": [1280, 720], "times": SAMPLE_TIMES, "tool": tool_hash}, sort_keys=True))
+        schema = {"type": "object", "properties": {"passed": {"type": "boolean"}, "reason": {"type": "string"},
+                  "evidenceDigest": {"type": "string", "enum": [stamp]}},
+                  "required": ["passed", "reason", "evidenceDigest"], "additionalProperties": False}
+        prompt = "Independently review the attached ACTUAL timed images (before then after, each at 0,3,10 seconds). Do not modify files. "
+        prompt += "Check rendering, visual coherence and requested intent. For performance requests preserve composition, colors, motion and detail. "
+        prompt += "For other affected shaders reject unintended visual regressions. Approximations are allowed only for unsupported runtime capabilities and must be disclosed. "
+        prompt += "You may inspect source/diff; no physical TV or frame-rate success is claimed. "
+        prompt += json.dumps({"shaderID": shader_id, "primary": shader_id == outcome["shaderID"], "request": self.request["prompt"],
+                              "purpose": self.request["purpose"], "outcome": outcome, "capturedContext": {k: v for k, v in self.request["context"].items() if k != "screenshot"},
+                              "sourceHashes": hashes, "evidenceDigest": stamp, "diff": diff})
+        images.append(captured)
+        verdict = self.codex(prompt, schema, "review-" + shader_id, images)
+        write(evidence_root / shader_id / "verdict.json", verdict)
+        if (not isinstance(verdict, dict) or verdict.get("evidenceDigest") != stamp
+                or type(verdict.get("passed")) is not bool or not isinstance(verdict.get("reason"), str)):
+            raise OperationalError("Independent visual reviewer returned an invalid verdict for " + shader_id)
+        if not verdict["passed"]:
+            raise VerificationError("Independent visual review: " + verdict["reason"], shader_id=shader_id, phase="review")
+
+    def verify_candidate(self, outcome, repair):
+        self.require_checker()
+        phase = repair.get("phase")
+        target = repair.get("shaderID")
+        shader_ids = sorted(path.parent.name for path in (self.root / "shaders").glob("*/metadata.json"))
+        before_ids = set(self.baseline_ids())
+        retry_render = phase == "render" and repair.get("sampleTime") in SAMPLE_TIMES
+        focused_sources = None
+        if target in shader_ids and (retry_render or phase == "review"):
+            focused_sources = self.visual_sources(target, outcome, before_ids)
+        tool = Path(self.config["shaderTool"])
+        tool_hash = digest(tool.read_bytes())
+        if not focused_sources:
+            self.technical(first_phase=phase)
         attempt = self.checkpoint.get("verificationAttempt", 0) + 1
         self.save(verificationAttempt=attempt)
         evidence_root = self.directory / "evidence" / f"attempt-{attempt}"
-        for sid in after_ids:
-            after = self.source(sid)
-            before = self.source(sid, base) if sid in before_ids else None
-            if before == after and sid != outcome["shaderID"]:
+        evidence = {}
+        reviewed = None
+        if focused_sources:
+            self.stage("reviewing", f"Rechecking {target} after repair")
+            if retry_render:
+                self.render_sample(evidence_root, evidence, target, "after", focused_sources["after"], repair["sampleTime"])
+            else:
+                self.review_shader(target, focused_sources, outcome, evidence_root, evidence, tool_hash)
+                reviewed = target
+            self.technical()
+        self.stage("reviewing", "Rendering samples and running independent visual review")
+        for shader_id in shader_ids:
+            if shader_id == reviewed:
                 continue
-            if before is None and sid == self.request["context"]["shaderID"]:
-                before = self.request["context"]["source"]
-            images = []
-            hashes = {}
-            for label, source in (("before", before), ("after", after)):
-                if source is None:
-                    continue
-                hashes[label] = digest(source)
-                path = evidence_root / sid / label
-                path.mkdir(parents=True, exist_ok=True)
-                metal = path / "source.metal"
-                metal.write_text(source)
-                for time in (0, 3, 10):
-                    png = path / f"{time}.png"
-                    png.unlink(missing_ok=True)
-                    try:
-                        result = run([self.config["shaderTool"], "render", metal, png, "--width", "1280", "--height", "720", "--time", str(time)], self.root, self.env, timeout=60, check=False)
-                    except subprocess.TimeoutExpired as error:
-                        if label == "before": raise OperationalError("Baseline render timed out: " + sid) from error
-                        raise VerificationError("Candidate render timed out: " + sid, shader_id=sid, time=time) from error
-                    if result.returncode or not self.valid_image(png):
-                        if label == "before":
-                            raise OperationalError("Baseline sample or host rendering failed: " + sid)
-                        raise VerificationError("Missing, failed or incorrectly sized render evidence: " + sid, shader_id=sid, time=time)
-                    images.append(png)
-                    evidence.append({"shaderID": sid, "variant": label, "time": time, "sourceHash": hashes[label],
-                                     "imageHash": digest(png.read_bytes()), "path": str(png)})
-            captured = self.directory / "captured.png"
-            stamp = digest(json.dumps({"requestID": self.request["id"], "prompt": self.request["prompt"], "outcome": outcome,
-                                        "capturedImage": digest(captured.read_bytes()), "captureTime": self.request["context"].get("animationTime"),
-                                        "diffHash": digest(self.git("diff", base, raw=True)), "sources": hashes, "images": [digest(p.read_bytes()) for p in images],
-                                        "size": [1280, 720], "times": [0, 3, 10], "tool": digest(Path(self.config["shaderTool"]).read_bytes())}, sort_keys=True))
-            schema = {"type": "object", "properties": {"passed": {"type": "boolean"}, "reason": {"type": "string"},
-                      "evidenceDigest": {"type": "string", "enum": [stamp]}},
-                      "required": ["passed", "reason", "evidenceDigest"], "additionalProperties": False}
-            prompt = "Independently review the attached ACTUAL timed images (before then after, each at 0,3,10 seconds). Do not modify files. "
-            prompt += "Check rendering, visual coherence and requested intent. For performance requests preserve composition, colors, motion and detail. "
-            prompt += "For other affected shaders reject unintended visual regressions. Approximations are allowed only for unsupported runtime capabilities and must be disclosed. "
-            prompt += "You may inspect source/diff; no physical TV or frame-rate success is claimed. "
-            prompt += json.dumps({"shaderID": sid, "primary": sid == outcome["shaderID"], "request": self.request["prompt"],
-                                  "purpose": self.request["purpose"], "outcome": outcome, "capturedContext": {k: v for k, v in self.request["context"].items() if k != "screenshot"}, "sourceHashes": hashes,
-                                  "evidenceDigest": stamp, "diff": self.git("diff", self.checkpoint["base"])})
-            screenshot = self.directory / "captured.png"
-            if screenshot.exists():
-                images.append(screenshot)
-            verdict = self.codex(prompt, schema, "review-" + sid, images)
-            write(evidence_root / sid / "verdict.json", verdict)
-            if verdict.get("evidenceDigest") != stamp or verdict.get("passed") is not True:
-                raise CandidateError("Independent visual review: " + verdict.get("reason", "invalid verdict"))
-        write(evidence_root / "manifest.json", evidence)
+            sources = self.visual_sources(shader_id, outcome, before_ids)
+            if sources:
+                self.review_shader(shader_id, sources, outcome, evidence_root, evidence, tool_hash)
+        if digest(tool.read_bytes()) != tool_hash:
+            raise OperationalError("The shader tool changed during candidate verification")
+        ordered = sorted(evidence, key=lambda key: (key[0], key[1] != "before", key[2]))
+        write(evidence_root / "manifest.json", [evidence[key] for key in ordered])
 
     def required_previews(self, outcome=None):
         if outcome:
@@ -968,9 +1095,16 @@ An unchanged existing shader may be successful if it already satisfies the promp
             schema["required"] = list(schema["properties"])
             feedback = ""
             while True:
-                self.stage("implementing", "Codex is working on the request")
-                outcome = self.codex(self.prompt(feedback), schema, "implementation", [screenshot], resume=True)
+                repair = self.checkpoint.get("verificationRepair")
+                if repair and repair["attemptID"] == self.checkpoint["attemptID"]:
+                    self.stage("repairing", "Codex is repairing the failed verification check")
+                else:
+                    repair = None
+                    self.stage("implementing", "Codex is working on the request")
+                outcome = self.codex(self.prompt(feedback, repair), schema, "implementation", [screenshot], resume=True)
+                feedback = ""
                 self.save(outcome=outcome)
+                phase = "scope"
                 try:
                     self.scope()
                     if outcome["status"] == "needsClarification":
@@ -981,8 +1115,10 @@ An unchanged existing shader may be successful if it already satisfies the promp
                     self.normalize_preview_colors(outcome)
                     frozen = self.fingerprint()
                     manifest = self.candidate_manifest()
-                    self.technical()
-                    self.visual(outcome)
+                    phase = "verification"
+                    focused = repair and repair["base"] == self.checkpoint["base"] and not repair["restoreConflict"]
+                    self.verify_candidate(outcome, repair if focused else {})
+                    phase = "consistency"
                     if self.fingerprint() != frozen:
                         raise CandidateError("Candidate changed while verification was running")
                     # No writable agent runs after this point; all review inputs remain immutable.
@@ -995,6 +1131,8 @@ An unchanged existing shader may be successful if it already satisfies the promp
                     if self.fingerprint() != frozen or self.candidate_manifest() != manifest:
                         emit("discardPublication")
                         raise CandidateError("Candidate changed while preparing publication")
+                    if repair:
+                        self.save(verificationRepair=None)
                     self.stage("pushing", "Committing verified changes and pushing to main")
                     write(self.directory / "candidate-manifest.json", manifest)
                     write(self.directory / "evidence" / f"attempt-{self.checkpoint['verificationAttempt']}" / "candidate-manifest.json", manifest)
@@ -1023,16 +1161,11 @@ An unchanged existing shader may be successful if it already satisfies the promp
                     self.finish_publication(self.publication_result(outcome, sha))
                     return
                 except (CandidateError, ValueError, SyntaxError, KeyError, TypeError, IndexError) as error:
-                    if isinstance(error, VerificationError):
-                        self.classify_verification_failure(error)
-                    feedback = str(error)
-                    emit("log", text="Repairing shader defect: " + feedback)
-                    self.stage("repairing", "Repairing verification findings")
+                    self.remember_verification_failure(error, outcome, phase)
+                    emit("log", text="Repairing shader defect: " + str(error)[-12000:])
                     self.git("fetch", "origin", "main")
                     if self.git("rev-parse", "origin/main").strip() != self.checkpoint["base"]:
                         self.synchronize()
-                        feedback += " Latest main advanced; the request has been reapplied to it."
-                    self.save_patch()
 
     def preflight(self):
         with (self.gitdir / "holodeck-requests.lock").open("w") as lease:
@@ -1156,6 +1289,8 @@ def main():
                         worker.clean()
                         for name in ("changes.patch", "untracked.json"):
                             (worker.directory / name).unlink(missing_ok=True)
+                        if worker.checkpoint.get("verificationRepair"):
+                            worker.save(verificationRepair=None)
             except Exception as cleanup_error:
                 emit("log", text="Cleanup remains pending: " + str(cleanup_error))
         emit("failure", message=str(error), failureKind="supervision" if isinstance(error, SupervisionError) else "operational",
