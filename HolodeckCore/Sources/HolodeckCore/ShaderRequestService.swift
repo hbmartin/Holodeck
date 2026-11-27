@@ -82,6 +82,7 @@ nonisolated struct RequestWorkerEvent: Decodable, Sendable {
     var failureError: Error? {
         guard event == "failure" else { return nil }
         let detail = message ?? "Shader worker failed"
+        if failureKind == "checkoutCleanup", recoveryRequired == true { return RequestWorkerEvidenceError(cause: detail) }
         if recoveryRequired == true { return RequestWorkerTeardownError(cause: detail) }
         if failureKind == "supervision" || failureKind == "interrupted" {
             return RequestWorkerSupervisionError(message: detail, retryable: failureKind == "supervision" && retryable != false)
@@ -2009,33 +2010,39 @@ public actor ShaderRequestService {
         try Task.checkCancellation()
         let hasTrustedPhase = replayTrusted && revocationCoordinator != nil
         var failures: [String] = [], completed: Set<UUID> = !hasTrustedPhase && local.completed ? [runtimeID] : []
-        var stoppingFailures: [String] = []
+        var abortedPasses: [TrustedPartialRecovery.AbortedPass] = []
         let hasIndependentPhase = replayTrusted && (revocationCoordinator != nil || authorityRecoveryEndpoints.values.contains(where: \.isCurrent) || failedRegistrationRecoveries.values.contains(where: { $0.identity.isCurrent }))
         var attemptedDepartures: Set<TrustedDepartureRecoveryKey> = []
+        var committedDepartures: Set<TrustedDepartureRecoveryKey> = []
+        func collect(_ result: TrustedRecoveryCompletion) {
+            completed.formUnion(result.completedServices)
+            attemptedDepartures.formUnion(result.attemptedDepartures)
+            committedDepartures.formUnion(result.committedDepartures)
+        }
         func collect(_ partial: TrustedPartialRecovery) {
             completed.formUnion(partial.completedServices)
             attemptedDepartures.formUnion(partial.attemptedDepartures)
+            committedDepartures.formUnion(partial.committedDepartures)
             failures += partial.otherFailures
-            if let abort = partial.abortedPass {
-                stoppingFailures.append(abort.stoppingError)
-            }
+            abortedPasses += partial.abortedPasses
         }
         let recoveredAuthority = replayTrusted ? ordinaryRecoveryAuthority : nil
         if replayTrusted, let coordinator = revocationCoordinator {
             do {
-                let result = try await coordinator(local)
-                completed.formUnion(result.completedServices)
-                attemptedDepartures.formUnion(result.attemptedDepartures)
+                collect(try await coordinator(local))
             } catch {
                 try Task.checkCancellation()
                 if let partial = error as? TrustedPartialRecovery {
                     collect(partial)
                     // Only the requester's own coordinator can leave this
                     // decision unmade. Later independent routes cannot reverse it.
-                    if let abort = partial.abortedPass, let receipt = local.receipt,
-                       !abort.evaluatedAttempts.contains(receipt.attemptID),
-                       validateTrustedRecovery(local).completed {
-                        completed.insert(runtimeID)
+                    if let abort = partial.abortedPasses.first, let original = local.receipt {
+                        let exact = abort.replacements[original.attemptID] ?? local
+                        if let receipt = exact.receipt, !abort.evaluatedAttempts.contains(receipt.attemptID),
+                           validateTrustedRecovery(exact).completed {
+                            local = exact
+                            completed.insert(runtimeID)
+                        }
                     }
                 } else {
                     // This set records verified local phases, not whole-pass
@@ -2059,7 +2066,7 @@ public actor ShaderRequestService {
             for endpoint in authorityRecoveryEndpoints.values.filter(\.isCurrent).sorted(by: { $0.ticketID.uuidString < $1.ticketID.uuidString })
                 where !registrationDependencies.contains(endpoint.key) && attemptedDepartures.insert(endpoint.key).inserted {
                 try Task.checkCancellation()
-                do { try await endpoint.retry() }
+                do { if try await endpoint.retry() { committedDepartures.insert(endpoint.key) } }
                 catch { try Task.checkCancellation(); failures.append(error.localizedDescription) }
             }
         }
@@ -2070,9 +2077,7 @@ public actor ShaderRequestService {
                       failedRegistrationRecoveries[authority]?.identity === pending.identity else { continue }
                 if let departure = pending.departure, departure.isCurrent, attemptedDepartures.contains(departure.key) { continue }
                 do {
-                    let result = try await pending.recover(local)
-                    completed.formUnion(result.completedServices)
-                    attemptedDepartures.formUnion(result.attemptedDepartures)
+                    collect(try await pending.recover(local))
                 } catch {
                     try Task.checkCancellation()
                     if let partial = error as? TrustedPartialRecovery {
@@ -2085,20 +2090,22 @@ public actor ShaderRequestService {
             for endpoint in authorityRecoveryEndpoints.values.sorted(by: { $0.ticketID.uuidString < $1.ticketID.uuidString })
                 where endpoint.isCurrent && attemptedDepartures.insert(endpoint.key).inserted {
                 try Task.checkCancellation()
-                do { try await endpoint.retry() }
+                do { if try await endpoint.retry() { committedDepartures.insert(endpoint.key) } }
                 catch { try Task.checkCancellation(); failures.append(error.localizedDescription) }
             }
         }
-        if !stoppingFailures.isEmpty || !failures.isEmpty {
+        if !abortedPasses.isEmpty || !failures.isEmpty {
             if let failure = local.failure { failures.insert(failure, at: 0) }
             throw TrustedPartialRecovery(completedServices: completed.sorted { $0.uuidString < $1.uuidString },
-                remaining: stoppingFailures + failures, attemptedDepartures: attemptedDepartures)
+                otherFailures: failures, attemptedDepartures: attemptedDepartures,
+                committedDepartures: committedDepartures, abortedPasses: abortedPasses)
         }
         if hasIndependentPhase, let failure = local.failure {
-            throw TrustedPartialRecovery(completedServices: completed.sorted { $0.uuidString < $1.uuidString }, remaining: [failure])
+            throw TrustedPartialRecovery(completedServices: completed.sorted { $0.uuidString < $1.uuidString },
+                otherFailures: [failure], attemptedDepartures: attemptedDepartures, committedDepartures: committedDepartures)
         }
         if let original = local.initiatingError { throw original }
-        if let failure = local.failure { throw TrustedPartialRecovery(completedServices: [], remaining: [failure]) }
+        if let failure = local.failure { throw TrustedPartialRecovery(completedServices: [], otherFailures: [failure]) }
     }
     private func cachedRecoveryOutcome(pass: UUID? = nil) -> TrustedLocalRecovery? {
         guard localRecoveryPhase == nil, let result = localRecoveryResult,

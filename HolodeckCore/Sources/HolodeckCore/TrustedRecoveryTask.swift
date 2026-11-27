@@ -299,10 +299,11 @@ nonisolated final class TrustedAuthorityRecoveryEndpoint: @unchecked Sendable {
     func attach(to target: ShaderRequestService) async {
         await authority?.attachDepartureRecovery(self, to: target)
     }
-    func retry() async throws {
-        guard isCurrent else { return }
+    @discardableResult
+    func retry() async throws -> Bool {
+        guard isCurrent else { return false }
         guard let authority else { throw ShaderRequestError.unavailable(message + " The retained authority is unavailable; preserve its trusted approval evidence for manual repair.") }
-        try await authority.recoverDeparture(serviceID: serviceID, ticket: ticketID)
+        return try await authority.recoverDeparture(serviceID: serviceID, ticket: ticketID)
     }
 }
 #endif

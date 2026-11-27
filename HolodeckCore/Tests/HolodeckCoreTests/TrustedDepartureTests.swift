@@ -34,6 +34,7 @@ import XCTest
             try await Task.sleep(for: .milliseconds(5))
         }
     }
+    @discardableResult
     private func completed<Value: Sendable>(_ body: @escaping @MainActor @Sendable () async throws -> Value) async throws -> Value {
         let result = DepartureCompletion<Value>()
         let task = Task {
@@ -231,7 +232,8 @@ import XCTest
         // Defensive injection, not a normal producer of exceptional departure state.
         try departure.activate {}; await authority.retainDepartureRecovery(serviceID: a.service.runtimeID, ticket: departure.id)
         let phases = await a.service.localRecoveryPhaseCount, reads = backend.reads
-        try await completed { try await authority.recoverDeparture(serviceID: a.service.runtimeID, ticket: departure.id) }
+        let committed = try await completed { try await authority.recoverDeparture(serviceID: a.service.runtimeID, ticket: departure.id) }
+        XCTAssertTrue(committed)
         let after = await a.service.localRecoveryPhaseCount, observation = await authority.observation
         XCTAssertEqual(after, phases); XCTAssertEqual(backend.reads, reads)
         XCTAssertEqual(observation.targets, 0); XCTAssertEqual(observation.recoverySubscriptions, 0)
@@ -322,7 +324,8 @@ import XCTest
         let recovered = await old.observation, statuses = await a.service.recoveryStatuses()
         XCTAssertEqual(recovered.targets, 0); XCTAssertEqual(recovered.recoverySubscriptions, 0)
         XCTAssertFalse(statuses.contains { $0.id == transfer.id })
-        try await old.recoverDeparture(serviceID: a.service.runtimeID, ticket: transfer.id) // stale receipt is harmless
+        let committedAgain = try await old.recoverDeparture(serviceID: a.service.runtimeID, ticket: transfer.id)
+        XCTAssertFalse(committedAgain)
         XCTAssertEqual(backend.writes, 0)
     }
     func testBlockedRegistrationReceivesAuthorityRecoveryWithoutAcceptedBinding() async throws {

@@ -253,6 +253,7 @@ if check:
         self.codex.write_text(codex.replace(
             "        Path('shaders/gamma/metadata.json').write_text(json.dumps(meta))",
             f"""        meta['colors'] = {colors!r} if count == 1 else {colors[:2]!r}
+        meta['name'] = 'Crème'
         Path('shaders/gamma/metadata.json').write_text(json.dumps(meta))
         authoring = json.loads(Path('authoring.json').read_text())
         authoring['sourceRequirements']['shaders/gamma/body.metal'] = []
@@ -282,7 +283,9 @@ if check:
         self.assertEqual(self.result(events)['outputKind'], 'new')
         self.assertEqual((self.job/'implementation-count').read_text(), '1')
         self.assertEqual(self.git(self.root, 'rev-list', '--count', 'origin/main').strip(), '2')
-        published = json.loads(self.git(self.root, 'show', 'origin/main:shaders/gamma/metadata.json'))
+        published_text = self.git(self.root, 'show', 'origin/main:shaders/gamma/metadata.json')
+        self.assertIn('Crème', published_text)
+        published = json.loads(published_text)
         self.assertEqual(published['colors'], colors[:2])
         self.assertEqual(published['discovery']['tags'], ['fluid'])
         self.assertEqual(self.git(self.root, 'show', 'origin/main:shaders/gamma/body.metal'), 'NEW\n')
@@ -446,6 +449,81 @@ Path(sys.argv[3]).write_bytes"""
                          ['compile', 'gpu'])
         self.assertEqual((self.root/'shaders/beta/body.metal').read_text(), 'INTERVENING\n')
 
+    def test_interruption_during_candidate_baseline_probe_saves_new_failure(self):
+        worker = self.ignored_worker()
+        worker.save(attemptID='initial', outcome={'shaderID': 'alpha'}, verificationRepair={'diagnostic': 'old'})
+        candidate = self.root/'shaders/alpha/body.metal'
+        candidate.write_text('BAD\n')
+        failure = worker_module.VerificationError('new GPU failure', command=['unused'], phase='gpu')
+        with patch.object(worker, 'probe_candidate_failure', side_effect=worker_module.WorkerInterrupted(15)):
+            with self.assertRaises(worker_module.WorkerInterrupted):
+                worker.remember_verification_failure(failure, {'shaderID': 'alpha'}, 'verification')
+        saved = json.loads((self.job/'checkpoint.json').read_text())['verificationRepair']
+        self.assertTrue(saved['pending'])
+        self.assertEqual(saved['diagnostic'], 'new GPU failure')
+        self.assertEqual(candidate.read_text(), 'ALPHA\n')
+        with contextlib.redirect_stdout(io.StringIO()):
+            restarted = worker_module.Worker(self.config, self.job)
+            restarted.request = self.request
+            restarted.synchronize()
+        self.assertFalse(restarted.checkpoint['verificationRepair']['pending'])
+        self.assertEqual(candidate.read_text(), 'BAD\n')
+
+    def test_verified_repair_resumes_publication_without_another_writable_call(self):
+        self.request['prompt'] = 'repair'
+        self.save_request()
+        worker = worker_module.Worker(self.config, self.job)
+        with patch.object(worker, 'prepare_publication', side_effect=worker_module.WorkerInterrupted(15)):
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(worker_module.WorkerInterrupted):
+                worker.perform()
+        saved = json.loads((self.job/'checkpoint.json').read_text())
+        self.assertIsNone(saved['verificationRepair'])
+        self.assertEqual(saved['verifiedCandidate']['base'], self.base_sha)
+
+        code, events = self.run_worker()
+
+        self.assertEqual(code, 0, events)
+        self.assertEqual((self.job/'implementation-count').read_text(), '2')
+        self.assertEqual(self.git(self.root,'show','HEAD:shaders/alpha/body.metal'), 'EDIT\n')
+
+    def test_remote_advance_after_verification_does_not_reopen_fixed_repair(self):
+        self.request['prompt'] = 'repair'
+        self.save_request()
+        upstream = self.base/'upstream'
+        self.git(self.base, 'clone', '-b', 'main', self.remote, upstream)
+        worker = worker_module.Worker(self.config, self.job)
+        verify = worker.verify_candidate
+        verified_repairs = []
+
+        def advance(outcome, repair):
+            verify(outcome, repair)
+            verified_repairs.append(repair)
+            if len(verified_repairs) == 1:
+                (upstream/'shaders/beta/body.metal').write_text('UPSTREAM\n')
+                self.git(upstream, '-c', 'user.name=Upstream', '-c', 'user.email=upstream@example.invalid',
+                         'commit', '-am', 'Advance main after verification')
+                self.git(upstream, 'push', 'origin', 'main')
+
+        with patch.object(worker, 'verify_candidate', side_effect=advance):
+            with patch.object(worker, 'prepare_publication'), contextlib.redirect_stdout(io.StringIO()):
+                worker.perform()
+
+        self.assertEqual([repair.get('phase') for repair in verified_repairs], ['compile', None])
+        self.assertEqual((self.job/'implementation-count').read_text(), '2')
+        self.assertEqual((self.root/'shaders/beta/body.metal').read_text(), 'UPSTREAM\n')
+
+    def test_prompt_keeps_failing_shader_ahead_of_unrelated_paths(self):
+        worker = self.ignored_worker()
+        (self.root/'shaders/alpha/body.metal').write_text('PROMPT_TARGET\n')
+        assets = self.root/'assets'; assets.mkdir()
+        for i in range(65):
+            (assets/f'file-{i}').write_text('forbidden contents')
+        context = worker.repair_prompt_context({'base': self.base_sha, 'shaderID': 'alpha'})
+        self.assertEqual(context['changedPaths'][0], 'shaders/alpha/body.metal')
+        self.assertTrue(context['changedPathsTruncated'])
+        self.assertIn('+PROMPT_TARGET', context['candidateDiff'])
+        self.assertNotIn('forbidden contents', context['candidateDiff'])
+
     def test_helper_changes_review_every_affected_shader(self):
         self.request['prompt']='helper';self.save_request();code,events=self.run_worker();self.assertEqual(code,0,events)
         manifests=list((self.job/'evidence').glob('*/manifest.json'));self.assertEqual(len(manifests),1)
@@ -472,6 +550,57 @@ Path(sys.argv[3]).write_bytes"""
         self.assertEqual(len(list((self.job/'evidence').glob('*/manifest.json'))),2)
         self.assertTrue(any(e['event']=='discardPublication' for e in events))
 
+    def test_push_race_reconciles_additions_without_overwriting_upstream(self):
+        import textwrap
+        self.request['prompt'] = 'new'
+        self.save_request()
+        self.codex.write_text(CODEX.replace("import json, sys", "import base64, json, sys").replace(
+            "    elif mode=='new' or",
+            textwrap.indent(textwrap.dedent("""\
+                elif 'resolvedRestoreConflicts' in schema['properties']:
+                    sid='delta'; kind='new'
+                    Path('shaders/delta').mkdir()
+                    context=json.loads('{' + prompt.split('\\n{', 1)[1])
+                    assert context['verificationRepair'] is None
+                    for conflict in context['restoreConflicts']:
+                        path=conflict['path']
+                        if not path.startswith('shaders/gamma/'): continue
+                        original=json.loads(Path(conflict['evidenceFile']).read_text())['files'][path]['candidate']
+                        data=base64.b64decode(original)
+                        if path.endswith('metadata.json'):
+                            metadata=json.loads(data); metadata['id']=sid; data=json.dumps(metadata).encode()
+                        Path('shaders/delta', Path(path).name).write_bytes(data)
+                """), '    ') + "    elif mode=='new' or"
+        ).replace("    print(json.dumps({'type':'thread.started'", """    if 'resolvedRestoreConflicts' in schema['properties']:
+        output['resolvedRestoreConflicts']=[item['path'] for item in context['restoreConflicts']]
+    print(json.dumps({'type':'thread.started'"""))
+        upstream = self.base/'upstream'
+        self.git(self.base, 'clone', '-b', 'main', self.remote, upstream)
+        pushed = False
+
+        def race(event):
+            nonlocal pushed
+            if event['event'] != 'preparePublication' or pushed:
+                return
+            shader = upstream/'shaders/gamma'; shader.mkdir()
+            (shader/'body.metal').write_text('UPSTREAM\n')
+            candidate = self.root/'shaders/gamma/metadata.json'
+            (shader/'metadata.json').write_text(json.dumps({**json.loads(candidate.read_text()), 'name': 'Upstream'}))
+            (upstream/'index.json').write_bytes((self.root/'index.json').read_bytes())
+            self.git(upstream,'add','--all')
+            self.git(upstream,'-c','user.name=Upstream','-c','user.email=upstream@example.invalid','commit','-m','Add gamma')
+            self.git(upstream,'push','origin','main')
+            pushed = True
+
+        code, events = self.run_worker(race)
+
+        self.assertEqual(code, 0, events)
+        self.assertEqual(self.result(events)['shaderID'], 'delta')
+        self.assertEqual((self.root/'shaders/gamma/body.metal').read_text(), 'UPSTREAM\n')
+        self.assertEqual((self.root/'shaders/delta/body.metal').read_text(), 'NEW\n')
+        self.assertEqual(len(list((self.job/'evidence').glob('*/manifest.json'))), 2)
+        self.assertFalse((self.job/'restore-evidence').exists())
+
     def test_boundary_rejects_other_bodies_logic_and_inconsistent_identity(self):
         worker=worker_module.Worker(self.config,self.job);worker.request=self.request;worker.save(base=self.base_sha)
         outcome={'shaderID':'alpha','outputKind':'edited','changed':True}
@@ -494,7 +623,7 @@ Path(sys.argv[3]).write_bytes"""
         self.assertEqual(len(list((self.job/'evidence').glob('*/alpha/*/*.png'))),12)
         repair = self.repair_context()
         self.assertEqual((repair['phase'], repair['shaderID']), ('review', 'alpha'))
-        self.assertEqual([check['phase'] for check in self.check_trace()[-8:]], ['render'] * 6 + ['compile', 'gpu'])
+        self.assertEqual([check['phase'] for check in self.check_trace()[-8:]], ['compile', 'gpu'] + ['render'] * 6)
 
     def test_invalid_visual_evidence_digest_is_operational_without_a_shader_repair(self):
         self.codex.write_text(CODEX.replace("schema['properties']['evidenceDigest']['enum'][0]", "'wrong digest'"))
@@ -778,6 +907,149 @@ Path(sys.argv[3]).write_bytes"""
         self.assertTrue((self.root/'shaders/alpha/metadata.json').is_file())
         self.assertFalse(restarted.owner.exists())
 
+    def test_cleanup_inventory_includes_invalid_and_empty_request_directories(self):
+        worker = self.ignored_worker()
+        preserved = self.root/'shaders/preserved'; preserved.mkdir()
+        worker_module.write(self.job/'baseline-directories.json',
+                            {'id': self.request['id'], 'paths': sorted(worker.shader_directories())})
+        invalid = self.root/'shaders/Thanksgiving_Hearth'; invalid.mkdir()
+        (invalid/'body.metal').write_text('not published')
+        empty = self.root/'shaders/renamed-away'; (empty/'nested').mkdir(parents=True)
+        ignored = self.root/'shaders/keep/ignored'; ignored.mkdir(parents=True)
+
+        worker.clean()
+
+        self.assertFalse(invalid.exists())
+        self.assertFalse(empty.exists())
+        self.assertTrue(ignored.is_dir())
+        self.assertTrue(preserved.is_dir())
+
+    def test_cleanup_preserves_target_file_with_different_case(self):
+        worker = self.ignored_worker()
+        if not (self.root/'shaders/ALPHA/body.metal').exists():
+            self.skipTest('Requires a case-insensitive checkout')
+        remote = self.base/'upstream'
+        self.git(self.base, 'clone', '-b', 'main', self.remote, remote)
+        up_dir = remote/'shaders/gamma'; up_dir.mkdir()
+        (up_dir/'body.metal').write_text('UPSTREAM\n')
+        self.git(remote, 'add', '--all')
+        self.git(remote, '-c', 'user.name=Upstream', '-c', 'user.email=upstream@example.invalid',
+                 'commit', '-m', 'Track lowercase shader')
+        self.git(remote, 'push', 'origin', 'main')
+        self.git(self.root, 'fetch', 'origin', 'main')
+        local = self.root/'shaders/GAMMA'; local.mkdir()
+        (local/'body.metal').write_text('LOCAL\n')
+
+        worker.clean(revision=self.git(self.root, 'rev-parse', 'origin/main').strip())
+
+        self.assertEqual((self.root/'shaders/gamma/body.metal').read_text(), 'UPSTREAM\n')
+        self.assertFalse(self.git(self.root, 'status', '--porcelain'))
+
+    def test_malformed_cleanup_record_fails_before_reset(self):
+        worker = self.ignored_worker()
+        candidate = self.root/'shaders/alpha/body.metal'; candidate.write_text('KEEP\n')
+        for value in ('shaders/foo', ['shaders/../outside'], [42]):
+            with self.subTest(value=value):
+                worker_module.write(worker.owner, {'id': self.request['id'], 'directory': str(self.job),
+                                                    'pendingShaderDirectories': value})
+                with self.assertRaises(worker_module.CleanupError):
+                    worker.clean()
+                self.assertEqual(candidate.read_text(), 'KEEP\n')
+
+    def test_legacy_pending_cleanup_does_not_resave_the_reset_checkout(self):
+        worker = self.ignored_worker()
+        legacy = self.root/'shaders/legacy'
+        legacy.mkdir()
+        data = base64.b64encode(b'LEGACY CANDIDATE\n').decode()
+        worker_module.write(self.job/'untracked.json', {'shaders/legacy/body.metal': data})
+        worker_module.write(worker.owner, {'id': self.request['id'], 'directory': str(self.job),
+                                            'pendingShaderDirectories': ['shaders/legacy']})
+
+        worker.synchronize()
+
+        self.assertEqual((legacy/'body.metal').read_text(), 'LEGACY CANDIDATE\n')
+
+    def test_failed_request_with_busy_cleanup_emits_recovery_required(self):
+        worker = self.ignored_worker()
+        output = io.StringIO()
+        with patch.object(worker_module, 'Worker', return_value=worker), \
+                patch.object(worker, 'perform', side_effect=worker_module.OperationalError('authoring failed')), \
+                patch.object(worker_module.fcntl, 'flock', side_effect=BlockingIOError('lease taken')), \
+                patch.object(worker_module.os, 'setsid'), patch.object(worker_module.signal, 'signal'), \
+                patch.object(sys, 'argv', [str(SCRIPT), 'run', str(self.config_path), str(self.job)]), \
+                contextlib.redirect_stdout(output):
+            with self.assertRaises(SystemExit):
+                worker_module.main()
+
+        failure = [json.loads(line) for line in output.getvalue().splitlines()][-1]
+        self.assertEqual(failure['failureKind'], 'checkoutCleanup')
+        self.assertTrue(failure['recoveryRequired'])
+        self.assertIn('lease taken', failure['message'])
+        self.assertTrue(worker.owner.exists())
+
+    def test_large_cleanup_inventory_keeps_owner_small_and_checkpoint_survives_reset(self):
+        worker = self.ignored_worker()
+        candidate = self.root/'shaders/alpha/body.metal'; candidate.write_text('KEEP\n')
+        directories = [f"shaders/unused-{number:04d}-{'x' * 55}" for number in range(1100)]
+        for name in directories:
+            (self.root/name).mkdir()
+        worker_module.write(self.job/'baseline-directories.json', {'id': self.request['id'], 'paths': []})
+        git = worker.git
+
+        def interrupt_after_reset(*args, **kwargs):
+            result = git(*args, **kwargs)
+            if args[:2] == ('reset', '--hard'):
+                raise worker_module.WorkerInterrupted(15)
+            return result
+
+        with patch.object(worker, 'git', side_effect=interrupt_after_reset):
+            with self.assertRaises(worker_module.WorkerInterrupted):
+                worker.park()
+        self.assertLess(worker.owner.stat().st_size, 65536)
+        self.assertGreater((self.job/'checkout-cleanup.json').stat().st_size, 65536)
+        restarted = worker_module.Worker(self.config, self.job)
+        restarted.request = self.request
+        restarted.synchronize()
+        self.assertEqual(candidate.read_text(), 'KEEP\n')
+        self.assertFalse(any((self.root/name).exists() for name in directories))
+
+    def test_resume_reclaims_palette_temp_and_quarantines_links(self):
+        worker = self.ignored_worker()
+        candidate = self.root/'shaders/alpha/body.metal'; candidate.write_text('KEEP\n')
+        name = 'shaders/alpha/.metadata.json-' + ('a' * 32) + '.tmp'
+        (self.root/name).write_text('partial temp')
+        worker_module.write(self.job/'palette-temp.json', {'id': self.request['id'], 'path': name})
+        outside = self.base/'external'; outside.write_text('keep external')
+        link = self.root/'shaders/alpha/link'; link.symlink_to(outside)
+
+        worker.synchronize()
+
+        self.assertEqual(candidate.read_text(), 'KEEP\n')
+        self.assertEqual(outside.read_text(), 'keep external')
+        self.assertFalse(link.is_symlink())
+        self.assertFalse((self.root/name).exists())
+        self.assertIn('shaders/alpha/link', worker.checkpoint['scopeRecovery'])
+
+    def test_interruption_during_restore_replays_the_whole_checkpoint(self):
+        worker = self.ignored_worker()
+        tracked = self.root/'shaders/alpha/body.metal'; tracked.write_text('TRACKED\n')
+        added = self.root/'shaders/new/metadata.json'; added.parent.mkdir(); added.write_text('NEW FILE\n')
+        worker.park()
+        with patch.object(worker, 'record_restore_conflicts', side_effect=worker_module.WorkerInterrupted(15)):
+            with self.assertRaises(worker_module.WorkerInterrupted):
+                worker.synchronize()
+        self.assertTrue(json.loads(worker.owner.read_text())['checkpointParked'])
+        self.assertEqual(added.read_text(), 'NEW FILE\n')
+
+        restarted = worker_module.Worker(self.config, self.job)
+        restarted.request = self.request
+        restarted.synchronize()
+
+        self.assertEqual(tracked.read_text(), 'TRACKED\n')
+        self.assertEqual(added.read_text(), 'NEW FILE\n')
+        self.assertFalse(json.loads(worker.owner.read_text())['checkpointParked'])
+        self.assertFalse((self.job/'restore-conflicts.json').exists())
+
     def test_ignored_agent_edits_survive_clarification_success_and_failure(self):
         self.ignored_worker()
         self.codex.write_text(CODEX.replace("count_file.write_text(str(count))", "count_file.write_text(str(count)); Path('ignored/original').write_text('agent data'); Path('ignored/deleted').unlink(missing_ok=True); Path('ignored/new').write_text('agent output')"))
@@ -936,7 +1208,8 @@ Path(sys.argv[3]).write_bytes"""
         worker.require_checker()
         with patch.object(worker_module,'run',side_effect=operation):
             with self.assertRaises(worker_module.VerificationError) as failure:worker.technical()
-            worker.classify_verification_failure(failure.exception)
+            worker.save(attemptID='initial')
+            worker.remember_verification_failure(failure.exception, {'shaderID': 'alpha'}, 'verification')
         self.assertEqual(observed,['EDIT\n','ALPHA\n'])
         self.assertEqual((self.root/'shaders/alpha/body.metal').read_text(),'EDIT\n')
 
@@ -1041,7 +1314,8 @@ worker.main()
         with self.assertRaises(worker_module.CandidateError):worker.scope()
 
     def test_candidate_checker_exit_two_requires_baseline_classification(self):
-        worker=worker_module.Worker(self.config,self.job);worker.request=self.request;worker.save(base=self.base_sha)
+        worker=worker_module.Worker(self.config,self.job);worker.request=self.request;worker.save(base=self.base_sha, attemptID='initial')
+        worker.mark_checkout(parked=False)
         marker=self.base/'executed'
         (self.root/'tools/library.py').write_text('from pathlib import Path\nPath('+repr(str(marker))+').touch()\n')
         worker.technical(baseline=True)
@@ -1049,7 +1323,7 @@ worker.main()
         self.tool.write_text(TOOL.replace("if args[:2] == ['library', 'validate']:", "if args[:2] == ['library', 'validate']: raise SystemExit(2)\nif False:"))
         with self.assertRaises(worker_module.VerificationError) as failure:worker.technical()
         with self.assertRaisesRegex(worker_module.OperationalError,'Baseline or host validation failed'):
-            worker.classify_verification_failure(failure.exception)
+            worker.remember_verification_failure(failure.exception, {'shaderID': 'alpha'}, 'verification')
 
     def test_attribution_checkout_conversion_fails_before_codex(self):
         file=self.root/'authoring.json';file.write_text(file.read_text()+'\n')
@@ -1136,7 +1410,8 @@ worker.main()
         worker.require_checker()
         with patch.object(worker_module,'run',side_effect=validate):
             with self.assertRaises(worker_module.VerificationError) as failure:worker.technical()
-            worker.classify_verification_failure(failure.exception)
+            worker.save(attemptID='initial')
+            worker.remember_verification_failure(failure.exception, {'shaderID': 'alpha'}, 'verification')
         self.assertEqual([(c[0],c[1]) for c in calls],[('--compile',600),('--gpu-only',600),('--gpu-only',600)])
         self.assertEqual(calls[-1][2],'ALPHA\n')
         self.assertEqual((self.root/'shaders/alpha/body.metal').read_text(),'EDIT\n')

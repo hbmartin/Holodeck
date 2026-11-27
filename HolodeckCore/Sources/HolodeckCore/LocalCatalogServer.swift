@@ -145,7 +145,7 @@ public actor LocalCatalogServer {
         clearRegistrationRetryMessage()
         defer { if registrationState == .pending(attempt) { registrationState = .idle } }
         let result = try await trusted.retryServerRegistration(id, server: instanceID, lifetime: failure.identity.lifetime)
-        let current = revision == lifetimeRevision && registrationState == .pending(attempt)
+        let current = revision == lifetimeRevision && registrationState == .pending(attempt) && !retired
         switch result {
         case .skipped:
             if current, transport == startGeneration {
@@ -153,11 +153,10 @@ public actor LocalCatalogServer {
                 publish()
             }
         case .repairFailedAfterSkip(let error):
-            if current, transport == startGeneration {
-                state.registrationRetryMessage = BoundedDiagnostics.bounded(
-                    "Registration repair failed before resubmission: " + error.localizedDescription, bytes: 8192)
-                publish()
-            }
+            guard current else { return }
+            state.registrationRetryMessage = BoundedDiagnostics.bounded(
+                "Registration repair failed before resubmission: " + error.localizedDescription, bytes: 8192)
+            publish()
             throw error
         case .submitted(.accepted(let accepted)):
             guard current else { return }

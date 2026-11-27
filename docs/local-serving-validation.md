@@ -1783,9 +1783,9 @@ The comparison checks structural counts without a timing threshold. Local receip
 
 Validation ran on macOS and Apple silicon. The final builds used isolated caches on the external validation volume. Validation used merged PR #63 as the baseline. PR #64 advanced main with disjoint Python worker changes during this run.
 
-- The **733-test** Swift core inventory recorded **727 passes, six expected skips** in bounded runs. The focused Debug run passed **100** tests. The focused Release run passed **100** tests. The existing latest-admitted registration case hit the Debug backstop and passed in Release.
+- The bounded Swift core inventory recorded **727 passes and six expected skips** across configurations. The focused Debug and Release runs each passed **100** tests. The separate Debug run of `testLatestAdmittedRegistrationWinsAndCancelledNewestDoesNotReviveOlder` timed out at the backstop. Its Release run passed and accounts for the case in the inventory. The Debug timeout remains open.
 - Nine boundary cases passed ten Debug repetitions and 10 Release repetitions, **180 executions**. The optimized recovery smoke probe passed **30** checks. The separate TLS/network and local native packaging, Metal compiler and GPU selections passed **39** and **14** tests respectively.
 - Both unsigned Release apps built. The tvOS app contains its privacy manifest, and the bundled Mac checker reports version **1.1.1**, interface **1**, and the pinned SHA-256.
 - Desktop UI runtime remains blocked by instruction. Physical-device and simulator runtime, live LAN, real Codex publication, and standalone suites for the unchanged Python worker, checker, and shaders were outside this run.
 
-Local receipts are in `/tmp/pr64-final-core-coverage.json`, `/tmp/pr64-final-*-results.json`, and `/tmp/pr64-final-focused-debug.log`.
+The local receipts for this Swift follow-up use the working prefix `/tmp/pr64-final-`; PR #64 itself contained the Python worker changes. The Debug and Release logs for the timed-out case end in `final-default-latest-registration.log` and `optimized-latest-registration.log`, respectively.
