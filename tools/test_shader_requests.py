@@ -5,6 +5,7 @@ import base64
 import ast
 import copy
 import contextlib
+import errno
 import io
 import importlib.util
 import json
@@ -122,7 +123,7 @@ class ShaderRequestWorkerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.base = Path(self.temp.name)
+        self.base = Path(self.temp.name).resolve()
         self.remote = self.base/'origin.git'
         self.git(self.base, 'init', '--bare', self.remote)
         self.root = self.base/'checkout'
@@ -182,6 +183,18 @@ class ShaderRequestWorkerTests(unittest.TestCase):
 
     def invocations(self): return [json.loads(line) for line in (self.job/'invocations.jsonl').read_text().splitlines()]
 
+    def worker_failure(self, worker):
+        output = io.StringIO()
+        with patch.object(worker_module, 'Worker', return_value=worker), \
+                patch.object(worker_module.os, 'setsid'), patch.object(worker_module.signal, 'signal'), \
+                patch.object(sys, 'argv', [str(SCRIPT), 'run', str(self.config_path), str(self.job)]), \
+                contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as stopped:
+            worker_module.main()
+        self.assertEqual(stopped.exception.code, 1)
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertFalse(any(event['event'] == 'result' for event in events))
+        return events[-1]
+
     def repair_context(self):
         invocation = next(call for call in self.invocations() if 'resume' in call['args'])
         self.assertTrue(invocation['prompt'].startswith('Repair the existing Holodeck shader candidate.'))
@@ -225,6 +238,54 @@ if check:
         code,recovered=self.run_worker();self.assertEqual(code,0,recovered)
         self.assertEqual(self.result(recovered)['commitSHA'],self.result(events)['commitSHA'])
         self.assertEqual(self.git(self.root,'rev-list','--count','origin/main').strip(),'2')
+
+    def test_saved_result_replay_retires_interrupted_publication_before_activation(self):
+        self.request['prompt'] = 'new'
+        self.save_request()
+        worker = worker_module.Worker(self.config, self.job)
+        with patch.object(worker, 'prepare_publication'), \
+                patch.object(worker, 'clear_candidate_checkpoint', side_effect=worker_module.WorkerInterrupted(15)), \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(worker_module.WorkerInterrupted):
+            worker.perform()
+
+        result_file = self.job/'worker-result.json'
+        saved = json.loads(result_file.read_text())
+        checkpoint = self.job/worker_module.CANDIDATE_CHECKPOINT
+        self.assertTrue(checkpoint.exists())
+        backup = self.job/worker_module.PREVIOUS_CANDIDATE_CHECKPOINT
+        backup.write_bytes(checkpoint.read_bytes())
+        temporary = self.job/(worker_module.CANDIDATE_CHECKPOINT + '.tmp')
+        temporary.write_text('partial snapshot')
+        evidence = self.job/'restore-evidence'
+        evidence.mkdir()
+        (evidence/'partial.json.tmp').write_text('partial conflict evidence')
+        calls = len(self.invocations())
+
+        replay = worker_module.Worker(self.config, self.job)
+        with patch.object(replay, 'prepare_publication'), \
+                patch.object(replay, 'clear_candidate_checkpoint', side_effect=OSError(errno.EIO, 'retirement fault')):
+            failure = self.worker_failure(replay)
+        self.assertEqual(failure['failureKind'], 'checkoutCleanup')
+        self.assertTrue(failure['recoveryRequired'])
+        self.assertEqual(json.loads(result_file.read_text()), saved)
+        self.assertTrue(checkpoint.exists())
+        self.assertTrue(worker.owner.exists())
+
+        code, events = self.run_worker()
+        self.assertEqual(code, 0, events)
+        self.assertEqual(self.result(events), saved)
+        self.assertEqual(len(self.invocations()), calls)
+        self.assertFalse(any(path.exists() for path in (checkpoint, backup, temporary, evidence, worker.owner)))
+        self.assertEqual(self.git(self.root, 'rev-parse', 'HEAD'), self.git(self.root, 'rev-parse', 'origin/main'))
+
+        (self.root/'shaders/gamma/body.metal').write_text('UPSTREAM\n')
+        self.git(self.root, 'commit', '-am', 'Upstream changes gamma after publication')
+        self.git(self.root, 'push', 'origin', 'main')
+        worker_module.write(self.job/'repair.json', {'shaderID': 'gamma', 'diagnostic': 'Activation failed'})
+        code, events = self.run_worker()
+        self.assertEqual(code, 0, events)
+        self.assertEqual(self.result(events)['shaderID'], 'gamma')
+        self.assertFalse(any(event['event'] == 'log' and 'Reapplying checkpoint' in event['text'] for event in events))
 
     def test_new_named_approximate_and_unchanged(self):
         for mode in ('new','named','approximate','unchanged'):
@@ -486,6 +547,77 @@ Path(sys.argv[3]).write_bytes"""
         self.assertEqual((self.job/'implementation-count').read_text(), '2')
         self.assertEqual(self.git(self.root,'show','HEAD:shaders/alpha/body.metal'), 'EDIT\n')
 
+    def test_verified_executable_addition_resumes_with_the_same_fingerprint(self):
+        self.request['prompt'] = 'new'
+        self.save_request()
+        self.git(self.root, 'config', 'core.filemode', 'true')
+        self.codex.write_text(CODEX.replace(
+            "        Path('shaders/gamma/body.metal').write_text('NEW\\n')",
+            "        assert count == 1\n"
+            "        Path('shaders/gamma/body.metal').write_text('NEW\\n')\n"
+            "        Path('shaders/gamma/body.metal').chmod(0o755)"))
+        worker = worker_module.Worker(self.config, self.job)
+        with patch.object(worker, 'prepare_publication', side_effect=worker_module.WorkerInterrupted(15)), \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(worker_module.WorkerInterrupted):
+            worker.perform()
+        checkpoint = json.loads((self.job/worker_module.CANDIDATE_CHECKPOINT).read_text())
+        body = 'shaders/gamma/body.metal'
+        self.assertEqual(checkpoint['untracked'][body]['mode'], '100755')
+        verified = worker.checkpoint['verifiedCandidate']['fingerprint']
+        worker.park_checkpoint()
+        self.assertFalse((self.root/body).exists())
+
+        resumed = worker_module.Worker(self.config, self.job)
+        verify = resumed.verify_candidate
+        observed = []
+
+        def verify_restored(outcome, repair):
+            observed.append(resumed.fingerprint())
+            return verify(outcome, repair)
+
+        with patch.object(resumed, 'verify_candidate', side_effect=verify_restored), \
+                patch.object(resumed, 'prepare_publication'), contextlib.redirect_stdout(io.StringIO()):
+            resumed.perform()
+
+        self.assertEqual(observed, [verified])
+        self.assertEqual((self.job/'implementation-count').read_text(), '1')
+        self.assertEqual(self.git(self.root, 'ls-tree', 'origin/main', '--', body).split()[0], '100755')
+
+    def test_restore_reports_a_mode_only_collision_and_accepts_byte_only_checkpoints(self):
+        worker = self.ignored_worker()
+        name = 'shaders/gamma/body.metal'
+        body = self.root/name
+        body.parent.mkdir()
+        body.write_bytes(b'SAME\n')
+        body.chmod(0o755)
+        worker.park()
+        body.parent.mkdir(exist_ok=True)
+        body.write_bytes(b'SAME\n')
+        body.chmod(0o644)
+        self.git(self.root, 'add', '--', name)
+        self.git(self.root, 'commit', '-m', 'Upstream added non-executable body')
+        worker.save(base=self.git(self.root, 'rev-parse', 'HEAD').strip())
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(worker.restore_patch())
+        conflict_path = self.job/'restore-conflicts.json'
+        active = json.loads(conflict_path.read_text())
+        evidence = json.loads(Path(active[name]['evidenceFile']).read_text())['files'][name]
+        self.assertEqual(base64.b64decode(evidence['candidate']), b'SAME\n')
+        self.assertEqual(evidence['candidateMode'], '100755')
+        self.assertEqual(worker.workspace_record(name)['mode'], '100644')
+
+        # Older records matched existing files using only the saved bytes.
+        conflict_path.unlink()
+        journal = self.job/worker_module.CANDIDATE_CHECKPOINT
+        old_snapshot = {'patch': '', 'untracked': {name: evidence['candidate']}}
+        worker_module.write(journal, old_snapshot)
+        self.assertFalse(worker.restore_patch())
+        self.assertFalse(conflict_path.exists())
+        body.unlink()
+        self.assertFalse(worker.restore_patch())
+        self.assertEqual(worker.read_workspace_with_mode(name, limit=None), (b'SAME\n', '100644'))
+
     def test_remote_advance_after_verification_does_not_reopen_fixed_repair(self):
         self.request['prompt'] = 'repair'
         self.save_request()
@@ -669,6 +801,65 @@ Path(sys.argv[3]).write_bytes"""
         result=self.result(repaired);self.assertEqual(result['outputKind'],'new');self.assertEqual(result['shaderID'],'gamma')
         self.assertNotEqual(result['commitSHA'],first['commitSHA'])
         self.assertEqual(self.git(self.root,'log','--format=%B').count(self.request['id']),2)
+
+    def test_activation_repair_resolves_upstream_conflict_under_its_published_id(self):
+        import textwrap
+
+        self.request['prompt'] = 'new'
+        self.save_request()
+        code, events = self.run_worker()
+        self.assertEqual(code, 0, events)
+        first = self.result(events)
+        worker_module.write(self.job/'repair.json', {'shaderID': 'gamma', 'diagnostic': 'Activation failed'})
+        self.codex.write_text(CODEX.replace(
+            "    if status=='completed':",
+            textwrap.indent(textwrap.dedent('''\
+                if 'resolvedRestoreConflicts' in schema['properties']:
+                    context = json.loads('{' + prompt.split('\\n{', 1)[1])
+                    conflicts = context['restoreConflicts']
+                    assert [entry['path'] for entry in conflicts] == ['shaders/gamma/body.metal']
+                    assert 'retainedShaderID' not in conflicts[0]
+                    assert 'retain its ID' in prompt
+                    assert '<<<<<<<' in before and 'UPSTREAM' in before and 'REPAIRED' in before
+                    assert count in (3, 4)
+                    Path('shaders/gamma/body.metal').write_text(before if count == 3 else 'REPAIRED\\nUPSTREAM\\n')
+                '''), '    ') + "    if status=='completed':").replace(
+                    "    elif (directory/'repair.json').exists() and mode=='new':\n",
+                    "    elif (directory/'repair.json').exists() and mode=='new':\n"
+                    "        before = Path('shaders/gamma/body.metal').read_text()\n").replace(
+                    "    print(json.dumps({'type':'thread.started'",
+                    "    if 'resolvedRestoreConflicts' in schema['properties']:\n"
+                    "        output['resolvedRestoreConflicts'] = [entry['path'] for entry in conflicts]\n"
+                    "    print(json.dumps({'type':'thread.started'"))
+        upstream = self.base/'upstream'
+        self.git(self.base, 'clone', '-b', 'main', self.remote, upstream)
+        pushed = False
+
+        def race(event):
+            nonlocal pushed
+            if event['event'] != 'preparePublication' or pushed:
+                return
+            (upstream/'shaders/gamma/body.metal').write_text('UPSTREAM\n')
+            (upstream/'shaders/beta/body.metal').write_text('INTERVENING\n')
+            self.git(upstream, '-c', 'user.name=Upstream', '-c', 'user.email=upstream@example.invalid',
+                     'commit', '-am', 'Upstream edits the published shader')
+            self.git(upstream, 'push', 'origin', 'main')
+            # A previous worker may already have persisted the wrong constraint.
+            name = 'shaders/gamma/body.metal'
+            worker_module.write(self.job/'restore-conflicts.json', {name: {'path': name, 'retainedShaderID': 'gamma'}})
+            pushed = True
+
+        code, events = self.run_worker(race)
+
+        self.assertEqual(code, 0, events)
+        self.assertTrue(pushed)
+        repaired = self.result(events)
+        self.assertEqual((repaired['outputKind'], repaired['shaderID']), ('new', 'gamma'))
+        self.assertNotEqual(repaired['commitSHA'], first['commitSHA'])
+        self.assertEqual(self.git(self.root, 'show', 'origin/main:shaders/gamma/body.metal'), 'REPAIRED\nUPSTREAM\n')
+        self.assertEqual(self.git(self.root, 'show', 'origin/main:shaders/beta/body.metal'), 'INTERVENING\n')
+        self.assertTrue(any(event['event'] == 'log' and 'Remove merge conflict markers' in event['text'] for event in events))
+        self.assertEqual((self.job/'implementation-count').read_text(), '4')
 
     def test_unchanged_activation_repair_keeps_prior_change_without_empty_commit(self):
         code,events=self.run_worker();self.assertEqual(code,0,events);first=self.result(events)
@@ -986,6 +1177,63 @@ Path(sys.argv[3]).write_bytes"""
         self.assertTrue(failure['recoveryRequired'])
         self.assertIn('lease taken', failure['message'])
         self.assertTrue(worker.owner.exists())
+
+    def test_checkpoint_write_failures_preserve_live_edits_and_the_previous_snapshot(self):
+        worker = self.ignored_worker()
+        candidate = self.root/'shaders/alpha/body.metal'
+        addition = self.root/'shaders/extra/body.metal'
+        addition.parent.mkdir()
+        journal = self.job/worker_module.CANDIDATE_CHECKPOINT
+        backup = self.job/worker_module.PREVIOUS_CANDIDATE_CHECKPOINT
+        original_write = worker_module.write
+
+        for boundary in ('file sync', 'rename', 'directory sync'):
+            with self.subTest(boundary=boundary):
+                candidate.write_text('OLDER TRACKED\n')
+                addition.write_text('OLDER ADDITION\n')
+                worker.save_patch()
+                previous = journal.read_bytes()
+                candidate.write_text('LIVE TRACKED\n')
+                addition.write_text('LIVE ADDITION\n')
+
+                def fail_candidate_write(path, *args, **kwargs):
+                    if path != journal:
+                        return original_write(path, *args, **kwargs)
+                    failure = OSError(errno.EIO, 'injected ' + boundary + ' failure')
+                    if boundary == 'file sync':
+                        fault = patch.object(worker_module.os, 'fsync', side_effect=failure)
+                    elif boundary == 'rename':
+                        fault = patch.object(Path, 'replace', side_effect=failure)
+                    else:
+                        fault = patch.object(worker_module, 'sync_directory', side_effect=failure)
+                    with fault:
+                        return original_write(path, *args, **kwargs)
+
+                with patch.object(worker, 'perform', side_effect=worker.park), \
+                        patch.object(worker_module, 'write', side_effect=fail_candidate_write):
+                    failure = self.worker_failure(worker)
+
+                self.assertEqual(failure['failureKind'], 'checkoutCleanup')
+                self.assertTrue(failure['recoveryRequired'])
+                self.assertIn('injected ' + boundary, failure['message'])
+                self.assertEqual(candidate.read_text(), 'LIVE TRACKED\n')
+                self.assertEqual(addition.read_text(), 'LIVE ADDITION\n')
+                self.assertFalse(worker.has_pending_cleanup(worker.owned_record()))
+                self.assertEqual(backup.read_bytes(), previous)
+                if boundary == 'directory sync':
+                    self.assertNotEqual(journal.read_bytes(), previous)
+                    journal.unlink()
+                    _, additions = worker.read_candidate_checkpoint()
+                    self.assertEqual(additions['shaders/extra/body.metal'][0], b'OLDER ADDITION\n')
+                else:
+                    self.assertEqual(journal.read_bytes(), previous)
+
+                worker = worker_module.Worker(self.config, self.job)
+                worker.request = self.request
+                worker.synchronize()
+                self.assertEqual(candidate.read_text(), 'LIVE TRACKED\n')
+                self.assertEqual(addition.read_text(), 'LIVE ADDITION\n')
+                self.assertFalse(backup.exists())
 
     def test_large_cleanup_inventory_keeps_owner_small_and_checkpoint_survives_reset(self):
         worker = self.ignored_worker()
