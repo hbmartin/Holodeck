@@ -8,6 +8,21 @@ import Clocks
 
 @MainActor
 final class DirectoryCatalogTests: XCTestCase {
+    func testTestSecretCleanupRejectsBothProductionNamespaces() async throws {
+        let (_, catalog) = try fixture()
+        let servers = [LocalCatalogServer(catalog: catalog),
+                       LocalCatalogServer(catalog: catalog, keychainNamespace: "mac-testflight-library")]
+        for server in servers {
+            do {
+                try await server.clearTestSecrets()
+                XCTFail("A production server accepted test secret cleanup")
+            } catch is LocalCatalogServer.TestSecretCleanupDenied {
+                let state = await server.currentState
+                XCTAssertEqual(state.message, LocalServerState().message)
+            }
+        }
+    }
+
     private func tlsClient(_ server: LocalCatalogServer, pin: String? = nil) async throws -> (LocalConnection, LocalTrust) {
         var port: UInt16?
         for _ in 0..<250 {

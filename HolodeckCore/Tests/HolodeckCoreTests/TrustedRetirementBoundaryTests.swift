@@ -193,6 +193,34 @@ import XCTest
         try await authority.recoverDeparture(serviceID: f.service.runtimeID, ticket: departure.id)
         let after = await admission.entries; XCTAssertEqual(after, 1)
     }
+    func testDepartureSuccessorReceivesCancelledPredecessorsCommittedReceipt() async throws {
+        let f = try await fixture(), admission = RetirementSettlementGate()
+        let backend = TrustedBackendFixture(nil)
+        let authority = TrustedApprovalsCoordinator(read: { try backend.checkedRead() }, write: { try backend.write($0) },
+            beforeDepartureRetirementAdmission: { _ in await admission.wait() })
+        _ = try await accepted(authority.register(TrustedOwnerRecorder().owner(service: f.service)))
+        let departure = try await exceptional(f, authority: authority)
+        let first = Task { try await authority.recoverDeparture(serviceID: f.service.runtimeID, ticket: departure.id) }
+        addTeardownBlock { first.cancel(); await admission.release() }
+        try await wait { await admission.entered }
+        first.cancel()
+        do { try await completed { try await first.value }; XCTFail("Cancelled participant succeeded") }
+        catch is CancellationError {}
+
+        let successor = Task { try await authority.recoverDeparture(serviceID: f.service.runtimeID, ticket: departure.id) }
+        addTeardownBlock { successor.cancel(); await admission.release() }
+        try await wait { await authority.observation.departureRecoverySuccessors == 1 }
+        await admission.release()
+
+        let committed = try await completed { try await successor.value }
+        let entries = await admission.entries
+        let observation = await authority.observation
+        XCTAssertTrue(committed)
+        XCTAssertEqual(entries, 1)
+        XCTAssertEqual(observation.departureRecoverySuccessors, 0)
+        XCTAssertEqual(observation.targets, 0)
+    }
+
     func testUnrelatedTrustedRecoveryWaitsForRetainedSettlement() async throws {
         let fault = RetirementSwitch(), armed = RetirementSwitch(), settling = RetirementSettlementGate()
         addTeardownBlock { await settling.release() }

@@ -24,7 +24,10 @@ TECHNICAL_PHASES = {"compile": "--compile", "gpu": "--gpu-only"}
 SAMPLE_TIMES = (0, 3, 10)
 CANDIDATE_CHECKPOINT = "candidate-checkpoint.json"
 PREVIOUS_CANDIDATE_CHECKPOINT = "candidate-checkpoint.previous.json"
-CONFLICT_MARKER = re.compile(rb"(?m)^(?:<{7,}|={7,}|>{7,}|\|{7,})(?: [^\r\n]*)?\r?$")
+FINGERPRINT_VERSION = 2
+PATCH_DIFF_OPTIONS = ("--no-ext-diff", "--no-textconv", "--no-color", "--src-prefix=a/", "--dst-prefix=b/")
+TRACKED_PATCH_CONFLICT = "(tracked patch)"
+REVERIFIED_SUMMARY = "Verified again after activation repair; no further source changes were necessary."
 
 
 class CandidateError(RuntimeError):
@@ -276,6 +279,12 @@ class Worker:
             raise CleanupError("Invalid checkout owner journal identity or state")
         return owner
 
+    def recoverable_owner(self):
+        owner = self.owned_record()
+        if owner is None and self.owner.exists():
+            raise CleanupError("Another interrupted request owns this checkout. Recover that request first.")
+        return owner
+
     def matches_request(self, record):
         request_id = self.request.get("id")
         owner_id = record.get("id")
@@ -350,7 +359,7 @@ class Worker:
     def clean(self, revision=None):
         owner = self.owned_record()
         if owner is None:
-            return
+            return False
         cleanup = self.directory / "checkout-cleanup.json"
         pending = self.read_record(cleanup)
         revision = revision or self.checkpoint.get("base", "HEAD")
@@ -405,6 +414,7 @@ class Worker:
                     raise
         self.owner.unlink(missing_ok=True)
         cleanup.unlink(missing_ok=True)
+        return True
 
     def untracked_paths(self):
         return set(filter(None, self.git("ls-files", "--others", "--exclude-standard", "-z").split("\0")))
@@ -429,7 +439,7 @@ class Worker:
             invalid = self.quarantine_obstructions(changed, move=False)
             # A quarantined tracked path is restored from the base, not checkpointed as a deletion.
             exclusions = [":(exclude,literal)" + name for name in sorted(invalid)]
-            patch = self.git("diff", "--binary", self.checkpoint["base"], "--", *exclusions, raw=True)
+            patch = self.git("diff", "--binary", *PATCH_DIFF_OPTIONS, self.checkpoint["base"], "--", *exclusions, raw=True)
             files = {}
             for name in sorted(untracked):
                 if any(name == path or name.startswith(path + "/") for path in invalid):
@@ -441,7 +451,9 @@ class Worker:
                 diagnostic = ("Quarantined invalid workspace entries: " + ", ".join(sorted(invalid)))[:12000]
                 emit("log", text=diagnostic)
                 self.save(scopeRecovery=diagnostic, durable=True)
-        except OSError as error:
+        except (CleanupError, SupervisionError):
+            raise
+        except (OSError, OperationalError, subprocess.TimeoutExpired) as error:
             raise CleanupError(f"Cannot save the candidate checkpoint. Live checkout edits were preserved: {error}") from error
         return bool(invalid)
 
@@ -524,7 +536,7 @@ class Worker:
                     message += "\n" + result.stderr[-4000:].decode(errors="replace").strip()
                 emit("log", text=message)
                 names = self.git("diff", "--name-only", "--diff-filter=U", "-z").split("\0")
-                for name in list(filter(None, names)) or ["(tracked patch)"]:
+                for name in list(filter(None, names)) or [TRACKED_PATCH_CONFLICT]:
                     conflicts[name] = {"diagnostic": message}
         for name, (data, mode) in untracked.items():
             try:
@@ -532,7 +544,7 @@ class Worker:
                     fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent)
                     with os.fdopen(fd, "wb") as target:
                         target.write(data)
-                        if mode == "100755":
+                        if self.file_mode and mode == "100755":
                             mode_bits = stat.S_IMODE(os.fstat(target.fileno()).st_mode)
                             os.fchmod(target.fileno(), mode_bits | stat.S_IXUSR)
             except OSError as error:
@@ -540,14 +552,14 @@ class Worker:
                     raise CleanupError(f"Cannot restore candidate file {name}: {error}") from error
                 try:
                     existing_data, existing_mode = self.read_workspace_with_mode(name, limit=None)
-                    if existing_data == data and (mode is None or mode == existing_mode):
+                    if existing_data == data and (not self.file_mode or mode is None or mode == existing_mode):
                         continue
                 except (OSError, WorkspaceTypeError):
                     pass
                 message = "Reapplying checkpoint encountered an existing path: " + name
                 emit("log", text=message)
                 conflicts[name] = {"diagnostic": message, "candidate": base64.b64encode(data).decode()}
-                if mode is not None:
+                if self.file_mode and mode is not None:
                     conflicts[name]["candidateMode"] = mode
         self.record_restore_conflicts(conflicts, patch)
         return bool(conflicts)
@@ -560,24 +572,50 @@ class Worker:
         self.mark_checkout(parked=False)
         return conflicted
 
+    def unmerged_paths(self):
+        return set(filter(None, self.git("diff", "--name-only", "--diff-filter=U", "-z").split("\0")))
+
+    def check_candidate_head(self):
+        if self.git("rev-parse", "HEAD").strip() != self.checkpoint["base"]:
+            raise OperationalError("Codex changed Git state; only the host may commit")
+
+    def check_conflict_markers(self, paths, unmerged):
+        if not paths:
+            return
+        path_list = b"".join(os.fsencode(name) + b"\0" for name in paths)
+        attributes = self.git("check-attr", "-z", "--stdin", "conflict-marker-size", input=path_list, raw=True).split(b"\0")
+        widths = {os.fsdecode(name): int(value) for name, value in zip(attributes[::3], attributes[2::3])
+                  if value.isdigit() and len(value) < 10 and int(value) > 0}
+        for name in paths:
+            try:
+                data = self.read_workspace(name, limit=None)
+            except (OSError, WorkspaceTypeError) as error:
+                if isinstance(error, FileNotFoundError) and name not in unmerged:
+                    continue
+                if isinstance(error, OSError) and error.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+                    raise CleanupError(f"Cannot read the resolved candidate file {name}: {error}") from error
+                raise CandidateError("Restore a regular file before resolving the merge conflict: " + name) from error
+            width = widths.get(name, 7)
+            for line in data.splitlines():
+                marker = line.partition(b" ")[0]
+                # A separator alone is ambiguous with an ordinary source banner.
+                if len(marker) == width and marker[:1] in (b"<", b">", b"|") and marker.count(marker[:1]) == width:
+                    raise CandidateError("Remove merge conflict markers from " + name)
+
     def accept_restore_resolution(self, outcome, conflicts):
+        self.check_candidate_head()
         if set(outcome.get("resolvedRestoreConflicts", [])) != set(conflicts):
             raise CandidateError("Account for every restored conflict before proceeding")
         retained = {entry["retainedShaderID"] for entry in conflicts.values() if "retainedShaderID" in entry}
         if retained and (outcome["outputKind"] != "new" or outcome["shaderID"] in retained):
             raise CandidateError("Preserve the upstream shader and recreate the candidate under an unused ID")
-        unmerged = set(filter(None, self.git("diff", "--name-only", "--diff-filter=U", "-z").split("\0")))
-        if unmerged - conflicts.keys():
+        unmerged = self.unmerged_paths()
+        paths = set(conflicts) - {TRACKED_PATCH_CONFLICT}
+        if any(not self.safe_path(name) for name in paths):
+            raise CleanupError("Invalid tracked restore conflict path")
+        if unmerged - paths:
             raise CandidateError("Resolve all merge conflicts")
-        for name in sorted(unmerged):
-            try:
-                data = self.read_workspace(name, limit=None)
-            except (OSError, WorkspaceTypeError) as error:
-                if isinstance(error, OSError) and error.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
-                    raise CleanupError(f"Cannot read the resolved candidate file {name}: {error}") from error
-                raise CandidateError("Restore a regular file before resolving the merge conflict: " + name) from error
-            if CONFLICT_MARKER.search(data):
-                raise CandidateError("Remove merge conflict markers from " + name)
+        self.check_conflict_markers(sorted(paths), unmerged)
         if unmerged:
             # Only the worker may change Git state. Reset the index entries to
             # the upstream versions and leave the reconciled worktree bytes for scope and verification.
@@ -593,10 +631,8 @@ class Worker:
 
     def synchronize(self):
         self.git_tree("HEAD")
-        if self.owner.exists():
-            owner = self.owned_record()
-            if owner is None:
-                raise OperationalError("Another interrupted request owns this checkout; recover it first")
+        owner = self.recoverable_owner()
+        if owner is not None:
             if self.has_pending_cleanup(owner):
                 self.read_candidate_checkpoint()
                 self.clean()
@@ -624,7 +660,7 @@ class Worker:
         self.restore_owned_patch()
 
     def clear_candidate_checkpoint(self):
-        for name in (CANDIDATE_CHECKPOINT, PREVIOUS_CANDIDATE_CHECKPOINT, "changes.patch", "untracked.json",
+        for name in (PREVIOUS_CANDIDATE_CHECKPOINT, CANDIDATE_CHECKPOINT + ".tmp", "changes.patch", "untracked.json",
                      "restore-conflicts.json", "baseline-directories.json"):
             path = self.directory / name
             path.unlink(missing_ok=True)
@@ -636,6 +672,10 @@ class Worker:
                 for path in evidence.glob(pattern):
                     path.unlink(missing_ok=True)
             evidence.rmdir()
+        # The reader may fall back to older files while the primary is absent.
+        sync_directory(self.directory)
+        (self.directory / CANDIDATE_CHECKPOINT).unlink(missing_ok=True)
+        sync_directory(self.directory)
 
     def discard(self):
         # Discarding owned work needs the durable request identity, even if its payload was corrupted.
@@ -732,7 +772,9 @@ class Worker:
         manifest = {}
         for name in sorted(names):
             record = self.workspace_record(name)
-            if not self.file_mode and name in tree: record["mode"] = tree[name]["mode"]
+            if not self.file_mode and record["mode"] in ("100644", "100755"):
+                base_mode = tree.get(name, {}).get("mode")
+                record["mode"] = "100755" if base_mode == "100755" else "100644"
             if name in tree and name not in changed:
                 record["oid"] = tree[name]["oid"]
             else:
@@ -754,13 +796,40 @@ class Worker:
         if not matches or not workspace_matches:
             raise OperationalError("Committed tree differs from verified source; publication filters or external changes must be corrected")
 
-    def begin_attempt(self):
+    def stage_candidate(self, manifest):
+        self.git("add", "--all")
+        if self.file_mode:
+            return
+        modes = {"100644": [], "100755": []}
+        for entry in filter(None, self.git("ls-files", "--stage", "-z").split("\0")):
+            descriptor, name = entry.split("\t", 1)
+            current = descriptor.split()[0]
+            desired = manifest.get(name, {}).get("mode")
+            if current in modes and desired in modes and current != desired:
+                modes[desired].append(name)
+        for mode, names in modes.items():
+            if names:
+                self.git("update-index", "--chmod=" + ("+x" if mode == "100755" else "-x"), "--", *names)
+
+    def active_repair_attempt(self):
         repair = self.directory / "repair.json"
-        if repair.exists():
-            payload = json.loads(repair.read_text())
-            attempt = payload.get("attemptID") or "legacy-repair-" + digest(repair.read_bytes())
-        else:
-            attempt = "initial"
+        try:
+            data = repair.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise CleanupError(f"Cannot read activation repair journal: {error}") from error
+        try:
+            payload = json.loads(data)
+            attempt = payload.get("attemptID") if isinstance(payload, dict) else None
+            if not isinstance(payload, dict) or (attempt is not None and not isinstance(attempt, str)):
+                raise ValueError("Invalid activation repair attempt")
+        except (ValueError, TypeError) as error:
+            raise CleanupError(f"Cannot read activation repair journal: {error}") from error
+        return attempt or "legacy-repair-" + digest(data)
+
+    def begin_attempt(self, repair_attempt):
+        attempt = repair_attempt or "initial"
         if self.checkpoint.get("attemptID") != attempt:
             previous = self.previous_publication()
             sha = self.checkpoint.get("commitSHA")
@@ -776,38 +845,46 @@ class Worker:
             response["changed"] = outcome["changed"] or previous["changed"]
             if not outcome["changed"] and previous["shaderID"] == outcome["shaderID"]:
                 sha = previous["commitSHA"]
-                response["summary"] = previous["summary"] + " Verified again after activation repair; no further source changes were necessary."
+                response["summary"] = previous["summary"]
+                if not response["summary"].endswith(REVERIFIED_SUMMARY):
+                    response["summary"] += " " + REVERIFIED_SUMMARY
                 response["approximations"] = list(dict.fromkeys(previous["approximations"] + outcome["approximations"]))
         response.update(commitSHA=sha, deliveredSourceHash=None)
         return response
 
     def finish_publication(self, response):
+        saved = {**response, "attemptID": self.checkpoint["attemptID"]}
         try:
-            write(self.directory / "worker-result.json", response, durable=True)
+            write(self.directory / "worker-result.json", saved, durable=True)
+        except OSError as error:
+            raise CleanupError(f"Cannot save the publication result: {error}") from error
+        self.emit_saved_publication(saved)
+
+    def emit_saved_publication(self, saved):
+        try:
             self.retire_published_candidate()
-            (self.directory / "repair.json").unlink(missing_ok=True)
+            repair_attempt = self.active_repair_attempt()
+            if repair_attempt is not None and saved.get("attemptID") == repair_attempt:
+                (self.directory / "repair.json").unlink(missing_ok=True)
+                sync_directory(self.directory)
         except OSError as error:
             raise CleanupError(f"Cannot finalize the saved publication: {error}") from error
-        emit("result", result=response)
+        emit("result", result={key: value for key, value in saved.items() if key != "attemptID"})
 
     def retire_published_candidate(self):
         owner = self.owned_record()
         try:
             self.clear_candidate_checkpoint()
-            sync_directory(self.directory)
             if owner is not None:
                 self.owner.unlink(missing_ok=True)
                 sync_directory(self.gitdir)
         except OSError as error:
             raise CleanupError(f"Cannot retire the published candidate checkpoint: {error}") from error
 
-    def fingerprint(self):
-        value = self.git("diff", "--binary", self.checkpoint["base"], raw=True)
-        for name in sorted(filter(None, self.git("ls-files", "--others", "--exclude-standard", "-z").split("\0"))):
-            path = self.root / name
-            value += name.encode("utf-8") + digest(path.read_bytes()).encode("ascii")
-        value += json.dumps(self.candidate_manifest(), sort_keys=True).encode()
-        return digest(value)
+    def fingerprint(self, manifest=None):
+        if manifest is None:
+            manifest = self.candidate_manifest()
+        return digest(json.dumps(manifest, sort_keys=True))
 
     def source(self, shader_id, revision=None):
         def read(name):
@@ -839,10 +916,9 @@ class Worker:
         names = self.git("ls-tree", "-r", "--name-only", self.checkpoint["base"]).splitlines()
         return [p.split("/")[1] for p in names if p.startswith("shaders/") and p.endswith("/metadata.json")]
 
-    def scope(self, outcome=None):
+    def scope(self, outcome=None, *, allowed_unmerged=()):
+        self.check_candidate_head()
         base = self.checkpoint["base"]
-        if self.git("rev-parse", "HEAD").strip() != base:
-            raise OperationalError("Codex changed Git state; only the host may commit")
         paths = self.git("diff", "--name-only", base).splitlines()
         paths += list(filter(None, self.git("ls-files", "--others", "--exclude-standard", "-z").split("\0")))
         paths += sorted(self.raw_workspace_changes() - set(paths))
@@ -950,7 +1026,7 @@ class Worker:
             for key, value in old_records["upstreamRequirements"].items():
                 if new_records["upstreamRequirements"].get(key) != value:
                     raise CandidateError("Existing upstream provenance cannot change")
-        if self.git("diff", "--name-only", "--diff-filter=U").strip():
+        if self.unmerged_paths().difference(allowed_unmerged):
             raise CandidateError("Resolve all merge conflicts")
         return paths
 
@@ -1059,7 +1135,7 @@ class Worker:
         diff = b""
         for group in (target_paths, other_paths):
             if group and len(diff) <= 16384:
-                diff += self.git("diff", "--no-ext-diff", "--no-textconv", base, "--", *group, raw=True)
+                diff += self.git("diff", *PATCH_DIFF_OPTIONS, base, "--", *group, raw=True)
         return {
             **repair,
             "baseAdvanced": repair["base"] != base,
@@ -1229,7 +1305,10 @@ An unchanged existing shader may be successful if it already satisfies the promp
             "restoreConflict": False,
             "pending": pending,
         }
-        self.save(verificationRepair=repair, verifiedCandidate=None, durable=True)
+        try:
+            self.save(verificationRepair=repair, verifiedCandidate=None, durable=True)
+        except OSError as error:
+            raise CleanupError(f"Cannot save the verification diagnostic. Live checkout edits were preserved: {error}") from error
         invalid = self.save_patch()
         if pending or invalid:
             # Keep the exact candidate parked until classification can finish.
@@ -1382,9 +1461,9 @@ An unchanged existing shader may be successful if it already satisfies the promp
                 raise OperationalError("Rebuilding requires a clean main checkout; no files or branches have been changed")
             self.check_checkout_inputs()
             self.save(base=self.git("rev-parse", "HEAD").strip())
-            frozen = self.fingerprint(), self.candidate_manifest()
+            frozen = self.fingerprint()
             self.prepare_publication(required=[])
-            if frozen != (self.fingerprint(), self.candidate_manifest()):
+            if frozen != self.fingerprint():
                 raise OperationalError("Checkout changed while rebuilding the publication")
             emit("publicationReady")
 
@@ -1405,11 +1484,10 @@ An unchanged existing shader may be successful if it already satisfies the promp
         screenshot.write_bytes(base64.b64decode(self.request["context"]["screenshot"]))
         with (self.gitdir / "holodeck-requests.lock").open("w") as lease:
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            ready = self.directory / "worker-result.json"
-            if ready.exists() and not (self.directory / "repair.json").exists():
-                if self.owner.exists() and self.owned_record() is None:
-                    raise CleanupError("Another interrupted request owns this checkout; recover it first")
-                result = json.loads(ready.read_text())
+            self.recoverable_owner()
+            repair_attempt = self.active_repair_attempt()
+            result = self.previous_publication()
+            if result is not None and (repair_attempt is None or result.get("attemptID") == repair_attempt):
                 self.git("fetch", "origin", "main")
                 if self.git("status", "--porcelain").strip():
                     raise OperationalError("Uncommitted work prevents publication recovery")
@@ -1419,11 +1497,10 @@ An unchanged existing shader may be successful if it already satisfies the promp
                 self.check_checkout_inputs()
                 self.verify_commit("origin/main", self.candidate_manifest())
                 self.prepare_publication()
-                self.retire_published_candidate()
-                emit("result", result=result)
+                self.emit_saved_publication(result)
                 return
             # Crash/lost-ack recovery: adopt an already-pushed request commit before reapplying any patch.
-            self.begin_attempt()
+            self.begin_attempt(repair_attempt)
             self.recover_pending_commit()
             if self.checkpoint.get("commitSHA"):
                 self.git("fetch", "origin", "main")
@@ -1465,6 +1542,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
                     verified.get("attemptID") == self.checkpoint["attemptID"] or unclassified_on_new_base)
                 if reverify:
                     outcome = self.checkpoint["outcome"]
+                    feedback = ""
                 else:
                     if conflicts or repair or self.checkpoint.get("scopeRecovery"):
                         self.stage("repairing", "Codex is reconciling the candidate" if conflicts else "Codex is repairing the candidate")
@@ -1478,12 +1556,15 @@ An unchanged existing shader may be successful if it already satisfies the promp
                     active_repair = repair if repair and not repair.get("pending") else None
                     outcome = self.codex(self.prompt(feedback, active_repair, conflicts), reply_schema,
                                          "implementation", [screenshot], resume=True)
-                    self.save(outcome=outcome, verifiedCandidate=None)
+                    if outcome.get("status") == "completed":
+                        self.save(outcome=outcome, verifiedCandidate=None)
+                    else:
+                        self.save(verifiedCandidate=None)
                     feedback = ""
                 phase = "scope"
                 try:
                     if outcome["status"] == "needsClarification":
-                        self.scope()
+                        self.scope(allowed_unmerged=conflicts)
                         self.park()
                         emit("clarification", question=outcome["question"], options=outcome["options"])
                         return
@@ -1496,10 +1577,11 @@ An unchanged existing shader may be successful if it already satisfies the promp
                     if self.checkpoint.get("scopeRecovery"):
                         self.save(scopeRecovery=None)
                     self.normalize_preview_colors(outcome)
-                    frozen = self.fingerprint()
-                    if reverify and verified.get("base") == self.checkpoint["base"] and verified.get("fingerprint") != frozen:
-                        raise CandidateError("Saved candidate changed since verification")
                     manifest = self.candidate_manifest()
+                    frozen = self.fingerprint(manifest)
+                    if (reverify and verified.get("base") == self.checkpoint["base"]
+                            and verified.get("fingerprintVersion") == FINGERPRINT_VERSION and verified.get("fingerprint") != frozen):
+                        raise CandidateError("Saved candidate changed since verification")
                     phase = "verification"
                     focused = not reverify and not conflicts and repair and repair["base"] == self.checkpoint["base"] and not repair["restoreConflict"]
                     self.verify_candidate(outcome, repair if focused else {})
@@ -1508,7 +1590,8 @@ An unchanged existing shader may be successful if it already satisfies the promp
                         raise CandidateError("Candidate changed while verification was running")
                     self.save_patch()
                     self.save(verificationRepair=None, verifiedCandidate={
-                        "attemptID": self.checkpoint["attemptID"], "base": self.checkpoint["base"], "fingerprint": frozen,
+                        "attemptID": self.checkpoint["attemptID"], "base": self.checkpoint["base"],
+                        "fingerprintVersion": FINGERPRINT_VERSION, "fingerprint": frozen,
                     }, durable=True)
                     # No writable agent runs after this point; all review inputs remain immutable.
                     self.git("fetch", "origin", "main")
@@ -1517,7 +1600,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
                         feedback = "Remote main changed; reapply the intent, resolve conflicts, and repeat verification."
                         continue
                     self.prepare_publication(self.required_previews(outcome))
-                    if self.fingerprint() != frozen or self.candidate_manifest() != manifest:
+                    if self.candidate_manifest() != manifest:
                         emit("discardPublication")
                         raise CandidateError("Candidate changed while preparing publication")
                     self.stage("pushing", "Committing verified changes and pushing to main")
@@ -1525,7 +1608,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
                     write(self.directory / "evidence" / f"attempt-{self.checkpoint['verificationAttempt']}" / "candidate-manifest.json", manifest)
                     if outcome["changed"]:
                         self.save(publicationCommitPending=True, commitManifest=manifest, durable=True)
-                        self.git("add", "--all")
+                        self.stage_candidate(manifest)
                         message = f"{outcome['summary'][:180]}\n\nHolodeck-Request-ID: {self.request['id']}"
                         self.git("commit", "-m", message)
                         sha = self.git("rev-parse", "HEAD").strip()
@@ -1674,11 +1757,9 @@ def main():
                             published = worker.git("merge-base", "--is-ancestor", sha, "origin/main", check=False).returncode == 0
                     if published:
                         worker.clean(revision=sha)
-                    else:
-                        worker.clean()
-                        if not (worker.directory / "restore-evidence").exists():
-                            worker.clear_candidate_checkpoint()
-                            worker.save(verificationRepair=None, verifiedCandidate=None, scopeRecovery=None)
+                    elif worker.clean() and not (worker.directory / "restore-evidence").exists():
+                        worker.clear_candidate_checkpoint()
+                        worker.save(verificationRepair=None, verifiedCandidate=None, scopeRecovery=None)
             except Exception as cleanup_error:
                 try:
                     cleanup_failure = worker.owned_record() is not None

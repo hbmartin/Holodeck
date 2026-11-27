@@ -4,11 +4,32 @@ import Network
 import Dependencies
 import Clocks
 import ConcurrencyExtras
+import Sentry
 @testable import Holodeck
 @testable import HolodeckCore
 
 @MainActor
 final class HolodeckTests: XCTestCase {
+    func testCrashPayloadDropsStableIdentifiersAndKeepsBuildContext() throws {
+        let event = Event(level: .fatal)
+        event.user = Sentry.User(userId: "installation-id")
+        event.serverName = "local-hostname"
+        event.releaseName = "me.haroldmartin.Holodeck@1.0+42"
+        event.dist = "42"
+        event.context = ["app": ["device_app_hash": "device-id", "app_build": "42"],
+                         "device": ["model": "Apple TV"]]
+
+        let payload = try XCTUnwrap(CrashReporting.scrubIdentifiers(event)).serialize()
+        let contexts = try XCTUnwrap(payload["contexts"] as? [String: [String: Any]])
+        XCTAssertNil(payload["user"])
+        XCTAssertNil(payload["server_name"])
+        XCTAssertNil(contexts["app"]?["device_app_hash"])
+        XCTAssertEqual(contexts["app"]?["app_build"] as? String, "42")
+        XCTAssertEqual(contexts["device"]?["model"] as? String, "Apple TV")
+        XCTAssertEqual(payload["release"] as? String, "me.haroldmartin.Holodeck@1.0+42")
+        XCTAssertEqual(payload["dist"] as? String, "42")
+    }
+
     func testDeliveryReportsOnlyOutputDefectsAndRetriesTransientFailures() async throws {
         for scenario in ["capture", "refresh", "control", "activation", "pipeline", "resource", "missing", "superseded", "success"] {
             let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())

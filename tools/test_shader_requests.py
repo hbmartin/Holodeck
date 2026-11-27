@@ -250,6 +250,7 @@ if check:
 
         result_file = self.job/'worker-result.json'
         saved = json.loads(result_file.read_text())
+        self.assertEqual(saved['attemptID'], 'initial')
         checkpoint = self.job/worker_module.CANDIDATE_CHECKPOINT
         self.assertTrue(checkpoint.exists())
         backup = self.job/worker_module.PREVIOUS_CANDIDATE_CHECKPOINT
@@ -273,7 +274,7 @@ if check:
 
         code, events = self.run_worker()
         self.assertEqual(code, 0, events)
-        self.assertEqual(self.result(events), saved)
+        self.assertEqual(self.result(events), {key: value for key, value in saved.items() if key != 'attemptID'})
         self.assertEqual(len(self.invocations()), calls)
         self.assertFalse(any(path.exists() for path in (checkpoint, backup, temporary, evidence, worker.owner)))
         self.assertEqual(self.git(self.root, 'rev-parse', 'HEAD'), self.git(self.root, 'rev-parse', 'origin/main'))
@@ -286,6 +287,54 @@ if check:
         self.assertEqual(code, 0, events)
         self.assertEqual(self.result(events)['shaderID'], 'gamma')
         self.assertFalse(any(event['event'] == 'log' and 'Reapplying checkpoint' in event['text'] for event in events))
+
+    def check_activation_result_replay(self, mode):
+        self.request['prompt'] = mode
+        self.save_request()
+        code, events = self.run_worker()
+        self.assertEqual(code, 0, events)
+        first = self.result(events)
+        repair = self.job/'repair.json'
+        attempt = str(uuid.uuid4())
+        worker_module.write(repair, {'attemptID': attempt, 'shaderID': first['shaderID'], 'diagnostic': 'Activation failed'})
+        worker = worker_module.Worker(self.config, self.job)
+        with patch.object(worker, 'prepare_publication'), \
+                patch.object(worker, 'clear_candidate_checkpoint', side_effect=OSError(errno.EIO, 'retirement fault')):
+            failure = self.worker_failure(worker)
+        self.assertTrue(failure['recoveryRequired'])
+        self.assertTrue(repair.exists())
+        saved = json.loads((self.job/'worker-result.json').read_text())
+        self.assertEqual(saved['attemptID'], attempt)
+        self.assertEqual(saved['commitSHA'] == first['commitSHA'], mode == 'edit')
+        calls = len(self.invocations())
+
+        replay = worker_module.Worker(self.config, self.job)
+        output = io.StringIO()
+        with patch.object(replay, 'prepare_publication'), \
+                patch.object(replay, 'verify_candidate', side_effect=AssertionError('reverified a saved result')), \
+                contextlib.redirect_stdout(output):
+            replay.perform()
+        result = self.result([json.loads(line) for line in output.getvalue().splitlines()])
+        self.assertEqual(result, {key: value for key, value in saved.items() if key != 'attemptID'})
+        self.assertEqual(len(self.invocations()), calls)
+        self.assertFalse(repair.exists())
+        self.assertEqual(result['summary'].count(worker_module.REVERIFIED_SUMMARY), int(mode == 'edit'))
+
+        if mode == 'new':
+            self.codex.write_text(CODEX.replace('REPAIRED', 'REPAIRED AGAIN'))
+        next_attempt = str(uuid.uuid4())
+        worker_module.write(repair, {'attemptID': next_attempt, 'shaderID': first['shaderID'], 'diagnostic': 'New failure'})
+        code, events = self.run_worker()
+        self.assertEqual(code, 0, events)
+        self.assertGreater(len(self.invocations()), calls)
+        self.assertEqual(json.loads((self.job/'worker-result.json').read_text())['attemptID'], next_attempt)
+        self.assertEqual(self.result(events)['summary'].count(worker_module.REVERIFIED_SUMMARY), int(mode == 'edit'))
+
+    def test_changed_activation_result_replays_after_retirement_failure(self):
+        self.check_activation_result_replay('new')
+
+    def test_unchanged_activation_result_replays_after_retirement_failure(self):
+        self.check_activation_result_replay('edit')
 
     def test_new_named_approximate_and_unchanged(self):
         for mode in ('new','named','approximate','unchanged'):
@@ -540,6 +589,9 @@ Path(sys.argv[3]).write_bytes"""
         saved = json.loads((self.job/'checkpoint.json').read_text())
         self.assertIsNone(saved['verificationRepair'])
         self.assertEqual(saved['verifiedCandidate']['base'], self.base_sha)
+        saved['verifiedCandidate'].pop('fingerprintVersion')
+        saved['verifiedCandidate']['fingerprint'] = 'legacy-fingerprint'
+        worker_module.write(self.job/'checkpoint.json', saved)
 
         code, events = self.run_worker()
 
@@ -557,15 +609,22 @@ Path(sys.argv[3]).write_bytes"""
             "        Path('shaders/gamma/body.metal').write_text('NEW\\n')\n"
             "        Path('shaders/gamma/body.metal').chmod(0o755)"))
         worker = worker_module.Worker(self.config, self.job)
-        with patch.object(worker, 'prepare_publication', side_effect=worker_module.WorkerInterrupted(15)), \
+        stage = worker.stage_candidate
+
+        def interrupt_after_staging(manifest):
+            stage(manifest)
+            raise worker_module.WorkerInterrupted(15)
+
+        with patch.object(worker, 'prepare_publication'), \
+                patch.object(worker, 'stage_candidate', side_effect=interrupt_after_staging), \
                 contextlib.redirect_stdout(io.StringIO()), self.assertRaises(worker_module.WorkerInterrupted):
             worker.perform()
         checkpoint = json.loads((self.job/worker_module.CANDIDATE_CHECKPOINT).read_text())
         body = 'shaders/gamma/body.metal'
         self.assertEqual(checkpoint['untracked'][body]['mode'], '100755')
         verified = worker.checkpoint['verifiedCandidate']['fingerprint']
-        worker.park_checkpoint()
-        self.assertFalse((self.root/body).exists())
+        self.assertEqual(worker.fingerprint(), verified)
+        self.assertIn(body, self.git(self.root, 'diff', '--cached', '--name-only').splitlines())
 
         resumed = worker_module.Worker(self.config, self.job)
         verify = resumed.verify_candidate
@@ -607,8 +666,17 @@ Path(sys.argv[3]).write_bytes"""
         self.assertEqual(evidence['candidateMode'], '100755')
         self.assertEqual(worker.workspace_record(name)['mode'], '100644')
 
-        # Older records matched existing files using only the saved bytes.
         conflict_path.unlink()
+        self.git(self.root, 'config', 'core.filemode', 'false')
+        disabled = worker_module.Worker(self.config, self.job)
+        disabled.request = self.request
+        self.assertFalse(disabled.restore_patch())
+        body.unlink()
+        self.assertFalse(disabled.restore_patch())
+        self.assertEqual(disabled.workspace_record(name)['mode'], '100644')
+        self.assertFalse(conflict_path.exists())
+
+        # Older records matched existing files using only the saved bytes.
         journal = self.job/worker_module.CANDIDATE_CHECKPOINT
         old_snapshot = {'patch': '', 'untracked': {name: evidence['candidate']}}
         worker_module.write(journal, old_snapshot)
@@ -617,6 +685,27 @@ Path(sys.argv[3]).write_bytes"""
         body.unlink()
         self.assertFalse(worker.restore_patch())
         self.assertEqual(worker.read_workspace_with_mode(name, limit=None), (b'SAME\n', '100644'))
+
+    def test_filemode_disabled_normalizes_new_and_tracked_index_modes(self):
+        worker = self.ignored_worker()
+        tracked = 'shaders/alpha/body.metal'
+        added = 'shaders/gamma/body.metal'
+        (self.root/added).parent.mkdir()
+        for name in (tracked, added):
+            (self.root/name).write_text('CANDIDATE\n')
+            (self.root/name).chmod(0o755)
+        self.git(self.root, 'config', 'core.filemode', 'true')
+        self.git(self.root, 'add', '--', tracked, added)
+        self.assertTrue(all(line.startswith('100755 ') for line in self.git(self.root, 'ls-files', '-s', tracked, added).splitlines()))
+        self.git(self.root, 'config', 'core.filemode', 'false')
+        worker = worker_module.Worker(self.config, self.job)
+        worker.request = self.request
+        manifest = worker.candidate_manifest()
+        self.assertEqual([manifest[name]['mode'] for name in (tracked, added)], ['100644', '100644'])
+        worker.stage_candidate(manifest)
+        self.assertTrue(all(line.startswith('100644 ') for line in self.git(self.root, 'ls-files', '-s', tracked, added).splitlines()))
+        self.git(self.root, 'commit', '-m', 'Publish with mode detection disabled')
+        worker.verify_commit('HEAD', manifest)
 
     def test_remote_advance_after_verification_does_not_reopen_fixed_repair(self):
         self.request['prompt'] = 'repair'
@@ -821,8 +910,13 @@ Path(sys.argv[3]).write_bytes"""
                     assert 'retainedShaderID' not in conflicts[0]
                     assert 'retain its ID' in prompt
                     assert '<<<<<<<' in before and 'UPSTREAM' in before and 'REPAIRED' in before
-                    assert count in (3, 4)
-                    Path('shaders/gamma/body.metal').write_text(before if count == 3 else 'REPAIRED\\nUPSTREAM\\n')
+                    assert count in (3, 4, 5)
+                    if count == 3:
+                        status, changed, question = 'needsClarification', False, 'Keep the upstream detail?'
+                    if count == 4:
+                        assert (directory/'answer.json').exists()
+                    resolved = 'REPAIRED\\nUPSTREAM\\n/*\\n========================================\\n*/\\n'
+                    Path('shaders/gamma/body.metal').write_text(before if count < 5 else resolved)
                 '''), '    ') + "    if status=='completed':").replace(
                     "    elif (directory/'repair.json').exists() and mode=='new':\n",
                     "    elif (directory/'repair.json').exists() and mode=='new':\n"
@@ -849,17 +943,25 @@ Path(sys.argv[3]).write_bytes"""
             worker_module.write(self.job/'restore-conflicts.json', {name: {'path': name, 'retainedShaderID': 'gamma'}})
             pushed = True
 
-        code, events = self.run_worker(race)
+        code, paused = self.run_worker(race)
+        self.assertEqual(code, 0, paused)
+        self.assertTrue(any(event.get('question') == 'Keep the upstream detail?' for event in paused))
+        self.assertTrue((self.job/'restore-conflicts.json').exists())
+        self.assertEqual(json.loads((self.job/'checkpoint.json').read_text())['outcome']['shaderID'], 'gamma')
+        self.assertFalse(self.git(self.root, 'diff', '--name-only', '--diff-filter=U').strip())
+        worker_module.write(self.job/'answer.json', 'Keep it')
+        code, events = self.run_worker()
 
         self.assertEqual(code, 0, events)
         self.assertTrue(pushed)
         repaired = self.result(events)
         self.assertEqual((repaired['outputKind'], repaired['shaderID']), ('new', 'gamma'))
         self.assertNotEqual(repaired['commitSHA'], first['commitSHA'])
-        self.assertEqual(self.git(self.root, 'show', 'origin/main:shaders/gamma/body.metal'), 'REPAIRED\nUPSTREAM\n')
+        self.assertEqual(self.git(self.root, 'show', 'origin/main:shaders/gamma/body.metal'),
+                         'REPAIRED\nUPSTREAM\n/*\n========================================\n*/\n')
         self.assertEqual(self.git(self.root, 'show', 'origin/main:shaders/beta/body.metal'), 'INTERVENING\n')
         self.assertTrue(any(event['event'] == 'log' and 'Remove merge conflict markers' in event['text'] for event in events))
-        self.assertEqual((self.job/'implementation-count').read_text(), '4')
+        self.assertEqual((self.job/'implementation-count').read_text(), '5')
 
     def test_unchanged_activation_repair_keeps_prior_change_without_empty_commit(self):
         code,events=self.run_worker();self.assertEqual(code,0,events);first=self.result(events)
@@ -942,7 +1044,8 @@ Path(sys.argv[3]).write_bytes"""
         self.assertEqual(self.git(self.root,'status','--porcelain').strip(),'')
         self.assertEqual(self.git(self.root,'rev-parse','origin/main').strip(),previous['commitSHA'])
         self.assertFalse((self.root/'.git/holodeck-request-owner.json').exists())
-        self.assertEqual(json.loads((self.job/'worker-result.json').read_text()),previous)
+        previous_record = json.loads((self.job/'worker-result.json').read_text())
+        self.assertEqual({key: value for key, value in previous_record.items() if key != 'attemptID'}, previous)
         self.codex.write_text(CODEX)
         self.job=self.base/'next-request';self.job.mkdir()
         self.request['id']=str(uuid.uuid4());self.request['prompt']='named';self.save_request()
@@ -1234,6 +1337,133 @@ Path(sys.argv[3]).write_bytes"""
                 self.assertEqual(candidate.read_text(), 'LIVE TRACKED\n')
                 self.assertEqual(addition.read_text(), 'LIVE ADDITION\n')
                 self.assertFalse(backup.exists())
+
+    def test_git_errors_during_checkpoint_capture_hold_live_candidate_for_retry(self):
+        worker = self.ignored_worker()
+        candidate = self.root/'shaders/alpha/body.metal'
+        journal = self.job/worker_module.CANDIDATE_CHECKPOINT
+        for fault in (worker_module.OperationalError('git diff failed'), subprocess.TimeoutExpired('git diff', 60)):
+            with self.subTest(fault=type(fault).__name__):
+                candidate.write_text('OLDER\n')
+                worker.save_patch()
+                previous = journal.read_bytes()
+                candidate.write_text('LIVE\n')
+                git = worker.git
+
+                def fail_diff(*args, **kwargs):
+                    if args[:2] == ('diff', '--binary'):
+                        raise fault
+                    return git(*args, **kwargs)
+
+                with patch.object(worker, 'perform', side_effect=worker.park), patch.object(worker, 'git', side_effect=fail_diff):
+                    failure = self.worker_failure(worker)
+                self.assertEqual(failure['failureKind'], 'checkoutCleanup')
+                self.assertTrue(failure['recoveryRequired'])
+                self.assertIn('Cannot save the candidate checkpoint', failure['message'])
+                self.assertEqual(journal.read_bytes(), previous)
+                self.assertEqual(candidate.read_text(), 'LIVE\n')
+                self.assertFalse(worker.has_pending_cleanup(worker.owned_record()))
+
+                worker = worker_module.Worker(self.config, self.job)
+                worker.request = self.request
+                worker.synchronize()
+                self.assertEqual(candidate.read_text(), 'LIVE\n')
+
+    def test_foreign_owner_preserves_both_requests_when_run_or_replay_is_blocked(self):
+        worker = self.ignored_worker()
+        candidate = self.root/'shaders/alpha/body.metal'
+        candidate.write_text('PARKED A\n')
+        worker.save(verificationRepair={'diagnostic': 'Keep A work'})
+        worker.park()
+        journal = self.job/worker_module.CANDIDATE_CHECKPOINT
+        original = journal.read_bytes(), (self.job/'checkpoint.json').read_bytes()
+        other = self.base/'other'
+        other.mkdir()
+        other_id = str(uuid.uuid4())
+        other_evidence = other/'candidate-checkpoint.json'
+        other_evidence.write_text('Parked B evidence')
+        worker_module.write(worker.owner, {'id': other_id, 'directory': str(other)})
+        candidate.write_text('LIVE B\n')
+        with patch.object(worker, 'perform', side_effect=worker_module.OperationalError('Failure before the ownership check')):
+            self.worker_failure(worker)
+
+        for replay in (False, True):
+            with self.subTest(replay=replay):
+                if replay:
+                    worker_module.write(self.job/'worker-result.json', {'outputKind': 'edited', 'shaderID': 'alpha'})
+                failure = self.worker_failure(worker)
+                self.assertEqual(failure['failureKind'], 'checkoutCleanup')
+                self.assertTrue(failure['recoveryRequired'])
+                self.assertIn('Recover that request first', failure['message'])
+                self.assertEqual((journal.read_bytes(), (self.job/'checkpoint.json').read_bytes()), original)
+                self.assertEqual(json.loads(worker.owner.read_text())['id'], other_id)
+                self.assertEqual(candidate.read_text(), 'LIVE B\n')
+                self.assertEqual(other_evidence.read_text(), 'Parked B evidence')
+
+    def test_interrupted_checkpoint_removal_cannot_fall_back_to_an_older_snapshot(self):
+        worker = self.ignored_worker()
+        journal = self.job/worker_module.CANDIDATE_CHECKPOINT
+        backup = self.job/worker_module.PREVIOUS_CANDIDATE_CHECKPOINT
+        legacy = self.job/'changes.patch'
+        worker_module.write(journal, {'patch': base64.b64encode(b'current').decode(), 'untracked': {}})
+        worker_module.write(backup, {'patch': base64.b64encode(b'old').decode(), 'untracked': {}})
+        legacy.write_bytes(b'legacy')
+        unlink = Path.unlink
+
+        def interrupt(path, *args, **kwargs):
+            if path == journal:
+                raise worker_module.WorkerInterrupted(15)
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(Path, 'unlink', interrupt), self.assertRaises(worker_module.WorkerInterrupted):
+            worker.clear_candidate_checkpoint()
+        self.assertFalse(backup.exists())
+        self.assertFalse(legacy.exists())
+        self.assertEqual(worker.read_candidate_checkpoint(), (b'current', {}))
+        worker.clear_candidate_checkpoint()
+        self.assertEqual(worker.read_candidate_checkpoint(), (b'', {}))
+
+    def test_saved_patch_ignores_user_diff_settings(self):
+        worker = self.ignored_worker()
+        candidate = self.root/'shaders/alpha/body.metal'
+        candidate.write_text('CANDIDATE\n')
+        driver = self.base/'external-diff'
+        driver.write_text('#!/bin/sh\nprintf "external driver output\\n"\n')
+        driver.chmod(0o755)
+        self.git(self.root, 'config', 'diff.external', str(driver))
+        self.git(self.root, 'config', 'diff.noprefix', 'true')
+        self.git(self.root, 'config', 'color.ui', 'always')
+        before = worker.fingerprint()
+        worker.park()
+        saved, _ = worker.read_candidate_checkpoint()
+        self.assertTrue(saved.startswith(b'diff --git a/shaders/alpha/body.metal b/shaders/alpha/body.metal'))
+        worker.synchronize()
+        self.assertEqual(candidate.read_text(), 'CANDIDATE\n')
+        self.assertEqual(worker.fingerprint(), before)
+        self.assertFalse((self.job/'restore-conflicts.json').exists())
+
+    def test_custom_conflict_markers_and_moved_head_are_rejected_before_index_changes(self):
+        worker = self.ignored_worker()
+        name = 'shaders/alpha/body.metal'
+        candidate = self.root/name
+        attributes = self.root/'.gitattributes'
+        attributes.write_text(f'{name} conflict-marker-size=11\n')
+        self.git(self.root, 'add', '.gitattributes')
+        self.git(self.root, 'commit', '-m', 'Use custom marker width')
+        conflicts = {name: {'path': name}}
+        outcome = {'outputKind': 'edited', 'shaderID': 'alpha', 'resolvedRestoreConflicts': [name]}
+        candidate.write_text('>>>>>>>>>>> partial closing marker\n')
+        before = self.git(self.root, 'ls-files', '--stage')
+        with self.assertRaisesRegex(worker_module.OperationalError, 'Codex changed Git state'):
+            worker.accept_restore_resolution(outcome, conflicts)
+        self.assertEqual(self.git(self.root, 'ls-files', '--stage'), before)
+
+        worker.save(base=self.git(self.root, 'rev-parse', 'HEAD').strip())
+        with self.assertRaisesRegex(worker_module.CandidateError, 'Remove merge conflict markers'):
+            worker.accept_restore_resolution(outcome, conflicts)
+        candidate.write_text('/*\n===========\n========================================\n*/\n')
+        worker.accept_restore_resolution(outcome, conflicts)
+        self.assertEqual(self.git(self.root, 'ls-files', '--stage'), before)
 
     def test_large_cleanup_inventory_keeps_owner_small_and_checkpoint_survives_reset(self):
         worker = self.ignored_worker()
