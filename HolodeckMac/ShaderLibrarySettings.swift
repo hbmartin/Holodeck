@@ -5,11 +5,13 @@ import HolodeckCore
 
 @MainActor @Observable
 final class MacLibraryModel {
-    let requests: MacRequestsModel
+    let requests: MacRequestsModel?
     var folder: URL?
     private var localReloading = false
     private var servicePublishing = false
     var isReloading: Bool { localReloading || servicePublishing }
+    var hasUnfinishedRequests: Bool { requests?.hasUnfinishedJobs == true }
+    var canSelectFolder: Bool { !isReloading && requests?.configuration.enabled != true && !hasUnfinishedRequests }
     private var publicationOperationSequence: UInt64 = 0
     private var publicationFailureSequence: UInt64?
     private var publicationGeneration: UUID?
@@ -79,22 +81,27 @@ final class MacLibraryModel {
     #endif
 
     init(catalog: DirectoryCatalog, session: ViewerSession, defaults: UserDefaults?, testingNamespace: String? = nil, testingAdvertises: Bool = false) {
+        #if HOLODECK_MAC_TESTFLIGHT
+        requests = nil
+        #else
         requests = MacRequestsModel(catalog: catalog, defaults: defaults, namespace: testingNamespace)
+        #endif
         self.catalog = catalog; self.session = session; self.defaults = defaults
         #if DEBUG
         MacInspectionLifecycle.snapshot.libraryCreations += 1
         server = testingNamespace.map { LocalCatalogServer.testing(catalog: catalog, namespace: $0, advertise: testingAdvertises) } ?? LocalCatalogServer(catalog: catalog)
         exposesFailureAssociationTests = testingNamespace != nil && UITestConfiguration(applicationID: "me.haroldmartin.HolodeckMac").hasExplicitStorageSuite && ProcessInfo.processInfo.environment["HOLODECK_UI_TEST_ERROR_ASSOCIATION"] == "1"
         holdsNextReloadForTesting = testingNamespace != nil && UITestConfiguration(applicationID: "me.haroldmartin.HolodeckMac").contains("--ui-test-hold-library-reload")
+        #elseif HOLODECK_MAC_TESTFLIGHT
+        server = LocalCatalogServer(catalog: catalog, keychainNamespace: "mac-testflight-library")
         #else
         server = LocalCatalogServer(catalog: catalog)
         #endif
         let server = server
-        let requestService = requests.service
         // The trusted approvals coordinator is registered in startup before any
         // publication or request scheduling can enter the checkout.
-        requests.onPublication = { [weak self] status in
-            guard let self, self.requests.configuration.enabled else { return }
+        requests?.onPublication = { [weak self] status in
+            guard let self, self.requests?.configuration.enabled == true else { return }
             self.ready = true; self.previewWarnings = status.warnings
             if self.publicationFailureSequence == nil { self.clearError(from: .publication) }
             Task {
@@ -102,7 +109,7 @@ final class MacLibraryModel {
                 if !self.sleeping { try? await self.startServer() }
             }
         }
-        requests.onPublicationEvent = { [weak self] event in self?.applyPublicationEvent(event) }
+        requests?.onPublicationEvent = { [weak self] event in self?.applyPublicationEvent(event) }
         updates = Task { [weak self] in
             for await state in await server.updates() { self?.serverState = state }
         }
@@ -123,24 +130,31 @@ final class MacLibraryModel {
         if let bookmark = fixtureBookmark ?? defaults?.data(forKey: "holodeck.shaderFolderBookmark") {
             do {
                 var stale = false
+                #if HOLODECK_MAC_TESTFLIGHT
+                let url = try Self.openScopedBookmark(bookmark, stale: &stale)
+                scopedURL = url
+                #else
                 let url = try URL(resolvingBookmarkData: bookmark, options: [], relativeTo: nil, bookmarkDataIsStale: &stale)
                 if url.startAccessingSecurityScopedResource() { scopedURL = url }
-                folder = url; requests.proposeRepository(url); refreshBookmark = stale
+                #endif
+                folder = url; requests?.proposeRepository(url); refreshBookmark = stale
             } catch { self.setError("Choose your shader folder again: \(error.localizedDescription)", from: .folder) }
         }
         let shouldRefreshBookmark = refreshBookmark
         localReloading = true
         Task {
             do {
-                await server.setRequestService(requestService)
-                try await requests.initialized()
-                if !requests.configuration.repository.isEmpty {
-                    folder = URL(fileURLWithPath: requests.configuration.repository)
+                if let requests {
+                    await server.setRequestService(requests.service)
+                    try await requests.initialized()
+                    if !requests.configuration.repository.isEmpty {
+                        folder = URL(fileURLWithPath: requests.configuration.repository)
+                    }
                 }
                 var restored = false
                 do { restored = try await catalog.cached() != nil }
                 catch { self.setError("Couldn’t restore the previous shader library: \(error.localizedDescription)", from: .publication) }
-                if !restored, requests.configuration.enabled {
+                if !restored, let requests, requests.configuration.enabled {
                     try await requests.service.ensurePublication()
                     restored = await catalog.publicationRevisionValue() != nil
                     if let status = await requests.service.publicationStatus() { previewWarnings = status.warnings }
@@ -151,11 +165,20 @@ final class MacLibraryModel {
                     if !sleeping { try await startServer() }
                 }
             } catch { showPublicationError(error, prefix: "Couldn’t rebuild the shader library: ") }
-            await requests.service.activateScheduling()
+            await requests?.service.activateScheduling()
             localReloading = false
-            if !requests.configuration.enabled, folder != nil { reload(refreshBookmark: shouldRefreshBookmark) }
+            if requests?.configuration.enabled != true, folder != nil { reload(refreshBookmark: shouldRefreshBookmark) }
         }
     }
+
+    #if HOLODECK_MAC_TESTFLIGHT
+    private static func openScopedBookmark(_ bookmark: Data, stale: inout Bool) throws -> URL {
+        let url = try URL(resolvingBookmarkData: bookmark, options: [.withSecurityScope, .withoutUI],
+                          relativeTo: nil, bookmarkDataIsStale: &stale)
+        guard url.startAccessingSecurityScopedResource() else { throw CocoaError(.fileReadNoPermission) }
+        return url
+    }
+    #endif
 
     isolated deinit {
         updates?.cancel(); scopedURL?.stopAccessingSecurityScopedResource()
@@ -165,23 +188,32 @@ final class MacLibraryModel {
     }
 
     func chooseFolder() {
-        guard !isReloading, !requests.configuration.enabled, !requests.hasUnfinishedJobs else { return }
+        guard canSelectFolder else { return }
         let panel = NSOpenPanel()
         panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
         panel.message = "Choose the HolodeckShaders folder containing index.json, shared, and shaders."
         panel.prompt = "Choose Shader Folder"
         panel.begin { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
+            #if HOLODECK_MAC_TESTFLIGHT
+            guard let self else {
+                url.stopAccessingSecurityScopedResource()
+                return
+            }
+            self.load(url, saveBookmark: true, releasePanelAccess: true)
+            #else
             self?.load(url, saveBookmark: true)
+            #endif
         }
     }
     func reload(refreshBookmark: Bool = false) {
-        guard !requests.configuration.enabled, !requests.hasUnfinishedJobs else { return }
+        guard canSelectFolder else { return }
         guard let folder else { chooseFolder(); return }
         load(folder, saveBookmark: refreshBookmark)
     }
     func rebuildPublication() {
         guard !isReloading else { return }
+        guard let requests else { reload(); return }
         localReloading = true
         Task {
             defer { localReloading = false }
@@ -203,7 +235,7 @@ final class MacLibraryModel {
         }
     }
     var canCancelPreparation: Bool { servicePublishing }
-    func cancelLibraryPreparation() { Task { await requests.service.cancelPublication() } }
+    func cancelLibraryPreparation() { Task { await requests?.service.cancelPublication() } }
     private func applyPublicationEvent(_ event: ShaderRequestPublicationEvent) {
         if publicationGeneration != event.generation {
             publicationGeneration = event.generation; publicationOperationSequence = 0; publicationResolvedSequence = 0
@@ -221,27 +253,58 @@ final class MacLibraryModel {
         }
         applyPublicationOperation(event.operation)
     }
-    private func load(_ url: URL, saveBookmark: Bool) {
-        guard !isReloading, !requests.configuration.enabled, !requests.hasUnfinishedJobs else { return }
+    private func load(_ url: URL, saveBookmark: Bool, releasePanelAccess: Bool = false) {
+        guard canSelectFolder else {
+            if releasePanelAccess { url.stopAccessingSecurityScopedResource() }
+            return
+        }
         localReloading = true; clearError(from: .folder); clearError(from: .manualReload)
         let correlationID = UUID()
         let accessed = url.startAccessingSecurityScopedResource()
         Task {
-            defer { localReloading = false; if accessed { url.stopAccessingSecurityScopedResource() } }
+            defer {
+                localReloading = false
+                if accessed { url.stopAccessingSecurityScopedResource() }
+                if releasePanelAccess { url.stopAccessingSecurityScopedResource() }
+            }
             do {
+                #if HOLODECK_MAC_TESTFLIGHT
+                let bookmarkOptions: URL.BookmarkCreationOptions = [.withSecurityScope, .securityScopeAllowOnlyReadAccess]
+                #else
+                let bookmarkOptions: URL.BookmarkCreationOptions = []
+                #endif
                 // Prepare the bookmark before replacing the current publication.
                 let bookmark: Data?
-                do { bookmark = saveBookmark ? try url.bookmarkData(options: [],
+                do { bookmark = saveBookmark ? try url.bookmarkData(options: bookmarkOptions,
                     includingResourceValuesForKeys: nil, relativeTo: nil) : nil }
                 catch { setError(error.localizedDescription, from: .folder); throw error }
+                #if HOLODECK_MAC_TESTFLIGHT
+                var stale = false
+                var replacementScope = try bookmark.map { try Self.openScopedBookmark($0, stale: &stale) }
+                defer { replacementScope?.stopAccessingSecurityScopedResource() }
+                let source = replacementScope ?? url
+                let result = try await catalog.reload(from: source)
+                previewWarnings = result.previewWarnings
+                if let replacement = replacementScope {
+                    scopedURL?.stopAccessingSecurityScopedResource()
+                    scopedURL = replacement
+                    replacementScope = nil
+                }
+                folder = source
+                if let bookmark { defaults?.set(bookmark, forKey: "holodeck.shaderFolderBookmark") }
+                #else
+                guard let requests else { return }
                 let result = try await requests.reloadRepository(url)
-                previewWarnings = result.previewWarnings; clearError(from: .publication)
+                previewWarnings = result.previewWarnings
                 if let bookmark { defaults?.set(bookmark, forKey: "holodeck.shaderFolderBookmark") }
                 if folder != url {
                     scopedURL?.stopAccessingSecurityScopedResource(); scopedURL = nil
                     if url.startAccessingSecurityScopedResource() { scopedURL = url }
                 }
-                folder = URL(fileURLWithPath: requests.configuration.repository); ready = true
+                folder = URL(fileURLWithPath: requests.configuration.repository)
+                #endif
+                clearError(from: .publication)
+                ready = true
                 await session.refresh(force: true, correlationID: correlationID).value
                 #if DEBUG
                 if holdsNextReloadForTesting {
@@ -300,9 +363,9 @@ final class MacLibraryModel {
     func setSleeping(_ value: Bool) {
         sleeping = value
         Task {
-            if value { await requests.service.suspend(); await server.stop() }
+            if value { await requests?.service.suspend(); await server.stop() }
             else {
-                await requests.service.resume()
+                await requests?.service.resume()
                 if ready { try? await startServer() }
             }
         }
@@ -367,10 +430,10 @@ struct ShaderLibrarySettings: View {
                     Button("Reload Shaders") { library.reload() }.disabled(library.folder == nil)
                         .accessibilityIdentifier("reload-shaders")
                     if library.isReloading { ProgressView().controlSize(.small).accessibilityIdentifier("shader-library-reloading") }
-                }.disabled(library.isReloading || library.requests.configuration.enabled || library.requests.hasUnfinishedJobs)
+                }.disabled(!library.canSelectFolder)
                 if library.folder != nil {
                     Button("Rebuild Library", action: library.rebuildPublication)
-                        .disabled(library.isReloading || library.requests.hasUnfinishedJobs)
+                        .disabled(library.isReloading || library.hasUnfinishedRequests)
                         .accessibilityIdentifier("rebuild-shader-library")
                     if library.canCancelPreparation {
                         Button("Cancel Library Preparation", action: library.cancelLibraryPreparation)
@@ -436,7 +499,7 @@ struct ShaderLibrarySettings: View {
                 }
                 #endif
             }
-            RequestSettingsView(model: library.requests)
+            if let requests = library.requests { RequestSettingsView(model: requests) }
             Section("Pairing Approvals from Apple TV") {
                 if library.serverState.pending.isEmpty { Text("No pending requests.").foregroundStyle(.secondary) }
                 ForEach(library.serverState.pending) { request in

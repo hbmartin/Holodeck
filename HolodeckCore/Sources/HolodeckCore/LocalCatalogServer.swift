@@ -277,8 +277,12 @@ public actor LocalCatalogServer {
     private var identity: LocalServerIdentity?
 
     public init(catalog: DirectoryCatalog) {
-        self.catalog = catalog; self.allowLoopback = false; self.secretNamespace = Self.productionNamespace; self.advertise = true
-        trusted = .keychain(namespace: Self.productionNamespace)
+        self.init(catalog: catalog, keychainNamespace: Self.productionNamespace)
+    }
+
+    public init(catalog: DirectoryCatalog, keychainNamespace: String) {
+        self.catalog = catalog; self.allowLoopback = false; self.secretNamespace = keychainNamespace; self.advertise = true
+        trusted = .keychain(namespace: keychainNamespace)
         clock = AnyClock(ContinuousClock())
         beforeTrustedCommit = { _ in }; beforeRevocationReplay = { _ in }
         readAsset = { try await catalog.get($0, limit: $1, pinFor: $2) }

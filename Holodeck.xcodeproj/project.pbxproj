@@ -7,6 +7,10 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		D10000000000000000000001 /* Sentry-Static in Frameworks */ = {isa = PBXBuildFile; productRef = D10000000000000000000003; };
+		D10000000000000000000002 /* Sentry-Static in Frameworks */ = {isa = PBXBuildFile; productRef = D10000000000000000000004; };
+		D10000000000000000000006 /* CrashReporting.swift in Sources */ = {isa = PBXBuildFile; fileRef = D10000000000000000000008; };
+		D10000000000000000000007 /* CrashReporting.swift in Sources */ = {isa = PBXBuildFile; fileRef = D10000000000000000000008; };
 		A20000000000000000000001 /* TestSupport in unit Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003; };
 		A20000000000000000000002 /* TestSupport in UI Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003; };
 		A10000000000000000000001 /* Dependencies in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000003 /* Dependencies */; };
@@ -38,6 +42,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		D10000000000000000000008 /* CrashReporting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/CrashReporting.swift; sourceTree = "<group>"; };
 		A20000000000000000000003 /* TestSupport */ = {isa = PBXFileReference; lastKnownFileType = folder; name = TestSupport; path = HolodeckCore/Tests/HolodeckCoreTests/TestSupport; sourceTree = "<group>"; };
 		24051A483076DFD7003E9983 /* Holodeck.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Holodeck.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		24051A603076DFD9003E9983 /* HolodeckTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = HolodeckTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -54,7 +59,7 @@
 			);
 			target = 24051A473076DFD7003E9983 /* Holodeck */;
 		};
-        C000000000000000000000E9 = {isa = PBXFileSystemSynchronizedBuildFileExceptionSet; membershipExceptions = (Info.plist,); target = C00000000000000000000064;};
+        C000000000000000000000E9 = {isa = PBXFileSystemSynchronizedBuildFileExceptionSet; membershipExceptions = (Info.plist, TestFlight.entitlements,); target = C00000000000000000000064;};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -87,6 +92,7 @@
 				A10000000000000000000001 /* Dependencies in Frameworks */,
 				A10000000000000000000006 /* IssueReporting in Frameworks */,
 				B0000000000000000000000C /* HolodeckCore */,
+				D10000000000000000000001 /* Sentry-Static in Frameworks */,
 			);
 		};
 		24051A5D3076DFD9003E9983 /* Frameworks */ = {
@@ -103,7 +109,7 @@
 			files = (
 			);
 		};
-		C00000000000000000000068 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (C0000000000000000000006E,); runOnlyForDeploymentPostprocessing = 0; };
+		C00000000000000000000068 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (C0000000000000000000006E, D10000000000000000000002,); runOnlyForDeploymentPostprocessing = 0; };
 		C000000000000000000000CC = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
 
@@ -118,6 +124,7 @@
 				24051A493076DFD7003E9983 /* Products */,
 				C00000000000000000000065 /* HolodeckMac */,
 				C000000000000000000000C9 /* HolodeckMacUITests */,
+				D10000000000000000000008 /* CrashReporting.swift */,
 			);
 			sourceTree = "<group>";
 		};
@@ -154,6 +161,7 @@
 				A10000000000000000000003 /* Dependencies */,
 				A10000000000000000000008 /* IssueReporting */,
 				B00000000000000000000002 /* HolodeckCore */,
+				D10000000000000000000003 /* Sentry-Static */,
 			);
 			productName = Holodeck;
 			productReference = 24051A483076DFD7003E9983 /* Holodeck.app */;
@@ -212,7 +220,7 @@
             buildPhases = (C00000000000000000000067, C00000000000000000000068, C00000000000000000000069, C000000000000000000000F1);
             buildRules = (); dependencies = (); fileSystemSynchronizedGroups = (C00000000000000000000065);
             name = HolodeckMac; productName = HolodeckMac; productReference = C00000000000000000000066;
-            packageProductDependencies = (C0000000000000000000006D); productType = "com.apple.product-type.application";
+            packageProductDependencies = (C0000000000000000000006D, D10000000000000000000004); productType = "com.apple.product-type.application";
         };
 		C000000000000000000000C8 /* HolodeckMacUITests */ = {
             isa = PBXNativeTarget; buildConfigurationList = C000000000000000000000CE;
@@ -259,6 +267,7 @@
 				A1000000000000000000000B /* XCRemoteSwiftPackageReference "swift-clocks" */,
 				A1000000000000000000000E /* XCRemoteSwiftPackageReference "swift-concurrency-extras" */,
 				B00000000000000000000001 /* HolodeckCore */,
+				D10000000000000000000005 /* XCRemoteSwiftPackageReference "sentry-apple-binaries" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 24051A493076DFD7003E9983 /* Products */;
@@ -297,13 +306,14 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
-        C000000000000000000000F1 = {isa = PBXShellScriptBuildPhase; alwaysOutOfDate = 1; buildActionMask = 2147483647; files = (); inputPaths = (); name = "Bundle Shader Tool"; outputPaths = ("$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Tools/holodeck-shader-tool",); runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/bash; shellScript = "set -euo pipefail\n/usr/bin/xcrun swift build --package-path \"${SRCROOT}/HolodeckCore\" -c release --product holodeck-shader-tool --force-resolved-versions --scratch-path \"${DERIVED_FILE_DIR}/shader-tool-build\"\nTOOL_BIN=$(/usr/bin/xcrun swift build --package-path \"${SRCROOT}/HolodeckCore\" -c release --show-bin-path --force-resolved-versions --scratch-path \"${DERIVED_FILE_DIR}/shader-tool-build\")\nmkdir -p \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/Tools\"\ninstall -m 755 \"${TOOL_BIN}/holodeck-shader-tool\" \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/Tools/holodeck-shader-tool\"\ntest -d \"${TOOL_BIN}/HolodeckCore_HolodeckCore.bundle\" || { echo \"Required shader checker resource bundle is missing\" >&2; exit 1; }\nfor CHECKER_BUNDLE in \"${TOOL_BIN}\"/*.bundle; do\n  if [ -d \"${CHECKER_BUNDLE}\" ]; then /usr/bin/ditto \"${CHECKER_BUNDLE}\" \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/Tools/$(basename \"${CHECKER_BUNDLE}\")\"; fi\ndone\nif [ \"${CODE_SIGNING_ALLOWED:-NO}\" = YES ]; then /usr/bin/codesign --force --sign \"${EXPANDED_CODE_SIGN_IDENTITY:--}\" \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/Tools/holodeck-shader-tool\"; fi\n"; };
+        C000000000000000000000F1 = {isa = PBXShellScriptBuildPhase; alwaysOutOfDate = 1; buildActionMask = 2147483647; files = (); inputPaths = (); name = "Bundle Shader Tool"; outputPaths = ("$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Tools/holodeck-shader-tool",); runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/bash; shellScript = "set -euo pipefail\nif [ \"${CONFIGURATION}\" = TestFlight ]; then exit 0; fi\n/usr/bin/xcrun swift build --package-path \"${SRCROOT}/HolodeckCore\" -c release --product holodeck-shader-tool --force-resolved-versions --scratch-path \"${DERIVED_FILE_DIR}/shader-tool-build\"\nTOOL_BIN=$(/usr/bin/xcrun swift build --package-path \"${SRCROOT}/HolodeckCore\" -c release --show-bin-path --force-resolved-versions --scratch-path \"${DERIVED_FILE_DIR}/shader-tool-build\")\nmkdir -p \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/Tools\"\ninstall -m 755 \"${TOOL_BIN}/holodeck-shader-tool\" \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/Tools/holodeck-shader-tool\"\ntest -d \"${TOOL_BIN}/HolodeckCore_HolodeckCore.bundle\" || { echo \"Required shader checker resource bundle is missing\" >&2; exit 1; }\nfor CHECKER_BUNDLE in \"${TOOL_BIN}\"/*.bundle; do\n  if [ -d \"${CHECKER_BUNDLE}\" ]; then /usr/bin/ditto \"${CHECKER_BUNDLE}\" \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/Tools/$(basename \"${CHECKER_BUNDLE}\")\"; fi\ndone\nif [ \"${CODE_SIGNING_ALLOWED:-NO}\" = YES ]; then /usr/bin/codesign --force --sign \"${EXPANDED_CODE_SIGN_IDENTITY:--}\" \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/Tools/holodeck-shader-tool\"; fi\n"; };
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		24051A443076DFD7003E9983 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			files = (
+				D10000000000000000000006 /* CrashReporting.swift in Sources */,
 			);
 		};
 		24051A5C3076DFD9003E9983 /* Sources */ = {
@@ -316,7 +326,7 @@
 			files = (
 			);
 		};
-		C00000000000000000000067 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		C00000000000000000000067 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (D10000000000000000000007,); runOnlyForDeploymentPostprocessing = 0; };
 		C000000000000000000000CB = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
@@ -514,6 +524,63 @@
 			};
 			name = Release;
 		};
+		D10000000000000000000009 /* TestFlight configuration for PBXProject "Holodeck" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = MGPHJKUJSY;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = appletvos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				TVOS_DEPLOYMENT_TARGET = 26.0;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = TestFlight;
+		};
 		24051A773076DFD9003E9983 /* Debug configuration for PBXNativeTarget "HolodeckTests" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -616,6 +683,17 @@
                 INFOPLIST_FILE = HolodeckMac/Info.plist;
                 PRODUCT_NAME = "$(TARGET_NAME)"; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks");
                 PRODUCT_BUNDLE_IDENTIFIER = "me.haroldmartin.HolodeckMac$(HOLODECK_TEST_BUNDLE_SUFFIX)"; INFOPLIST_KEY_CFBundleDisplayName = Holodeck; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment"; COMBINE_HIDPI_IMAGES = YES;}; name = Release; };
+		D1000000000000000000000A = {isa = XCBuildConfiguration; buildSettings = {ARCHS = arm64; SDKROOT = macosx; SUPPORTED_PLATFORMS = macosx; MACOSX_DEPLOYMENT_TARGET = 15.0;
+                CODE_SIGN_STYLE = Automatic; CODE_SIGN_IDENTITY = "Apple Development"; DEVELOPMENT_TEAM = MGPHJKUJSY;
+                GENERATE_INFOPLIST_FILE = YES; SWIFT_VERSION = 6.0; SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+                SWIFT_APPROACHABLE_CONCURRENCY = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 1.0;
+                ENABLE_APP_SANDBOX = YES; CODE_SIGN_ENTITLEMENTS = HolodeckMac/TestFlight.entitlements; ENABLE_USER_SCRIPT_SANDBOXING = NO; ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
+                ENABLE_INCOMING_NETWORK_CONNECTIONS = YES; ENABLE_USER_SELECTED_FILES = readonly;
+                ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+                SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) HOLODECK_MAC_TESTFLIGHT";
+                INFOPLIST_FILE = HolodeckMac/Info.plist;
+                PRODUCT_NAME = "$(TARGET_NAME)"; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks");
+                PRODUCT_BUNDLE_IDENTIFIER = "me.haroldmartin.HolodeckMac$(HOLODECK_TEST_BUNDLE_SUFFIX)"; INFOPLIST_KEY_CFBundleDisplayName = Holodeck; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment"; COMBINE_HIDPI_IMAGES = YES;}; name = TestFlight; };
 		C000000000000000000000CF = {isa = XCBuildConfiguration; buildSettings = {ARCHS = arm64; SDKROOT = macosx; SUPPORTED_PLATFORMS = macosx; MACOSX_DEPLOYMENT_TARGET = 15.0;
                 CODE_SIGN_STYLE = Automatic; CODE_SIGN_IDENTITY = "-"; DEVELOPMENT_TEAM = MGPHJKUJSY;
                 GENERATE_INFOPLIST_FILE = YES; SWIFT_VERSION = 6.0;
@@ -638,6 +716,7 @@
 			buildConfigurations = (
 				24051A743076DFD9003E9983 /* Debug configuration for PBXProject "Holodeck" */,
 				24051A753076DFD9003E9983 /* Release configuration for PBXProject "Holodeck" */,
+				D10000000000000000000009 /* TestFlight configuration for PBXProject "Holodeck" */,
 			);
 			defaultConfigurationName = Release;
 		};
@@ -665,10 +744,15 @@
 			);
 			defaultConfigurationName = Release;
 		};
-		C0000000000000000000006A = {isa = XCConfigurationList; buildConfigurations = (C0000000000000000000006B, C0000000000000000000006C); defaultConfigurationName = Release; };
+		C0000000000000000000006A = {isa = XCConfigurationList; buildConfigurations = (C0000000000000000000006B, C0000000000000000000006C, D1000000000000000000000A); defaultConfigurationName = Release; };
 		C000000000000000000000CE = {isa = XCConfigurationList; buildConfigurations = (C000000000000000000000CF, C000000000000000000000D0); defaultConfigurationName = Release; };
 /* End XCConfigurationList section */
 /* Begin XCRemoteSwiftPackageReference section */
+		D10000000000000000000005 /* XCRemoteSwiftPackageReference "sentry-apple-binaries" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/getsentry/sentry-apple-binaries.git";
+			requirement = {kind = exactVersion; version = 9.35.0; };
+		};
 		A10000000000000000000005 /* XCRemoteSwiftPackageReference "swift-dependencies" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/pointfreeco/swift-dependencies";
@@ -692,6 +776,8 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		D10000000000000000000003 /* Sentry-Static */ = {isa = XCSwiftPackageProductDependency; package = D10000000000000000000005; productName = "Sentry-Static"; };
+		D10000000000000000000004 /* Sentry-Static */ = {isa = XCSwiftPackageProductDependency; package = D10000000000000000000005; productName = "Sentry-Static"; };
 		A10000000000000000000003 /* Dependencies */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = A10000000000000000000005 /* XCRemoteSwiftPackageReference "swift-dependencies" */;

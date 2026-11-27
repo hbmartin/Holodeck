@@ -14,9 +14,12 @@ struct HolodeckMacApp: App {
             return
         }
         #endif
+        CrashReporting.start()
         let model = MacModel()
         _model = State(initialValue: model)
-        MacAppDelegate.prepareTermination = { await model.library?.requests.service.suspend() }
+        if let requests = model.library?.requests {
+            MacAppDelegate.prepareTermination = { await requests.service.suspend() }
+        }
     }
     var body: some Scene {
         Window("Holodeck", id: "viewer") {
@@ -41,7 +44,7 @@ struct HolodeckMacApp: App {
                 }
             }
             CommandGroup(after: .appInfo) {
-                if model?.library != nil { Button("Shader Requests") { openWindow(id: "requests") } }
+                if model?.library?.requests != nil { Button("Shader Requests") { openWindow(id: "requests") } }
                 if let model {
                     Button(model.library == nil ? "Check for Scene Updates" : "Reload Shaders") {
                         if let library = model.library { library.reload() } else { model.session.refresh(force: true) }
@@ -50,9 +53,11 @@ struct HolodeckMacApp: App {
                 }
             }
         }
+        #if !HOLODECK_MAC_TESTFLIGHT
         Window("Shader Requests", id: "requests") {
             if let requests = model?.library?.requests { RequestsView(model: requests) }
         }
+        #endif
         Settings {
             if let library = model?.library { ShaderLibrarySettings(library: library) }
         }
