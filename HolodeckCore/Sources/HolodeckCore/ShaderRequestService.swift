@@ -294,6 +294,11 @@ public actor ShaderRequestService {
 
     private var schedulingWakeupPending = false
     private var schedulingDeferred = false
+    private struct ClarificationAnswer: Encodable, Sendable {
+        let answer: String
+        let clarification: ShaderClarification?
+    }
+
     /// Caller drafts never enter accepted state while the writer is suspended.
     private struct StorageProposal {
         var records: [UUID: Record] = [:]
@@ -3224,7 +3229,8 @@ public actor ShaderRequestService {
         } else if operation == "requestAnswer" {
             guard record.status.stage == .awaitingClarification, let answer = payload.answer,
                   !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, answer.utf8.count <= 16_384 else { throw ShaderRequestError.invalidRequest }
-            files.append(.init(url: folder(id).appendingPathComponent("answer.json"), value: answer))
+            let response = ClarificationAnswer(answer: answer, clarification: record.status.clarification)
+            files.append(.init(url: folder(id).appendingPathComponent("answer.json"), value: response))
             record.status.clarification = nil
             Self.setStatus(&record, stage: .queued, message: "Ready to continue after clarification")
         } else if record.status.stage == .awaitingActivation {

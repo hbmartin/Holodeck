@@ -10,8 +10,7 @@ import Clocks
 final class DirectoryCatalogTests: XCTestCase {
     func testTestSecretCleanupRejectsBothProductionNamespaces() async throws {
         let (_, catalog) = try fixture()
-        let servers = [LocalCatalogServer(catalog: catalog),
-                       LocalCatalogServer(catalog: catalog, keychainNamespace: "mac-testflight-library")]
+        let servers = [LocalCatalogServer(catalog: catalog), LocalCatalogServer.testFlight(catalog: catalog)]
         for server in servers {
             do {
                 try await server.clearTestSecrets()

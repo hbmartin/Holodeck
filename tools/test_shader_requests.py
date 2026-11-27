@@ -446,7 +446,79 @@ if check:
         self.assertTrue(any(e['event']=='clarification' for e in events));self.assertEqual(self.git(self.root,'status','--porcelain').strip(),'')
         (self.job/'answer.json').write_text(json.dumps('Edit Alpha'))
         code,events=self.run_worker();self.assertEqual(code,0,events)
-        args=self.invocations()[1]['args'];self.assertEqual(args[args.index('resume')+1],'00000000-0000-0000-0000-000000000042')
+        invocation = self.invocations()[1]
+        args = invocation['args']
+        self.assertEqual(args[args.index('resume')+1], '00000000-0000-0000-0000-000000000042')
+        prompt = json.loads('{' + invocation['prompt'].split('\n{', 1)[1])
+        self.assertEqual(prompt['answer'], 'Edit Alpha')
+        self.assertIsNone(prompt['clarification'])
+
+    def test_clarification_answers_carry_each_exact_question_without_a_retained_thread(self):
+        self.request['prompt'] = 'ambiguous'
+        self.save_request()
+        self.codex.write_text(CODEX.replace(
+            "    if status=='completed':",
+            "    if count == 2:\n"
+            "        status, changed, question = 'needsClarification', False, 'Keep the current colors?'\n"
+            "    if status=='completed':"))
+        checkpoint = self.job/'checkpoint.json'
+        answers = [("Edit Alpha or create a new shader?", "Edit Alpha"), ("Keep the current colors?", "Yes")]
+        for question, answer in answers:
+            code, events = self.run_worker()
+            self.assertEqual(code, 0, events)
+            clarification = next(event for event in events if event['event'] == 'clarification')
+            self.assertEqual(clarification['question'], question)
+            saved = json.loads(checkpoint.read_text())
+            self.assertIsNone(saved.get('outcome'))
+            saved.pop('threadID')
+            worker_module.write(checkpoint, saved)
+            worker_module.write(self.job/'answer.json', {'answer': answer, 'clarification': {
+                'question': question, 'options': clarification['options'],
+            }})
+
+        code, events = self.run_worker()
+        self.assertEqual(code, 0, events)
+        self.assertEqual(self.result(events)['shaderID'], 'alpha')
+        calls = [call for call in self.invocations() if 'workspace-write' in call['args']]
+        self.assertEqual(len(calls), 3)
+        for call, (question, answer) in zip(calls[1:], answers):
+            self.assertNotIn('resume', call['args'])
+            prompt = json.loads('{' + call['prompt'].split('\n{', 1)[1])
+            self.assertEqual(prompt['answer'], answer)
+            self.assertEqual(prompt['clarification'], {'question': question, 'options': ['Edit', 'Create']})
+
+    def test_malformed_implementation_replies_keep_edits_and_last_completed_outcome(self):
+        import textwrap
+
+        self.request['prompt'] = 'new'
+        self.save_request()
+        previous = {'status': 'completed', 'outputKind': 'new', 'shaderID': 'gamma', 'summary': 'Earlier candidate'}
+        worker_module.write(self.job/'checkpoint.json', {'outcome': previous})
+        self.codex.write_text(CODEX.replace(
+            "        Path('shaders/gamma').mkdir(exist_ok=True)",
+            textwrap.indent(textwrap.dedent('''\
+                if count > 1:
+                    context = json.loads('{' + prompt.split('\\n{', 1)[1])
+                    assert context['previousOutput']['summary'] == 'Earlier candidate'
+                    assert 'Codex implementation reply' in context['verificationRepair']['diagnostic']
+                    assert Path('shaders/gamma/body.metal').read_bytes() == b'NEW\\n'
+                    assert json.loads(Path('shaders/gamma/metadata.json').read_text())['id'] == 'gamma'
+                    assert 'gamma' in json.loads(Path('index.json').read_text())['shaders']
+                Path('shaders/gamma').mkdir(exist_ok=True)
+            '''), '        ').rstrip()).replace(
+                "    print(json.dumps({'type':'thread.started'",
+                "    invalid = [[], None, 'not an object', {'status': 'unknown'}]\n"
+                "    assert count <= 5\n"
+                "    if count <= len(invalid): output = invalid[count - 1]\n"
+                "    print(json.dumps({'type':'thread.started'"))
+
+        code, events = self.run_worker()
+
+        self.assertEqual(code, 0, events)
+        self.assertEqual((self.job/'implementation-count').read_text(), '5')
+        self.assertEqual(self.result(events)['shaderID'], 'gamma')
+        self.assertEqual(self.git(self.root, 'show', 'origin/main:shaders/gamma/body.metal'), 'NEW\n')
+        self.assertEqual(sum('Repairing shader defect: The Codex implementation reply' in e.get('text', '') for e in events), 4)
 
     def test_compilation_failure_repairs_and_keeps_attempt_evidence(self):
         self.request['prompt']='repair';self.save_request();code,events=self.run_worker();self.assertEqual(code,0,events)
@@ -603,10 +675,11 @@ Path(sys.argv[3]).write_bytes"""
         self.request['prompt'] = 'new'
         self.save_request()
         self.git(self.root, 'config', 'core.filemode', 'true')
+        self.git(self.root, 'config', 'apply.whitespace', 'error')
         self.codex.write_text(CODEX.replace(
             "        Path('shaders/gamma/body.metal').write_text('NEW\\n')",
             "        assert count == 1\n"
-            "        Path('shaders/gamma/body.metal').write_text('NEW\\n')\n"
+            "        Path('shaders/gamma/body.metal').write_text('NEW   \\n')\n"
             "        Path('shaders/gamma/body.metal').chmod(0o755)"))
         worker = worker_module.Worker(self.config, self.job)
         stage = worker.stage_candidate
@@ -641,6 +714,7 @@ Path(sys.argv[3]).write_bytes"""
         self.assertEqual(observed, [verified])
         self.assertEqual((self.job/'implementation-count').read_text(), '1')
         self.assertEqual(self.git(self.root, 'ls-tree', 'origin/main', '--', body).split()[0], '100755')
+        self.assertEqual(self.git(self.root, 'show', f'origin/main:{body}'), 'NEW   \n')
 
     def test_restore_reports_a_mode_only_collision_and_accepts_byte_only_checkpoints(self):
         worker = self.ignored_worker()
@@ -1426,21 +1500,52 @@ Path(sys.argv[3]).write_bytes"""
     def test_saved_patch_ignores_user_diff_settings(self):
         worker = self.ignored_worker()
         candidate = self.root/'shaders/alpha/body.metal'
-        candidate.write_text('CANDIDATE\n')
+        baseline = b'a\nb\nc\nd\ne\nf\ng\n'
+        candidate.write_bytes(baseline)
+        self.git(self.root, 'commit', '-am', 'Give the edit surrounding context')
+        self.git(self.root, 'push', 'origin', 'main')
+        worker.save(base=self.git(self.root, 'rev-parse', 'HEAD').strip())
+        replacement = baseline.replace(b'd\n', b'CANDIDATE   \n')
+        candidate.write_bytes(replacement)
         driver = self.base/'external-diff'
         driver.write_text('#!/bin/sh\nprintf "external driver output\\n"\n')
         driver.chmod(0o755)
         self.git(self.root, 'config', 'diff.external', str(driver))
         self.git(self.root, 'config', 'diff.noprefix', 'true')
         self.git(self.root, 'config', 'color.ui', 'always')
+        self.git(self.root, 'config', 'diff.context', '0')
         before = worker.fingerprint()
-        worker.park()
-        saved, _ = worker.read_candidate_checkpoint()
-        self.assertTrue(saved.startswith(b'diff --git a/shaders/alpha/body.metal b/shaders/alpha/body.metal'))
-        worker.synchronize()
-        self.assertEqual(candidate.read_text(), 'CANDIDATE\n')
-        self.assertEqual(worker.fingerprint(), before)
-        self.assertFalse((self.job/'restore-conflicts.json').exists())
+        for whitespace in ('fix', 'error'):
+            with self.subTest(whitespace=whitespace):
+                self.git(self.root, 'config', 'apply.whitespace', whitespace)
+                worker.park()
+                saved, _ = worker.read_candidate_checkpoint()
+                self.assertTrue(saved.startswith(b'diff --git a/shaders/alpha/body.metal b/shaders/alpha/body.metal'))
+                self.assertIn(b'@@ -1,7 +1,7 @@', saved)
+                worker.synchronize()
+                self.assertEqual(candidate.read_bytes(), replacement)
+                self.assertEqual(worker.fingerprint(), before)
+                self.assertFalse((self.job/'restore-conflicts.json').exists())
+
+    def test_legacy_zero_context_patch_failure_retains_exact_conflict_evidence(self):
+        worker = self.ignored_worker()
+        candidate = self.root/'shaders/alpha/body.metal'
+        candidate.write_bytes(b'a\nb\nc\nd\ne\nf\ng\n')
+        self.git(self.root, 'commit', '-am', 'Give the legacy edit surrounding context')
+        worker.save(base=self.git(self.root, 'rev-parse', 'HEAD').strip())
+        candidate.write_bytes(b'a\nb\nc\nCHANGED\ne\nf\ng\n')
+        original = worker.git('diff', '--binary', '--unified=0', 'HEAD', raw=True)
+        (self.job/'changes.patch').write_bytes(original)
+        worker.clean()
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(worker.restore_patch())
+
+        conflict = worker.restore_conflicts(None)[worker_module.TRACKED_PATCH_CONFLICT]
+        evidence = json.loads(Path(conflict['evidenceFile']).read_text())
+        self.assertEqual(base64.b64decode(evidence['patch']), original)
+        self.assertEqual((self.job/'changes.patch').read_bytes(), original)
+        self.assertEqual(candidate.read_bytes(), b'a\nb\nc\nd\ne\nf\ng\n')
 
     def test_custom_conflict_markers_and_moved_head_are_rejected_before_index_changes(self):
         worker = self.ignored_worker()
@@ -1464,6 +1569,52 @@ Path(sys.argv[3]).write_bytes"""
         candidate.write_text('/*\n===========\n========================================\n*/\n')
         worker.accept_restore_resolution(outcome, conflicts)
         self.assertEqual(self.git(self.root, 'ls-files', '--stage'), before)
+
+    def test_tracked_conflict_marker_widths_accumulate_and_survive_attribute_changes(self):
+        worker = self.ignored_worker()
+        name = 'shaders/alpha/body.metal'
+        candidate = self.root/name
+        candidate.write_text('CANDIDATE\n')
+        worker.park()
+        attributes = self.root/'.gitattributes'
+        conflicted_contents = []
+
+        for widths in ([7], [7, 11]):
+            width = widths[-1]
+            if width != 7:
+                attributes.write_text(f'{name} conflict-marker-size={width}\n')
+            candidate.write_text(f'UPSTREAM {width}\n')
+            self.git(self.root, 'add', '--all')
+            self.git(self.root, 'commit', '-m', f'Change upstream body with marker width {width}')
+            worker.save(base=self.git(self.root, 'rev-parse', 'HEAD').strip())
+            worker.mark_checkout(parked=True)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(worker.restore_owned_patch())
+            self.assertEqual(worker.restore_conflicts(None)[name]['markerWidths'], widths)
+            conflicted_contents.append(candidate.read_bytes())
+            self.assertTrue(conflicted_contents[-1].startswith(b'<' * width + b' '))
+            worker.clean()
+
+        attributes.write_text(f'{name} conflict-marker-size=13\n')
+        self.git(self.root, 'add', '.gitattributes')
+        self.git(self.root, 'commit', '-m', 'Change marker width again before recovery')
+        restarted = worker_module.Worker(self.config, self.job)
+        restarted.request = self.request
+        restarted.save(base=self.git(self.root, 'rev-parse', 'HEAD').strip())
+        conflicts = restarted.restore_conflicts(None)
+        outcome = {'outputKind': 'edited', 'shaderID': 'alpha', 'resolvedRestoreConflicts': [name]}
+        for contents in conflicted_contents:
+            candidate.write_bytes(contents)
+            self.assertFalse(restarted.unmerged_paths())
+            with self.assertRaisesRegex(worker_module.CandidateError, 'Remove merge conflict markers'):
+                restarted.accept_restore_resolution(outcome, conflicts)
+
+        conflicts[name].pop('markerWidths')
+        candidate.write_bytes(b'>>>>>>>>>>> theirs\n')
+        with self.assertRaisesRegex(worker_module.CandidateError, 'Remove merge conflict markers'):
+            restarted.accept_restore_resolution(outcome, conflicts)
+        candidate.write_text('/*\n=======\n===========\n========================================\n*/\n')
+        restarted.accept_restore_resolution(outcome, conflicts)
 
     def test_large_cleanup_inventory_keeps_owner_small_and_checkpoint_survives_reset(self):
         worker = self.ignored_worker()

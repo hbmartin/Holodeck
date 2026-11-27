@@ -1275,6 +1275,12 @@ final class ShaderRequestTests: XCTestCase {
         try await service.retryReconciliation()
         let recovered = await service.allJobs().first; XCTAssertEqual(recovered?.stage, .awaitingClarification)
         XCTAssertFalse(RequestProcessIdentity.evidenceExists(answer))
+        _ = try await service.control(operation: "requestAnswer", payload: .init(requestID: request.id, answer: "A"), deviceID: "TV")
+        let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: answer)) as? [String: Any])
+        XCTAssertEqual(saved["answer"] as? String, "A")
+        let clarification = try XCTUnwrap(saved["clarification"] as? [String: Any])
+        XCTAssertEqual(clarification["question"] as? String, "Choose")
+        XCTAssertEqual(clarification["options"] as? [String], ["A", "B"])
     }
 
     func testDirectPayloadWriteFaultClosesTheSameServiceGate() async throws {
