@@ -22,6 +22,9 @@ import time
 SHADER_ID_PATTERN = r"[a-z0-9]+(?:-[a-z0-9]+)*"
 TECHNICAL_PHASES = {"compile": "--compile", "gpu": "--gpu-only"}
 SAMPLE_TIMES = (0, 3, 10)
+CANDIDATE_CHECKPOINT = "candidate-checkpoint.json"
+PREVIOUS_CANDIDATE_CHECKPOINT = "candidate-checkpoint.previous.json"
+CONFLICT_MARKER = re.compile(rb"(?m)^(?:<{7,}|={7,}|>{7,}|\|{7,})(?: [^\r\n]*)?\r?$")
 
 
 class CandidateError(RuntimeError):
@@ -62,6 +65,14 @@ class VerificationError(CandidateError):
         self.phase = phase
 
 
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def write(path, value, *, durable=False):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,11 +84,7 @@ def write(path, value, *, durable=False):
             os.fsync(stream.fileno())
     temporary.replace(path)
     if durable:
-        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        sync_directory(path.parent)
 
 
 def emit(event, **data):
@@ -88,6 +95,10 @@ def digest(value):
     if isinstance(value, str):
         value = value.encode()
     return hashlib.sha256(value).hexdigest()
+
+
+def git_file_mode(mode):
+    return "100755" if mode & stat.S_IXUSR else "100644"
 
 
 def run(args, cwd, env=None, timeout=600, check=True, input=None):
@@ -185,17 +196,22 @@ class Worker:
                 hasher = hashlib.sha256()
                 for chunk in iter(lambda: source.read(65536), b""):
                     hasher.update(chunk)
-                return {"mode": "100755" if info.st_mode & stat.S_IXUSR else "100644", "hash": hasher.hexdigest()}
+                return {"mode": git_file_mode(info.st_mode), "hash": hasher.hexdigest()}
 
     def read_workspace(self, name, limit=2097152):
+        data, _ = self.read_workspace_with_mode(name, limit)
+        return data
+
+    def read_workspace_with_mode(self, name, limit):
         with self.workspace_parent(name) as (parent, leaf):
             fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             with os.fdopen(fd, 'rb') as source:
-                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                mode = os.fstat(source.fileno()).st_mode
+                if not stat.S_ISREG(mode):
                     raise WorkspaceTypeError('Publication input must be a regular file: ' + name)
                 data = source.read() if limit is None else source.read(limit + 1)
                 if limit is not None and len(data) > limit: raise CandidateError('Publication input exceeds size limit: ' + name)
-                return data
+                return data, git_file_mode(mode)
 
     def quarantine_obstructions(self, names, *, move=True):
         quarantine = self.gitdir / 'holodeck-recovery' / self.directory.name
@@ -406,25 +422,44 @@ class Worker:
         self.clean()
 
     def save_patch(self):
-        self.reclaim_palette_temp()
-        untracked = self.untracked_paths()
-        changed = untracked | self.raw_workspace_changes()
-        invalid = self.quarantine_obstructions(changed, move=False)
-        # A quarantined tracked path is restored from the base, not checkpointed as a deletion.
-        exclusions = [":(exclude,literal)" + name for name in sorted(invalid)]
-        patch = self.git("diff", "--binary", self.checkpoint["base"], "--", *exclusions, raw=True)
-        files = {name: base64.b64encode(self.read_workspace(name, limit=None)).decode()
-                 for name in sorted(untracked) if not any(name == path or name.startswith(path + "/") for path in invalid)}
-        write(self.directory / "candidate-checkpoint.json",
-              {"patch": base64.b64encode(patch).decode(), "untracked": files}, durable=True)
-        if invalid:
-            diagnostic = ("Quarantined invalid workspace entries: " + ", ".join(sorted(invalid)))[:12000]
-            emit("log", text=diagnostic)
-            self.save(scopeRecovery=diagnostic, durable=True)
+        try:
+            self.reclaim_palette_temp()
+            untracked = self.untracked_paths()
+            changed = untracked | self.raw_workspace_changes()
+            invalid = self.quarantine_obstructions(changed, move=False)
+            # A quarantined tracked path is restored from the base, not checkpointed as a deletion.
+            exclusions = [":(exclude,literal)" + name for name in sorted(invalid)]
+            patch = self.git("diff", "--binary", self.checkpoint["base"], "--", *exclusions, raw=True)
+            files = {}
+            for name in sorted(untracked):
+                if any(name == path or name.startswith(path + "/") for path in invalid):
+                    continue
+                data, mode = self.read_workspace_with_mode(name, limit=None)
+                files[name] = {"data": base64.b64encode(data).decode(), "mode": mode}
+            self.write_candidate_checkpoint({"patch": base64.b64encode(patch).decode(), "untracked": files})
+            if invalid:
+                diagnostic = ("Quarantined invalid workspace entries: " + ", ".join(sorted(invalid)))[:12000]
+                emit("log", text=diagnostic)
+                self.save(scopeRecovery=diagnostic, durable=True)
+        except OSError as error:
+            raise CleanupError(f"Cannot save the candidate checkpoint. Live checkout edits were preserved: {error}") from error
         return bool(invalid)
 
+    def write_candidate_checkpoint(self, snapshot):
+        path = self.directory / CANDIDATE_CHECKPOINT
+        previous = self.directory / PREVIOUS_CANDIDATE_CHECKPOINT
+        if path.exists() and not previous.exists():
+            os.link(path, previous, follow_symlinks=False)
+        if previous.exists():
+            # Keep the prior snapshot reachable even if syncing the replacement fails.
+            sync_directory(self.directory)
+        write(path, snapshot, durable=True)
+        previous.unlink(missing_ok=True)
+
     def read_candidate_checkpoint(self):
-        checkpoint = self.read_record(self.directory / "candidate-checkpoint.json")
+        checkpoint = self.read_record(self.directory / CANDIDATE_CHECKPOINT)
+        if checkpoint is None:
+            checkpoint = self.read_record(self.directory / PREVIOUS_CANDIDATE_CHECKPOINT)
         if checkpoint is None:
             patch_path = self.directory / "changes.patch"
             patch = patch_path.read_bytes() if patch_path.exists() else b""
@@ -434,10 +469,26 @@ class Worker:
             files = checkpoint["untracked"]
             if not isinstance(files, dict) or any(not self.safe_path(name) for name in files):
                 raise ValueError("invalid untracked paths")
-            return (base64.b64decode(checkpoint["patch"], validate=True),
-                    {name: base64.b64decode(data, validate=True) for name, data in files.items()})
+            additions = {}
+            for name, entry in files.items():
+                if isinstance(entry, str):
+                    data, mode = entry, None
+                else:
+                    data, mode = entry["data"], entry["mode"]
+                    if mode not in ("100644", "100755"):
+                        raise ValueError("invalid Git mode for " + name)
+                additions[name] = base64.b64decode(data, validate=True), mode
+            return base64.b64decode(checkpoint["patch"], validate=True), additions
         except (KeyError, TypeError, ValueError) as error:
             raise CleanupError(f"Invalid candidate checkpoint: {error}") from error
+
+    def restore_conflicts(self, published_id):
+        active = self.read_record(self.directory / "restore-conflicts.json") or {}
+        if published_id is not None:
+            for entry in active.values():
+                if entry.get("retainedShaderID") == published_id:
+                    entry.pop("retainedShaderID")
+        return active
 
     def record_restore_conflicts(self, conflicts, patch):
         if not conflicts:
@@ -445,13 +496,14 @@ class Worker:
         # Store evidence separately from the live checkpoint. Saving the next
         # candidate must never overwrite the only copy of a colliding addition.
         record = self.directory / "restore-conflicts.json"
-        active = self.read_record(record) or {}
+        published_id = (self.previous_publication() or {}).get("shaderID")
+        active = self.restore_conflicts(published_id)
         payload = {"files": conflicts, "patch": base64.b64encode(patch).decode()}
         evidence = self.directory / "restore-evidence" / (digest(json.dumps(payload, sort_keys=True)) + ".json")
         write(evidence, payload, durable=True)
         output = self.checkpoint.get("outcome") or {}
         new_id = output.get("shaderID") if output.get("outputKind") == "new" else None
-        occupied_id = new_id if new_id and new_id in self.baseline_ids() else None
+        occupied_id = new_id if new_id and new_id != published_id and new_id in self.baseline_ids() else None
         for name, detail in conflicts.items():
             entry = {"path": name, "diagnostic": detail["diagnostic"], "evidenceFile": str(evidence)}
             if occupied_id and name.startswith(f"shaders/{occupied_id}/"):
@@ -474,23 +526,29 @@ class Worker:
                 names = self.git("diff", "--name-only", "--diff-filter=U", "-z").split("\0")
                 for name in list(filter(None, names)) or ["(tracked patch)"]:
                     conflicts[name] = {"diagnostic": message}
-        for name, data in untracked.items():
+        for name, (data, mode) in untracked.items():
             try:
                 with self.workspace_parent(name, create=True) as (parent, leaf):
                     fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent)
                     with os.fdopen(fd, "wb") as target:
                         target.write(data)
+                        if mode == "100755":
+                            mode_bits = stat.S_IMODE(os.fstat(target.fileno()).st_mode)
+                            os.fchmod(target.fileno(), mode_bits | stat.S_IXUSR)
             except OSError as error:
                 if error.errno not in (errno.EEXIST, errno.ENOTDIR, errno.ELOOP):
-                    raise
+                    raise CleanupError(f"Cannot restore candidate file {name}: {error}") from error
                 try:
-                    if self.read_workspace(name, limit=None) == data:
+                    existing_data, existing_mode = self.read_workspace_with_mode(name, limit=None)
+                    if existing_data == data and (mode is None or mode == existing_mode):
                         continue
                 except (OSError, WorkspaceTypeError):
                     pass
                 message = "Reapplying checkpoint encountered an existing path: " + name
                 emit("log", text=message)
                 conflicts[name] = {"diagnostic": message, "candidate": base64.b64encode(data).decode()}
+                if mode is not None:
+                    conflicts[name]["candidateMode"] = mode
         self.record_restore_conflicts(conflicts, patch)
         return bool(conflicts)
 
@@ -501,6 +559,30 @@ class Worker:
             self.save(verificationRepair={**repair, "restoreConflict": True}, durable=True)
         self.mark_checkout(parked=False)
         return conflicted
+
+    def accept_restore_resolution(self, outcome, conflicts):
+        if set(outcome.get("resolvedRestoreConflicts", [])) != set(conflicts):
+            raise CandidateError("Account for every restored conflict before proceeding")
+        retained = {entry["retainedShaderID"] for entry in conflicts.values() if "retainedShaderID" in entry}
+        if retained and (outcome["outputKind"] != "new" or outcome["shaderID"] in retained):
+            raise CandidateError("Preserve the upstream shader and recreate the candidate under an unused ID")
+        unmerged = set(filter(None, self.git("diff", "--name-only", "--diff-filter=U", "-z").split("\0")))
+        if unmerged - conflicts.keys():
+            raise CandidateError("Resolve all merge conflicts")
+        for name in sorted(unmerged):
+            try:
+                data = self.read_workspace(name, limit=None)
+            except (OSError, WorkspaceTypeError) as error:
+                if isinstance(error, OSError) and error.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+                    raise CleanupError(f"Cannot read the resolved candidate file {name}: {error}") from error
+                raise CandidateError("Restore a regular file before resolving the merge conflict: " + name) from error
+            if CONFLICT_MARKER.search(data):
+                raise CandidateError("Remove merge conflict markers from " + name)
+        if unmerged:
+            # Only the worker may change Git state. Reset the index entries to
+            # the upstream versions and leave the reconciled worktree bytes for scope and verification.
+            paths = [":(literal)" + name for name in sorted(unmerged)]
+            self.git("reset", "--quiet", self.checkpoint["base"], "--", *paths)
 
     def prepare_baseline(self):
         self.check_checkout_inputs()
@@ -542,13 +624,17 @@ class Worker:
         self.restore_owned_patch()
 
     def clear_candidate_checkpoint(self):
-        for name in ("candidate-checkpoint.json", "changes.patch", "untracked.json",
+        for name in (CANDIDATE_CHECKPOINT, PREVIOUS_CANDIDATE_CHECKPOINT, "changes.patch", "untracked.json",
                      "restore-conflicts.json", "baseline-directories.json"):
-            (self.directory / name).unlink(missing_ok=True)
+            path = self.directory / name
+            path.unlink(missing_ok=True)
+            if path.suffix == ".json":
+                path.with_suffix(".json.tmp").unlink(missing_ok=True)
         evidence = self.directory / "restore-evidence"
         if evidence.is_dir():
-            for path in evidence.glob("*.json"):
-                path.unlink()
+            for pattern in ("*.json", "*.json.tmp"):
+                for path in evidence.glob(pattern):
+                    path.unlink(missing_ok=True)
             evidence.rmdir()
 
     def discard(self):
@@ -696,11 +782,24 @@ class Worker:
         return response
 
     def finish_publication(self, response):
-        write(self.directory / "worker-result.json", response)
-        self.owner.unlink(missing_ok=True)
-        self.clear_candidate_checkpoint()
-        (self.directory / "repair.json").unlink(missing_ok=True)
+        try:
+            write(self.directory / "worker-result.json", response, durable=True)
+            self.retire_published_candidate()
+            (self.directory / "repair.json").unlink(missing_ok=True)
+        except OSError as error:
+            raise CleanupError(f"Cannot finalize the saved publication: {error}") from error
         emit("result", result=response)
+
+    def retire_published_candidate(self):
+        owner = self.owned_record()
+        try:
+            self.clear_candidate_checkpoint()
+            sync_directory(self.directory)
+            if owner is not None:
+                self.owner.unlink(missing_ok=True)
+                sync_directory(self.gitdir)
+        except OSError as error:
+            raise CleanupError(f"Cannot retire the published candidate checkpoint: {error}") from error
 
     def fingerprint(self):
         value = self.git("diff", "--binary", self.checkpoint["base"], raw=True)
@@ -980,7 +1079,10 @@ class Worker:
         if conflicts:
             action = """Reconcile the saved Holodeck candidate with the current checkout. Inspect every restoreConflicts entry.
 The checkout contains upstream files. The evidence JSON contains candidate additions as base64 in files[path].candidate and the saved tracked diff as base64 in patch.
-If upstream took the ID of a newly authored shader, preserve the upstream shader and recreate the candidate under one fresh ID. Reconcile index and attribution records with upstream.
+Use files[path].candidateMode when present to reproduce the candidate's Git executable bit.
+If a conflict lists retainedShaderID, preserve the upstream shader and recreate the unpublished candidate under one fresh ID.
+If this request already published the existing activation output, retain its ID and reconcile the repair with upstream edits to that shader.
+Reconcile index and attribution records with upstream.
 Resolve every listed conflict and include its path in resolvedRestoreConflicts when returning a completed candidate.
 """
         elif verification_repair or self.checkpoint.get("scopeRecovery"):
@@ -1305,6 +1407,8 @@ An unchanged existing shader may be successful if it already satisfies the promp
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
             ready = self.directory / "worker-result.json"
             if ready.exists() and not (self.directory / "repair.json").exists():
+                if self.owner.exists() and self.owned_record() is None:
+                    raise CleanupError("Another interrupted request owns this checkout; recover it first")
                 result = json.loads(ready.read_text())
                 self.git("fetch", "origin", "main")
                 if self.git("status", "--porcelain").strip():
@@ -1315,6 +1419,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
                 self.check_checkout_inputs()
                 self.verify_commit("origin/main", self.candidate_manifest())
                 self.prepare_publication()
+                self.retire_published_candidate()
                 emit("result", result=result)
                 return
             # Crash/lost-ack recovery: adopt an already-pushed request commit before reapplying any patch.
@@ -1341,6 +1446,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
                 if self.owned_record() is not None and self.git("rev-parse", "HEAD").strip() == sha:
                     self.park_checkpoint()
             self.synchronize()
+            published_id = (self.previous_publication() or {}).get("shaderID")
             schema = {"type": "object", "properties": {"status": {"type": "string", "enum": ["completed", "needsClarification"]},
                       "outputKind": {"type": "string", "enum": ["new", "edited"]}, "shaderID": {"type": "string"},
                       "changed": {"type": "boolean"}, "summary": {"type": "string"},
@@ -1353,7 +1459,7 @@ An unchanged existing shader may be successful if it already satisfies the promp
                 if repair and repair["attemptID"] != self.checkpoint["attemptID"]:
                     repair = None
                 verified = self.checkpoint.get("verifiedCandidate") or {}
-                conflicts = self.read_record(self.directory / "restore-conflicts.json") or {}
+                conflicts = self.restore_conflicts(published_id)
                 unclassified_on_new_base = repair and repair.get("pending")
                 reverify = not conflicts and not self.checkpoint.get("scopeRecovery") and (
                     verified.get("attemptID") == self.checkpoint["attemptID"] or unclassified_on_new_base)
@@ -1376,18 +1482,15 @@ An unchanged existing shader may be successful if it already satisfies the promp
                     feedback = ""
                 phase = "scope"
                 try:
-                    self.scope()
                     if outcome["status"] == "needsClarification":
+                        self.scope()
                         self.park()
                         emit("clarification", question=outcome["question"], options=outcome["options"])
                         return
+                    if conflicts:
+                        self.accept_restore_resolution(outcome, conflicts)
                     self.scope(outcome)
                     if conflicts:
-                        if set(outcome.get("resolvedRestoreConflicts", [])) != set(conflicts):
-                            raise CandidateError("Account for every restored conflict before proceeding")
-                        retained = {entry["retainedShaderID"] for entry in conflicts.values() if "retainedShaderID" in entry}
-                        if retained and (outcome["outputKind"] != "new" or outcome["shaderID"] in retained):
-                            raise CandidateError("Preserve the upstream shader and recreate the candidate under an unused ID")
                         self.save_patch()
                         (self.directory / "restore-conflicts.json").unlink()
                     if self.checkpoint.get("scopeRecovery"):
