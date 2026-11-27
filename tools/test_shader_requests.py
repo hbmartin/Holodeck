@@ -924,6 +924,27 @@ Path(sys.argv[3]).write_bytes"""
         self.assertTrue(ignored.is_dir())
         self.assertTrue(preserved.is_dir())
 
+    def test_cleanup_preserves_target_file_with_different_case(self):
+        worker = self.ignored_worker()
+        if not (self.root/'shaders/ALPHA/body.metal').exists():
+            self.skipTest('Requires a case-insensitive checkout')
+        remote = self.base/'upstream'
+        self.git(self.base, 'clone', '-b', 'main', self.remote, remote)
+        up_dir = remote/'shaders/gamma'; up_dir.mkdir()
+        (up_dir/'body.metal').write_text('UPSTREAM\n')
+        self.git(remote, 'add', '--all')
+        self.git(remote, '-c', 'user.name=Upstream', '-c', 'user.email=upstream@example.invalid',
+                 'commit', '-m', 'Track lowercase shader')
+        self.git(remote, 'push', 'origin', 'main')
+        self.git(self.root, 'fetch', 'origin', 'main')
+        local = self.root/'shaders/GAMMA'; local.mkdir()
+        (local/'body.metal').write_text('LOCAL\n')
+
+        worker.clean(revision=self.git(self.root, 'rev-parse', 'origin/main').strip())
+
+        self.assertEqual((self.root/'shaders/gamma/body.metal').read_text(), 'UPSTREAM\n')
+        self.assertFalse(self.git(self.root, 'status', '--porcelain'))
+
     def test_malformed_cleanup_record_fails_before_reset(self):
         worker = self.ignored_worker()
         candidate = self.root/'shaders/alpha/body.metal'; candidate.write_text('KEEP\n')

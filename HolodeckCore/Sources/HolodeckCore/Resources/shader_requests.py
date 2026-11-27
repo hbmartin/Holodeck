@@ -14,6 +14,7 @@ import sys
 import re
 import stat
 import struct
+import unicodedata
 import uuid
 import time
 
@@ -131,7 +132,10 @@ class Worker:
         if config.get("checkoutID") and (not self.checkout_identity.exists() or self.checkout_identity.read_text().strip() != config["checkoutID"]):
             raise OperationalError("Selected checkout identity does not match the request journal")
         self.object_format = self.git("rev-parse", "--show-object-format").strip()
-        self.file_mode = self.git("config", "--bool", "core.fileMode", check=False).stdout.strip() != "false"
+        checkout_config = self.git("config", "--type=bool", "--get-regexp", r"^core\.(filemode|ignorecase)$", check=False)
+        values = dict(line.split(maxsplit=1) for line in checkout_config.stdout.splitlines())
+        self.file_mode = values.get("core.filemode") != "false"
+        self.ignore_case = values.get("core.ignorecase") == "true"
 
     def git(self, *args, check=True, raw=False, input=None):
         result = managed_run([*self.git_arguments, *args], self.root, self.env, timeout=60, input=input, text=not raw)
@@ -307,6 +311,10 @@ class Worker:
             directories -= {os.fsdecode(name).rstrip("/") for name in result.stdout.split(b"\0") if name}
         return directories
 
+    def checkout_path_key(self, path):
+        canonical = unicodedata.normalize("NFC", path)
+        return canonical.casefold() if self.ignore_case else canonical
+
     def reclaim_palette_temp(self):
         journal = self.directory / "palette-temp.json"
         record = self.read_record(journal)
@@ -361,13 +369,18 @@ class Worker:
         self.git("checkout-index", "--all", "--force", "--index")
         tracked = set(filter(None, self.git("ls-files", "-z").split("\0")))
         tracked_directories = {parent.as_posix() for name in tracked for parent in Path(name).parents}
-        for name in sorted(others - tracked - tracked_directories):
+        protected = {self.checkout_path_key(name) for name in tracked | tracked_directories}
+        for name in sorted(others):
+            if self.checkout_path_key(name) in protected:
+                continue
             try:
                 with self.workspace_parent(name) as (parent, leaf):
                     os.unlink(leaf, dir_fd=parent)
             except (FileNotFoundError, NotADirectoryError):
                 pass
-        for name in sorted(directories - tracked - tracked_directories, key=lambda name: (-name.count("/"), name)):
+        for name in sorted(directories, key=lambda name: (-name.count("/"), name)):
+            if self.checkout_path_key(name) in protected:
+                continue
             try:
                 with self.workspace_parent(name) as (parent, leaf):
                     os.rmdir(leaf, dir_fd=parent)
