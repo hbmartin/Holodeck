@@ -275,8 +275,8 @@ import XCTest
     func testAbortedPassKeepsStoppingErrorAtDiagnosticCapacity() {
         let ticket = TrustedDepartureRecoveryKey(authority: UUID(), ticket: UUID())
         let prior = (1...12).map { "Prior failure \($0)" }
-        let failure = TrustedPartialRecovery(completedServices: [], remaining: prior,
-            attemptedDepartures: [ticket], abortedPass: .init(error: POSIXError(.EBUSY), evaluatedAttempts: []))
+        let failure = TrustedPartialRecovery(completedServices: [], otherFailures: prior,
+            attemptedDepartures: [ticket], abortedPasses: [.init(error: POSIXError(.EBUSY), evaluatedAttempts: [])])
         XCTAssertEqual(failure.remaining, [POSIXError(.EBUSY).localizedDescription] + Array(prior.prefix(8)))
         XCTAssertEqual(failure.attemptedDepartures, [ticket])
         XCTAssertFalse(failure.localizedDescription.contains("completed phases were committed"))
@@ -294,8 +294,8 @@ import XCTest
                     let validated = await service.validateTrustedRecovery(local)
                     XCTAssertFalse(validated.completed)
                 }
-                throw TrustedPartialRecovery(completedServices: [], remaining: [],
-                    abortedPass: .init(error: POSIXError(.EBUSY), evaluatedAttempts: reviewed ? [receipt.attemptID] : []))
+                throw TrustedPartialRecovery(completedServices: [], otherFailures: [],
+                    abortedPasses: [.init(error: POSIXError(.EBUSY), evaluatedAttempts: reviewed ? [receipt.attemptID] : [])])
             })
             do { try await service.retryReconciliation(); XCTFail("Aborted pass reported success") }
             catch let error as TrustedPartialRecovery {
@@ -306,23 +306,63 @@ import XCTest
         }
     }
 
+    func testAbortCountsOnlyAnUnevaluatedReplacementReceiptFromItsPass() async throws {
+        for evaluated in [false, true] {
+            let service = try await fixture()
+            _ = await service.registerRevocationCoordinator(id: UUID(), recovery: { [weak service] local in
+                let service = try XCTUnwrap(service), original = try XCTUnwrap(local.receipt)
+                let authority = UUID(), pass = UUID()
+                let registration = await service.registerRevocationCoordinator(id: authority, {})
+                let binding = TrustedTargetInstallation(serviceID: service.runtimeID, authority: authority,
+                    predecessorAuthority: authority, predecessorRegistration: registration)
+                let fresh = try await service.recoverAfterTrustedBinding(pass: pass, installation: binding)
+                let receipt = try XCTUnwrap(fresh.receipt)
+                XCTAssertTrue(fresh.completed)
+                XCTAssertNotEqual(original.attemptID, receipt.attemptID)
+                await service.finishTrustedRecovery(pass: pass)
+                throw TrustedPartialRecovery(completedServices: [], otherFailures: [],
+                    abortedPasses: [.init(error: POSIXError(.EBUSY), evaluatedAttempts: evaluated ? [receipt.attemptID] : [],
+                                          replacements: [original.attemptID: fresh])])
+            })
+            do { try await service.retryReconciliation(); XCTFail("Aborted pass reported success") }
+            catch let error as TrustedPartialRecovery {
+                XCTAssertEqual(error.completedServices, evaluated ? [] : [service.runtimeID])
+                XCTAssertEqual(error.abortedPasses.count, 1)
+            }
+        }
+    }
+
+    func testOnlyCommittedDeparturesCountAsPartialProgress() {
+        let ticket = TrustedDepartureRecoveryKey(authority: UUID(), ticket: UUID())
+        let attempted = TrustedPartialRecovery(completedServices: [], otherFailures: ["Other recovery failed"],
+            attemptedDepartures: [ticket])
+        let committed = TrustedPartialRecovery(completedServices: [], otherFailures: ["Other recovery failed"],
+            attemptedDepartures: [ticket], committedDepartures: [ticket])
+        XCTAssertFalse(attempted.localizedDescription.contains("completed phases were committed"))
+        XCTAssertTrue(committed.localizedDescription.contains("completed phases were committed"))
+    }
+
     func testIndependentAbortKeepsItsErrorWithoutReversingRequesterExclusion() async throws {
         let service = try await fixture(), authority = UUID()
         let prior = (1...9).map { "Primary pass failure \($0)" }
-        _ = await service.registerRevocationCoordinator(id: UUID(), recovery: { _ in
-            throw TrustedPartialRecovery(completedServices: [], remaining: prior)
+        _ = await service.registerRevocationCoordinator(id: UUID(), recovery: { local in
+            let receipt = try XCTUnwrap(local.receipt)
+            throw TrustedPartialRecovery(completedServices: [], otherFailures: prior,
+                abortedPasses: [.init(error: POSIXError(.EDEADLK), evaluatedAttempts: [receipt.attemptID])])
         })
         let registration = TrustedFailedRegistration(authority: authority, generation: 1, server: UUID(), lifetime: .init())
         let ticket = TrustedDepartureRecoveryKey(authority: authority, ticket: UUID())
         await service.rememberFailedRegistration(registration, error: POSIXError(.EIO)) { local in
             XCTAssertTrue(local.completed)
-            throw TrustedPartialRecovery(completedServices: [], remaining: [],
-                attemptedDepartures: [ticket], abortedPass: .init(error: POSIXError(.EBUSY), evaluatedAttempts: []))
+            throw TrustedPartialRecovery(completedServices: [], otherFailures: [],
+                attemptedDepartures: [ticket], abortedPasses: [.init(error: POSIXError(.EBUSY), evaluatedAttempts: [])])
         }
         do { try await service.retryReconciliation(); XCTFail("Independent abort reported success") }
         catch let error as TrustedPartialRecovery {
             XCTAssertTrue(error.completedServices.isEmpty)
-            XCTAssertEqual(error.remaining, [POSIXError(.EBUSY).localizedDescription] + Array(prior.prefix(8)))
+            XCTAssertEqual(error.remaining, [POSIXError(.EDEADLK).localizedDescription,
+                                             POSIXError(.EBUSY).localizedDescription] + Array(prior.prefix(7)))
+            XCTAssertEqual(error.abortedPasses.count, 2)
             XCTAssertEqual(error.attemptedDepartures, [ticket])
         }
     }
@@ -402,7 +442,7 @@ import XCTest
     func testRequesterDoesNotReintroduceExcludedTrustedCompletion() async throws {
         let a = try await fixture()
         _ = await a.registerRevocationCoordinator(id: UUID(), recovery: { _ in
-            throw TrustedPartialRecovery(completedServices: [], remaining: ["The requester epoch was superseded."])
+            throw TrustedPartialRecovery(completedServices: [], otherFailures: ["The requester epoch was superseded."])
         })
         do { try await a.retryReconciliation(); XCTFail("Partial result ignored") }
         catch let error as TrustedPartialRecovery {

@@ -1931,7 +1931,27 @@ private final class OutcomeBackend: @unchecked Sendable {
         try await checkStandaloneRetryBeforeSubmission(repairError: POSIXError(.EIO))
     }
 
-    private func checkStandaloneRetryBeforeSubmission(repairError: POSIXError?) async throws {
+    func testStartDuringStandaloneRetryPreservesItsRepairFailure() async throws {
+        try await checkStandaloneRetryBeforeSubmission(repairError: POSIXError(.EIO), interleave: .start)
+    }
+
+    func testShutdownDropsObsoleteStandaloneRetryFailure() async throws {
+        try await checkStandaloneRetryBeforeSubmission(repairError: POSIXError(.EIO), interleave: .shutdown)
+    }
+
+    func testNewerLocalRegistrationDropsObsoleteStandaloneRetryFailure() async throws {
+        try await checkStandaloneRetryBeforeSubmission(repairError: POSIXError(.EIO), interleave: .replace)
+    }
+
+    func testStandaloneRetryDistinguishesDependencyAndCallerCancellation() async throws {
+        try await checkStandaloneRetryBeforeSubmission(repairError: CancellationError())
+        try await checkStandaloneRetryBeforeSubmission(repairError: POSIXError(.EIO), interleave: .cancel)
+    }
+
+    private enum RetryInterleave { case none, start, shutdown, replace, cancel }
+
+    private func checkStandaloneRetryBeforeSubmission(repairError: (any Error)?,
+                                                       interleave: RetryInterleave = .none) async throws {
         let a = try await fixture(), retirement = RecoveryGate()
         addTeardownBlock { await retirement.release() }
         let authority = TrustedApprovalsCoordinator(read: { nil }, write: { _ in },
@@ -1958,11 +1978,45 @@ private final class OutcomeBackend: @unchecked Sendable {
         addTeardownBlock { retry.cancel(); await retirement.release() }
         try await wait { await retirement.hasEntered }
         let newer = try await authority.register(TrustedOwnerRecorder().owner())
+        var replacementTask: Task<Void, Never>?
+        switch interleave {
+        case .none: break
+        case .start:
+            do { try await server.start(); XCTFail("Start overtook a pending retry") }
+            catch { XCTAssertTrue(error.localizedDescription.contains("handoff is pending")) }
+        case .shutdown: await server.shutdown()
+        case .replace:
+            let replacement = try await fixture()
+            replacementTask = Task { await server.setRequestService(replacement.service) }
+            try await wait { await authority.observation.requestedGeneration > newer.generation }
+        case .cancel: retry.cancel()
+        }
         await retirement.release()
         try await wait { result.value != nil }
         let outcome = try XCTUnwrap(result.value)
 
-        if let repairError {
+        if interleave == .shutdown || interleave == .replace {
+            try outcome.get()
+            let state = await server.currentState
+            XCTAssertNil(state.registrationRetryMessage)
+            await replacementTask?.value
+            return
+        }
+        if interleave == .cancel {
+            do { try outcome.get(); XCTFail("Caller cancellation was lost") }
+            catch is CancellationError {}
+            let state = await server.currentState
+            XCTAssertNil(state.registrationRetryMessage)
+            return
+        }
+        if repairError is CancellationError {
+            do { try outcome.get(); XCTFail("Dependency interruption was lost") }
+            catch is TrustedRegistrationInterrupted {}
+            let state = await server.currentState
+            XCTAssertTrue(state.registrationRetryMessage?.contains("registration preparation was cancelled") == true)
+            return
+        }
+        if let repairError = repairError as? POSIXError {
             do { try outcome.get(); XCTFail("Obsolete retry discarded its repair error") }
             catch let error as POSIXError { XCTAssertEqual(error.code, repairError.code) }
         } else {
@@ -2079,6 +2133,34 @@ private final class OutcomeBackend: @unchecked Sendable {
             XCTAssertEqual(error.attemptedDepartures, [.init(authority: authority.id, ticket: departure.id)])
         }
         XCTAssertEqual(attempts.count, 1, "An attempted departure must not re-enter the fallback sweep")
+        let status = await requester.service.recoveryStatuses()
+        XCTAssertTrue(status.contains { $0.id == departure.id })
+    }
+
+    func testIndependentAbortedDestinationDoesNotRetryAnAttemptedDeparture() async throws {
+        let original = try await fixture(), requester = try await fixture(), attempts = OutcomePaths(), abort = OutcomeSwitch()
+        let source = OutcomeBackend().coordinator()
+        let destination = TrustedApprovalsCoordinator(read: { nil }, write: { _ in },
+            beforeRecoverySealing: { if abort.on { throw POSIXError(.EBUSY) } },
+            beforeDepartureRetirementAdmission: { _ in attempts.add("retire"); throw POSIXError(.EIO) })
+        _ = try await accepted(source.register(TrustedOwnerRecorder().owner(service: requester.service)))
+        _ = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: original.service)))
+        let departure = try await destination.prepareDeparture(original.service, ticket: UUID())
+        try departure.activate {}
+        await destination.retainDepartureRecovery(serviceID: original.service.runtimeID, ticket: departure.id)
+        do {
+            _ = try await accepted(destination.register(TrustedOwnerRecorder().owner(service: requester.service)))
+            XCTFail("Unsettled departure accepted")
+        } catch let error as TrustedDepartureRecoveryError { XCTAssertEqual(error.diagnosticID, departure.id) }
+        abort.on = true
+        do { try await requester.service.retryReconciliation(); XCTFail("Aborted departure reported as success") }
+        catch let error as TrustedPartialRecovery {
+            XCTAssertEqual(error.abortedPasses.map(\.stoppingError), [POSIXError(.EBUSY).localizedDescription])
+            XCTAssertTrue(error.remaining.contains { $0.contains(POSIXError(.EIO).localizedDescription) })
+            XCTAssertEqual(error.attemptedDepartures, [.init(authority: destination.id, ticket: departure.id)])
+            XCTAssertTrue(error.committedDepartures.isEmpty)
+        }
+        XCTAssertEqual(attempts.count, 1)
         let status = await requester.service.recoveryStatuses()
         XCTAssertTrue(status.contains { $0.id == departure.id })
     }

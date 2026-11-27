@@ -22,6 +22,7 @@ import XCTest
             try await Task.sleep(for: .milliseconds(5))
         }
     }
+    @discardableResult
     private func completed<Value: Sendable>(_ body: @escaping @MainActor @Sendable () async throws -> Value) async throws -> Value {
         let result = RetirementResult<Value>()
         let task = Task { do { result.value = .success(try await body()) } catch { result.value = .failure(error) } }
