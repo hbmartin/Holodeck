@@ -281,6 +281,10 @@ public actor LocalCatalogServer {
         self.init(catalog: catalog, keychainNamespace: Self.productionNamespace)
     }
 
+    public static func testFlight(catalog: DirectoryCatalog) -> LocalCatalogServer {
+        LocalCatalogServer(catalog: catalog, keychainNamespace: Self.testFlightNamespace)
+    }
+
     public init(catalog: DirectoryCatalog, keychainNamespace: String) {
         self.catalog = catalog; self.allowLoopback = false; self.secretNamespace = keychainNamespace; self.advertise = true
         allowsTestSecretCleanup = false

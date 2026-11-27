@@ -93,7 +93,7 @@ final class MacLibraryModel {
         exposesFailureAssociationTests = testingNamespace != nil && UITestConfiguration(applicationID: "me.haroldmartin.HolodeckMac").hasExplicitStorageSuite && ProcessInfo.processInfo.environment["HOLODECK_UI_TEST_ERROR_ASSOCIATION"] == "1"
         holdsNextReloadForTesting = testingNamespace != nil && UITestConfiguration(applicationID: "me.haroldmartin.HolodeckMac").contains("--ui-test-hold-library-reload")
         #elseif HOLODECK_MAC_TESTFLIGHT
-        server = LocalCatalogServer(catalog: catalog, keychainNamespace: "mac-testflight-library")
+        server = LocalCatalogServer.testFlight(catalog: catalog)
         #else
         server = LocalCatalogServer(catalog: catalog)
         #endif

@@ -25,8 +25,10 @@ SAMPLE_TIMES = (0, 3, 10)
 CANDIDATE_CHECKPOINT = "candidate-checkpoint.json"
 PREVIOUS_CANDIDATE_CHECKPOINT = "candidate-checkpoint.previous.json"
 FINGERPRINT_VERSION = 2
-PATCH_DIFF_OPTIONS = ("--no-ext-diff", "--no-textconv", "--no-color", "--src-prefix=a/", "--dst-prefix=b/")
+PATCH_DIFF_OPTIONS = ("--no-ext-diff", "--no-textconv", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--unified=3")
 TRACKED_PATCH_CONFLICT = "(tracked patch)"
+DEFAULT_CONFLICT_MARKER_WIDTH = 7
+GIT_CONFLICT_LABELS = {b"<": b"ours", b"|": b"base", b">": b"theirs"}
 REVERIFIED_SUMMARY = "Verified again after activation repair; no further source changes were necessary."
 
 
@@ -517,11 +519,17 @@ class Worker:
         new_id = output.get("shaderID") if output.get("outputKind") == "new" else None
         occupied_id = new_id if new_id and new_id != published_id and new_id in self.baseline_ids() else None
         for name, detail in conflicts.items():
+            previous = active.get(name, {})
             entry = {"path": name, "diagnostic": detail["diagnostic"], "evidenceFile": str(evidence)}
             if occupied_id and name.startswith(f"shaders/{occupied_id}/"):
                 entry["retainedShaderID"] = occupied_id
-            elif active.get(name, {}).get("retainedShaderID"):
-                entry["retainedShaderID"] = active[name]["retainedShaderID"]
+            elif previous.get("retainedShaderID"):
+                entry["retainedShaderID"] = previous["retainedShaderID"]
+            widths = self.saved_marker_widths(previous)
+            if "markerWidth" in detail:
+                widths.add(detail["markerWidth"])
+            if widths:
+                entry["markerWidths"] = sorted(widths)
             active[name] = entry
         write(record, active, durable=True)
 
@@ -529,15 +537,19 @@ class Worker:
         patch, untracked = self.read_candidate_checkpoint()
         conflicts = {}
         if patch:
-            result = self.git("apply", "--3way", "-", input=patch, raw=True, check=False)
+            result = self.git("apply", "--3way", "--whitespace=nowarn", "-", input=patch, raw=True, check=False)
             if result.returncode:
                 message = "Reapplying checkpoint requires conflict resolution by Codex."
                 if result.stderr:
                     message += "\n" + result.stderr[-4000:].decode(errors="replace").strip()
                 emit("log", text=message)
-                names = self.git("diff", "--name-only", "--diff-filter=U", "-z").split("\0")
-                for name in list(filter(None, names)) or [TRACKED_PATCH_CONFLICT]:
-                    conflicts[name] = {"diagnostic": message}
+                unmerged = sorted(self.unmerged_paths())
+                widths = self.conflict_marker_widths(unmerged)
+                if unmerged:
+                    for name in unmerged:
+                        conflicts[name] = {"diagnostic": message, "markerWidth": widths.get(name, DEFAULT_CONFLICT_MARKER_WIDTH)}
+                else:
+                    conflicts[TRACKED_PATCH_CONFLICT] = {"diagnostic": message}
         for name, (data, mode) in untracked.items():
             try:
                 with self.workspace_parent(name, create=True) as (parent, leaf):
@@ -579,13 +591,23 @@ class Worker:
         if self.git("rev-parse", "HEAD").strip() != self.checkpoint["base"]:
             raise OperationalError("Codex changed Git state; only the host may commit")
 
-    def check_conflict_markers(self, paths, unmerged):
+    def conflict_marker_widths(self, paths):
         if not paths:
-            return
+            return {}
         path_list = b"".join(os.fsencode(name) + b"\0" for name in paths)
         attributes = self.git("check-attr", "-z", "--stdin", "conflict-marker-size", input=path_list, raw=True).split(b"\0")
-        widths = {os.fsdecode(name): int(value) for name, value in zip(attributes[::3], attributes[2::3])
-                  if value.isdigit() and len(value) < 10 and int(value) > 0}
+        return {os.fsdecode(name): int(value) for name, value in zip(attributes[::3], attributes[2::3])
+                if value.isdigit() and len(value) < 10 and int(value) > 0}
+
+    @staticmethod
+    def saved_marker_widths(entry):
+        widths = entry.get("markerWidths", [])
+        if not isinstance(widths, list) or any(type(width) is not int or width < 1 for width in widths):
+            raise CleanupError("Invalid saved conflict marker widths")
+        return set(widths)
+
+    def check_conflict_markers(self, paths, unmerged, conflicts):
+        widths = self.conflict_marker_widths(paths)
         for name in paths:
             try:
                 data = self.read_workspace(name, limit=None)
@@ -595,11 +617,15 @@ class Worker:
                 if isinstance(error, OSError) and error.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
                     raise CleanupError(f"Cannot read the resolved candidate file {name}: {error}") from error
                 raise CandidateError("Restore a regular file before resolving the merge conflict: " + name) from error
-            width = widths.get(name, 7)
+            saved_widths = self.saved_marker_widths(conflicts[name])
+            known_widths = saved_widths | {DEFAULT_CONFLICT_MARKER_WIDTH, widths.get(name, DEFAULT_CONFLICT_MARKER_WIDTH)}
             for line in data.splitlines():
-                marker = line.partition(b" ")[0]
+                marker, _, label = line.partition(b" ")
+                git_label = GIT_CONFLICT_LABELS.get(marker[:1])
                 # A separator alone is ambiguous with an ordinary source banner.
-                if len(marker) == width and marker[:1] in (b"<", b">", b"|") and marker.count(marker[:1]) == width:
+                if git_label is None or marker.count(marker[:1]) != len(marker):
+                    continue
+                if len(marker) in known_widths or (not saved_widths and label == git_label):
                     raise CandidateError("Remove merge conflict markers from " + name)
 
     def accept_restore_resolution(self, outcome, conflicts):
@@ -615,7 +641,7 @@ class Worker:
             raise CleanupError("Invalid tracked restore conflict path")
         if unmerged - paths:
             raise CandidateError("Resolve all merge conflicts")
-        self.check_conflict_markers(sorted(paths), unmerged)
+        self.check_conflict_markers(sorted(paths), unmerged, conflicts)
         if unmerged:
             # Only the worker may change Git state. Reset the index entries to
             # the upstream versions and leave the reconciled worktree bytes for scope and verification.
@@ -1150,6 +1176,10 @@ class Worker:
         context.pop("screenshot", None)
         answer_path = self.directory / "answer.json"
         answer = json.loads(answer_path.read_text()) if answer_path.exists() else None
+        clarification = None
+        if isinstance(answer, dict):
+            clarification = answer.get("clarification")
+            answer = answer.get("answer")
         repair_path = self.directory / "repair.json"
         repair = json.loads(repair_path.read_text()) if repair_path.exists() else None
         if conflicts:
@@ -1185,7 +1215,7 @@ GPU access can be unavailable inside the implementation sandbox. Do not render o
 Make one candidate and return the schema. A host independently verifies and reviews it. No attempt/time budget.
 An unchanged existing shader may be successful if it already satisfies the prompt. Do not fabricate an empty change.
 """ + json.dumps({"request": {k: v for k, v in self.request.items() if k != "context"},
-                          "capturedContext": context, "answer": answer, "activationRepair": repair,
+                          "capturedContext": context, "answer": answer, "clarification": clarification, "activationRepair": repair,
                           "previousOutput": self.checkpoint.get("outcome"), "previousPublication": self.previous_publication(),
                           "verificationFeedback": feedback,
                           "scopeRecovery": self.checkpoint.get("scopeRecovery"),
@@ -1556,14 +1586,20 @@ An unchanged existing shader may be successful if it already satisfies the promp
                     active_repair = repair if repair and not repair.get("pending") else None
                     outcome = self.codex(self.prompt(feedback, active_repair, conflicts), reply_schema,
                                          "implementation", [screenshot], resume=True)
-                    if outcome.get("status") == "completed":
-                        self.save(outcome=outcome, verifiedCandidate=None)
-                    else:
-                        self.save(verifiedCandidate=None)
                     feedback = ""
                 phase = "scope"
                 try:
-                    if outcome["status"] == "needsClarification":
+                    if not isinstance(outcome, dict):
+                        raise CandidateError("The Codex implementation reply must be a JSON object")
+                    status = outcome.get("status")
+                    if status not in ("completed", "needsClarification"):
+                        raise CandidateError("The Codex implementation reply must have status completed or needsClarification")
+                    if not reverify:
+                        if status == "completed":
+                            self.save(outcome=outcome, verifiedCandidate=None)
+                        else:
+                            self.save(verifiedCandidate=None)
+                    if status == "needsClarification":
                         self.scope(allowed_unmerged=conflicts)
                         self.park()
                         emit("clarification", question=outcome["question"], options=outcome["options"])
