@@ -23,9 +23,9 @@ Choose an unused, increasing build number from App Store Connect. macOS build nu
 tools/distribute.sh all --build-number 42 --internal-only
 ```
 
-Use `tvos` or `macos` to release one app. Omit `--internal-only` to allow external TestFlight testing after Apple review. The script verifies each archive's dSYM UUIDs, waits for Sentry symbol processing, then submits the same archive to App Store Connect. Check processing, export compliance, and tester groups in App Store Connect. Declare Sentry crash and diagnostic data as applicable in the app privacy details.
+Use `tvos` or `macos` to release one app. Omit `--internal-only` to allow external TestFlight testing after Apple review. With `all`, the script archives both apps and verifies both dSYMs before submitting either archive. Each App Store Connect upload follows Sentry symbol processing for that archive. Check processing, export compliance, and tester groups in App Store Connect. Declare Sentry crash and diagnostic data as applicable in the app privacy details.
 
-Use `--archive-only` to build and verify a signed archive without uploading it. Set the public DSN at archive time if you intend to upload that build later. If a symbol or Apple upload fails, inspect the logs under `.build/distribution/`. Check whether Apple already received that build before retrying the saved archive with the same target and Sentry settings.
+Use `--archive-only` to build and verify a signed archive without uploading it. Set the public DSN at archive time if you intend to upload that build later. If an upload fails, use the printed commands to resume the failed and pending platforms. The commands use the verified archives and original tester setting. Inspect the logs under `.build/distribution/` and check whether Apple already received a build before retrying its Apple upload.
 
 ```sh
 tools/distribute.sh macos --archive '/path/to/HolodeckMac.xcarchive' --internal-only

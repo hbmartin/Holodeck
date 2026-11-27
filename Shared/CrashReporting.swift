@@ -35,10 +35,15 @@ enum CrashReporting {
         }
     }
 
-    nonisolated private static func scrubIdentifiers(_ event: Event) -> Event? {
+    nonisolated static func scrubIdentifiers(_ event: Event) -> Event? {
         // Cocoa v9 otherwise supplies a persistent installation ID as the event user.
         event.user = nil
         event.serverName = nil
+        if var context = event.context, var app = context["app"] {
+            app.removeValue(forKey: "device_app_hash")
+            context["app"] = app
+            event.context = context
+        }
         return event
     }
 }

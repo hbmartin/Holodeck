@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -38,10 +39,14 @@ MOCK_TOOL = textwrap.dedent('''\
         assert options['uploadSymbols']
         assert 'SENTRY_AUTH_TOKEN' not in os.environ
         record('apple', archive.stem, options['testFlightInternalTestingOnly'])
+        if os.environ.get('DISTRIBUTION_TEST_APPLE_FAILURE') == archive.stem:
+            sys.exit(1)
     elif tool == 'xcodebuild':
         scheme, config, destination = map(value, ('-scheme', '-configuration', '-destination'))
         record('archive', scheme, config, destination)
         assert 'SENTRY_AUTH_TOKEN' not in os.environ
+        if os.environ.get('DISTRIBUTION_TEST_ARCHIVE_FAILURE') == scheme:
+            sys.exit(1)
         archive = Path(value('-archivePath'))
         app = archive / 'Products' / 'Applications' / f'{scheme}.app'
         if scheme == 'HolodeckMac':
@@ -121,9 +126,39 @@ class DistributionTests(unittest.TestCase):
     def test_both_apps_upload_symbols_then_the_same_archive(self):
         self.run_release('all', '--build-number', '42', '--internal-only')
         self.assertEqual(self.calls(), [
-            'archive Holodeck Release generic/platform=tvOS', 'sentry holodeck tv Holodeck', 'apple Holodeck True',
-            'archive HolodeckMac TestFlight generic/platform=macOS', 'sentry holodeck mac HolodeckMac', 'apple HolodeckMac True',
+            'archive Holodeck Release generic/platform=tvOS', 'archive HolodeckMac TestFlight generic/platform=macOS',
+            'sentry holodeck tv Holodeck', 'apple Holodeck True', 'sentry holodeck mac HolodeckMac', 'apple HolodeckMac True',
         ])
+
+    def test_mac_archive_failure_prevents_both_uploads(self):
+        self.environment['DISTRIBUTION_TEST_ARCHIVE_FAILURE'] = 'HolodeckMac'
+        message = self.run_release('all', '--build-number', '42', success=False)
+        self.assertIn('Archiving HolodeckMac failed', message)
+        self.assertEqual(self.calls(), ['archive Holodeck Release generic/platform=tvOS',
+                                        'archive HolodeckMac TestFlight generic/platform=macOS'])
+
+    def test_partial_upload_prints_a_mac_only_retry_for_the_same_archive(self):
+        self.environment['DISTRIBUTION_TEST_APPLE_FAILURE'] = 'HolodeckMac'
+        message = self.run_release('all', '--build-number', '42', '--internal-only', success=False)
+        self.assertIn('Submitted to App Store Connect: tvos', message)
+        self.assertIn('already received macos before retrying', message)
+        archive, = self.root.glob('.build/distribution/*/HolodeckMac.xcarchive')
+        command, = (shlex.split(line) for line in message.splitlines() if line.startswith('  '))
+        self.assertEqual(command, [str(self.script.resolve()), 'macos', '--archive', str(archive.resolve()), '--internal-only'])
+        del self.environment['DISTRIBUTION_TEST_APPLE_FAILURE']
+        self.run_release(*command[1:])
+        self.assertEqual(self.calls().count('apple Holodeck True'), 1)
+        self.assertEqual(self.calls().count('archive HolodeckMac TestFlight generic/platform=macOS'), 1)
+        self.assertEqual(self.calls()[-1], 'apple HolodeckMac True')
+
+    def test_first_upload_failure_lists_both_verified_archives(self):
+        self.environment['DISTRIBUTION_TEST_SENTRY_STATUS'] = '1'
+        message = self.run_release('all', '--build-number', '42', success=False)
+        self.assertIn('No platform submission was confirmed', message)
+        commands = [shlex.split(line) for line in message.splitlines() if line.startswith('  ')]
+        self.assertEqual([command[1:3] for command in commands], [['tvos', '--archive'], ['macos', '--archive']])
+        self.assertTrue(all(Path(command[3]).is_dir() for command in commands))
+        self.assertEqual(self.calls()[-1], 'sentry holodeck tv Holodeck')
 
     def test_missing_configuration_for_second_app_prevents_both_uploads(self):
         del self.environment['SENTRY_PROJECT_MACOS']
@@ -135,10 +170,12 @@ class DistributionTests(unittest.TestCase):
                                 ('DISTRIBUTION_TEST_MISMATCH', 'UUIDs do not match')]:
             with self.subTest(variable=variable):
                 self.environment[variable] = '1'
-                self.assertIn(error, self.run_release('tvos', '--build-number', '42', success=False))
-                self.assertEqual(self.calls(), ['archive Holodeck Release generic/platform=tvOS'])
-                del self.environment[variable]
-                self.log.unlink()
+                try:
+                    self.assertIn(error, self.run_release('tvos', '--build-number', '42', success=False))
+                    self.assertEqual(self.calls(), ['archive Holodeck Release generic/platform=tvOS'])
+                finally:
+                    del self.environment[variable]
+                    self.log.unlink(missing_ok=True)
 
     def test_archive_only_and_retry_preserve_the_archive(self):
         upload_settings = {key: self.environment.pop(key) for key in
@@ -151,7 +188,7 @@ class DistributionTests(unittest.TestCase):
         self.assertIn('dSYMs to Sentry failed', self.run_release('macos', '--archive', str(archive), success=False))
         self.assertEqual(self.calls()[-1], 'sentry holodeck mac HolodeckMac')
         del self.environment['DISTRIBUTION_TEST_SENTRY_STATUS']
-        self.run_release('macos', '--archive', str(archive))
+        self.run_release('macos', '--archive', str(archive) + '/')
         self.assertEqual(self.calls(), ['archive HolodeckMac TestFlight generic/platform=macOS',
                                        'sentry holodeck mac HolodeckMac', 'sentry holodeck mac HolodeckMac',
                                        'apple HolodeckMac False'])

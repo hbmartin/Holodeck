@@ -1580,12 +1580,19 @@ actor TrustedApprovalsCoordinator {
         }
     }
     private func finishedDepartureRecovery(_ ticket: UUID, job: UUID, result: Result<Bool, Error>) {
-        guard departureRecoveryTasks[ticket]?.id == job else { return }
-        let waiting = departureRecoveryTasks[ticket]!.participants.values
-        departureRecoveryTasks[ticket] = departureRecoverySuccessors.removeValue(forKey: ticket)
+        guard let current = departureRecoveryTasks[ticket], current.id == job else { return }
+        let successor = departureRecoverySuccessors.removeValue(forKey: ticket)
+        departureRecoveryTasks[ticket] = nil
         publishDepartureSettlement(ticket, settling: false)
-        waiting.forEach { $0.complete(result) }
-        startDepartureRecovery(ticket)
+        current.participants.values.forEach { $0.complete(result) }
+        if let successor {
+            if case .success(true) = result, current.serviceID == successor.serviceID {
+                successor.participants.values.forEach { $0.complete(result) }
+            } else {
+                departureRecoveryTasks[ticket] = successor
+                startDepartureRecovery(ticket)
+            }
+        }
     }
     private func publishDepartureSettlement(_ ticket: UUID, settling: Bool) {
         guard let endpoint = departureEndpoints[ticket], endpoint.setSettling(settling) else { return }

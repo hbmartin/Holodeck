@@ -28,7 +28,8 @@ run_logged() {
     shift 2
     printf '%s\n' "$action"
     if ! "$@" >"$log" 2>&1; then
-        fail "$action failed. See $log."
+        printf 'Distribution error: %s failed. See %s.\n' "$action" "$log" >&2
+        return 1
     fi
 }
 
@@ -68,8 +69,11 @@ while [[ $# -gt 0 ]]; do
             build_number=$2
             shift 2 ;;
         --archive)
-            [[ $# -gt 1 && -z $existing_archive && -d $2 && $2 == *.xcarchive ]] || fail "Pass an existing .xcarchive directory to --archive."
-            existing_archive=$(cd -- "$2" && pwd -P)
+            [[ $# -gt 1 && -z $existing_archive ]] || fail "Pass an existing .xcarchive directory to --archive."
+            archive_argument=$2
+            while [[ $archive_argument == */ ]]; do archive_argument=${archive_argument%/}; done
+            [[ -d $archive_argument && $archive_argument == *.xcarchive ]] || fail "Pass an existing .xcarchive directory to --archive."
+            existing_archive=$(cd -- "$archive_argument" && pwd -P)
             shift 2 ;;
         --archive-only) archive_only=true; shift ;;
         --internal-only) internal_only=true; shift ;;
@@ -124,8 +128,11 @@ cd -- "$repo_root"
 output="$repo_root/.build/distribution"
 mkdir -p "$output"
 
-distribute() {
-    local platform=$1 scheme=Holodeck configuration=Release suffix=TVOS destination='generic/platform=tvOS'
+archives=() run_dirs=() schemes=() versions=() builds=() projects=()
+
+prepare_archive() {
+    local index=$1
+    local platform=${platforms[$index]} scheme=Holodeck configuration=Release suffix=TVOS destination='generic/platform=tvOS'
     local platform_name=appletvos
     local dsn_variable project_variable dsn run_dir archive app info executable executable_path
     local archived_build archived_version app_uuids dsym dsym_uuids entitlement_log
@@ -194,9 +201,12 @@ distribute() {
     printf 'Verified %s %s (%s) and its dSYM.\n' "$platform" "$archived_version" "$archived_build"
     [[ $archive_only == false ]] || return 0
 
-    run_logged "$run_dir/sentry.log" "Uploading $scheme dSYMs to Sentry" \
-        env -u SENTRY_ALLOW_FAILURE sentry-cli debug-files upload --type dsym --no-sources --wait \
-        --org "$SENTRY_ORG" --project "${!project_variable}" "$archive/dSYMs"
+    archives[$index]=$archive
+    run_dirs[$index]=$run_dir
+    schemes[$index]=$scheme
+    versions[$index]=$archived_version
+    builds[$index]=$archived_build
+    projects[$index]=${!project_variable}
 
     /usr/bin/plutil -create xml1 "$run_dir/ExportOptions.plist"
     local options="$run_dir/ExportOptions.plist"
@@ -206,14 +216,49 @@ distribute() {
     /usr/bin/plutil -insert manageAppVersionAndBuildNumber -bool NO "$options"
     /usr/bin/plutil -insert uploadSymbols -bool YES "$options"
     /usr/bin/plutil -insert testFlightInternalTestingOnly -bool "$internal_only" "$options"
+}
+
+report_upload_failure() {
+    local failed_index=$1 apple_attempted=$2 index
+    if (( failed_index > 0 )); then
+        printf 'Submitted to App Store Connect:' >&2
+        printf ' %s' "${platforms[@]:0:failed_index}" >&2
+        printf '\n' >&2
+    else
+        printf 'No platform submission was confirmed.\n' >&2
+    fi
+    if [[ $apple_attempted == true ]]; then
+        printf 'Check whether App Store Connect already received %s before retrying it.\n' "${platforms[$failed_index]}" >&2
+    fi
+    printf 'Resume the failed or pending platforms with their verified archives:\n' >&2
+    for ((index = failed_index; index < ${#platforms[@]}; index++)); do
+        printf '  %q %s --archive %q' "$repo_root/tools/distribute.sh" "${platforms[$index]}" "${archives[$index]}" >&2
+        if [[ $internal_only == true ]]; then printf ' --internal-only' >&2; fi
+        printf '\n' >&2
+    done
+    exit 1
+}
+
+upload_archive() {
+    local index=$1
+    local platform=${platforms[$index]} scheme=${schemes[$index]} archive=${archives[$index]} run_dir=${run_dirs[$index]}
+    run_logged "$run_dir/sentry.log" "Uploading $scheme dSYMs to Sentry" \
+        env -u SENTRY_ALLOW_FAILURE sentry-cli debug-files upload --type dsym --no-sources --wait \
+        --org "$SENTRY_ORG" --project "${projects[$index]}" "$archive/dSYMs" || report_upload_failure "$index" false
 
     run_logged "$run_dir/testflight.log" "Uploading $scheme to App Store Connect" \
         env -u SENTRY_AUTH_TOKEN xcodebuild -exportArchive -archivePath "$archive" \
-        -exportPath "$run_dir/export" -exportOptionsPlist "$options" "${apple_auth[@]}"
+        -exportPath "$run_dir/export" -exportOptionsPlist "$run_dir/ExportOptions.plist" "${apple_auth[@]}" \
+        || report_upload_failure "$index" true
     printf 'Submitted %s %s (%s) for App Store Connect processing. Logs: %s\n' \
-        "$platform" "$archived_version" "$archived_build" "$run_dir"
+        "$platform" "${versions[$index]}" "${builds[$index]}" "$run_dir"
 }
 
-for platform in "${platforms[@]}"; do
-    distribute "$platform"
+for index in "${!platforms[@]}"; do
+    prepare_archive "$index"
 done
+if [[ $archive_only == false ]]; then
+    for index in "${!platforms[@]}"; do
+        upload_archive "$index"
+    done
+fi

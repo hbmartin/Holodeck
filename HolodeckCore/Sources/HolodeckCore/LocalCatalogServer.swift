@@ -87,6 +87,7 @@ nonisolated struct TrustedTVApprovals: Codable, Sendable {
 
 public actor LocalCatalogServer {
     nonisolated static let productionNamespace = "mac-library"
+    nonisolated private static let testFlightNamespace = "mac-testflight-library"
     public func setRequestService(_ service: ShaderRequestService) async {
         do {
             guard try await registerTrustedBinding(service: service) else { return }
@@ -247,6 +248,7 @@ public actor LocalCatalogServer {
     private let catalog: DirectoryCatalog
     private let allowLoopback: Bool
     private let secretNamespace: String
+    private let allowsTestSecretCleanup: Bool
     private let advertise: Bool
     private var listener: NWListener?
     private var listenerID: UUID?
@@ -281,6 +283,7 @@ public actor LocalCatalogServer {
 
     public init(catalog: DirectoryCatalog, keychainNamespace: String) {
         self.catalog = catalog; self.allowLoopback = false; self.secretNamespace = keychainNamespace; self.advertise = true
+        allowsTestSecretCleanup = false
         trusted = .keychain(namespace: keychainNamespace)
         clock = AnyClock(ContinuousClock())
         beforeTrustedCommit = { _ in }; beforeRevocationReplay = { _ in }
@@ -294,8 +297,9 @@ public actor LocalCatalogServer {
          beforeTrustedCommit: @escaping @Sendable (RequestRevocationIntent) async throws -> Void = { _ in },
          beforeRevocationReplay: @escaping @Sendable (RequestRevocationIntent) async throws -> Void = { _ in },
          trustedApprovals: TrustedApprovalsCoordinator? = nil) {
-        precondition(testingNamespace != Self.productionNamespace)
+        precondition(testingNamespace != Self.productionNamespace && testingNamespace != Self.testFlightNamespace)
         self.catalog = catalog; self.allowLoopback = !advertise; self.secretNamespace = testingNamespace; self.advertise = advertise
+        allowsTestSecretCleanup = true
         self.clock = AnyClock(clock)
         self.beforeTrustedCommit = beforeTrustedCommit; self.beforeRevocationReplay = beforeRevocationReplay
         if let trustedApprovals { self.trusted = trustedApprovals }
@@ -420,8 +424,12 @@ public actor LocalCatalogServer {
         permit?.invalidate(); permit?.lifetime.invalidate()
         if withdrawal == nil { Task { await trusted.withdraw(serverID: serverID, eligibility: eligibility) } }
     }
+    struct TestSecretCleanupDenied: LocalizedError {
+        var errorDescription: String? { "Only a test catalog server may reset its keychain secrets." }
+    }
+
     func clearTestSecrets() async throws {
-        precondition(secretNamespace != Self.productionNamespace)
+        guard allowsTestSecretCleanup else { throw TestSecretCleanupDenied() }
         try await shutdownReceipt().value()
         try LocalServerIdentity.remove(account: secretNamespace + "-tls-identity")
         try LocalSecrets.remove(TrustedApprovalsCoordinator.approvalsAccount(secretNamespace))
